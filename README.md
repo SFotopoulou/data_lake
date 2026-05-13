@@ -145,6 +145,7 @@ dl-ingest-cutouts cutouts.fits --survey des_dr2 --ra-col RA --dec-col DEC
 ```bash
 pip install 'data-lake[desi]'
 
+# Single file (debug / smoke-testing).
 # With $DATA_LAKE_CONFIG set, OUTPUT_ROOT is taken from the config.
 dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits --survey desi_edr
 
@@ -159,6 +160,60 @@ dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits /data/lake --survey desi
 # SDSS/BOSS (no extra dependency needed)
 dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17
 ```
+
+#### Parallel batch ingest (many coadd files)
+
+For survey-scale jobs (e.g. ~10 000 DESI coadd files) use the parallel
+batch CLI.  It runs decode + ``coadd_cameras`` in N worker processes while
+a single main-thread writer is the only process that touches the Zarr
+store — that's the only multi-file pattern that is **safe** here, since
+``LocalStore`` has no cross-process locks for shard writes.
+
+```bash
+# By directory + glob
+dl-ingest-spectra-batch \
+    --survey desi_dr1 \
+    --coadd-root /data/desi/coadds \
+    --coadd-glob 'coadd-*.fits' \
+    --n-workers 16
+
+# Or by explicit file list (one path per line)
+ls /data/desi/coadds/coadd-*.fits > coadds.txt
+dl-ingest-spectra-batch \
+    --survey desi_dr1 \
+    --file-list coadds.txt \
+    --n-workers 16
+```
+
+Key properties:
+
+- **Resumable** — completed file paths are persisted to a JSON checkpoint
+  (default `<output>/spectra/<survey>/.ingest_checkpoint.json`); restarts
+  skip them.
+- **Error-isolated** — per-file failures are appended to a JSONL log
+  (default `<output>/spectra/<survey>/.ingest_failures.jsonl`) and the
+  run continues.  At 10k-file scale a small percentage of corrupt
+  inputs is normal.
+- **Vectorised HEALPix assignment** — one `assign_healpix` call per file
+  instead of per record.
+- **Automatic catalog patch** — after ingest the run patches
+  `_spectrum_index` in the Parquet catalog (`--no-update-catalog` to
+  skip; silently no-ops if no catalog exists yet for the survey).
+- **`--n-workers` is required** — no implicit default; pick consciously
+  (typical: `cpu_count - 1` to keep one core for the writer / OS).
+- **Threads do not help here**: `read_spectra` is mostly Python under
+  the GIL.  Stick to processes.
+
+Rough timing on a single workstation for 10 000 DESI coadd files
+(~500 spectra each, no resolution matrix):
+
+| n_workers | Wall-clock estimate |
+|---:|---|
+|  1 |  6–11 h |
+| 16 | 30–50 min |
+| 32 | 20–35 min (SSD I/O may dominate beyond this) |
+
+Disk footprint: ~120–170 GB compressed for ~5 M spectra at ~8 000 px.
 
 #### Using the resolution matrix
 
@@ -203,6 +258,62 @@ N       = spec.flux.shape[0]
 R       = dia_matrix((diags, offsets), shape=(N, N))
 ```
 
+### Extract a curated subset into one flat Zarr
+
+Once spectra are ingested, you can materialise a self-contained Zarr
+group containing only a user-specified subset of sources (e.g. 129k
+DESI targets out of a fully-ingested release). Reads are batched per
+HEALPix tile via Zarr orthogonal indexing so each source shard is
+decompressed at most once.
+
+Python API:
+
+```python
+import numpy as np
+from astropy.table import Table
+from data_lake.io.spectra import SpectrumAccessor
+
+target_ids = np.asarray(Table.read("zall-pix-iron-qso.fits")["TARGETID"])
+
+acc = SpectrumAccessor("/data/lake", "desi_dr1")
+result = acc.extract_subset_to_zarr(
+    source_ids=target_ids,
+    output_zarr="/scratch/qso_subset.zarr",
+    missing="skip",          # report-and-skip IDs not in the lake
+    overwrite=False,
+)
+print(result["n_written"], "rows written;",
+      len(result["missing_ids"]), "missing")
+```
+
+Or the CLI:
+
+```bash
+dl-extract-spectra-subset \
+    --survey desi_dr1 \
+    --target-list zall-pix-iron-qso.fits \
+    --target-id-col TARGETID \
+    --output /scratch/qso_subset.zarr
+```
+
+Output layout (single Zarr group, `wavelength_mode="shared"` only):
+
+```
+qso_subset.zarr/
+  flux/        (N_written, N_pix) float32 sharded
+  ivar/        (N_written, N_pix) float32 sharded
+  mask/        (N_written, N_pix) uint8   sharded
+  wavelength/  (N_pix,)           float64 shared grid
+  source_id/   (N_written,)       int64
+  redshift/    (N_written,)       float32  (per-source z from meta)
+```
+
+Rows are written in HEALPix-tile-traversal order for fast contiguous
+writes; the returned `id_to_row` mapping lets you reorder if needed.
+Lookup uses the catalog's `_spectrum_index` column when available
+(O(catalog SQL) batched), otherwise falls back to a vectorised tile
+scan (one `source_id` array read per tile + `np.isin`).
+
 ### Update catalog with spectrum index
 
 ```python
@@ -227,6 +338,7 @@ data_lake/
     fits_to_parquet.py        FITS/VOTable → HATS-partitioned Parquet
     fits_to_zarr.py           FITS cutouts → Zarr v3 sharded stacks
     fits_to_spectra_zarr.py   FITS 1-D spectra → Zarr v3 sharded stacks
+    desi_parallel_ingest.py   Multi-process batch ingest of many DESI coadd files
     update_catalog_indices.py Patch _cutout_index / _spectrum_index in Parquet tiles
   io/
     catalog.py           DuckDB-backed Parquet accessor
@@ -241,6 +353,7 @@ data_lake/
   export/
     to_fits.py           Zarr cutout → standards-compliant FITS export
     to_spectrum_fits.py  Zarr spectrum → 1-D FITS + BINTABLE export
+    spectra_subset.py    Curated source-id subset → single flat Zarr group
 notebooks/
   01_duckdb_catalog_query.ipynb
   02_pytorch_training_loop.ipynb

@@ -62,20 +62,121 @@ def assign_healpix(
 # ---------------------------------------------------------------------------
 
 
+def _astropy_col_to_pyarrow(col) -> pa.Array:
+    """Convert one astropy ``Column`` (or ``MaskedColumn``) to a PyArrow Array.
+
+    Preserves multidim columns as ``FixedSizeListArray`` of the same inner
+    size — essential for FITS BINTABLE vector columns such as DESI's
+    ``COEFF`` (shape ``(N_rows, 10)``).  Without this, ``astropy.to_pandas``
+    raises because pandas/pyarrow DataFrames can't represent 2-D cells.
+
+    Handles:
+    * big-endian FITS dtypes → cast to native byte-order (PyArrow requires it)
+    * fixed-width byte strings (``|S<n>``) → decode to UTF-8 strings
+    * 1-D masked columns → propagate the null mask
+    * >2-D columns → flattened to a single FixedSizeList whose inner length
+      is ``prod(shape[1:])`` (the original inner shape is recorded as
+      schema metadata by :func:`_astropy_table_to_arrow`).
+    """
+    from astropy.table import MaskedColumn
+
+    data = np.asarray(col)
+
+    # FITS BINTABLE is big-endian; PyArrow needs native byte-order.
+    if data.dtype.kind in "biufc" and data.dtype.byteorder not in ("=", "|", ""):
+        data = data.astype(data.dtype.newbyteorder("="), copy=False)
+
+    if data.ndim == 1:
+        if data.dtype.kind == "S":
+            data = np.char.decode(data, "utf-8", errors="replace")
+        if isinstance(col, MaskedColumn) and col.mask is not None and np.any(col.mask):
+            return pa.array(data, mask=np.asarray(col.mask, dtype=bool))
+        return pa.array(data)
+
+    # ndim >= 2 → FixedSizeList(inner_size)
+    n_rows = data.shape[0]
+    inner_size = int(np.prod(data.shape[1:]))
+    flat = np.ascontiguousarray(data).reshape(n_rows * inner_size)
+    if flat.dtype.kind == "S":
+        flat = np.char.decode(flat, "utf-8", errors="replace")
+    inner = pa.array(flat)
+    return pa.FixedSizeListArray.from_arrays(inner, list_size=inner_size)
+
+
+def _astropy_table_to_arrow(tbl: Table) -> pa.Table:
+    """Convert an astropy Table to a PyArrow Table, preserving multidim columns.
+
+    Unlike ``astropy.Table.to_pandas`` + ``pa.Table.from_pandas``, this path
+    handles vector/matrix BINTABLE columns (e.g. DESI ``COEFF`` shape (N, 10)
+    or per-band fluxes shape (N, 4)) by storing them as Arrow
+    ``FixedSizeList`` arrays.  Inner shapes for >2-D columns are recorded
+    in ``schema.metadata['data_lake.inner_shapes']`` as a JSON map so the
+    original tensor shape can be reconstructed if needed.
+    """
+    arrays: list[pa.Array] = []
+    names: list[str] = []
+    inner_shapes: dict[str, list[int]] = {}
+    multidim_cols: list[str] = []
+
+    for name in tbl.colnames:
+        col = tbl[name]
+        data = np.asarray(col)
+        if data.ndim > 2:
+            inner_shapes[name] = list(map(int, data.shape[1:]))
+        if data.ndim >= 2:
+            multidim_cols.append(f"{name}{tuple(int(d) for d in data.shape[1:])}")
+        arrays.append(_astropy_col_to_pyarrow(col))
+        names.append(name)
+
+    table = pa.Table.from_arrays(arrays, names=names)
+
+    if inner_shapes:
+        schema_meta = dict(table.schema.metadata or {})
+        schema_meta[b"data_lake.inner_shapes"] = json.dumps(inner_shapes).encode()
+        table = table.replace_schema_metadata(schema_meta)
+
+    if multidim_cols:
+        log.info("Preserved %d multidim column(s) as FixedSizeList: %s",
+                 len(multidim_cols), ", ".join(multidim_cols))
+
+    return table
+
+
 def _read_source_table(path: Path) -> pa.Table:
-    """Read a FITS or VOTable file into a PyArrow Table."""
+    """Read a catalog file into a PyArrow Table.
+
+    Supported inputs (by file suffix):
+    * ``.fits`` / ``.fit`` / ``.fz`` / ``.fits.gz``  – FITS BINTABLE via astropy
+    * ``.xml`` / ``.vot`` / ``.votable``             – VOTable via astropy
+    * ``.parquet`` / ``.pq``                         – Parquet via pyarrow (direct)
+    * ``.ecsv``                                      – ECSV via astropy
+    * ``.csv`` / ``.tsv``                            – CSV via astropy
+    * anything else                                  – astropy auto-detect
+
+    Multidim FITS columns (e.g. DESI ``COEFF``) are preserved as
+    ``FixedSizeList`` arrays rather than crashing in the pandas conversion.
+    """
+    name = path.name.lower()
     suffix = path.suffix.lower()
-    if suffix in {".fit", ".fits", ".fits.gz", ".fz"}:
-        fmt = "fits"
+
+    if suffix in {".parquet", ".pq"}:
+        log.info("Reading %s as Parquet …", path.name)
+        return pq.read_table(str(path))
+
+    if name.endswith(".fits.gz") or suffix in {".fit", ".fits", ".fz"}:
+        fmt: str | None = "fits"
     elif suffix in {".xml", ".vot", ".votable"}:
         fmt = "votable"
+    elif suffix == ".ecsv":
+        fmt = "ascii.ecsv"
+    elif suffix in {".csv", ".tsv"}:
+        fmt = "ascii.csv"
     else:
-        # Try FITS first, fall back to auto-detect
-        fmt = "fits"
+        fmt = None  # let astropy auto-detect
 
-    log.info("Reading %s as %s …", path.name, fmt)
-    astropy_table = Table.read(str(path), format=fmt)
-    return pa.Table.from_pandas(astropy_table.to_pandas(index=False), preserve_index=False)
+    log.info("Reading %s as %s …", path.name, fmt or "auto-detect")
+    astropy_table = Table.read(str(path)) if fmt is None else Table.read(str(path), format=fmt)
+    return _astropy_table_to_arrow(astropy_table)
 
 
 def _add_healpix_columns(

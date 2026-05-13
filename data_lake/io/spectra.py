@@ -10,18 +10,28 @@ Core API
 >>> sp.wavelength    # (N_pix,) float64 in Angstrom
 >>> sp.wcs_attrs     # dict with crval, cdelt, ctype …
 >>> batch = acc.get_batch([id1, id2, id3])   # (N, N_pix) float32
+
+Bulk subset extraction
+----------------------
+>>> result = acc.extract_subset_to_zarr(
+...     source_ids=my_129k_targetids,
+...     output_zarr="/scratch/desi_subset.zarr",
+... )
+>>> result["n_written"], len(result["missing_ids"])
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import zarr
+import zarr.codecs
 
 from data_lake.ingest.fits_to_parquet import healpix_dir
 from data_lake.ingest.fits_to_spectra_zarr import _META_DTYPE
@@ -441,6 +451,360 @@ class SpectrumAccessor:
         if shared_wavelength is not None:
             return flux_out, ivar_out, mask_out, shared_wavelength
         return flux_out, ivar_out, mask_out, per_source_wavelength
+
+    # ------------------------------------------------------------------
+    # Bulk subset extraction
+    # ------------------------------------------------------------------
+
+    def _build_source_id_lookup(
+        self,
+        requested: np.ndarray,
+        show_progress: bool = True,
+    ) -> dict[int, tuple[int, int]]:
+        """Resolve ``source_id -> (npix, local_idx)`` for a batch of IDs.
+
+        Uses two strategies in order:
+
+        1. **Bulk catalog SQL** (when ``self._catalog`` is set and its catalog
+           carries the ``_spectrum_index`` column): one DuckDB query per
+           ~10k-id batch, with predicate pushdown over the per-tile Parquet
+           files via ``_metadata``.
+        2. **Vectorised tile scan** (always works): read each tile's
+           ``source_id`` array once and ``np.isin`` against the remaining
+           requested IDs.  O(N_tiles · (|tile| + |remaining|)) with no
+           per-id Python overhead.
+        """
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:  # tqdm is a hard dep, but stay defensive
+            def tqdm(x, **_kw):
+                return x
+
+        requested_int = np.unique(requested.astype(np.int64, copy=False))
+        result: dict[int, tuple[int, int]] = {}
+
+        # --- 1. Fast path: bulk catalog SQL ---
+        if self._catalog is not None:
+            try:
+                cat_cols = self._catalog.columns
+                hp_col = f"_healpix_norder{self._catalog.norder}"
+                if "_spectrum_index" in cat_cols and hp_col in cat_cols:
+                    batch_size = 10_000
+                    for start in tqdm(
+                        range(0, len(requested_int), batch_size),
+                        desc="catalog lookup",
+                        disable=not show_progress,
+                        unit="batch",
+                    ):
+                        chunk = requested_int[start : start + batch_size]
+                        ids_csv = ",".join(str(int(s)) for s in chunk)
+                        sql = (
+                            f"SELECT source_id, {hp_col}, _spectrum_index "
+                            f"FROM catalog WHERE source_id IN ({ids_csv}) "
+                            f"AND _spectrum_index >= 0"
+                        )
+                        rows = self._catalog._con.execute(sql).fetchall()
+                        for sid, npix, lidx in rows:
+                            result[int(sid)] = (int(npix), int(lidx))
+            except Exception:  # pragma: no cover - defensive
+                log.warning(
+                    "Catalog fast-path failed, falling back to tile scan.",
+                    exc_info=True,
+                )
+
+        # --- 2. Tile-scan fallback for whatever the catalog did not cover ---
+        remaining = np.setdiff1d(
+            requested_int,
+            np.fromiter(result.keys(), dtype=np.int64, count=len(result)),
+            assume_unique=True,
+        )
+
+        if remaining.size > 0:
+            tiles = self.available_tiles()
+            for npix in tqdm(
+                tiles,
+                desc="tile scan",
+                disable=not show_progress,
+                unit="tile",
+            ):
+                if remaining.size == 0:
+                    break
+                store = self._get_tile_store(npix)
+                sids_in_tile = store.get_source_ids()
+                hit_mask = np.isin(sids_in_tile, remaining, assume_unique=False)
+                if not hit_mask.any():
+                    continue
+                local_idxs = np.nonzero(hit_mask)[0]
+                hit_sids = sids_in_tile[local_idxs]
+                for sid, lidx in zip(hit_sids.tolist(), local_idxs.tolist()):
+                    result[int(sid)] = (int(npix), int(lidx))
+                remaining = np.setdiff1d(remaining, hit_sids, assume_unique=False)
+
+        return result
+
+    def extract_subset_to_zarr(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        output_zarr: Path | str,
+        *,
+        missing: str = "skip",
+        chunks_per_shard: int = 512,
+        show_progress: bool = True,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Extract a curated subset of spectra into a single flat Zarr v3 group.
+
+        Writes one self-contained Zarr group containing only the requested
+        spectra, with rows in **tile-traversal order** (contiguous writes →
+        each output shard is written exactly once, no read-modify-write).
+        The returned ``id_to_row`` mapping lets callers reorder if needed.
+
+        Output layout
+        -------------
+        ::
+
+            output_zarr/
+              flux/        (N_written, N_pix)  float32  sharded
+              ivar/        (N_written, N_pix)  float32  sharded
+              mask/        (N_written, N_pix)  uint8/16 sharded
+              wavelength/  (N_pix,)            float64  shared grid
+              source_id/   (N_written,)        int64
+              redshift/    (N_written,)        float32  (from per-source meta.z)
+
+        Parameters
+        ----------
+        source_ids:
+            Requested source identifiers.  Duplicates are deduplicated.
+        output_zarr:
+            Destination ``.zarr`` directory (must not exist unless
+            ``overwrite=True``).
+        missing:
+            ``"skip"`` (default) silently omits IDs not found in the lake and
+            reports them in the result; ``"error"`` raises ``KeyError``.
+        chunks_per_shard:
+            Output shard rows (same convention as ingest; default 512).
+        show_progress:
+            Show tqdm progress bars for the lookup and extract phases.
+        overwrite:
+            Remove an existing ``output_zarr`` before writing.
+
+        Returns
+        -------
+        dict with keys:
+            ``n_requested``  – unique IDs requested
+            ``n_written``    – rows actually written
+            ``missing_ids``  – list[int] of IDs not found in the lake
+            ``id_to_row``    – dict[int, int] source_id → row in output
+            ``output_zarr``  – str path to the destination
+
+        Notes
+        -----
+        * Requires the source survey to be stored with
+          ``wavelength_mode='shared'`` (single common wavelength grid across
+          tiles).  Per-source wavelength support is a deliberate follow-up.
+        * Reads each tile's flux / ivar / mask with a single
+          ``get_orthogonal_selection`` call so each shard is decompressed at
+          most once per tile.  This is typically 10–50× faster than looping
+          ``root["flux"][i]`` per source.
+        """
+        if missing not in ("skip", "error"):
+            raise ValueError(f"missing must be 'skip' or 'error', got {missing!r}")
+
+        output_zarr = Path(output_zarr)
+        if output_zarr.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"{output_zarr} already exists. Pass overwrite=True to replace it."
+                )
+            import shutil
+            shutil.rmtree(output_zarr)
+
+        wave_mode = str(self._info.get("wavelength_mode", "shared"))
+        if wave_mode != "shared":
+            raise NotImplementedError(
+                f"extract_subset_to_zarr currently supports wavelength_mode='shared' "
+                f"only (survey {self.survey_name!r} uses {wave_mode!r})."
+            )
+
+        requested = np.asarray(source_ids, dtype=np.int64).ravel()
+        if requested.size == 0:
+            raise ValueError("source_ids is empty.")
+        n_requested = int(np.unique(requested).size)
+
+        log.info(
+            "Resolving %d unique source_ids in %s …",
+            n_requested, self.survey_name,
+        )
+        sid_to_loc = self._build_source_id_lookup(requested, show_progress=show_progress)
+
+        # Group hits by HEALPix tile (preserve user request order within a tile only
+        # by virtue of dict insertion order; output rows are contiguous per tile).
+        by_tile: dict[int, list[tuple[int, int]]] = {}
+        missing_ids: list[int] = []
+        seen: set[int] = set()
+        for sid_raw in requested.tolist():
+            sid = int(sid_raw)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            loc = sid_to_loc.get(sid)
+            if loc is None:
+                missing_ids.append(sid)
+                continue
+            npix, lidx = loc
+            by_tile.setdefault(npix, []).append((lidx, sid))
+
+        if missing == "error" and missing_ids:
+            raise KeyError(
+                f"{len(missing_ids)} source_id(s) not found in lake "
+                f"(first few: {missing_ids[:10]})."
+            )
+
+        n_written = sum(len(v) for v in by_tile.values())
+        if n_written == 0:
+            raise ValueError("None of the requested source_ids were found in the lake.")
+
+        # Sample first tile for shape, dtype, wavelength, WCS
+        first_npix = next(iter(by_tile))
+        first_store = self._get_tile_store(first_npix)
+        first_root = first_store._open()
+        n_pix = int(first_root["flux"].shape[1])
+        wavelength = np.asarray(first_root["wavelength"][:], dtype=np.float64)
+        flux_dtype = first_root["flux"].dtype
+        ivar_dtype = first_root["ivar"].dtype
+        mask_dtype = first_root["mask"].dtype
+        src_wcs = dict(first_store.wcs_attrs)
+
+        # --- Create destination Zarr ---
+        store = zarr.storage.LocalStore(str(output_zarr))
+        out_root = zarr.open_group(store=store, mode="w", zarr_format=3)
+
+        compressors = zarr.codecs.BloscCodec(
+            cname="zstd",
+            clevel=3,
+            shuffle=zarr.codecs.BloscShuffle.bitshuffle,
+        )
+        shard_rows = max(1, min(chunks_per_shard, n_written))
+
+        def _arr2d(name: str, dtype, fill):
+            out_root.create_array(
+                name,
+                shape=(n_written, n_pix),
+                chunks=(1, n_pix),
+                shards=(shard_rows, n_pix),
+                dtype=dtype,
+                compressors=compressors,
+                fill_value=fill,
+            )
+
+        _arr2d("flux", flux_dtype, np.nan)
+        _arr2d("ivar", ivar_dtype, 0.0)
+        _arr2d("mask", mask_dtype, 0)
+        out_root.create_array(
+            "wavelength", shape=(n_pix,), chunks=(n_pix,), dtype=np.float64, fill_value=0.0,
+        )
+        out_root.create_array(
+            "source_id",
+            shape=(n_written,),
+            chunks=(min(4096, n_written),),
+            dtype=np.int64,
+            fill_value=-1,
+        )
+        out_root.create_array(
+            "redshift",
+            shape=(n_written,),
+            chunks=(min(4096, n_written),),
+            dtype=np.float32,
+            fill_value=np.nan,
+        )
+
+        out_root["wavelength"][:] = wavelength
+
+        attrs: dict[str, Any] = dict(src_wcs)
+        attrs.update({
+            "source_survey": self.survey_name,
+            "source_lake_root": str(self.lake_root),
+            "wavelength_mode": "shared",
+            "n_sources": n_written,
+            "n_pix": n_pix,
+            "n_requested": n_requested,
+            "n_missing": len(missing_ids),
+            "extract_created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "schema_version": "1",
+        })
+        out_root.attrs.update(attrs)
+
+        # --- Stream tile-by-tile, batched reads via fancy indexing ---
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:
+            def tqdm(x, **_kw):
+                return x
+
+        id_to_row: dict[int, int] = {}
+        write_offset = 0
+        for npix, items in tqdm(
+            by_tile.items(),
+            desc="extract",
+            disable=not show_progress,
+            unit="tile",
+            total=len(by_tile),
+        ):
+            local_idxs = np.fromiter((t[0] for t in items), dtype=np.int64, count=len(items))
+            sids = np.fromiter((t[1] for t in items), dtype=np.int64, count=len(items))
+
+            # Sort local idxs for sequential shard access on the source side
+            order = np.argsort(local_idxs)
+            sorted_local = local_idxs[order]
+            sorted_sids = sids[order]
+
+            t_store = self._get_tile_store(npix)
+            t_root = t_store._open()
+            if int(t_root["flux"].shape[1]) != n_pix:
+                raise ValueError(
+                    f"Tile {npix} has N_pix={t_root['flux'].shape[1]} but expected "
+                    f"{n_pix}; non-uniform wavelength grid is not supported."
+                )
+
+            flux_batch = t_root["flux"].get_orthogonal_selection(
+                (sorted_local, slice(None))
+            )
+            ivar_batch = t_root["ivar"].get_orthogonal_selection(
+                (sorted_local, slice(None))
+            )
+            mask_batch = t_root["mask"].get_orthogonal_selection(
+                (sorted_local, slice(None))
+            )
+
+            meta_raw = t_root["meta"][sorted_local]
+            z_batch = np.empty(len(sorted_local), dtype=np.float32)
+            for i, raw in enumerate(meta_raw):
+                z_batch[i] = _decode_meta(raw).get("z", np.nan)
+
+            k = len(sorted_local)
+            slc = slice(write_offset, write_offset + k)
+            out_root["flux"][slc, :] = flux_batch
+            out_root["ivar"][slc, :] = ivar_batch
+            out_root["mask"][slc, :] = mask_batch
+            out_root["source_id"][slc] = sorted_sids
+            out_root["redshift"][slc] = z_batch
+
+            for j, sid in enumerate(sorted_sids.tolist()):
+                id_to_row[int(sid)] = write_offset + j
+            write_offset += k
+
+        log.info(
+            "Extracted %d/%d spectra → %s (skipped %d missing across %d tiles)",
+            n_written, n_requested, output_zarr, len(missing_ids), len(by_tile),
+        )
+
+        return {
+            "n_requested": n_requested,
+            "n_written": n_written,
+            "missing_ids": missing_ids,
+            "id_to_row": id_to_row,
+            "output_zarr": str(output_zarr),
+        }
 
     def iter_tile(self, npix: int):
         """

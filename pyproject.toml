@@ -46,6 +46,8 @@ dl-init            = "data_lake.admin.init_lake:dl_init"
 dl-ingest-catalog  = "data_lake.ingest.fits_to_parquet:cli"
 dl-ingest-cutouts  = "data_lake.ingest.fits_to_zarr:cli"
 dl-ingest-spectra  = "data_lake.ingest.fits_to_spectra_zarr:cli"
+dl-ingest-spectra-batch   = "data_lake.ingest.desi_parallel_ingest:cli"
+dl-extract-spectra-subset = "data_lake.export.spectra_subset:cli"
 dl-pack-tile       = "data_lake.share.pack_tile:cli"
 
 [tool.setuptools.packages.find]
