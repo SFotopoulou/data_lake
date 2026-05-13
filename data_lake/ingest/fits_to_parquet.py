@@ -73,6 +73,10 @@ def _astropy_col_to_pyarrow(col) -> pa.Array:
     Handles:
     * big-endian FITS dtypes → cast to native byte-order (PyArrow requires it)
     * fixed-width byte strings (``|S<n>``) → decode to UTF-8 strings
+    * **all** string columns → stored as ``large_string`` (int64 offsets) so
+      that downstream ``Table.take`` / ``Table.filter`` operations on
+      multi-million-row catalogs cannot hit the 2 GB offset overflow of the
+      default ``string`` type
     * 1-D masked columns → propagate the null mask
     * >2-D columns → flattened to a single FixedSizeList whose inner length
       is ``prod(shape[1:])`` (the original inner shape is recorded as
@@ -89,9 +93,12 @@ def _astropy_col_to_pyarrow(col) -> pa.Array:
     if data.ndim == 1:
         if data.dtype.kind == "S":
             data = np.char.decode(data, "utf-8", errors="replace")
+        # Strings: force large_string so 28M+ row catalogs don't blow up
+        # `table.take` with `offset overflow while concatenating arrays`.
+        pa_type = pa.large_string() if data.dtype.kind == "U" else None
         if isinstance(col, MaskedColumn) and col.mask is not None and np.any(col.mask):
-            return pa.array(data, mask=np.asarray(col.mask, dtype=bool))
-        return pa.array(data)
+            return pa.array(data, type=pa_type, mask=np.asarray(col.mask, dtype=bool))
+        return pa.array(data, type=pa_type)
 
     # ndim >= 2 → FixedSizeList(inner_size)
     n_rows = data.shape[0]
@@ -99,7 +106,8 @@ def _astropy_col_to_pyarrow(col) -> pa.Array:
     flat = np.ascontiguousarray(data).reshape(n_rows * inner_size)
     if flat.dtype.kind == "S":
         flat = np.char.decode(flat, "utf-8", errors="replace")
-    inner = pa.array(flat)
+    inner_type = pa.large_string() if flat.dtype.kind == "U" else None
+    inner = pa.array(flat, type=inner_type)
     return pa.FixedSizeListArray.from_arrays(inner, list_size=inner_size)
 
 

@@ -88,6 +88,37 @@ class TestAstropyToArrow:
         assert all(isinstance(s, str) for s in spectype)
         assert spectype[0].startswith("QSO")
 
+    def test_string_columns_are_large_string(self):
+        """All string columns must use large_string (int64 offsets).
+
+        The default `string` type caps total UTF-8 bytes per chunk at 2 GB
+        (int32 offsets); table.take()/filter() on a 28M-row DESI catalog
+        overflows that limit with `ArrowInvalid: offset overflow ...`.
+        """
+        from data_lake.ingest.fits_to_parquet import _astropy_table_to_arrow
+
+        tbl = _make_desi_like_table(n_rows=6)
+        arrow_tbl = _astropy_table_to_arrow(tbl)
+
+        # 1-D string column
+        assert arrow_tbl.schema.field("SPECTYPE").type == pa.large_string()
+
+    def test_take_on_large_string_does_not_overflow_pattern(self):
+        """Smoke-test: table.take() must work on our large_string columns.
+
+        This is the exact call site that crashed at 28M-row scale; the
+        regression check ensures the conversion path still produces a take-
+        compatible Table.
+        """
+        from data_lake.ingest.fits_to_parquet import _astropy_table_to_arrow
+
+        tbl = _make_desi_like_table(n_rows=50)
+        arrow_tbl = _astropy_table_to_arrow(tbl)
+        # Pass shuffled indices through take() — same pattern as ingest_catalog
+        idx = np.arange(50)[::-1]
+        reordered = arrow_tbl.take(pa.array(idx, type=pa.int64()))
+        assert reordered.num_rows == 50
+
     def test_3d_column_flattens_and_records_inner_shape(self):
         """>2-D columns flatten to FixedSizeList(inner_prod) with metadata."""
         from data_lake.ingest.fits_to_parquet import _astropy_table_to_arrow
