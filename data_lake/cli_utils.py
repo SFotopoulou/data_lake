@@ -54,6 +54,32 @@ def pick(cli_value: Any, cfg_value: Any, fallback: Any) -> Any:
     return fallback
 
 
+def configure_warning_filters() -> None:
+    """Dedup the noisiest warnings emitted by ingest readers.
+
+    FITS-heavy workflows frequently trigger ``astropy.units.UnitsWarning``
+    once per BINTABLE column carrying an unknown survey unit (e.g.
+    ``nanomaggy`` in DESI catalogs).  Setting the action to ``"once"``
+    collapses each unique message+category to a single emission per
+    process — enough to keep the warning visible without flooding the log.
+
+    Notes
+    -----
+    * Library code never calls this; only CLI entry points do.  This keeps
+      ``import data_lake`` side-effect-free with respect to the user's
+      global warning filters.
+    * Filters do **not** propagate across ``multiprocessing`` /
+      ``ProcessPoolExecutor`` workers.  Pass this function as the
+      executor's ``initializer=`` to apply it in every worker process.
+    """
+    import warnings
+    try:
+        from astropy.units.core import UnitsWarning
+    except ImportError:
+        return
+    warnings.filterwarnings("once", category=UnitsWarning)
+
+
 def require_output_root(
     output_root: Path | None,
     cfg: LakeConfig | None,

@@ -381,6 +381,7 @@ try:
 
     from ..cli_utils import (
         config_option,
+        configure_warning_filters,
         load_optional_config,
         pick,
         require_output_root,
@@ -417,6 +418,7 @@ try:
         ``<lake.root>/<paths.cutouts>``.
         """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        configure_warning_filters()
         cfg = load_optional_config(config_path)
         resolved_output = require_output_root(output_root, cfg, kind="cutouts")
 

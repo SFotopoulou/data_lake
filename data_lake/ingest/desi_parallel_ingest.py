@@ -315,7 +315,14 @@ def ingest_spectra_parallel(
         }
 
     if executor_factory is None:
-        executor_factory = lambda nw: ProcessPoolExecutor(max_workers=nw)  # noqa: E731
+        from data_lake.cli_utils import configure_warning_filters as _wf
+
+        def _default_executor(nw: int) -> Executor:
+            # initializer runs once in each worker process — filter state
+            # does not propagate from the parent, so set it up there too.
+            return ProcessPoolExecutor(max_workers=nw, initializer=_wf)
+
+        executor_factory = _default_executor
 
     # --- Writer state ---
     tile_groups: dict[int, "object"] = {}  # npix -> zarr.Group
@@ -467,6 +474,7 @@ try:
 
     from ..cli_utils import (
         config_option,
+        configure_warning_filters,
         load_optional_config,
         pick,
         require_output_root,
@@ -544,6 +552,7 @@ try:
             format="[%(asctime)s] %(name)-26s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
         )
+        configure_warning_filters()
 
         if (file_list is None) == (coadd_root is None):
             raise click.UsageError(
