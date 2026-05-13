@@ -54,30 +54,73 @@ def pick(cli_value: Any, cfg_value: Any, fallback: Any) -> Any:
     return fallback
 
 
+_DEDUP_INSTALLED = False
+
+
 def configure_warning_filters() -> None:
     """Dedup the noisiest warnings emitted by ingest readers.
 
-    FITS-heavy workflows frequently trigger ``astropy.units.UnitsWarning``
-    once per BINTABLE column carrying an unknown survey unit (e.g.
-    ``nanomaggy`` in DESI catalogs).  Setting the action to ``"once"``
-    collapses each unique message+category to a single emission per
-    process — enough to keep the warning visible without flooding the log.
+    FITS-heavy workflows trigger ``astropy.units.UnitsWarning`` once per
+    BINTABLE column carrying an unknown survey unit (e.g. ``nanomaggy``
+    in DESI catalogs).  Naively setting ``warnings.filterwarnings("once",
+    ...)`` does **not** work here: astropy's FITS unit parser calls
+    ``warnings.warn_explicit(..., registry=None)`` with a fresh per-column
+    registry, which short-circuits Python's ``__onceregistry__`` and
+    causes every column to re-emit the same message.
+
+    The only reliable choke point is ``warnings.showwarning``, which both
+    ``warn`` and ``warn_explicit`` ultimately call.  We wrap it with a
+    dedup that hashes by ``(str(message), category)`` and suppresses
+    repeats of ``UnitsWarning`` only; everything else is forwarded to the
+    original handler unchanged.  We also disable astropy's own
+    warnings-to-logger forwarding (which prints a second ``WARNING:
+    astropy:...`` copy per emission).
 
     Notes
     -----
     * Library code never calls this; only CLI entry points do.  This keeps
       ``import data_lake`` side-effect-free with respect to the user's
       global warning filters.
-    * Filters do **not** propagate across ``multiprocessing`` /
-      ``ProcessPoolExecutor`` workers.  Pass this function as the
-      executor's ``initializer=`` to apply it in every worker process.
+    * The ``showwarning`` hook lives in the current process only.  Pass
+      this function as ``ProcessPoolExecutor(..., initializer=...)`` to
+      apply it in every worker.
+    * Idempotent: safe to call multiple times.
     """
+    global _DEDUP_INSTALLED
     import warnings
+
     try:
         from astropy.units.core import UnitsWarning
     except ImportError:
         return
-    warnings.filterwarnings("once", category=UnitsWarning)
+
+    if _DEDUP_INSTALLED:
+        return
+
+    try:
+        from astropy import log as _astropy_log
+        if _astropy_log.warnings_logging_enabled():
+            _astropy_log.disable_warnings_logging()
+    except Exception:
+        # disable_warnings_logging() raises LoggingError if anything else
+        # (pytest's warning capture, a prior hook, etc.) has already replaced
+        # warnings.showwarning.  In that case astropy's duplicate emitter is
+        # already out of the chain, so we can safely ignore it.
+        pass
+
+    seen: set[tuple[str, type]] = set()
+    original_showwarning = warnings.showwarning
+
+    def _dedup_showwarning(message, category, filename, lineno, file=None, line=None):
+        if isinstance(category, type) and issubclass(category, UnitsWarning):
+            key = (str(message), category)
+            if key in seen:
+                return
+            seen.add(key)
+        return original_showwarning(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = _dedup_showwarning
+    _DEDUP_INSTALLED = True
 
 
 def require_output_root(
