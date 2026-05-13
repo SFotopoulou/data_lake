@@ -246,3 +246,125 @@ class TestIngestCatalogEndToEnd:
         assert "_spectrum_index" in names
         assert "_cutout_index" in names
         assert "_healpix_norder5" in names
+
+
+class TestStreamingIngest:
+    """Streaming and in-memory paths must produce equivalent per-tile output.
+
+    This is the key correctness gate for the --streaming flag: the schema
+    set, tile partitioning, multidim columns, and per-row values must all
+    round-trip identically.  Row *order* may differ within a tile because
+    streaming uses argsort+fancy-index while the in-memory path uses
+    table.sort+slice; we compare set-wise by TARGETID.
+    """
+
+    def _read_merged(self, lake_root: Path, survey: str) -> pa.Table:
+        files = sorted((lake_root / "catalogs" / survey).rglob("Npix=*.parquet"))
+        return pa.concat_tables([pq.read_table(str(p)) for p in files])
+
+    def test_streaming_equals_in_memory(self, tmp_path: Path):
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        tbl = _make_desi_like_table(n_rows=40)
+        fits_path = tmp_path / "zall_like.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        mem_root = tmp_path / "mem"
+        ingest_catalog(
+            source_path=fits_path, output_root=mem_root, survey_name="syn",
+            ra_col="TARGET_RA", dec_col="TARGET_DEC", norder=5,
+            source_id_col="TARGETID", overwrite=True, streaming=False,
+        )
+
+        stream_root = tmp_path / "stream"
+        ingest_catalog(
+            source_path=fits_path, output_root=stream_root, survey_name="syn",
+            ra_col="TARGET_RA", dec_col="TARGET_DEC", norder=5,
+            source_id_col="TARGETID", overwrite=True, streaming=True,
+        )
+
+        # Same tile set
+        mem_tiles = {p.relative_to(mem_root) for p in
+                     (mem_root / "catalogs" / "syn").rglob("Npix=*.parquet")}
+        stream_tiles = {p.relative_to(stream_root) for p in
+                        (stream_root / "catalogs" / "syn").rglob("Npix=*.parquet")}
+        assert mem_tiles == stream_tiles, "tile partitioning differs between paths"
+
+        mem_tbl = self._read_merged(mem_root, "syn")
+        stream_tbl = self._read_merged(stream_root, "syn")
+
+        # Same row counts
+        assert mem_tbl.num_rows == stream_tbl.num_rows == 40
+
+        # Same set of columns (schemas may differ only in nullability/order)
+        assert set(mem_tbl.schema.names) == set(stream_tbl.schema.names)
+
+        # Required bookkeeping columns
+        for col in ("_healpix_norder5", "_cutout_index", "_spectrum_index"):
+            assert col in mem_tbl.schema.names
+            assert col in stream_tbl.schema.names
+
+        # COEFF preserved as FixedSizeList(10) in both paths
+        for t in (mem_tbl, stream_tbl):
+            f = t.schema.field("COEFF").type
+            assert isinstance(f, pa.FixedSizeListType) and f.list_size == 10
+
+        # SPECTYPE preserved as large_string in both
+        for t in (mem_tbl, stream_tbl):
+            assert t.schema.field("SPECTYPE").type == pa.large_string()
+
+        # Set-wise value equivalence (order may differ within a tile)
+        def by_tid(t):
+            tids = np.asarray(t.column("TARGETID"))
+            order = np.argsort(tids)
+            return order, tids[order]
+
+        mo, mt = by_tid(mem_tbl)
+        so, st = by_tid(stream_tbl)
+        np.testing.assert_array_equal(mt, st)
+        np.testing.assert_allclose(
+            np.asarray(mem_tbl.column("COEFF").to_pylist())[mo],
+            np.asarray(stream_tbl.column("COEFF").to_pylist())[so],
+        )
+        np.testing.assert_allclose(
+            np.asarray(mem_tbl.column("Z"))[mo],
+            np.asarray(stream_tbl.column("Z"))[so],
+        )
+
+    def test_streaming_rejects_non_fits(self, tmp_path: Path):
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        pq_path = tmp_path / "cat.parquet"
+        pq.write_table(pa.table({"ra": [1.0], "dec": [2.0]}), str(pq_path))
+
+        with pytest.raises(ValueError, match="streaming=True is supported only for FITS"):
+            ingest_catalog(
+                source_path=pq_path, output_root=tmp_path / "lake",
+                survey_name="x", ra_col="ra", dec_col="dec",
+                streaming=True,
+            )
+
+    def test_streaming_with_auto_generated_source_id(self, tmp_path: Path):
+        """When source_id_col is None, streaming should auto-generate sequential IDs."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        # Build a minimal table without an explicit ID column
+        tbl = Table({
+            "RA":  np.array([10.0, 20.0, 30.0, 40.0]),
+            "DEC": np.array([1.0, 2.0, 3.0, 4.0]),
+            "MAG": np.array([18.0, 19.0, 20.0, 21.0]),
+        })
+        fits_path = tmp_path / "noid.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        lake_root = tmp_path / "lake"
+        ingest_catalog(
+            source_path=fits_path, output_root=lake_root, survey_name="noid",
+            ra_col="RA", dec_col="DEC", norder=5,
+            source_id_col=None, overwrite=True, streaming=True,
+        )
+
+        merged = self._read_merged(lake_root, "noid")
+        assert merged.num_rows == 4
+        assert "source_id" in merged.schema.names
+        assert set(np.asarray(merged.column("source_id")).tolist()) == {0, 1, 2, 3}

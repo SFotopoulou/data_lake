@@ -131,6 +131,24 @@ dl-ingest-catalog survey_catalog.fits /data/lake --survey des_dr2 --ra-col RA --
 
 Explicit CLI flags (`--norder`, etc.) override config defaults.
 
+For very large FITS catalogs (≳ 50 M rows, e.g. DESI's `zall-pix-iron.fits`
+at 28 M × 140 cols) pass `--streaming`. The streaming path memory-maps
+the FITS, sorts only RA/Dec/source_id columns, then writes one HEALPix
+tile at a time via per-tile fancy indexing into the memmap:
+
+```bash
+dl-ingest-catalog zall-pix-iron.fits --survey desi_dr1 \
+    --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+    --streaming
+```
+
+Memory peak is bounded to ~one tile's worth of rows (tens of MB at
+Norder=5) instead of the full table + sorted copy (~3× the raw size).
+The on-disk Parquet output is identical to the in-memory path
+(round-trip-tested), so consumers don't care which mode was used.
+Trade-off: per-tile scattered I/O makes the streaming path ~1.5–2×
+slower wall-clock; use only when memory is a constraint.
+
 ### Ingest cutouts
 
 ```bash

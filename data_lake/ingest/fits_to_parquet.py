@@ -221,6 +221,7 @@ def ingest_catalog(
     norder: int = 5,
     source_id_col: str | None = None,
     overwrite: bool = False,
+    streaming: bool = False,
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -243,10 +244,31 @@ def ingest_catalog(
         is generated.
     overwrite:
         If False (default), skip tiles that already exist.
+    streaming:
+        When ``True`` (FITS input only), memory-map the input and write
+        one tile at a time using per-tile fancy indexing.  Memory peak is
+        bounded to ~one tile's worth of rows, not the full table.  Use this
+        for catalogs ≳ 50 M rows on machines where you don't want to spend
+        ~3× the raw table size in RAM (full copy + sorted copy + per-tile
+        slice).  Slightly slower per-tile due to scattered I/O.  See
+        :func:`_ingest_catalog_streaming` for the implementation.
     """
     source_path = Path(source_path)
     output_root = Path(output_root)
     catalog_root = output_root / "catalogs" / survey_name
+
+    if streaming:
+        _ingest_catalog_streaming(
+            source_path=source_path,
+            catalog_root=catalog_root,
+            survey_name=survey_name,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            norder=norder,
+            source_id_col=source_id_col,
+            overwrite=overwrite,
+        )
+        return
 
     table = _read_source_table(source_path)
     log.info("Loaded %d rows × %d columns", len(table), len(table.schema))
@@ -268,29 +290,28 @@ def ingest_catalog(
     table = _add_healpix_columns(table, ra_col, dec_col, norder)
     hp_col = f"_healpix_norder{norder}"
 
-    # Sort by healpix for locality
+    # Sort by healpix for locality (so per-tile slicing is contiguous and O(1))
     sort_indices = pa.compute.sort_indices(table, sort_keys=[(hp_col, "ascending")])
     table = table.take(sort_indices)
 
-    pix_array = table.column(hp_col).to_pylist()
-    unique_pixels = sorted(set(pix_array))
+    # Find tile boundaries vectorised; replaces a per-tile O(N) filter+mask
+    # scan that became prohibitive at 28M rows.  np.unique on a sorted
+    # int64 column with return_index gives the start offset of each tile;
+    # pa.Table.slice is O(1) (just adjusts column offsets, no data copy).
+    pix_np = np.asarray(table.column(hp_col))
+    unique_pixels, group_starts = np.unique(pix_np, return_index=True)
+    group_starts = np.append(group_starts, len(pix_np))
     log.info("Writing %d HEALPix tiles at Norder=%d …", len(unique_pixels), norder)
 
-    # Map pixel -> row range
-    pix_np = np.array(pix_array, dtype=np.int64)
     writer_meta: list[pq.FileMetaData] = []
-
-    compression = pq.ParquetWriter  # just a reference check
-    _ = compression  # suppress lint
-
     t0 = time.perf_counter()
-    for npix in unique_pixels:
-        mask = pix_np == npix
-        tile_table = table.filter(pa.array(mask))
+    for g, npix in enumerate(unique_pixels.tolist()):
+        s, e = int(group_starts[g]), int(group_starts[g + 1])
+        tile_table = table.slice(s, e - s)
 
-        out_dir = catalog_root / healpix_dir(norder, npix)
+        out_dir = catalog_root / healpix_dir(norder, int(npix))
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_file = out_dir / f"Npix={npix}.parquet"
+        out_file = out_dir / f"Npix={int(npix)}.parquet"
 
         if out_file.exists() and not overwrite:
             log.debug("Skip existing tile %s", out_file)
@@ -307,17 +328,188 @@ def ingest_catalog(
         writer.write_table(tile_table)
         writer.close()
 
-        # Collect metadata for aggregate _metadata file
         meta = pq.read_metadata(str(out_file))
         writer_meta.append(meta)
 
     elapsed = time.perf_counter() - t0
     log.info("Wrote %d tiles in %.1f s", len(unique_pixels), elapsed)
 
-    # Write aggregate _metadata
     _write_aggregate_metadata(catalog_root, writer_meta, table.schema)
     _write_catalog_info(catalog_root, survey_name, norder, len(table), len(table.schema))
     log.info("Catalog written to %s", catalog_root)
+
+
+def _ingest_catalog_streaming(
+    source_path: Path,
+    catalog_root: Path,
+    survey_name: str,
+    ra_col: str,
+    dec_col: str,
+    norder: int,
+    source_id_col: str | None,
+    overwrite: bool,
+) -> None:
+    """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
+    the full catalog as a PyArrow Table in RAM.
+
+    Pipeline (FITS only — other input formats fall back to the in-memory path):
+
+    1. ``fits.open(memmap=True)`` exposes the BINTABLE as a memory-mapped
+       numpy recarray; no decompression / copy yet.
+    2. Read only ``ra_col``, ``dec_col``, and (optionally) ``source_id_col``
+       into RAM.  Compute HEALPix and an argsort permutation by tile.
+    3. For each HEALPix tile (contiguous slice of the sorted order):
+       a. Use numpy fancy indexing into the memmap to materialise only
+          the rows for this tile (triggers paged disk reads — random I/O
+          on spinning rust, fine on SSD).
+       b. Wrap in an astropy Table and route through
+          :func:`_astropy_table_to_arrow` so multidim columns and the
+          large_string fix carry over.
+       c. Append source_id (if not in the FITS), ``_healpix_norder<N>``,
+          ``_cutout_index = -1``, ``_spectrum_index = -1``.
+       d. Write one Parquet file for the tile; drop the slice from RAM.
+    4. Aggregate ``_metadata`` + ``catalog_info.json`` from the per-tile
+       FileMetaData objects (same as the in-memory path).
+
+    Memory peak: bounded by the largest tile's row count × column widths.
+    At Norder=5 over the DESI footprint this is typically a few thousand
+    rows → tens of MB, vs ~tens of GB for the full in-memory table.
+    """
+    from astropy.io import fits
+    from astropy.table import Table
+
+    if source_path.suffix.lower() not in {".fit", ".fits", ".fz"} \
+            and not source_path.name.lower().endswith(".fits.gz"):
+        raise ValueError(
+            f"streaming=True is supported only for FITS inputs; "
+            f"got {source_path.name!r}.  Use the default in-memory path for "
+            "Parquet / VOTable / CSV / ECSV inputs."
+        )
+
+    log.info("Reading %s as fits (streaming, memmapped) …", source_path.name)
+
+    with fits.open(str(source_path), memmap=True) as hdul:
+        bintable_hdu = next(
+            (hdu for hdu in hdul if isinstance(hdu, fits.BinTableHDU)), None
+        )
+        if bintable_hdu is None:
+            raise ValueError(f"No BINTABLE HDU found in {source_path.name}")
+
+        data = bintable_hdu.data
+        n_rows = len(data)
+        col_names = list(data.dtype.names)
+        log.info(
+            "FITS BINTABLE: %d rows × %d columns (memmapped)",
+            n_rows, len(col_names),
+        )
+
+        for required in (ra_col, dec_col):
+            if required not in col_names:
+                raise KeyError(
+                    f"Required column {required!r} not in FITS BINTABLE.  "
+                    f"Available columns: {col_names[:20]}"
+                    f"{'…' if len(col_names) > 20 else ''}"
+                )
+
+        ra = np.ascontiguousarray(np.asarray(data[ra_col], dtype=np.float64))
+        dec = np.ascontiguousarray(np.asarray(data[dec_col], dtype=np.float64))
+
+        if source_id_col and source_id_col in col_names:
+            sid_in_fits = True
+            sids = np.asarray(data[source_id_col], dtype=np.int64)
+        else:
+            sid_in_fits = False
+            sids = np.arange(n_rows, dtype=np.int64)
+
+        npix_arr = assign_healpix(ra, dec, norder)
+        sort_order = np.argsort(npix_arr, kind="stable")
+        npix_sorted = npix_arr[sort_order]
+        unique_pixels, group_starts = np.unique(npix_sorted, return_index=True)
+        group_starts = np.append(group_starts, n_rows)
+        log.info(
+            "Writing %d HEALPix tiles at Norder=%d (streaming) …",
+            len(unique_pixels), norder,
+        )
+
+        catalog_root.mkdir(parents=True, exist_ok=True)
+        hp_col = f"_healpix_norder{norder}"
+
+        writer_meta: list[pq.FileMetaData] = []
+        tile_schema: pa.Schema | None = None
+        t0 = time.perf_counter()
+
+        for g, npix in enumerate(unique_pixels.tolist()):
+            s, e = int(group_starts[g]), int(group_starts[g + 1])
+            n_tile = e - s
+            row_idx = sort_order[s:e]
+
+            # Materialise only this tile's rows from the memmap.  This is
+            # the only place the heavy column data is touched.
+            chunk = np.asarray(data[row_idx])
+            astropy_chunk = Table(chunk, copy=False)
+            tile_table = _astropy_table_to_arrow(astropy_chunk)
+
+            if not sid_in_fits and "source_id" not in tile_table.schema.names:
+                tile_table = tile_table.append_column(
+                    "source_id",
+                    pa.array(sids[row_idx], type=pa.int64()),
+                )
+            elif sid_in_fits and tile_table.schema.field(source_id_col).type != pa.int64():
+                i = tile_table.schema.get_field_index(source_id_col)
+                tile_table = tile_table.set_column(
+                    i, source_id_col,
+                    tile_table.column(source_id_col).cast(pa.int64()),
+                )
+
+            tile_table = tile_table.append_column(
+                hp_col,
+                pa.array(np.full(n_tile, npix, dtype=np.int64), type=pa.int64()),
+            )
+            tile_table = tile_table.append_column(
+                "_cutout_index",
+                pa.array(np.full(n_tile, -1, dtype=np.int64), type=pa.int64()),
+            )
+            tile_table = tile_table.append_column(
+                "_spectrum_index",
+                pa.array(np.full(n_tile, -1, dtype=np.int64), type=pa.int64()),
+            )
+
+            if tile_schema is None:
+                tile_schema = tile_table.schema
+
+            out_dir = catalog_root / healpix_dir(norder, int(npix))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / f"Npix={int(npix)}.parquet"
+
+            if out_file.exists() and not overwrite:
+                log.debug("Skip existing tile %s", out_file)
+                continue
+
+            writer = pq.ParquetWriter(
+                str(out_file),
+                tile_table.schema,
+                compression="zstd",
+                compression_level=_ZSTD_LEVEL,
+                write_statistics=True,
+                use_dictionary=True,
+            )
+            writer.write_table(tile_table)
+            writer.close()
+
+            writer_meta.append(pq.read_metadata(str(out_file)))
+
+        elapsed = time.perf_counter() - t0
+        log.info(
+            "Wrote %d tiles in %.1f s (streaming, peak ≈ tile-sized)",
+            len(unique_pixels), elapsed,
+        )
+
+        if tile_schema is not None:
+            _write_aggregate_metadata(catalog_root, writer_meta, tile_schema)
+            _write_catalog_info(
+                catalog_root, survey_name, norder, n_rows, len(tile_schema),
+            )
+        log.info("Catalog written to %s", catalog_root)
 
 
 def _write_aggregate_metadata(
@@ -410,6 +602,13 @@ try:
                   help="HEALPix order (overrides config; default 5).")
     @click.option("--source-id-col", default=None)
     @click.option("--overwrite", is_flag=True)
+    @click.option(
+        "--streaming/--no-streaming", default=False, show_default=True,
+        help="FITS-only: memmap the input and write one tile at a time. "
+             "Bounds memory peak to ~one tile's worth of rows (tens of MB) "
+             "instead of holding the full table + sorted copy in RAM. "
+             "Recommended for catalogs >~ 50 M rows.",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         source_path: Path,
@@ -421,6 +620,7 @@ try:
         norder: int | None,
         source_id_col: str | None,
         overwrite: bool,
+        streaming: bool,
         verbose: bool,
     ) -> None:
         """Ingest FITS/VOTable SOURCE_PATH into HATS-partitioned Parquet.
@@ -444,6 +644,7 @@ try:
                         cfg.partitioning.hats_order if cfg else None, 5),
             source_id_col=source_id_col,
             overwrite=overwrite,
+            streaming=streaming,
         )
 
 except ImportError:
