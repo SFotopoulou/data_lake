@@ -784,60 +784,87 @@ def _write_spectrum_info(
 try:
     import click
 
+    from ..cli_utils import (
+        config_option,
+        load_optional_config,
+        pick,
+        require_output_root,
+    )
+
     @click.command("dl-ingest-spectra")
     @click.argument("source_path", type=click.Path(exists=True, path_type=Path))
-    @click.argument("output_root", type=click.Path(path_type=Path))
+    @click.argument("output_root", type=click.Path(path_type=Path), required=False)
+    @config_option
     @click.option("--survey", "survey_name", required=True, help="Short survey name.")
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
-    @click.option("--norder", default=5, type=int, show_default=True)
+    @click.option("--norder", default=None, type=int,
+                  help="HEALPix order (overrides config; default 5).")
     @click.option("--wavelength-mode",
                   type=click.Choice(["shared", "per_source"]),
-                  default="shared", show_default=True)
+                  default=None,
+                  help="Wavelength storage mode (overrides config; default 'shared').")
     @click.option("--mask-dtype",
                   type=click.Choice(["uint8", "uint16"]),
-                  default="uint8", show_default=True)
+                  default=None,
+                  help="Mask dtype (overrides config; default 'uint8').")
     @click.option("--fmt", default=None,
                   type=click.Choice(["sdss_boss", "desi_coadd", "generic"]),
                   help="Force input format (auto-detected by default).")
     @click.option("--on-length-mismatch",
                   type=click.Choice(["error", "pad", "truncate"]),
                   default="error", show_default=True)
-    @click.option("--with-resolution", is_flag=True, default=False,
+    @click.option("--with-resolution/--no-with-resolution", default=None,
                   help=(
                       "Store the DESI banded resolution matrix (n_diag × N_pix per source). "
                       "Requires DESI coadd input and wavelength-mode=shared. "
-                      "Increases storage by ~3×."
+                      "Overrides config; default false."
                   ))
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         source_path: Path,
-        output_root: Path,
+        output_root: Path | None,
+        config_path: Path | None,
         survey_name: str,
         ra_col: str,
         dec_col: str,
-        norder: int,
-        wavelength_mode: str,
-        mask_dtype: str,
+        norder: int | None,
+        wavelength_mode: str | None,
+        mask_dtype: str | None,
         fmt: str | None,
         on_length_mismatch: str,
-        with_resolution: bool,
+        with_resolution: bool | None,
         verbose: bool,
     ) -> None:
-        """Ingest 1-D FITS spectra into sharded Zarr v3 stacks at OUTPUT_ROOT."""
+        """Ingest 1-D FITS spectra into sharded Zarr v3 stacks.
+
+        OUTPUT_ROOT is optional when a lake config is available (via
+        --config or $DATA_LAKE_CONFIG); in that case it defaults to
+        ``<lake.root>/<paths.spectra>``.
+        """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        cfg = load_optional_config(config_path)
+        resolved_output = require_output_root(output_root, cfg, kind="spectra")
+
         ingest_spectra_from_fits(
             source_path=source_path,
-            output_root=output_root,
+            output_root=resolved_output,
             survey_name=survey_name,
             ra_col=ra_col,
             dec_col=dec_col,
-            norder=norder,
-            wavelength_mode=wavelength_mode,
-            mask_dtype=np.dtype(mask_dtype),
+            norder=pick(norder,
+                        cfg.partitioning.hats_order if cfg else None, 5),
+            wavelength_mode=pick(wavelength_mode,
+                                 cfg.defaults.wavelength_mode if cfg else None,
+                                 "shared"),
+            mask_dtype=np.dtype(pick(mask_dtype,
+                                     cfg.defaults.mask_dtype if cfg else None,
+                                     "uint8")),
             fmt=fmt,
             on_length_mismatch=on_length_mismatch,
-            with_resolution=with_resolution,
+            with_resolution=pick(with_resolution,
+                                 cfg.defaults.with_resolution if cfg else None,
+                                 False),
         )
 
 except ImportError:

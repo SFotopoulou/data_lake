@@ -379,38 +379,57 @@ def _write_cutout_info(
 try:
     import click
 
+    from ..cli_utils import (
+        config_option,
+        load_optional_config,
+        pick,
+        require_output_root,
+    )
+
     @click.command("dl-ingest-cutouts")
     @click.argument("source_path", type=click.Path(exists=True, path_type=Path))
-    @click.argument("output_root", type=click.Path(path_type=Path))
+    @click.argument("output_root", type=click.Path(path_type=Path), required=False)
+    @config_option
     @click.option("--survey", "survey_name", required=True)
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
     @click.option("--image-hdu", "image_hdu_index", default=0, type=int, show_default=True)
     @click.option("--band-axis", default=None, type=int)
-    @click.option("--norder", default=5, type=int, show_default=True)
+    @click.option("--norder", default=None, type=int,
+                  help="HEALPix order (overrides config; default 5).")
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         source_path: Path,
-        output_root: Path,
+        output_root: Path | None,
+        config_path: Path | None,
         survey_name: str,
         ra_col: str,
         dec_col: str,
         image_hdu_index: int,
         band_axis: int | None,
-        norder: int,
+        norder: int | None,
         verbose: bool,
     ) -> None:
-        """Ingest FITS cutouts into sharded Zarr v3 stacks at OUTPUT_ROOT."""
+        """Ingest FITS cutouts into sharded Zarr v3 stacks.
+
+        OUTPUT_ROOT is optional when a lake config is available
+        (via --config or $DATA_LAKE_CONFIG); in that case it defaults to
+        ``<lake.root>/<paths.cutouts>``.
+        """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        cfg = load_optional_config(config_path)
+        resolved_output = require_output_root(output_root, cfg, kind="cutouts")
+
         ingest_cutouts_from_fits(
             source_path=source_path,
-            output_root=output_root,
+            output_root=resolved_output,
             survey_name=survey_name,
             ra_col=ra_col,
             dec_col=dec_col,
             image_hdu_index=image_hdu_index,
             band_axis=band_axis,
-            norder=norder,
+            norder=pick(norder,
+                        cfg.partitioning.hats_order if cfg else None, 5),
         )
 
 except ImportError:

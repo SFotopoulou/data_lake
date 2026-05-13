@@ -282,36 +282,55 @@ def ingest_catalog_batch(
 try:
     import click
 
+    from ..cli_utils import (
+        config_option,
+        load_optional_config,
+        pick,
+        require_output_root,
+    )
+
     @click.command("dl-ingest-catalog")
     @click.argument("source_path", type=click.Path(exists=True, path_type=Path))
-    @click.argument("output_root", type=click.Path(path_type=Path))
+    @click.argument("output_root", type=click.Path(path_type=Path), required=False)
+    @config_option
     @click.option("--survey", "survey_name", required=True, help="Short survey name.")
     @click.option("--ra-col", default="ra", show_default=True)
     @click.option("--dec-col", default="dec", show_default=True)
-    @click.option("--norder", default=5, show_default=True, type=int)
+    @click.option("--norder", default=None, type=int,
+                  help="HEALPix order (overrides config; default 5).")
     @click.option("--source-id-col", default=None)
     @click.option("--overwrite", is_flag=True)
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         source_path: Path,
-        output_root: Path,
+        output_root: Path | None,
+        config_path: Path | None,
         survey_name: str,
         ra_col: str,
         dec_col: str,
-        norder: int,
+        norder: int | None,
         source_id_col: str | None,
         overwrite: bool,
         verbose: bool,
     ) -> None:
-        """Ingest FITS/VOTable SOURCE_PATH into HATS-partitioned Parquet at OUTPUT_ROOT."""
+        """Ingest FITS/VOTable SOURCE_PATH into HATS-partitioned Parquet.
+
+        OUTPUT_ROOT is optional when a lake config is available
+        (via --config or $DATA_LAKE_CONFIG); in that case it defaults to
+        ``<lake.root>/<paths.catalogs>``.
+        """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        cfg = load_optional_config(config_path)
+        resolved_output = require_output_root(output_root, cfg, kind="catalogs")
+
         ingest_catalog(
             source_path=source_path,
-            output_root=output_root,
+            output_root=resolved_output,
             survey_name=survey_name,
             ra_col=ra_col,
             dec_col=dec_col,
-            norder=norder,
+            norder=pick(norder,
+                        cfg.partitioning.hats_order if cfg else None, 5),
             source_id_col=source_id_col,
             overwrite=overwrite,
         )

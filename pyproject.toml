@@ -9,7 +9,7 @@ description = "Astronomy data lake: wide multi-survey catalogs (Parquet/HATS) + 
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Sotiria Fotopoulou" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     # Array / columnar I/O
     "pyarrow>=15.0",
@@ -42,6 +42,7 @@ dev = [
 ]
 
 [project.scripts]
+dl-init            = "data_lake.admin.init_lake:dl_init"
 dl-ingest-catalog  = "data_lake.ingest.fits_to_parquet:cli"
 dl-ingest-cutouts  = "data_lake.ingest.fits_to_zarr:cli"
 dl-ingest-spectra  = "data_lake.ingest.fits_to_spectra_zarr:cli"

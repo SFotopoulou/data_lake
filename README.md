@@ -7,6 +7,32 @@ A local-first data lake for multi-survey astronomy catalogs, galaxy image cutout
 - **1-D spectra** (SDSS/BOSS, DESI, generic): stored as sharded Zarr v3 stacks alongside cutouts — flux, IVAR, mask, shared or per-source wavelength, per-source scalar metadata.
 - FITS is kept as the **ingest/export** format for observatory interoperability; it is not used as internal storage.
 
+## Two layers: library vs. deployment
+
+This repository is the **library**: a generic Python package (`data_lake`)
+that you install once. Your actual data and configuration live in a
+**deployment** directory — a thin instance that depends on the library:
+
+```
+github.com/SFotopoulou/data_lake       (this repo — the library, published)
+        |
+        | pip install -e ...
+        v
+~/projects/<your_lake_name>/           (the deployment, private)
+    lake_config.toml                   (single source of truth)
+    data/                              (actual Parquet / Zarr tiles)
+    notebooks/  scripts/               (your own)
+```
+
+The library never knows the name of your lake or where its data lives;
+all that is captured by one `lake_config.toml` in the deployment. The
+`dl-init` CLI creates a deployment scaffold; the `dl-ingest-*` CLIs read
+the config automatically (via `$DATA_LAKE_CONFIG` or `--config`).
+
+This separation lets you publish a clean reusable library, while keeping
+your private data, parameters, and notebooks isolated and free to
+diverge.
+
 ## Quick-start
 
 We recommend [`uv`](https://docs.astral.sh/uv/) for environment management - it is
@@ -48,16 +74,67 @@ finiteness, and (for the resolution path) interior row sums ~1.0.
 pip install -e ".[desi,dev]"
 ```
 
+### Create a deployment
+
+A deployment is *your* private instance of the data lake. Use `dl-init`
+to scaffold one:
+
+```bash
+dl-init my_lake ~/projects \
+    --description "Personal multi-survey lake" \
+    --root /scratch/my_lake/data \
+    --norder 5
+```
+
+This creates `~/projects/my_lake/` with:
+
+```
+my_lake/
+  lake_config.toml      # name, root, defaults — single source of truth
+  README.md             # auto-generated, deployment-specific
+  .gitignore            # excludes data/, logs/
+  data/                 # actual tiles (lives at --root if you passed one)
+    catalogs/ spectra/ cutouts/ shared/
+  notebooks/  scripts/  # yours to fill in
+```
+
+Point every subsequent CLI at the deployment with a single env var:
+
+```bash
+export DATA_LAKE_CONFIG=~/projects/my_lake/lake_config.toml
+```
+
+You can either:
+
+- `git init` the deployment to version-control your config, notebooks
+  and scripts (but keep `data/` gitignored); or
+- leave it un-tracked — it is just a working directory.
+
+You can have multiple deployments side by side (e.g. `prod`, `staging`,
+`personal`) and switch between them by exporting a different
+`DATA_LAKE_CONFIG`.
+
 ### Ingest a survey catalog
+
+With a deployment config in place (`$DATA_LAKE_CONFIG` set), the
+`OUTPUT_ROOT` argument is optional — it is filled in from the config:
+
+```bash
+dl-ingest-catalog survey_catalog.fits --survey des_dr2 --ra-col RA --dec-col DEC
+```
+
+Without a config you can still pass the path explicitly (legacy mode):
 
 ```bash
 dl-ingest-catalog survey_catalog.fits /data/lake --survey des_dr2 --ra-col RA --dec-col DEC
 ```
 
+Explicit CLI flags (`--norder`, etc.) override config defaults.
+
 ### Ingest cutouts
 
 ```bash
-dl-ingest-cutouts cutouts.fits /data/lake --survey des_dr2 --ra-col RA --dec-col DEC
+dl-ingest-cutouts cutouts.fits --survey des_dr2 --ra-col RA --dec-col DEC
 ```
 
 ### Ingest spectra
@@ -68,16 +145,19 @@ dl-ingest-cutouts cutouts.fits /data/lake --survey des_dr2 --ra-col RA --dec-col
 ```bash
 pip install 'data-lake[desi]'
 
-# Basic DESI ingest
-dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits /data/lake --survey desi_edr
+# With $DATA_LAKE_CONFIG set, OUTPUT_ROOT is taken from the config.
+dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits --survey desi_edr
 
 # With resolution matrix (needed for redshift fitting / SPS / kinematic measurements)
 # Storage cost: ~3× flux+ivar footprint (~170–200 GB per million coadded BRZ spectra)
-dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits /data/lake \
+dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits \
     --survey desi_edr --with-resolution
 
+# Without a config, pass OUTPUT_ROOT explicitly:
+dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits /data/lake --survey desi_edr
+
 # SDSS/BOSS (no extra dependency needed)
-dl-ingest-spectra spec-3586-55181-0001.fits /data/lake --survey sdss_dr17
+dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17
 ```
 
 #### Using the resolution matrix
@@ -243,6 +323,53 @@ See `notebooks/` for worked examples:
 | Spectrum mask | uint8 (default) / uint16 | 8 bits covers SDSS/DESI defaults; bump if >8 flag bits needed |
 | Sharing unit | Per-tile .tar (catalog + cutouts + spectra) | Matches partition granularity; already compressed inside |
 | ML dataloader | CutoutDataset / SpectrumDataset (map) or Tile* (iterable) | Map-style for random sampling; tile-iterable for full-epoch streaming |
+
+## `lake_config.toml` reference
+
+Generated by `dl-init`; edit by hand later if you need to.
+
+```toml
+schema_version = "1"                # data-lake config schema; bumped on breaking changes
+
+[lake]
+name        = "my_lake"             # short identifier (no spaces)
+description = "Free-text"
+root        = "/abs/path/to/data"   # where catalogs/spectra/cutouts live
+created_utc = "2026-05-13T11:43:00Z"
+
+[partitioning]
+hats_order       = 5                # default HEALPix order (Norder=5 → ~3.7 deg² tiles)
+chunks_per_shard = 512              # rows per Zarr shard
+
+[defaults]
+wavelength_mode  = "shared"         # "shared" | "per_source"
+mask_dtype       = "uint8"          # "uint8" | "uint16"
+with_resolution  = false            # default for DESI spectra ingest
+
+[paths]                             # relative to lake.root
+catalogs = "catalogs"
+spectra  = "spectra"
+cutouts  = "cutouts"
+shared   = "shared"
+
+[ingest]
+num_workers = "auto"                # "auto" (= cpu_count) | <int>
+log_level   = "INFO"
+```
+
+Discovery order for the config (highest priority first):
+
+1. CLI: `dl-ingest-* --config /path/to/lake_config.toml`
+2. Environment: `$DATA_LAKE_CONFIG=/path/to/lake_config.toml`
+3. Walk up from the current working directory looking for `lake_config.toml`
+
+Programmatic access:
+
+```python
+from data_lake.config import LakeConfig
+cfg = LakeConfig.discover()                # explicit > env > cwd walk-up
+print(cfg.lake.name, cfg.spectra_root)
+```
 
 ## Dependencies
 
