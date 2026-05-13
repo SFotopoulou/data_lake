@@ -57,13 +57,19 @@ def pick(cli_value: Any, cfg_value: Any, fallback: Any) -> Any:
 def require_output_root(
     output_root: Path | None,
     cfg: LakeConfig | None,
-    kind: str,
+    kind: str | None = None,  # kept for forward-compat; currently unused
 ) -> Path:
     """Resolve OUTPUT_ROOT positional arg against the config.
 
-    ``kind`` is one of ``"catalogs"``, ``"spectra"``, ``"cutouts"`` and
-    selects which sub-root from the config is used.
+    OUTPUT_ROOT is the **lake root** (``cfg.lake.root``); each ingest
+    function appends its own per-kind subdirectory (``catalogs/``,
+    ``spectra/``, or ``cutouts/``) underneath.  This matches the layout
+    created by ``dl-init``.
+
+    ``kind`` is accepted for forward compatibility (e.g. if we later
+    expose ``[paths]`` customisation) but is currently unused.
     """
+    del kind  # not used in v1
     if output_root is not None:
         return output_root
     if cfg is None:
@@ -71,5 +77,4 @@ def require_output_root(
             "OUTPUT_ROOT is required when no lake config is provided. "
             "Either pass it explicitly, set $DATA_LAKE_CONFIG, or use --config."
         )
-    attr = f"{kind}_root"
-    return getattr(cfg, attr)
+    return cfg.lake.root
