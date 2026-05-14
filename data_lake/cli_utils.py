@@ -9,6 +9,9 @@ defaults for parameters such as ``output_root``, ``norder``,
 
 from __future__ import annotations
 
+import logging
+import os
+import sys
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -121,6 +124,78 @@ def configure_warning_filters() -> None:
 
     warnings.showwarning = _dedup_showwarning
     _DEDUP_INSTALLED = True
+
+
+# Env keys used by ``desi_parallel_ingest`` worker processes (fork/spawn).
+PARALLEL_INGEST_WORKER_FLAG = "DATA_LAKE_PARALLEL_INGEST_WORKER"
+PARALLEL_WORKER_LOG_FILE_ENV = "DATA_LAKE_WORKER_LOG_FILE"
+PARALLEL_WORKER_VERBOSE_ENV = "DATA_LAKE_WORKER_VERBOSE"
+
+
+def init_parallel_ingest_subprocess() -> None:
+    """``ProcessPoolExecutor`` initializer: mark process + apply warning filters."""
+    os.environ[PARALLEL_INGEST_WORKER_FLAG] = "1"
+    configure_warning_filters()
+
+
+def apply_parallel_worker_logging_after_heavy_imports() -> None:
+    """Detach library loggers from the TTY inside parallel-ingest worker processes.
+
+    The parent CLI attaches ``FileHandler`` to the root logger only in the main
+    process.  ``desispec`` (and similar) register their own ``StreamHandler``
+    when imported inside workers, which is why ``INFO:…read_spectra`` lines
+    still appeared on stderr.  This function strips TTY stream handlers and
+    routes everything through the root logger again (file or ``NullHandler``).
+
+    No-op unless ``init_parallel_ingest_subprocess`` has run in this process.
+    Safe to call repeatedly (e.g. once per decoded coadd).
+    """
+    if os.environ.get(PARALLEL_INGEST_WORKER_FLAG) != "1":
+        return
+
+    raw = os.environ.get(PARALLEL_WORKER_LOG_FILE_ENV, "")
+    log_file = raw.strip() or None
+    verbose = os.environ.get(PARALLEL_WORKER_VERBOSE_ENV) == "1"
+    level = logging.DEBUG if verbose else logging.INFO
+
+    fmt = logging.Formatter(
+        fmt="[%(asctime)s] %(process)d %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    def _is_tty_stream_handler(handler: logging.Handler) -> bool:
+        if isinstance(handler, logging.StreamHandler):
+            stream = getattr(handler, "stream", None)
+            return stream in (sys.stdout, sys.stderr)
+        return False
+
+    # Remove every stderr/stdout stream handler (desispec, astropy, etc.).
+    for name in list(logging.Logger.manager.loggerDict.keys()):
+        if not isinstance(name, str):
+            continue
+        lg = logging.getLogger(name)
+        for h in lg.handlers[:]:
+            if _is_tty_stream_handler(h):
+                lg.removeHandler(h)
+
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+
+    if log_file:
+        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+        root.setLevel(level)
+    else:
+        root.addHandler(logging.NullHandler())
+        root.setLevel(logging.WARNING)
+
+    for prefix in ("desispec", "desi"):
+        lg = logging.getLogger(prefix)
+        lg.handlers.clear()
+        lg.propagate = True
+        lg.setLevel(level if log_file else logging.WARNING)
 
 
 def require_output_root(

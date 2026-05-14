@@ -113,6 +113,10 @@ def _decode_one_coadd(path_str: str, norder: int) -> WorkerResult:
     ``coadd_cameras`` IVAR-weighted combine, healpy assignment, meta byte
     packing) happens here so the writer is essentially free.
     """
+    from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
+
+    apply_parallel_worker_logging_after_heavy_imports()
+
     t0 = time.perf_counter()
     path = Path(path_str)
 
@@ -273,6 +277,8 @@ def ingest_spectra_parallel(
     show_progress: bool = True,
     decoder: Callable[[str, int], WorkerResult] = _decode_one_coadd_safe,
     executor_factory: Callable[[int], Executor] | None = None,
+    worker_log_file: Path | str | None = None,
+    worker_verbose: bool = False,
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -304,6 +310,13 @@ def ingest_spectra_parallel(
     executor_factory:
         Callable taking ``n_workers`` and returning an ``Executor``.  Defaults
         to ``ProcessPoolExecutor``; tests can pass a thread-pool factory.
+    worker_log_file:
+        When using the default process pool, library loggers in child
+        processes (e.g. ``desispec``) append here; same file as the main CLI
+        log is typical.  Ignored when ``executor_factory`` is overridden.
+    worker_verbose:
+        If true, worker-side library log level follows DEBUG when combined with
+        ``worker_log_file``; passed with ``worker_log_file`` via subprocess env.
 
     Returns
     -------
@@ -363,13 +376,14 @@ def ingest_spectra_parallel(
             "elapsed_s": 0.0,
         }
 
+    uses_parallel_subprocess_workers = executor_factory is None
     if executor_factory is None:
-        from data_lake.cli_utils import configure_warning_filters as _wf
+        from data_lake.cli_utils import init_parallel_ingest_subprocess as _init
 
         def _default_executor(nw: int) -> Executor:
             # initializer runs once in each worker process — filter state
             # does not propagate from the parent, so set it up there too.
-            return ProcessPoolExecutor(max_workers=nw, initializer=_wf)
+            return ProcessPoolExecutor(max_workers=nw, initializer=_init)
 
         executor_factory = _default_executor
 
@@ -387,108 +401,135 @@ def ingest_spectra_parallel(
     if failures_log is not None:
         failures_log.parent.mkdir(parents=True, exist_ok=True)
 
-    with executor_factory(n_workers) as pool:
-        futures: dict[Future, str] = {
-            pool.submit(decoder, p, norder): p for p in pending
-        }
-        with tqdm(
-            total=len(futures),
-            disable=not show_progress,
-            unit="file",
-            desc="ingest",
-        ) as pbar:
-            for fut in as_completed(futures):
-                path_str = futures[fut]
-                try:
-                    res: WorkerResult = fut.result()
-                except Exception as exc:
-                    res = WorkerResult(
-                        path=path_str, ok=False,
-                        error=f"executor: {type(exc).__name__}: {exc}",
-                        tb=traceback.format_exc(),
-                    )
+    _env_prev_parallel: dict[str, str | None] = {}
+    if uses_parallel_subprocess_workers:
+        from data_lake.cli_utils import (
+            PARALLEL_WORKER_LOG_FILE_ENV,
+            PARALLEL_WORKER_VERBOSE_ENV,
+        )
 
-                pbar.update(1)
+        _env_prev_parallel[PARALLEL_WORKER_LOG_FILE_ENV] = os.environ.get(
+            PARALLEL_WORKER_LOG_FILE_ENV
+        )
+        _env_prev_parallel[PARALLEL_WORKER_VERBOSE_ENV] = os.environ.get(
+            PARALLEL_WORKER_VERBOSE_ENV
+        )
+        os.environ[PARALLEL_WORKER_LOG_FILE_ENV] = (
+            str(Path(worker_log_file).resolve()) if worker_log_file else ""
+        )
+        os.environ[PARALLEL_WORKER_VERBOSE_ENV] = "1" if worker_verbose else "0"
 
-                if not res.ok:
-                    n_files_fail += 1
-                    fail_entry = {
-                        "path": res.path,
-                        "error": res.error,
-                        "traceback": res.tb,
-                    }
-                    failures.append(fail_entry)
-                    log.warning("FAIL %s: %s", res.path, res.error)
-                    if failures_log is not None:
-                        with failures_log.open("a") as fh:
-                            fh.write(json.dumps(fail_entry) + "\n")
-                            fh.flush()
-                    continue
+    try:
+        with executor_factory(n_workers) as pool:
+            futures: dict[Future, str] = {
+                pool.submit(decoder, p, norder): p for p in pending
+            }
+            with tqdm(
+                total=len(futures),
+                disable=not show_progress,
+                unit="file",
+                desc="ingest",
+            ) as pbar:
+                for fut in as_completed(futures):
+                    path_str = futures[fut]
+                    try:
+                        res: WorkerResult = fut.result()
+                    except Exception as exc:
+                        res = WorkerResult(
+                            path=path_str, ok=False,
+                            error=f"executor: {type(exc).__name__}: {exc}",
+                            tb=traceback.format_exc(),
+                        )
 
-                if not res.batches:
+                    pbar.update(1)
+
+                    if not res.ok:
+                        n_files_fail += 1
+                        fail_entry = {
+                            "path": res.path,
+                            "error": res.error,
+                            "traceback": res.tb,
+                        }
+                        failures.append(fail_entry)
+                        log.warning("FAIL %s: %s", res.path, res.error)
+                        if failures_log is not None:
+                            with failures_log.open("a") as fh:
+                                fh.write(json.dumps(fail_entry) + "\n")
+                                fh.flush()
+                        continue
+
+                    if not res.batches:
+                        n_files_ok += 1
+                        completed.add(res.path)
+                        if checkpoint_path is not None:
+                            _atomic_write_json(
+                                checkpoint_path, {"completed": sorted(completed)}
+                            )
+                        continue
+
+                    # First successful file fixes the wavelength grid & WCS
+                    if n_pix_known is None:
+                        n_pix_known = res.n_pix
+                        wcs_attrs_known = res.wcs_attrs
+                    elif res.n_pix != n_pix_known:
+                        fail_entry = {
+                            "path": res.path,
+                            "error": (
+                                f"n_pix={res.n_pix} differs from established "
+                                f"grid n_pix={n_pix_known}; file rejected."
+                            ),
+                            "traceback": None,
+                        }
+                        failures.append(fail_entry)
+                        n_files_fail += 1
+                        if failures_log is not None:
+                            with failures_log.open("a") as fh:
+                                fh.write(json.dumps(fail_entry) + "\n")
+                        continue
+
+                    for b in res.batches:
+                        tile_dir = survey_root / healpix_dir(norder, b.npix)
+                        tile_dir.mkdir(parents=True, exist_ok=True)
+                        tile_path = tile_dir / f"Npix={b.npix}.zarr"
+                        if b.npix not in tile_groups:
+                            tile_groups[b.npix] = _open_or_create_spectrum_tile(
+                                tile_path, n_pix_known, "shared",
+                                np.dtype(np.uint8), wcs_attrs_known,
+                            )
+                        root = tile_groups[b.npix]
+                        start_idx = root["flux"].shape[0]
+
+                        root["flux"].append(b.flux)
+                        root["ivar"].append(b.ivar)
+                        root["mask"].append(b.mask)
+                        root["source_id"].append(b.source_ids)
+                        meta_arr = np.frombuffer(
+                            b.meta_bytes,
+                            dtype="|V" + str(_META_DTYPE.itemsize),
+                        )
+                        root["meta"].append(meta_arr)
+
+                        if start_idx == 0 and res.wavelength is not None:
+                            root["wavelength"][:] = res.wavelength.astype(np.float64)
+
+                        for i, sid in enumerate(b.source_ids.tolist()):
+                            index_map[int(sid)] = start_idx + i
+                        n_spectra_written += int(b.source_ids.size)
+
                     n_files_ok += 1
                     completed.add(res.path)
                     if checkpoint_path is not None:
                         _atomic_write_json(
                             checkpoint_path, {"completed": sorted(completed)}
                         )
-                    continue
 
-                # First successful file fixes the wavelength grid & WCS
-                if n_pix_known is None:
-                    n_pix_known = res.n_pix
-                    wcs_attrs_known = res.wcs_attrs
-                elif res.n_pix != n_pix_known:
-                    fail_entry = {
-                        "path": res.path,
-                        "error": (
-                            f"n_pix={res.n_pix} differs from established "
-                            f"grid n_pix={n_pix_known}; file rejected."
-                        ),
-                        "traceback": None,
-                    }
-                    failures.append(fail_entry)
-                    n_files_fail += 1
-                    if failures_log is not None:
-                        with failures_log.open("a") as fh:
-                            fh.write(json.dumps(fail_entry) + "\n")
-                    continue
-
-                for b in res.batches:
-                    tile_dir = survey_root / healpix_dir(norder, b.npix)
-                    tile_dir.mkdir(parents=True, exist_ok=True)
-                    tile_path = tile_dir / f"Npix={b.npix}.zarr"
-                    if b.npix not in tile_groups:
-                        tile_groups[b.npix] = _open_or_create_spectrum_tile(
-                            tile_path, n_pix_known, "shared",
-                            np.dtype(np.uint8), wcs_attrs_known,
-                        )
-                    root = tile_groups[b.npix]
-                    start_idx = root["flux"].shape[0]
-
-                    root["flux"].append(b.flux)
-                    root["ivar"].append(b.ivar)
-                    root["mask"].append(b.mask)
-                    root["source_id"].append(b.source_ids)
-                    meta_arr = np.frombuffer(
-                        b.meta_bytes,
-                        dtype="|V" + str(_META_DTYPE.itemsize),
-                    )
-                    root["meta"].append(meta_arr)
-
-                    if start_idx == 0 and res.wavelength is not None:
-                        root["wavelength"][:] = res.wavelength.astype(np.float64)
-
-                    for i, sid in enumerate(b.source_ids.tolist()):
-                        index_map[int(sid)] = start_idx + i
-                    n_spectra_written += int(b.source_ids.size)
-
-                n_files_ok += 1
-                completed.add(res.path)
-                if checkpoint_path is not None:
-                    _atomic_write_json(
-                        checkpoint_path, {"completed": sorted(completed)}
-                    )
+    finally:
+        if uses_parallel_subprocess_workers:
+            for _k, _v in _env_prev_parallel.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
 
     if n_pix_known is not None and wcs_attrs_known is not None:
         _write_spectrum_info(
@@ -664,6 +705,8 @@ try:
             norder=resolved_norder,
             checkpoint_path=checkpoint_path,
             failures_log=failures_log,
+            worker_log_file=log_file_path,
+            worker_verbose=verbose,
         )
 
         click.echo(

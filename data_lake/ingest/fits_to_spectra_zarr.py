@@ -97,6 +97,9 @@ def _import_desispec():
         import desispec.io          # noqa: F401
         import desispec.coaddition  # noqa: F401
         import desispec
+        from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
+
+        apply_parallel_worker_logging_after_heavy_imports()
         return desispec
     except ImportError as exc:
         raise ImportError(
