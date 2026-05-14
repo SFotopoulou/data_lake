@@ -58,6 +58,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file as _paths_from_file_list_file
 from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
 from data_lake.ingest.fits_to_spectra_zarr import (
     _META_DTYPE,
@@ -195,20 +196,6 @@ def _decode_one_coadd_safe(path_str: str, norder: int) -> WorkerResult:
 def _canonical_fits_path(p: Path | str) -> str:
     """Absolute, resolved path string used for checkpoint ↔ pending matching."""
     return str(Path(p).expanduser().resolve())
-
-
-def _paths_from_file_list_file(file_list_path: Path) -> list[Path]:
-    """Paths from a text file list; relative lines are resolved vs the list file's parent."""
-    fl = file_list_path.resolve()
-    base = fl.parent
-    paths: list[Path] = []
-    for line in fl.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        p = Path(line)
-        paths.append(p if p.is_absolute() else (base / p))
-    return paths
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:

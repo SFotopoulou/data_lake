@@ -335,7 +335,22 @@ def ingest_catalog(
     log.info("Wrote %d tiles in %.1f s", len(unique_pixels), elapsed)
 
     _write_aggregate_metadata(catalog_root, writer_meta, table.schema)
-    _write_catalog_info(catalog_root, survey_name, norder, len(table), len(table.schema))
+    sid_mode = (
+        f"column:{source_id_col}"
+        if source_id_col and source_id_col in table.schema.names
+        else "sequential"
+    )
+    _write_catalog_info(
+        catalog_root,
+        survey_name,
+        norder,
+        len(table),
+        len(table.schema),
+        ra_column=ra_col,
+        dec_column=dec_col,
+        source_id_mode=sid_mode,
+        streaming=False,
+    )
     log.info("Catalog written to %s", catalog_root)
 
 
@@ -506,8 +521,21 @@ def _ingest_catalog_streaming(
 
         if tile_schema is not None:
             _write_aggregate_metadata(catalog_root, writer_meta, tile_schema)
+            sid_mode = (
+                f"column:{source_id_col}"
+                if source_id_col and source_id_col in col_names
+                else "sequential"
+            )
             _write_catalog_info(
-                catalog_root, survey_name, norder, n_rows, len(tile_schema),
+                catalog_root,
+                survey_name,
+                norder,
+                n_rows,
+                len(tile_schema),
+                ra_column=ra_col,
+                dec_column=dec_col,
+                source_id_mode=sid_mode,
+                streaming=True,
             )
         log.info("Catalog written to %s", catalog_root)
 
@@ -531,6 +559,11 @@ def _write_catalog_info(
     norder: int,
     n_rows: int,
     n_cols: int,
+    *,
+    ra_column: str,
+    dec_column: str,
+    source_id_mode: str,
+    streaming: bool,
 ) -> None:
     info = {
         "catalog_name": survey_name,
@@ -540,8 +573,10 @@ def _write_catalog_info(
         "total_columns": n_cols,
         "schema_version": "1",
         "epoch": "J2000",
-        "ra_column": "ra",
-        "dec_column": "dec",
+        "ra_column": ra_column,
+        "dec_column": dec_column,
+        "source_id_mode": source_id_mode,
+        "ingest_streaming": streaming,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     with open(catalog_root / "catalog_info.json", "w") as fh:
@@ -561,8 +596,13 @@ def ingest_catalog_batch(
     dec_col: str = "dec",
     norder: int = 5,
     source_id_col: str | None = None,
+    overwrite: bool = False,
 ) -> None:
-    """Ingest multiple source files into the same survey catalog."""
+    """Ingest multiple source files into the same survey catalog.
+
+    Each file is passed to :func:`ingest_catalog` with the same ``overwrite``
+    flag (default ``False``, matching single-file ingest).
+    """
     for path in source_paths:
         ingest_catalog(
             source_path=path,
@@ -572,7 +612,7 @@ def ingest_catalog_batch(
             dec_col=dec_col,
             norder=norder,
             source_id_col=source_id_col,
-            overwrite=True,
+            overwrite=overwrite,
         )
 
 

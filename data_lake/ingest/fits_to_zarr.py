@@ -8,10 +8,10 @@ Each HEALPix tile is stored as a separate Zarr group:
       source_id/ shape=(N_sources,)                 int64
       wcs/       shape=(N_sources,)                 structured array with WCS scalars
 
-The catalog Parquet row for each source must be updated with ``_cutout_index``
-(the position inside its tile's Zarr array) after ingest.  A companion CSV/
-Parquet index file ``<tile>.zarr/index.parquet`` is written so the IO layer
-can perform O(1) source_id → cutout_index lookups.
+After ingest, update the survey Parquet catalog with ``_cutout_index`` (tile-local
+row index) using :func:`data_lake.ingest.update_catalog_indices.update_index_column`.
+Fast random access uses that index together with the tile's ``source_id`` array;
+there is **no** separate ``index.parquet`` sidecar on disk.
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 import zarr
@@ -129,30 +129,22 @@ def _open_or_create_tile_store(
 
     root = zarr.open_group(store=store, mode="w", zarr_format=3)
 
-    chunk_shape = (1, n_bands, height, width)
-    shard_shape = (_CHUNKS_PER_SHARD, n_bands, height, width)
-
-    codec_pipeline = [
-        zarr.codecs.ShardingCodec(
-            chunk_shape=chunk_shape,
-            codecs=[
-                zarr.codecs.BytesCodec(),
-                zarr.codecs.BloscCodec(
-                    cname="zstd",
-                    clevel=_ZSTD_LEVEL,
-                    shuffle=zarr.codecs.BloscShuffle.bitshuffle,
-                ),
-            ],
-        )
-    ]
+    blosc = zarr.codecs.BloscCodec(
+        cname="zstd",
+        clevel=_ZSTD_LEVEL,
+        shuffle=zarr.codecs.BloscShuffle.bitshuffle,
+    )
+    shard_n = _CHUNKS_PER_SHARD
+    chunk_img = (1, n_bands, height, width)
+    shard_img = (shard_n, n_bands, height, width)
 
     root.create_array(
         "images",
         shape=(0, n_bands, height, width),
-        chunks=shard_shape,
+        chunks=chunk_img,
+        shards=shard_img,
         dtype=dtype,
-        compressor=None,
-        codecs=codec_pipeline,
+        compressors=blosc,
         fill_value=np.nan,
     )
     root.create_array("source_id", shape=(0,), chunks=(4096,), dtype=np.int64, fill_value=-1)
@@ -167,6 +159,33 @@ def _open_or_create_tile_store(
     )
 
     return root
+
+
+def _filter_tile_records_duplicates(
+    tile_records: list[CutoutRecord],
+    existing_source_ids: set[int],
+    on_duplicate: Literal["append", "error", "skip"],
+) -> list[CutoutRecord]:
+    """Enforce duplicate policy for one tile's incoming batch vs Zarr contents."""
+    seen_batch: set[int] = set()
+    for r in tile_records:
+        if r.source_id in seen_batch:
+            raise ValueError(
+                f"Duplicate source_id {r.source_id} within a single ingest batch for one tile"
+            )
+        seen_batch.add(r.source_id)
+
+    if on_duplicate == "append":
+        return tile_records
+    if on_duplicate == "error":
+        for r in tile_records:
+            if r.source_id in existing_source_ids:
+                raise ValueError(
+                    f"source_id {r.source_id} already exists in this tile's Zarr; "
+                    f"use on_duplicate_source_id='skip' or 'append'."
+                )
+        return tile_records
+    return [r for r in tile_records if r.source_id not in existing_source_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +204,7 @@ def ingest_cutouts_from_fits(
     band_names: list[str] | None = None,
     norder: int = 5,
     dtype: np.dtype | type = _DEFAULT_DTYPE,
+    on_duplicate_source_id: Literal["append", "error", "skip"] = "append",
 ) -> dict[int, int]:
     """
     Ingest cutout images from a FITS file (one HDU = one source or one MEF
@@ -212,6 +232,10 @@ def ingest_cutouts_from_fits(
         HEALPix partitioning order.
     dtype:
         Storage dtype (float32 default).
+    on_duplicate_source_id:
+        ``append`` (default) always appends new rows (may duplicate ``source_id``
+        in a tile if re-run).  ``error`` raises if any incoming ``source_id`` is
+        already present.  ``skip`` drops conflicting rows and only appends new IDs.
 
     Returns
     -------
@@ -249,6 +273,17 @@ def ingest_cutouts_from_fits(
         sid_arr = root["source_id"]
         wcs_arr = root["wcs"]
 
+        n_existing = int(sid_arr.shape[0])
+        existing: set[int] = set()
+        if n_existing > 0:
+            existing = set(np.asarray(sid_arr[:]).tolist())
+
+        tile_records = _filter_tile_records_duplicates(
+            tile_records, existing, on_duplicate_source_id,
+        )
+        if not tile_records:
+            continue
+
         start_idx = images_arr.shape[0]
 
         batch_images = np.stack([r.image for r in tile_records], axis=0).astype(dtype)
@@ -272,7 +307,17 @@ def ingest_cutouts_from_fits(
 
     # Write cutout_info.json at survey root
     cutout_root = output_root / "cutouts" / survey_name
-    _write_cutout_info(cutout_root, survey_name, norder, n_bands, h, w, band_names or [])
+    _write_cutout_info(
+        cutout_root,
+        survey_name,
+        norder,
+        n_bands,
+        h,
+        w,
+        band_names or [],
+        dtype=dtype,
+        on_duplicate_source_id=on_duplicate_source_id,
+    )
 
     return index_map
 
@@ -351,6 +396,9 @@ def _write_cutout_info(
     height: int,
     width: int,
     band_names: list[str],
+    *,
+    dtype: np.dtype,
+    on_duplicate_source_id: str,
 ) -> None:
     info = {
         "survey_name": survey_name,
@@ -359,7 +407,8 @@ def _write_cutout_info(
         "height": height,
         "width": width,
         "band_names": band_names,
-        "dtype": "float32",
+        "dtype": np.dtype(dtype).name,
+        "on_duplicate_source_id": on_duplicate_source_id,
         "chunk_shape": [1, n_bands, height, width],
         "chunks_per_shard": _CHUNKS_PER_SHARD,
         "compression": "blosc-zstd-bitshuffle",
@@ -398,6 +447,24 @@ try:
     @click.option("--band-axis", default=None, type=int)
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
+    @click.option(
+        "--band-names",
+        default=None,
+        help="Comma-separated band names (stored on the Zarr group as band_names).",
+    )
+    @click.option(
+        "--dtype",
+        default="float32",
+        show_default=True,
+        help="NumPy dtype name for stored image arrays.",
+    )
+    @click.option(
+        "--on-duplicate",
+        type=click.Choice(["append", "error", "skip"]),
+        default="append",
+        show_default=True,
+        help="If source_id already exists in a tile, append (default), raise, or skip rows.",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         source_path: Path,
@@ -409,6 +476,9 @@ try:
         image_hdu_index: int,
         band_axis: int | None,
         norder: int | None,
+        band_names: str | None,
+        dtype: str,
+        on_duplicate: str,
         verbose: bool,
     ) -> None:
         """Ingest FITS cutouts into sharded Zarr v3 stacks.
@@ -417,10 +487,14 @@ try:
         (via --config or $DATA_LAKE_CONFIG); in that case it defaults to
         ``<lake.root>/<paths.cutouts>``.
         """
+        import numpy as np
+
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
         resolved_output = require_output_root(output_root, cfg, kind="cutouts")
+
+        bn = [x.strip() for x in band_names.split(",")] if band_names else None
 
         ingest_cutouts_from_fits(
             source_path=source_path,
@@ -430,8 +504,11 @@ try:
             dec_col=dec_col,
             image_hdu_index=image_hdu_index,
             band_axis=band_axis,
+            band_names=bn,
             norder=pick(norder,
                         cfg.partitioning.hats_order if cfg else None, 5),
+            dtype=np.dtype(dtype),
+            on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
         )
 
 except ImportError:

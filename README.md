@@ -155,6 +155,9 @@ slower wall-clock; use only when memory is a constraint.
 dl-ingest-cutouts cutouts.fits --survey des_dr2 --ra-col RA --dec-col DEC
 ```
 
+Optional flags: ``--band-names r,i,z``, ``--dtype float64``, and ``--on-duplicate``
+(``append`` / ``error`` / ``skip``) to control re-ingest behaviour per tile.
+
 ### Ingest spectra
 
 **DESI** ingest requires the `desispec` optional extra (uses `read_spectra` +
@@ -232,6 +235,31 @@ Rough timing on a single workstation for 10 000 DESI coadd files
 | 32 | 20–35 min (SSD I/O may dominate beyond this) |
 
 Disk footprint: ~120–170 GB compressed for ~5 M spectra at ~8 000 px.
+
+#### Sequential file-list ingest (catalogs & cutouts)
+
+```bash
+find /data/cats -name '*.fits' > cat_files.txt
+dl-ingest-catalog-from-list cat_files.txt --survey my_survey --ra-col RA --dec-col DEC
+
+find /data/cutouts -name '*.fits' > cutout_files.txt
+dl-ingest-cutouts-from-list cutout_files.txt --survey my_cutouts \
+  --band-names r,i,z --on-duplicate skip
+```
+
+Checkpoints default to ``catalogs/<survey>/.ingest_checkpoint.json`` or
+``cutouts/<survey>/.ingest_checkpoint.json`` under the lake root.  Optional
+``--failures-log`` writes JSONL per-file errors.
+
+#### Validate Parquet / Zarr survey directories
+
+```bash
+dl-validate-catalog-ingest --survey des_dr2
+dl-validate-cutout-ingest --survey des_dr2
+dl-validate-spectra-ingest --survey desi_edr
+```
+
+These accept ``--file-list``, ``--checkpoint``, ``--inflight``, ``--max-tiles``, and ``--strict`` (same semantics as the spectrum validator).
 
 #### Using the resolution matrix
 

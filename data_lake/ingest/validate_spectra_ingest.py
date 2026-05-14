@@ -14,6 +14,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from data_lake.ingest.checkpoint_sidecars import (
+    paths_from_file_list_file,
+    validate_ingest_sidecars,
+)
+
 _ROW_ARRAYS = ("flux", "ivar", "mask", "source_id", "meta")
 
 
@@ -28,24 +33,6 @@ class ValidationReport:
         if strict and self.warnings:
             return False
         return True
-
-
-def _paths_from_file_list_file(file_list_path: Path) -> list[Path]:
-    """Match ``desi_parallel_ingest`` path resolution (relative to list parent)."""
-    fl = file_list_path.resolve()
-    base = fl.parent
-    paths: list[Path] = []
-    for line in fl.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        p = Path(line)
-        paths.append(p if p.is_absolute() else (base / p))
-    return paths
-
-
-def _canonical(p: Path | str) -> str:
-    return str(Path(p).expanduser().resolve())
 
 
 def _iter_tile_zarrs(survey_root: Path) -> Iterator[Path]:
@@ -82,44 +69,13 @@ def validate_sidecars(
     file_list: Path | None,
     rep: ValidationReport,
 ) -> None:
-    ck = checkpoint_path or (survey_root / ".ingest_checkpoint.json")
-    if ck.exists():
-        try:
-            data = _load_json(ck)
-        except Exception as exc:
-            rep.errors.append(f"Invalid checkpoint JSON {ck}: {exc}")
-            return
-        done = set()
-        for p in data.get("completed", []):
-            if not p or not isinstance(p, str):
-                continue
-            try:
-                done.add(_canonical(p))
-            except OSError:
-                done.add(p)
-        for p in sorted(done):
-            if not Path(p).is_file():
-                rep.warnings.append(f"Checkpoint lists missing file: {p}")
-        if file_list is not None:
-            listed = [_canonical(x) for x in _paths_from_file_list_file(file_list)]
-            missing_ck = [p for p in listed if p not in done]
-            for p in missing_ck:
-                rep.warnings.append(f"File-list entry not in checkpoint (not ingested?): {p}")
-    elif file_list is not None:
-        rep.warnings.append(f"No checkpoint at {ck}; cannot compare --file-list")
-
-    infl = inflight_path or (survey_root / ".ingest_inflight.json")
-    if infl.exists():
-        try:
-            infl_data = _load_json(infl)
-        except Exception as exc:
-            rep.errors.append(f"Invalid inflight JSON {infl}: {exc}")
-            return
-        commit = infl_data.get("commit")
-        if commit:
-            rep.warnings.append(
-                f"Non-null inflight commit in {infl} (possible mid-file crash): {commit!r}"
-            )
+    validate_ingest_sidecars(
+        survey_root,
+        rep,
+        checkpoint_path=checkpoint_path,
+        inflight_path=inflight_path,
+        file_list=file_list,
+    )
 
 
 def validate_tile(tile_path: Path, info: dict[str, Any], rep: ValidationReport) -> None:

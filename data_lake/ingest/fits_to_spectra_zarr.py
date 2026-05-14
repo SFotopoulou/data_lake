@@ -75,7 +75,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 import zarr
@@ -496,6 +496,31 @@ def _detect_format_from_path(path: Path) -> str:
     return "generic"
 
 
+def _filter_spectrum_tile_duplicates(
+    tile_records: list[SpectrumRecord],
+    existing_source_ids: set[int],
+    on_duplicate: Literal["append", "error", "skip"],
+) -> list[SpectrumRecord]:
+    seen: set[int] = set()
+    for r in tile_records:
+        if r.source_id in seen:
+            raise ValueError(
+                f"Duplicate source_id {r.source_id} within a single ingest batch for one tile"
+            )
+        seen.add(r.source_id)
+    if on_duplicate == "append":
+        return tile_records
+    if on_duplicate == "error":
+        for r in tile_records:
+            if r.source_id in existing_source_ids:
+                raise ValueError(
+                    f"source_id {r.source_id} already exists in this tile's Zarr; "
+                    f"use on_duplicate_source_id='skip' or 'append'."
+                )
+        return tile_records
+    return [r for r in tile_records if r.source_id not in existing_source_ids]
+
+
 # ---------------------------------------------------------------------------
 # Core ingest
 # ---------------------------------------------------------------------------
@@ -526,6 +551,7 @@ def ingest_spectra_from_fits(
     n_pix_expected: int | None = None,
     on_length_mismatch: str = "error",
     with_resolution: bool = False,
+    on_duplicate_source_id: Literal["append", "error", "skip"] = "append",
 ) -> dict[int, int]:
     """
     Ingest 1-D spectra from a FITS file into HEALPix-partitioned Zarr v3 stacks.
@@ -559,6 +585,10 @@ def ingest_spectra_from_fits(
         When True, store the DESI banded resolution matrix alongside flux/ivar.
         Requires ``wavelength_mode="shared"`` and DESI coadd input.
         Increases storage by ~3× (see README for cost estimates).
+    on_duplicate_source_id:
+        ``append`` (default) may duplicate ``source_id`` rows if a file is
+        ingested twice.  ``error`` raises when an ID already exists in the tile.
+        ``skip`` drops only conflicting rows from the incoming batch.
 
     Returns
     -------
@@ -640,6 +670,17 @@ def ingest_spectra_from_fits(
             n_diag=n_diag, resolution_offsets=res_offsets,
         )
 
+        n_existing = int(root["source_id"].shape[0])
+        existing: set[int] = set()
+        if n_existing > 0:
+            existing = set(np.asarray(root["source_id"][:]).tolist())
+
+        tile_records = _filter_spectrum_tile_duplicates(
+            tile_records, existing, on_duplicate_source_id,
+        )
+        if not tile_records:
+            continue
+
         start_idx = root["flux"].shape[0]
 
         batch_flux  = np.stack([r.flux  for r in tile_records]).astype(np.float32)
@@ -686,6 +727,7 @@ def ingest_spectra_from_fits(
         has_resolution=has_resolution,
         resolution_n_diag=n_diag,
         resolution_offsets=res_offsets.tolist() if res_offsets is not None else None,
+        on_duplicate_source_id=on_duplicate_source_id,
     )
 
     log.info(
@@ -753,6 +795,7 @@ def _write_spectrum_info(
     has_resolution: bool = False,
     resolution_n_diag: int | None = None,
     resolution_offsets: list[int] | None = None,
+    on_duplicate_source_id: str = "append",
 ) -> None:
     info = {
         "survey_name": survey_name,
@@ -763,6 +806,7 @@ def _write_spectrum_info(
         "ivar_dtype": "float32",
         "mask_dtype": mask_dtype,
         "mask_bits": _DEFAULT_MASK_BITS,
+        "on_duplicate_source_id": on_duplicate_source_id,
         "meta_fields": list(_META_DTYPE.names),
         "chunk_shape": [1, n_pix],
         "chunks_per_shard": _CHUNKS_PER_SHARD,
@@ -818,6 +862,13 @@ try:
     @click.option("--on-length-mismatch",
                   type=click.Choice(["error", "pad", "truncate"]),
                   default="error", show_default=True)
+    @click.option(
+        "--on-duplicate",
+        type=click.Choice(["append", "error", "skip"]),
+        default="append",
+        show_default=True,
+        help="If a source_id already exists in a tile Zarr, append (default), raise, or skip.",
+    )
     @click.option("--with-resolution/--no-with-resolution", default=None,
                   help=(
                       "Store the DESI banded resolution matrix (n_diag × N_pix per source). "
@@ -837,6 +888,7 @@ try:
         mask_dtype: str | None,
         fmt: str | None,
         on_length_mismatch: str,
+        on_duplicate: str,
         with_resolution: bool | None,
         verbose: bool,
     ) -> None:
@@ -867,6 +919,7 @@ try:
                                      "uint8")),
             fmt=fmt,
             on_length_mismatch=on_length_mismatch,
+            on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
             with_resolution=pick(with_resolution,
                                  cfg.defaults.with_resolution if cfg else None,
                                  False),

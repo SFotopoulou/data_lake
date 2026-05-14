@@ -16,13 +16,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file
 from data_lake.ingest.desi_parallel_ingest import (
     TileBatch,
     WorkerResult,
     _atomic_write_json,
     _canonical_fits_path,
     _load_checkpoint,
-    _paths_from_file_list_file,
     _recover_stale_parallel_commit,
     _truncate_spectrum_tile_row_arrays,
     ingest_spectra_parallel,
@@ -280,9 +280,9 @@ class TestCheckpoint:
         flist.write_text("../data/coadd.fits\n")
 
         monkeypatch.chdir(tmp_path)
-        paths_a = _paths_from_file_list_file(flist)
+        paths_a = paths_from_file_list_file(flist)
         monkeypatch.chdir("/")
-        paths_b = _paths_from_file_list_file(flist)
+        paths_b = paths_from_file_list_file(flist)
 
         assert len(paths_a) == 1 and len(paths_b) == 1
         assert _canonical_fits_path(paths_a[0]) == _canonical_fits_path(paths_b[0])
