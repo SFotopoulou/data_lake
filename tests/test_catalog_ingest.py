@@ -4,9 +4,8 @@ Tests for data_lake.ingest.fits_to_parquet.
 Focuses on the FITS → PyArrow conversion path, especially:
 
 * Multidim BINTABLE columns (e.g. DESI's ``COEFF`` shape (N, 10)) survive
-  the conversion as Arrow ``FixedSizeList`` arrays — the original
-  ``to_pandas`` path crashed with ``ValueError: Cannot convert a table with
-  multidimensional columns``.
+  the conversion as Arrow ``FixedSizeList`` arrays — a naive table→rectangular
+  dataframe conversion would fail on multidimensional cells.
 * Byte-string columns (FITS fixed-width ASCII) decode to UTF-8.
 * Format detection works for FITS / Parquet / unknown suffix.
 * End-to-end ``ingest_catalog`` writes HEALPix-partitioned Parquet tiles

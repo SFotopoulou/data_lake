@@ -504,6 +504,8 @@ print(cfg.lake.name, cfg.spectra_root)
 
 ## Dependencies
 
-Core: `pyarrow`, `zarr>=3`, `numcodecs`, `duckdb`, `astropy`, `healpy`, `numpy`, `pandas`, `polars`, `torch`, `tqdm`, `click`
+Core: `pyarrow`, `zarr>=3`, `numcodecs`, `duckdb`, `astropy`, `healpy`, `numpy`, `polars`, `torch`, `tqdm`, `click`
+
+Catalog queries (`CatalogAccessor.query` and related helpers) return **Polars** DataFrames by default (`fmt="polars"`). Use `fmt="arrow"` or `fmt="astropy"` when you need those types instead.
 
 Optional: `napari`, `matplotlib`, `jupyterlab` (install with `pip install -e ".[dev]"`)

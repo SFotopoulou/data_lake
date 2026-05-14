@@ -1,7 +1,7 @@
 """
 catalog – DuckDB-backed accessor for HATS-partitioned Parquet catalogs.
 
-Exposes results as pandas DataFrame, Polars DataFrame, or Astropy Table.
+Exposes results as Polars DataFrame, Astropy Table, or PyArrow Table.
 
 Usage
 -----
@@ -21,11 +21,41 @@ from typing import Literal
 import duckdb
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
 
-ReturnFormat = Literal["pandas", "polars", "astropy", "arrow"]
+ReturnFormat = Literal["polars", "astropy", "arrow"]
+
+
+def _arrow_array_to_numpy_or_sequence(arr: pa.Array):
+    """Convert a single Arrow array to something Astropy Table columns accept."""
+    if pa.types.is_dictionary(arr.type):
+        arr = pc.dictionary_decode(arr)
+    if pa.types.is_null(arr.type):
+        return np.array([], dtype=np.float64)
+    if pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
+        return np.array(arr.to_pylist(), dtype=object)
+    if pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type):
+        return np.array(arr.to_pylist(), dtype=object)
+    if pa.types.is_nested(arr.type):
+        return arr.to_pylist()
+    try:
+        return arr.to_numpy(zero_copy_only=False)
+    except (pa.ArrowInvalid, TypeError, ValueError):
+        return np.array(arr.to_pylist(), dtype=object)
+
+
+def _arrow_table_to_astropy(table: pa.Table):
+    """Build an ``astropy.table.Table`` from PyArrow without pandas."""
+    from astropy.table import Table
+
+    cols = {}
+    for name in table.column_names:
+        arr = table[name].combine_chunks()
+        cols[name] = _arrow_array_to_numpy_or_sequence(arr)
+    return Table(cols)
 
 
 class CatalogAccessor:
@@ -106,7 +136,7 @@ class CatalogAccessor:
     def query(
         self,
         sql: str,
-        fmt: ReturnFormat = "pandas",
+        fmt: ReturnFormat = "polars",
     ):
         """
         Execute an arbitrary SQL query against the catalog view.
@@ -118,8 +148,7 @@ class CatalogAccessor:
         sql:
             DuckDB SQL statement.  Use ``catalog`` as the table name.
         fmt:
-            Return type: ``"pandas"``, ``"polars"``, ``"astropy"``, or
-            ``"arrow"``.
+            Return type: ``"polars"`` (default), ``"astropy"``, or ``"arrow"``.
         """
         arrow_result: pa.Table = self._con.execute(sql).arrow()
         return self._convert(arrow_result, fmt)
@@ -132,7 +161,7 @@ class CatalogAccessor:
         self,
         npix: int,
         columns: list[str] | None = None,
-        fmt: ReturnFormat = "pandas",
+        fmt: ReturnFormat = "polars",
     ):
         """Return all sources in a HEALPix tile."""
         col_expr = ", ".join(columns) if columns else "*"
@@ -146,7 +175,7 @@ class CatalogAccessor:
         dec: float,
         radius_deg: float,
         columns: list[str] | None = None,
-        fmt: ReturnFormat = "pandas",
+        fmt: ReturnFormat = "polars",
     ):
         """
         Return sources within a cone.
@@ -194,7 +223,7 @@ class CatalogAccessor:
         self,
         source_ids: list[int],
         columns: list[str] | None = None,
-        fmt: ReturnFormat = "pandas",
+        fmt: ReturnFormat = "polars",
     ):
         """Fetch rows by a list of source_ids."""
         col_expr = ", ".join(columns) if columns else "*"
@@ -247,8 +276,6 @@ class CatalogAccessor:
     def _convert(table: pa.Table, fmt: ReturnFormat):
         if fmt == "arrow":
             return table
-        if fmt == "pandas":
-            return table.to_pandas()
         if fmt == "polars":
             try:
                 import polars as pl
@@ -257,11 +284,10 @@ class CatalogAccessor:
                 raise ImportError("polars is not installed.") from e
         if fmt == "astropy":
             try:
-                from astropy.table import Table
-                return Table.from_pandas(table.to_pandas())
+                return _arrow_table_to_astropy(table)
             except ImportError as e:
                 raise ImportError("astropy is not installed.") from e
-        raise ValueError(f"Unknown fmt={fmt!r}. Choose from: pandas, polars, astropy, arrow.")
+        raise ValueError(f"Unknown fmt={fmt!r}. Choose from: polars, astropy, arrow.")
 
     # ------------------------------------------------------------------
     # Multi-survey cross-catalog helper
@@ -313,7 +339,7 @@ class MultiCatalogAccessor:
             )
             self._accessors[name] = acc
 
-    def query(self, sql: str, fmt: ReturnFormat = "pandas"):
+    def query(self, sql: str, fmt: ReturnFormat = "polars"):
         """Run SQL referencing any survey by its name as a table."""
         arrow_result = self._con.execute(sql).arrow()
         return CatalogAccessor._convert(arrow_result, fmt)

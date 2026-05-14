@@ -38,10 +38,11 @@ from pathlib import Path
 
 import healpy as hp
 import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_lake.io.catalog import CatalogAccessor
+from data_lake.io.catalog import CatalogAccessor, ReturnFormat
 from data_lake.ingest.fits_to_parquet import healpix_dir, _HATS_DIR_STRIDE, _ZSTD_LEVEL
 
 log = logging.getLogger(__name__)
@@ -111,14 +112,14 @@ def build_crossmatch(
             df_a = acc_a.sources_in_tile(
                 npix_a,
                 columns=["source_id", ra_col, dec_col],
-                fmt="pandas",
+                fmt="polars",
             )
-            if df_a.empty:
+            if df_a.is_empty():
                 continue
 
-            ra_a = df_a[ra_col].values.astype(np.float64)
-            dec_a = df_a[dec_col].values.astype(np.float64)
-            ids_a = df_a["source_id"].values.astype(np.int64)
+            ra_a = df_a[ra_col].to_numpy().astype(np.float64)
+            dec_a = df_a[dec_col].to_numpy().astype(np.float64)
+            ids_a = df_a["source_id"].to_numpy().astype(np.int64)
 
             # Neighbouring tiles for surveyB to cover border effects
             vec_center = hp.ang2vec(
@@ -136,19 +137,18 @@ def build_crossmatch(
                 df_b_tile = acc_b.sources_in_tile(
                     npix_b,
                     columns=["source_id", ra_col, dec_col],
-                    fmt="pandas",
+                    fmt="polars",
                 )
-                if not df_b_tile.empty:
+                if not df_b_tile.is_empty():
                     frames_b.append(df_b_tile)
 
             if not frames_b:
                 continue
 
-            import pandas as pd
-            df_b = pd.concat(frames_b, ignore_index=True).drop_duplicates("source_id")
-            ra_b = df_b[ra_col].values.astype(np.float64)
-            dec_b = df_b[dec_col].values.astype(np.float64)
-            ids_b = df_b["source_id"].values.astype(np.int64)
+            df_b = pl.concat(frames_b).unique(subset=["source_id"], keep="first")
+            ra_b = df_b[ra_col].to_numpy().astype(np.float64)
+            dec_b = df_b[dec_col].to_numpy().astype(np.float64)
+            ids_b = df_b["source_id"].to_numpy().astype(np.int64)
 
             # Sky match
             matched_a, matched_b, sep = _match_sky(
@@ -286,7 +286,7 @@ class CrossmatchAccessor:
         source_id_a: int | None = None,
         source_id_b: int | None = None,
         max_sep_arcsec: float | None = None,
-        fmt: str = "pandas",
+        fmt: ReturnFormat = "polars",
     ):
         """
         Query cross-match rows.
@@ -307,8 +307,7 @@ class CrossmatchAccessor:
         where = " AND ".join(conditions)
         sql = f"SELECT * FROM xmatch WHERE {where}"
         result = self._con.execute(sql).arrow()
-        from data_lake.io.catalog import CatalogAccessor
-        return CatalogAccessor._convert(result, fmt)  # type: ignore[arg-type]
+        return CatalogAccessor._convert(result, fmt)
 
     def close(self) -> None:
         self._con.close()

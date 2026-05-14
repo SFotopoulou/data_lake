@@ -18,7 +18,6 @@ dependencies = [
     # Catalog query engines
     "duckdb>=0.10",
     "polars>=0.20",
-    "pandas>=2.0",
     # Astronomy
     "astropy>=6.0",
     "healpy>=1.16",

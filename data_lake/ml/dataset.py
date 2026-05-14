@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import numpy as np
+import polars as pl
 
 try:
     import torch
@@ -150,8 +151,13 @@ class CutoutDataset(Dataset):
                 hp_col = f"_healpix_norder{self.norder}"
                 id_list = ", ".join(str(s) for s in self.source_ids)
                 sql = f"SELECT source_id, {hp_col} FROM catalog WHERE source_id IN ({id_list})"
-                df = self._catalog.query(sql, fmt="pandas")
-                id_to_tile = dict(zip(df["source_id"].astype(int), df[hp_col].astype(int)))
+                df = self._catalog.query(sql, fmt="polars")
+                id_to_tile = dict(
+                    zip(
+                        df["source_id"].cast(pl.Int64).to_list(),
+                        df[hp_col].cast(pl.Int64).to_list(),
+                    )
+                )
                 tiles = [id_to_tile.get(sid, 0) for sid in self.source_ids]
                 return list(np.argsort(tiles, kind="stable"))
         except Exception as exc:

@@ -67,8 +67,8 @@ def _astropy_col_to_pyarrow(col) -> pa.Array:
 
     Preserves multidim columns as ``FixedSizeListArray`` of the same inner
     size — essential for FITS BINTABLE vector columns such as DESI's
-    ``COEFF`` (shape ``(N_rows, 10)``).  Without this, ``astropy.to_pandas``
-    raises because pandas/pyarrow DataFrames can't represent 2-D cells.
+    ``COEFF`` (shape ``(N_rows, 10)``).  A rectangular dataframe-style export
+    cannot represent arbitrary 2-D cells per row; Arrow ``FixedSizeList`` does.
 
     Handles:
     * big-endian FITS dtypes → cast to native byte-order (PyArrow requires it)
@@ -114,7 +114,7 @@ def _astropy_col_to_pyarrow(col) -> pa.Array:
 def _astropy_table_to_arrow(tbl: Table) -> pa.Table:
     """Convert an astropy Table to a PyArrow Table, preserving multidim columns.
 
-    Unlike ``astropy.Table.to_pandas`` + ``pa.Table.from_pandas``, this path
+    Unlike conversions that round-trip through a flat dataframe layout, this path
     handles vector/matrix BINTABLE columns (e.g. DESI ``COEFF`` shape (N, 10)
     or per-band fluxes shape (N, 4)) by storing them as Arrow
     ``FixedSizeList`` arrays.  Inner shapes for >2-D columns are recorded
@@ -162,7 +162,7 @@ def _read_source_table(path: Path) -> pa.Table:
     * anything else                                  – astropy auto-detect
 
     Multidim FITS columns (e.g. DESI ``COEFF``) are preserved as
-    ``FixedSizeList`` arrays rather than crashing in the pandas conversion.
+    ``FixedSizeList`` arrays rather than failing on non-scalar cells.
     """
     name = path.name.lower()
     suffix = path.suffix.lower()
