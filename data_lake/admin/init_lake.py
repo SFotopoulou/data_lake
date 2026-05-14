@@ -8,14 +8,14 @@ library; it is a thin instance that depends on the published
 
 Example
 -------
-    dl-init caspian ~/projects \
-        --root ~/projects/caspian/data \
+    dl-init mylake ~/projects \
+        --root ~/projects/mylake/data \
         --norder 5 \
         --description "Personal multi-survey lake"
 
 Creates::
 
-    ~/projects/caspian/
+    ~/projects/mylake/
         lake_config.toml
         README.md
         .gitignore
@@ -130,7 +130,7 @@ def init_lake(
     Parameters
     ----------
     name:
-        Short identifier for the lake (e.g. ``"caspian"``).  Becomes both
+        Short identifier for the lake (e.g. ``"mylake"``).  Becomes both
         the deployment directory name and the ``lake.name`` field.
     parent:
         Directory in which to create ``<parent>/<name>/``.
