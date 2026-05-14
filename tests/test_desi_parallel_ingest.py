@@ -23,9 +23,11 @@ from data_lake.ingest.desi_parallel_ingest import (
     _canonical_fits_path,
     _load_checkpoint,
     _paths_from_file_list_file,
+    _recover_stale_parallel_commit,
+    _truncate_spectrum_tile_row_arrays,
     ingest_spectra_parallel,
 )
-from data_lake.ingest.fits_to_spectra_zarr import _meta_to_bytes
+from data_lake.ingest.fits_to_spectra_zarr import _META_DTYPE, _meta_to_bytes, _open_or_create_spectrum_tile
 
 
 N_PIX = 16
@@ -240,6 +242,10 @@ class TestCheckpoint:
         ckpt_data = json.loads(ckpt.read_text())
         assert len(ckpt_data["completed"]) == 3
 
+        inflight = tmp_path / "lake" / "spectra" / "syn" / ".ingest_inflight.json"
+        assert inflight.exists()
+        assert json.loads(inflight.read_text()).get("commit") is None
+
     def test_atomic_write_json_round_trip(self, tmp_path: Path):
         target = tmp_path / "nested" / "ckpt.json"
         _atomic_write_json(target, {"completed": ["/a", "/b"]})
@@ -281,6 +287,138 @@ class TestCheckpoint:
         assert len(paths_a) == 1 and len(paths_b) == 1
         assert _canonical_fits_path(paths_a[0]) == _canonical_fits_path(paths_b[0])
         assert _canonical_fits_path(paths_a[0]) == _canonical_fits_path(coadd)
+
+
+class TestInflightJournal:
+    def test_truncate_spectrum_tile_row_arrays(self, tmp_path: Path) -> None:
+        import zarr
+
+        wave = np.linspace(3600.0, 9800.0, N_PIX, dtype=np.float64)
+        wcs = {
+            "ctype": "WAVE", "crval": float(wave[0]),
+            "cdelt": float(wave[1] - wave[0]), "crpix": 1.0,
+            "unit": "Angstrom", "air_or_vacuum": "vacuum", "n_pix": N_PIX,
+        }
+        tile_path = tmp_path / "Npix=1.zarr"
+        root = _open_or_create_spectrum_tile(
+            tile_path, N_PIX, "shared", np.dtype(np.uint8), wcs,
+        )
+        mb_one = _meta_to_bytes({
+            "z": 0.5, "z_err": 0.01, "snr": 5.0,
+            "exptime": 100.0, "R": 3000.0, "instr": "TEST",
+        })
+        meta_dtype = "|V" + str(_META_DTYPE.itemsize)
+        meta_arr = np.frombuffer(mb_one * 5, dtype=meta_dtype)
+        root["flux"].append(np.ones((5, N_PIX), dtype=np.float32))
+        root["ivar"].append(np.ones((5, N_PIX), dtype=np.float32))
+        root["mask"].append(np.zeros((5, N_PIX), dtype=np.uint8))
+        root["source_id"].append(np.arange(5, dtype=np.int64))
+        root["meta"].append(meta_arr)
+        assert root["flux"].shape[0] == 5
+
+        _truncate_spectrum_tile_row_arrays(root, 2)
+        assert root["flux"].shape[0] == 2
+        root_r = zarr.open_group(
+            store=zarr.storage.LocalStore(str(tile_path)), mode="r", zarr_format=3,
+        )
+        assert root_r["meta"].shape[0] == 2
+
+    def test_recovery_truncates_orphan_commit(self, tmp_path: Path, fake_files) -> None:
+        """Stale inflight for a file not in checkpoint rewinds Zarr row counts."""
+        import zarr
+
+        ckpt = tmp_path / "ckpt.json"
+        lake = tmp_path / "lake"
+        survey_root = lake / "spectra" / "syn"
+        inflight = survey_root / ".ingest_inflight.json"
+
+        first = ingest_spectra_parallel(
+            file_paths=[fake_files[0]],
+            output_root=lake,
+            survey_name="syn",
+            n_workers=1,
+            norder=5,
+            checkpoint_path=ckpt,
+            failures_log=tmp_path / "fail.jsonl",
+            show_progress=False,
+            decoder=_fake_decoder,
+            executor_factory=_thread_executor,
+        )
+        assert first["n_files_succeeded"] == 1
+
+        p_a = _canonical_fits_path(fake_files[0])
+        _atomic_write_json(ckpt, {"completed": []})
+        _atomic_write_json(
+            inflight,
+            {
+                "commit": {
+                    "path": p_a,
+                    "tiles": {"100": 0, "200": 0},
+                    "norder": 5,
+                },
+            },
+        )
+        _recover_stale_parallel_commit(survey_root, 5, inflight, completed=set())
+        assert json.loads(inflight.read_text()).get("commit") is None
+
+        t100 = next(survey_root.rglob("Npix=100.zarr"))
+        r100 = zarr.open_group(
+            store=zarr.storage.LocalStore(str(t100)), mode="r", zarr_format=3,
+        )
+        assert r100["flux"].shape[0] == 0
+
+        second = ingest_spectra_parallel(
+            file_paths=[fake_files[0]],
+            output_root=lake,
+            survey_name="syn",
+            n_workers=1,
+            norder=5,
+            checkpoint_path=ckpt,
+            failures_log=tmp_path / "fail.jsonl",
+            show_progress=False,
+            decoder=_fake_decoder,
+            executor_factory=_thread_executor,
+        )
+        assert second["n_files_succeeded"] == 1
+        r100b = zarr.open_group(
+            store=zarr.storage.LocalStore(str(t100)), mode="r", zarr_format=3,
+        )
+        assert r100b["flux"].shape[0] == 2
+
+    def test_recovery_clears_inflight_when_path_already_completed(
+        self, tmp_path: Path, fake_files,
+    ) -> None:
+        import zarr
+
+        ckpt = tmp_path / "ckpt.json"
+        lake = tmp_path / "lake"
+        survey_root = lake / "spectra" / "syn"
+        inflight = survey_root / ".ingest_inflight.json"
+
+        ingest_spectra_parallel(
+            file_paths=[fake_files[0]],
+            output_root=lake,
+            survey_name="syn",
+            n_workers=1,
+            checkpoint_path=ckpt,
+            failures_log=tmp_path / "fail.jsonl",
+            show_progress=False,
+            decoder=_fake_decoder,
+            executor_factory=_thread_executor,
+        )
+        p_a = _canonical_fits_path(fake_files[0])
+        _atomic_write_json(
+            inflight,
+            {"commit": {"path": p_a, "tiles": {"100": 0}, "norder": 5}},
+        )
+        _recover_stale_parallel_commit(survey_root, 5, inflight, completed={p_a})
+
+        assert json.loads(inflight.read_text()).get("commit") is None
+        t100 = next(survey_root.rglob("Npix=100.zarr"))
+        r100 = zarr.open_group(
+            store=zarr.storage.LocalStore(str(t100)), mode="r", zarr_format=3,
+        )
+        assert r100["flux"].shape[0] == 2
 
 
 class TestInconsistentNPix:

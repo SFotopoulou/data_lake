@@ -18,9 +18,9 @@ Architecture
             └──▶ main-process writer  (single thread)
                       futures.as_completed →
                           open / create tile zarr (cached per npix)
-                          append flux/ivar/mask/source_id/meta batch
+                          inflight journal (per-tile row snapshot) → append
                           track {source_id: (npix, local_idx)} for catalog patch
-                      atomic checkpoint after every successful file
+                      checkpoint after append (then clear inflight)
                       append-only failures.jsonl on errors
 
 Why this split
@@ -54,7 +54,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -260,6 +260,118 @@ def _load_checkpoint(path: Path | None) -> set[str]:
         return set()
 
 
+# Row-aligned arrays in a spectrum tile (2-D source axis + wavelength metadata).
+_SPECTRUM_ROW_ALIGNED = ("flux", "ivar", "mask", "source_id", "meta")
+
+
+def _truncate_spectrum_tile_row_arrays(root: Any, n_rows: int) -> None:
+    """Shrink every per-source array so its first dimension equals ``n_rows``."""
+    if n_rows < 0:
+        raise ValueError("n_rows must be non-negative")
+    for name in _SPECTRUM_ROW_ALIGNED:
+        arr = root[name]
+        shape = list(arr.shape)
+        cur = int(shape[0])
+        if cur == n_rows:
+            continue
+        if n_rows > cur:
+            raise ValueError(
+                f"Cannot truncate {name!r} to {n_rows} rows (current {cur})."
+            )
+        shape[0] = n_rows
+        arr.resize(tuple(shape))
+
+
+def _clear_parallel_inflight(path: Path) -> None:
+    """Mark no in-flight file commit (atomic JSON write)."""
+    _atomic_write_json(path, {"commit": None})
+
+
+def _recover_stale_parallel_commit(
+    survey_root: Path,
+    norder: int,
+    inflight_path: Path,
+    completed: set[str],
+) -> None:
+    """If a previous run died mid-file, truncate Zarr rows then clear the journal.
+
+    A commit journal entry records per-tile row counts *before* appending a
+    coadd.  If that coadd's path is already listed in ``completed``, the
+    append phase finished and the checkpoint was persisted (clear journal only).
+    Otherwise we rewind each listed tile to the saved row counts so the next
+    run can re-ingest the whole file without duplicates.
+    """
+    if not inflight_path.exists():
+        return
+    try:
+        data = json.loads(inflight_path.read_text())
+    except Exception as exc:
+        log.warning(
+            "Could not parse inflight journal %s (%s); removing file.",
+            inflight_path, exc,
+        )
+        try:
+            inflight_path.unlink()
+        except OSError:
+            pass
+        return
+
+    commit = data.get("commit")
+    if not commit or not isinstance(commit, dict):
+        return
+
+    path_raw = commit.get("path")
+    if not path_raw or not isinstance(path_raw, str):
+        _clear_parallel_inflight(inflight_path)
+        return
+
+    try:
+        path_canon = _canonical_fits_path(path_raw)
+    except OSError:
+        path_canon = path_raw
+
+    if path_canon in completed:
+        _clear_parallel_inflight(inflight_path)
+        return
+
+    tiles = commit.get("tiles")
+    if not isinstance(tiles, dict):
+        _clear_parallel_inflight(inflight_path)
+        return
+
+    stored_norder = int(commit.get("norder", norder))
+    if stored_norder != int(norder):
+        log.warning(
+            "Inflight journal norder=%s differs from this run (%s); "
+            "recovery uses this run's norder for tile paths.",
+            stored_norder, norder,
+        )
+
+    import zarr
+
+    for npix_str, start_rows in tiles.items():
+        try:
+            npix = int(npix_str)
+            nrow = int(start_rows)
+        except (TypeError, ValueError):
+            continue
+        tile_dir = survey_root / healpix_dir(norder, npix)
+        tile_path = tile_dir / f"Npix={npix}.zarr"
+        if not (tile_path / "zarr.json").exists():
+            continue
+        store = zarr.storage.LocalStore(str(tile_path))
+        root = zarr.open_group(store=store, mode="a", zarr_format=3)
+        try:
+            _truncate_spectrum_tile_row_arrays(root, nrow)
+        except Exception as exc:
+            log.warning(
+                "Inflight recovery: failed to truncate Npix=%s to %s rows: %s",
+                npix, nrow, exc,
+            )
+
+    _clear_parallel_inflight(inflight_path)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -279,6 +391,7 @@ def ingest_spectra_parallel(
     executor_factory: Callable[[int], Executor] | None = None,
     worker_log_file: Path | str | None = None,
     worker_verbose: bool = False,
+    inflight_path: Path | str | None = None,
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -317,6 +430,9 @@ def ingest_spectra_parallel(
     worker_verbose:
         If true, worker-side library log level follows DEBUG when combined with
         ``worker_log_file``; passed with ``worker_log_file`` via subprocess env.
+    inflight_path:
+        JSON journal used for crash-safe per-file commits (default
+        ``<survey_root>/.ingest_inflight.json``).  Pass ``None`` for that default.
 
     Returns
     -------
@@ -338,6 +454,13 @@ def ingest_spectra_parallel(
     state lives in this process; workers only return numpy arrays.  Pickle
     protocol 5 (default in Python 3.11) carries the arrays as out-of-band
     buffers so transfer is near-zero-copy.
+
+    **Crash safety:** before appending a coadd, the writer records each touched
+    tile's current row count in ``inflight_path`` (atomic JSON).  After all
+    appends for that file succeed, it updates the checkpoint (if enabled) and
+    then clears the inflight journal.  On startup, if the journal names a file
+    that is not yet in the checkpoint, each listed tile is truncated back to
+    the saved row counts so the coadd can be re-ingested without duplicate rows.
     """
     try:
         from tqdm.auto import tqdm
@@ -353,6 +476,13 @@ def ingest_spectra_parallel(
     failures_log = Path(failures_log) if failures_log else None
 
     completed: set[str] = _load_checkpoint(checkpoint_path)
+    resolved_inflight = (
+        Path(inflight_path).resolve()
+        if inflight_path is not None
+        else survey_root / ".ingest_inflight.json"
+    )
+    _recover_stale_parallel_commit(survey_root, norder, resolved_inflight, completed)
+
     requested = [_canonical_fits_path(p) for p in file_paths]
     n_requested = len(requested)
 
@@ -465,6 +595,7 @@ def ingest_spectra_parallel(
                             _atomic_write_json(
                                 checkpoint_path, {"completed": sorted(completed)}
                             )
+                        _clear_parallel_inflight(resolved_inflight)
                         continue
 
                     # First successful file fixes the wavelength grid & WCS
@@ -487,6 +618,7 @@ def ingest_spectra_parallel(
                                 fh.write(json.dumps(fail_entry) + "\n")
                         continue
 
+                    snap: dict[int, int] = {}
                     for b in res.batches:
                         tile_dir = survey_root / healpix_dir(norder, b.npix)
                         tile_dir.mkdir(parents=True, exist_ok=True)
@@ -496,6 +628,21 @@ def ingest_spectra_parallel(
                                 tile_path, n_pix_known, "shared",
                                 np.dtype(np.uint8), wcs_attrs_known,
                             )
+                        root = tile_groups[b.npix]
+                        snap[b.npix] = int(root["flux"].shape[0])
+
+                    _atomic_write_json(
+                        resolved_inflight,
+                        {
+                            "commit": {
+                                "path": res.path,
+                                "tiles": {str(k): v for k, v in snap.items()},
+                                "norder": int(norder),
+                            },
+                        },
+                    )
+
+                    for b in res.batches:
                         root = tile_groups[b.npix]
                         start_idx = root["flux"].shape[0]
 
@@ -522,6 +669,7 @@ def ingest_spectra_parallel(
                         _atomic_write_json(
                             checkpoint_path, {"completed": sorted(completed)}
                         )
+                    _clear_parallel_inflight(resolved_inflight)
 
     finally:
         if uses_parallel_subprocess_workers:
