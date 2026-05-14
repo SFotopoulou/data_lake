@@ -188,6 +188,25 @@ def _decode_one_coadd_safe(path_str: str, norder: int) -> WorkerResult:
 # ---------------------------------------------------------------------------
 
 
+def _canonical_fits_path(p: Path | str) -> str:
+    """Absolute, resolved path string used for checkpoint ↔ pending matching."""
+    return str(Path(p).expanduser().resolve())
+
+
+def _paths_from_file_list_file(file_list_path: Path) -> list[Path]:
+    """Paths from a text file list; relative lines are resolved vs the list file's parent."""
+    fl = file_list_path.resolve()
+    base = fl.parent
+    paths: list[Path] = []
+    for line in fl.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line)
+        paths.append(p if p.is_absolute() else (base / p))
+    return paths
+
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     """Write JSON atomically by writing to a tempfile then renaming."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,7 +220,17 @@ def _load_checkpoint(path: Path | None) -> set[str]:
         return set()
     try:
         data = json.loads(path.read_text())
-        return set(data.get("completed", []))
+        raw = data.get("completed", [])
+        out: set[str] = set()
+        for item in raw:
+            if not item or not isinstance(item, str):
+                continue
+            try:
+                out.add(_canonical_fits_path(item))
+            except OSError:
+                # Broken symlinks / odd paths: keep literal so we do not drop entries
+                out.add(item)
+        return out
     except Exception:
         log.warning("Could not parse checkpoint %s; starting fresh.", path)
         return set()
@@ -297,7 +326,7 @@ def ingest_spectra_parallel(
     failures_log = Path(failures_log) if failures_log else None
 
     completed: set[str] = _load_checkpoint(checkpoint_path)
-    requested = [str(Path(p).resolve()) for p in file_paths]
+    requested = [_canonical_fits_path(p) for p in file_paths]
     n_requested = len(requested)
 
     pending = [p for p in requested if p not in completed]
@@ -499,7 +528,8 @@ try:
         "--file-list", "file_list", type=click.Path(exists=True, dir_okay=False, path_type=Path),
         default=None,
         help="Plain-text file with one coadd FITS path per line "
-             "(mutually exclusive with --coadd-root).",
+             "(mutually exclusive with --coadd-root).  Relative paths are "
+             "resolved against this file's directory, not the process cwd.",
     )
     @click.option(
         "--coadd-root", type=click.Path(exists=True, file_okay=False, path_type=Path),
@@ -578,13 +608,9 @@ try:
             norder, cfg.partitioning.hats_order if cfg else None, 5,
         )
 
-        # Build file list
+        # Build file list (relative paths are anchored to the list file, not cwd)
         if file_list is not None:
-            paths = [
-                Path(line.strip())
-                for line in file_list.read_text().splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            ]
+            paths = _paths_from_file_list_file(file_list)
         else:
             assert coadd_root is not None
             paths = sorted(coadd_root.rglob(coadd_glob))

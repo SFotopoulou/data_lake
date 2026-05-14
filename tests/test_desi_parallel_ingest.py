@@ -20,7 +20,9 @@ from data_lake.ingest.desi_parallel_ingest import (
     TileBatch,
     WorkerResult,
     _atomic_write_json,
+    _canonical_fits_path,
     _load_checkpoint,
+    _paths_from_file_list_file,
     ingest_spectra_parallel,
 )
 from data_lake.ingest.fits_to_spectra_zarr import _meta_to_bytes
@@ -247,6 +249,38 @@ class TestCheckpoint:
     def test_load_checkpoint_missing_returns_empty(self, tmp_path: Path):
         assert _load_checkpoint(tmp_path / "nope.json") == set()
         assert _load_checkpoint(None) == set()
+
+    def test_load_checkpoint_normalizes_paths(self, tmp_path: Path):
+        """Equivalent path spellings in JSON match the canonical pending path."""
+        f = tmp_path / "d" / "x.fits"
+        f.parent.mkdir(parents=True)
+        f.touch()
+        ckpt = tmp_path / "ckpt.json"
+        redundant = str(tmp_path / "d" / "." / "x.fits")
+        _atomic_write_json(ckpt, {"completed": [redundant]})
+        assert _load_checkpoint(ckpt) == {_canonical_fits_path(f)}
+
+    def test_paths_from_file_list_relative_to_list_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Relative lines resolve vs the list file's parent, not process cwd."""
+        lists = tmp_path / "lists"
+        lists.mkdir()
+        data = tmp_path / "data"
+        data.mkdir()
+        coadd = data / "coadd.fits"
+        coadd.touch()
+        flist = lists / "files.txt"
+        flist.write_text("../data/coadd.fits\n")
+
+        monkeypatch.chdir(tmp_path)
+        paths_a = _paths_from_file_list_file(flist)
+        monkeypatch.chdir("/")
+        paths_b = _paths_from_file_list_file(flist)
+
+        assert len(paths_a) == 1 and len(paths_b) == 1
+        assert _canonical_fits_path(paths_a[0]) == _canonical_fits_path(paths_b[0])
+        assert _canonical_fits_path(paths_a[0]) == _canonical_fits_path(coadd)
 
 
 class TestInconsistentNPix:
