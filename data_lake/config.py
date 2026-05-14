@@ -1,7 +1,7 @@
 """
 LakeConfig - single source of truth for a deployment.
 
-A *deployment* (your private data lake instance, e.g. ``caspian``) is a
+A *deployment* (your private data lake instance, e.g. ``mylake``) is a
 directory containing a ``lake_config.toml`` file plus user-managed
 notebooks, scripts, and data subdirectories.  The library itself is
 deployment-agnostic; everything specific to a particular lake lives in
@@ -12,7 +12,7 @@ Schema (lake_config.toml)
     schema_version = "1"
 
     [lake]
-    name        = "caspian"                # short identifier
+    name        = "mylake"                 # short identifier
     description = "Personal multi-survey"  # free text
     root        = "/path/to/lake/data"     # where tiles live
     created_utc = "2026-05-13T11:43:00Z"   # ISO-8601
