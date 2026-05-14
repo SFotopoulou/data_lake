@@ -279,9 +279,15 @@ def ingest_spectra_parallel(
     """
     try:
         from tqdm.auto import tqdm
+        from tqdm.contrib.logging import logging_redirect_tqdm
     except ImportError:
+        from contextlib import nullcontext
+
         def tqdm(x, **_kw):
             return x
+
+        def logging_redirect_tqdm(*_a, **_kw):
+            return nullcontext()
 
     output_root = Path(output_root)
     survey_root = output_root / "spectra" / survey_name
@@ -342,100 +348,105 @@ def ingest_spectra_parallel(
         futures: dict[Future, str] = {
             pool.submit(decoder, p, norder): p for p in pending
         }
-        with tqdm(
-            total=len(futures),
-            disable=not show_progress,
-            unit="file",
-            desc="ingest",
-        ) as pbar:
-            for fut in as_completed(futures):
-                path_str = futures[fut]
-                try:
-                    res: WorkerResult = fut.result()
-                except Exception as exc:
-                    res = WorkerResult(
-                        path=path_str, ok=False,
-                        error=f"executor: {type(exc).__name__}: {exc}",
-                        tb=traceback.format_exc(),
-                    )
+        with logging_redirect_tqdm():
+            with tqdm(
+                total=len(futures),
+                disable=not show_progress,
+                unit="file",
+                desc="ingest",
+            ) as pbar:
+                for fut in as_completed(futures):
+                    path_str = futures[fut]
+                    try:
+                        res: WorkerResult = fut.result()
+                    except Exception as exc:
+                        res = WorkerResult(
+                            path=path_str, ok=False,
+                            error=f"executor: {type(exc).__name__}: {exc}",
+                            tb=traceback.format_exc(),
+                        )
 
-                pbar.update(1)
+                    pbar.update(1)
 
-                if not res.ok:
-                    n_files_fail += 1
-                    fail_entry = {
-                        "path": res.path,
-                        "error": res.error,
-                        "traceback": res.tb,
-                    }
-                    failures.append(fail_entry)
-                    log.warning("FAIL %s: %s", res.path, res.error)
-                    if failures_log is not None:
-                        with failures_log.open("a") as fh:
-                            fh.write(json.dumps(fail_entry) + "\n")
-                            fh.flush()
-                    continue
+                    if not res.ok:
+                        n_files_fail += 1
+                        fail_entry = {
+                            "path": res.path,
+                            "error": res.error,
+                            "traceback": res.tb,
+                        }
+                        failures.append(fail_entry)
+                        log.warning("FAIL %s: %s", res.path, res.error)
+                        if failures_log is not None:
+                            with failures_log.open("a") as fh:
+                                fh.write(json.dumps(fail_entry) + "\n")
+                                fh.flush()
+                        continue
 
-                if not res.batches:
+                    if not res.batches:
+                        n_files_ok += 1
+                        completed.add(res.path)
+                        if checkpoint_path is not None:
+                            _atomic_write_json(
+                                checkpoint_path, {"completed": sorted(completed)}
+                            )
+                        continue
+
+                    # First successful file fixes the wavelength grid & WCS
+                    if n_pix_known is None:
+                        n_pix_known = res.n_pix
+                        wcs_attrs_known = res.wcs_attrs
+                    elif res.n_pix != n_pix_known:
+                        fail_entry = {
+                            "path": res.path,
+                            "error": (
+                                f"n_pix={res.n_pix} differs from established "
+                                f"grid n_pix={n_pix_known}; file rejected."
+                            ),
+                            "traceback": None,
+                        }
+                        failures.append(fail_entry)
+                        n_files_fail += 1
+                        if failures_log is not None:
+                            with failures_log.open("a") as fh:
+                                fh.write(json.dumps(fail_entry) + "\n")
+                        continue
+
+                    for b in res.batches:
+                        tile_dir = survey_root / healpix_dir(norder, b.npix)
+                        tile_dir.mkdir(parents=True, exist_ok=True)
+                        tile_path = tile_dir / f"Npix={b.npix}.zarr"
+                        if b.npix not in tile_groups:
+                            tile_groups[b.npix] = _open_or_create_spectrum_tile(
+                                tile_path, n_pix_known, "shared",
+                                np.dtype(np.uint8), wcs_attrs_known,
+                            )
+                        root = tile_groups[b.npix]
+                        start_idx = root["flux"].shape[0]
+
+                        root["flux"].append(b.flux)
+                        root["ivar"].append(b.ivar)
+                        root["mask"].append(b.mask)
+                        root["source_id"].append(b.source_ids)
+                        meta_arr = np.frombuffer(
+                            b.meta_bytes,
+                            dtype="|V" + str(_META_DTYPE.itemsize),
+                        )
+                        root["meta"].append(meta_arr)
+
+                        if start_idx == 0 and res.wavelength is not None:
+                            root["wavelength"][:] = res.wavelength.astype(np.float64)
+
+                        for i, sid in enumerate(b.source_ids.tolist()):
+                            index_map[int(sid)] = start_idx + i
+                        n_spectra_written += int(b.source_ids.size)
+
                     n_files_ok += 1
                     completed.add(res.path)
                     if checkpoint_path is not None:
-                        _atomic_write_json(checkpoint_path, {"completed": sorted(completed)})
-                    continue
-
-                # First successful file fixes the wavelength grid & WCS
-                if n_pix_known is None:
-                    n_pix_known = res.n_pix
-                    wcs_attrs_known = res.wcs_attrs
-                elif res.n_pix != n_pix_known:
-                    fail_entry = {
-                        "path": res.path,
-                        "error": (
-                            f"n_pix={res.n_pix} differs from established "
-                            f"grid n_pix={n_pix_known}; file rejected."
-                        ),
-                        "traceback": None,
-                    }
-                    failures.append(fail_entry)
-                    n_files_fail += 1
-                    if failures_log is not None:
-                        with failures_log.open("a") as fh:
-                            fh.write(json.dumps(fail_entry) + "\n")
-                    continue
-
-                for b in res.batches:
-                    tile_dir = survey_root / healpix_dir(norder, b.npix)
-                    tile_dir.mkdir(parents=True, exist_ok=True)
-                    tile_path = tile_dir / f"Npix={b.npix}.zarr"
-                    if b.npix not in tile_groups:
-                        tile_groups[b.npix] = _open_or_create_spectrum_tile(
-                            tile_path, n_pix_known, "shared",
-                            np.dtype(np.uint8), wcs_attrs_known,
+                        _atomic_write_json(
+                            checkpoint_path, {"completed": sorted(completed)}
                         )
-                    root = tile_groups[b.npix]
-                    start_idx = root["flux"].shape[0]
-
-                    root["flux"].append(b.flux)
-                    root["ivar"].append(b.ivar)
-                    root["mask"].append(b.mask)
-                    root["source_id"].append(b.source_ids)
-                    meta_arr = np.frombuffer(
-                        b.meta_bytes,
-                        dtype="|V" + str(_META_DTYPE.itemsize),
-                    )
-                    root["meta"].append(meta_arr)
-
-                    if start_idx == 0 and res.wavelength is not None:
-                        root["wavelength"][:] = res.wavelength.astype(np.float64)
-
-                    for i, sid in enumerate(b.source_ids.tolist()):
-                        index_map[int(sid)] = start_idx + i
-                    n_spectra_written += int(b.source_ids.size)
-
-                n_files_ok += 1
-                completed.add(res.path)
-                if checkpoint_path is not None:
-                    _atomic_write_json(checkpoint_path, {"completed": sorted(completed)})
 
     if n_pix_known is not None and wcs_attrs_known is not None:
         _write_spectrum_info(
