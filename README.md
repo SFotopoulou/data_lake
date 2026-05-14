@@ -401,10 +401,9 @@ data_lake/
     to_spectrum_fits.py  Zarr spectrum → 1-D FITS + BINTABLE export
     spectra_subset.py    Curated source-id subset → single flat Zarr group
 notebooks/
-  01_duckdb_catalog_query.ipynb
-  02_pytorch_training_loop.ipynb
-  03_visualization.ipynb
-  04_spectrum_workflow.ipynb
+  01_duckdb_catalog_query.ipynb … 07_cutout_ingest.ipynb   # see “Example notebooks” below
+examples/
+  cross_survey_lsst_desi_euclid/   # synthetic lake + DuckDB join (master + modalities)
 ```
 
 ## Data layout on disk
@@ -447,6 +446,85 @@ Each catalog row carries:
 - `_cutout_index` — position inside the tile's Zarr cutout array (O(1) lookup)
 - `_spectrum_index` — position inside the tile's Zarr spectrum array (O(1) lookup; -1 = not ingested)
 
+## Lake inventory and master association tables
+
+The library does **not** emit one automatic “master file” that lists every survey
+and object in the lake. **Discovery** is by convention: each modality keeps its
+own metadata (`catalog_info.json`, `cutout_info.json`, `spectrum_info.json`,
+Parquet `_metadata`, Zarr `source_id` arrays, and optional ingest checkpoints).
+For **multi-survey science** you maintain a separate **association table**
+(usually columnar Parquet or CSV) that records how identifiers line up and,
+when needed, how to open the right Zarr row.
+
+### What goes in a master / association file
+
+Shape it for how you query (DuckDB, Polars, ADQL). Typical columns:
+
+| Column | Purpose |
+|--------|--------|
+| Primary `source_id` | Integer key for your “home” survey catalog row |
+| Partner IDs | e.g. `desi_targetid`, `euclid_source_id` — whatever the other survey stores |
+| `sep_arcsec` | Sky separation from the matcher (optional but good for QA) |
+| `match_rank` / `find` flag | If the matcher can return multiple neighbours, disambiguate |
+| `healpix_npix`, `norder` | Same HEALPix **nested** index and order used for lake tiles (must match ingest `hats_order` / `--norder`) |
+| Zarr row indices | After ingest, optional `desi_spectrum_row`, `euclid_cutout_row` — tile-local indices aligned with `_spectrum_index` / `_cutout_index` |
+
+Tile paths under the lake follow `healpix_dir(norder, npix)` from
+`data_lake.ingest.fits_to_parquet` (e.g. `Norder=5/Dir=10000/Npix=12345`).
+Either store `npix` + `norder` and build paths in SQL/Python, or **join** the
+master back to an ingested catalog on `source_id` and read `_healpix_norder5`
+from Parquet.
+
+Put the file wherever you prefer: many teams use
+`<lake_root>/shared/associations/<name>.parquet` (easy to back up, not confused
+with a formal `catalogs/<survey>/` ingest), or a dedicated tree under
+`catalogs/` if you want the same validation tooling as other catalogs.
+
+### Building an inventory of “what is in the lake”
+
+Use the same tools as production queries:
+
+1. **List surveys** — directories under `catalogs/`, `cutouts/`, `spectra/`
+   (each name is the survey identifier you passed to ingest).
+2. **Row counts / columns** — `duckdb` / `polars` over
+   `read_parquet('.../catalogs/<survey>/**/*.parquet')`, or read each survey’s
+   `catalog_info.json` (`total_rows`, `total_columns`, `hats_order`, …).
+3. **Notebook** — `notebooks/05_ingestion_report.ipynb` walks a deployment tree
+   and summarises what exists.
+
+There is no requirement to materialise a single wide table of the whole lake;
+often a **small association Parquet** plus **on-demand joins** to native
+catalog tiles is enough.
+
+### Associations with STILTS
+
+[STILTS](https://www.starlink.ac.uk/stilts/) is a strong choice when you need
+**explicit match semantics** (all neighbours in a radius, symmetric / mutual
+best matches, extra columns, proper motions, etc.) beyond the built-in
+`build_crossmatch` helper (nearest neighbour within a radius, survey-A-centric
+partitioning — see `data_lake/io/crossmatch.py`).
+
+**Suggested workflow:**
+
+1. **Materialise inputs** — Export the lake catalogs you need to FITS or
+   VOTable (e.g. DuckDB `COPY (SELECT source_id, ra, dec, …) TO 'a.parquet'`
+   then convert with Astropy / Polars, or write FITS directly). Keep
+   **`source_id`** and sky columns consistent with the Parquet catalog.
+2. **Run STILTS** — e.g. `tskymatch2` / `tmatch2` with your chosen `find=`
+   policy, error circles, and output columns for both tables.
+3. **Write the master** — Convert STILTS output to **Parquet** (columnar,
+   typed). Add `healpix_npix` / `norder` if missing (recompute with the same
+   `assign_healpix` / `hats_order` as the lake so tile paths stay consistent).
+4. **Use in analysis** — DuckDB / Polars joins: filter the primary catalog,
+   join to the master on `source_id`, optionally join to partner catalogs or
+   open Zarr using `npix` + row indices. A minimal end-to-end pattern lives in
+   `examples/cross_survey_lsst_desi_euclid/` (synthetic tiles + `query.sql`).
+
+**After STILTS:** if you ingest new spectra or cutouts for matched IDs, call
+`update_index_column` so `_spectrum_index` / `_cutout_index` on the **native**
+survey catalog stay in sync; the master table can carry partner IDs and
+separations while the lake catalog keeps machine indices for fast accessors.
+
 ## Schema versioning policy
 
 Parquet handles column add/drop natively.  The following rules apply:
@@ -468,6 +546,9 @@ See `notebooks/` for worked examples:
 2. **`02_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
 3. **`03_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
 4. **`04_spectrum_workflow.ipynb`** — Ingest spectra, query, transform, 1-D CNN training loop, FITS export + round-trip
+5. **`05_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`)
+6. **`06_catalog_ingest.ipynb`** — FITS → HEALPix Parquet ingest, validation, and `CatalogAccessor` queries (self-contained temp lake or your paths)
+7. **`07_cutout_ingest.ipynb`** — FITS stamps → Zarr cutout stacks, validation, `CutoutAccessor`, optional `_cutout_index` catalog patch
 
 ## Key design decisions
 
