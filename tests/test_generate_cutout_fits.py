@@ -1,4 +1,4 @@
-"""Tests for data_lake.cutouts.generate_fits."""
+"""Tests for data_lake.cutouts.generate_fits (dl-generate-cutout-fits)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
 
-from data_lake.scripts.create_cutouts.generate_fits import generate_cutout_fits
+from data_lake.cutouts.generate_fits import generate_cutout_fits
 from data_lake.ingest.fits_to_zarr import ingest_cutouts_from_fits
 
 

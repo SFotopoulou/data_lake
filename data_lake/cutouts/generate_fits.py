@@ -167,7 +167,6 @@ def _write_cutout_fits(
 ) -> None:
     """Write one ingest-ready multi-band stamp FITS."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # cube: (N_bands, H, W) — matches ingest band_axis=0
     hdu = fits.PrimaryHDU(data=cube.astype(np.float32, copy=False))
     hdr = hdu.header
     hdr[id_hdu_key] = int(source_id)
@@ -177,10 +176,7 @@ def _write_cutout_fits(
     if band_names:
         hdr["NBANDS"] = len(band_names)
         hdr["BANDLIST"] = ",".join(band_names)[:68]
-
-    # 2-D celestial WCS for the cutout footprint (from Cutout2D)
     hdr.update(wcs.to_header(relax=True))
-
     hdu.writeto(str(out_path), overwrite=True)
 
 
@@ -204,42 +200,7 @@ def generate_cutout_fits(
     skip_existing: bool = False,
     show_progress: bool = True,
 ) -> GenerateResult:
-    """
-    Generate per-source multi-band cutout FITS files.
-
-    Parameters
-    ----------
-    catalog_path:
-        Table with object ID and sky position (FITS, Parquet, ECSV, CSV, …).
-    output_dir:
-        Directory for one ``.fits`` per row.
-    image_paths:
-        Band images **in Zarr band order** (first path = band index 0).
-    size_pix:
-        Square cutout size in pixels (applied to every band image).
-    id_col, ra_col, dec_col:
-        Catalog column names.
-    id_hdu_key, ra_hdu_key, dec_hdu_key:
-        FITS header keywords written on each stamp (use ``TARGETID`` etc. for DESI).
-    image_hdu_index:
-        HDU index to read in each band FITS (default primary = 0).
-    fill_value:
-        Value for pixels outside the image or partial edges (``partial`` mode).
-    filename_template:
-        Output name pattern; ``{source_id}`` is substituted.
-    band_names:
-        Optional labels stored in header ``BANDLIST`` (also pass to ``dl-ingest-cutouts``).
-    max_sources:
-        Process at most this many catalog rows (for tests / debugging).
-    skip_existing:
-        If True, do not overwrite existing output files.
-    show_progress:
-        Show a tqdm progress bar when tqdm is installed.
-
-    Returns
-    -------
-    GenerateResult with counts and output directory.
-    """
+    """Generate per-source multi-band cutout FITS files."""
     catalog_path = Path(catalog_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -253,7 +214,6 @@ def generate_cutout_fits(
         n_rows = min(n_rows, max_sources)
         tbl = tbl[:n_rows]
 
-    # Open all band images once (memmap)
     bands: list[tuple[np.ndarray, WCS]] = []
     open_hdus: list[fits.HDUList] = []
     try:
@@ -313,50 +273,24 @@ def generate_cutout_fits(
     return GenerateResult(n_written=n_written, n_skipped=n_skipped, output_dir=output_dir)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 try:
     import click
 
     @click.command("dl-generate-cutout-fits")
     @click.argument("catalog_path", type=click.Path(exists=True, path_type=Path))
     @click.argument("output_dir", type=click.Path(path_type=Path))
-    @click.option(
-        "--images",
-        default=None,
-        help="Comma-separated band FITS paths in Zarr band order (e.g. r.fits,i.fits,z.fits).",
-    )
-    @click.option(
-        "--images-file",
-        type=click.Path(exists=True, dir_okay=False, path_type=Path),
-        default=None,
-        help="Text file: one band image path per line (order = band index).",
-    )
-    @click.option("--size", "size_pix", required=True, type=int,
-                  help="Square cutout size in pixels.")
+    @click.option("--images", default=None)
+    @click.option("--images-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
+    @click.option("--size", "size_pix", required=True, type=int)
     @click.option("--id-col", default="source_id", show_default=True)
     @click.option("--ra-col", default="ra", show_default=True)
     @click.option("--dec-col", default="dec", show_default=True)
-    @click.option(
-        "--id-hdu-key", default="SOURCE_ID", show_default=True,
-        help="FITS header keyword for object ID (match dl-ingest-cutouts --source-id-col).",
-    )
+    @click.option("--id-hdu-key", default="SOURCE_ID", show_default=True)
     @click.option("--ra-hdu-key", default="RA", show_default=True)
     @click.option("--dec-hdu-key", default="DEC", show_default=True)
-    @click.option("--image-hdu", "image_hdu_index", default=0, show_default=True,
-                  help="HDU index in each band image FITS.")
-    @click.option(
-        "--band-names",
-        default=None,
-        help="Comma-separated band names (stored in header; pass same order to ingest).",
-    )
-    @click.option(
-        "--filename-template",
-        default="cutout_{source_id}.fits",
-        show_default=True,
-    )
+    @click.option("--image-hdu", "image_hdu_index", default=0, show_default=True)
+    @click.option("--band-names", default=None)
+    @click.option("--filename-template", default="cutout_{source_id}.fits", show_default=True)
     @click.option("--max-sources", default=None, type=int)
     @click.option("--skip-existing", is_flag=True)
     @click.option("--no-progress", is_flag=True)
@@ -383,10 +317,7 @@ try:
     ) -> None:
         """Cut stamps from band images into per-source FITS for lake ingest."""
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        image_list = _parse_image_paths(
-            [images] if images else None,
-            images_file,
-        )
+        image_list = _parse_image_paths([images] if images else None, images_file)
         bn = [x.strip() for x in band_names.split(",") if x.strip()] if band_names else None
         if bn is not None and len(bn) != len(image_list):
             raise click.ClickException(

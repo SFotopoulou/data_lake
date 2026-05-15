@@ -68,8 +68,6 @@ desktop.ini
 # Local data caches the user may drop in the project root
 data/
 lake/
-spectra/
-cutouts/
 *.zarr/
 *.parquet
 *.fits
