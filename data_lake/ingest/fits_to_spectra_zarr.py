@@ -82,7 +82,12 @@ import zarr
 import zarr.codecs
 from astropy.io import fits
 
-from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+from data_lake.ingest.fits_to_parquet import (
+    assign_healpix,
+    healpix_dir,
+    object_id_from_fits_header,
+    sky_from_fits_header,
+)
 
 log = logging.getLogger(__name__)
 
@@ -291,7 +296,13 @@ def _open_or_create_spectrum_tile(
 # ---------------------------------------------------------------------------
 
 
-def _read_sdss_boss(hdul: fits.HDUList) -> tuple[list[SpectrumRecord], dict]:
+def _read_sdss_boss(
+    hdul: fits.HDUList,
+    *,
+    source_id_col: str | None = None,
+    ra_col: str = "RA",
+    dec_col: str = "DEC",
+) -> tuple[list[SpectrumRecord], dict]:
     """
     Read an SDSS/BOSS spec-*.fits file.
 
@@ -312,9 +323,12 @@ def _read_sdss_boss(hdul: fits.HDUList) -> tuple[list[SpectrumRecord], dict]:
 
     # Object-level header
     phdr = hdul[0].header
-    ra  = float(phdr.get("RA",  phdr.get("PLUG_RA",  0.0)))
-    dec = float(phdr.get("DEC", phdr.get("PLUG_DEC", 0.0)))
-    source_id = int(phdr.get("FIBERID", phdr.get("OBJID", 0)))
+    ra, dec = sky_from_fits_header(phdr, ra_col, dec_col)
+    if ra_col not in phdr and "PLUG_RA" in phdr:
+        ra = float(phdr["PLUG_RA"])
+    if dec_col not in phdr and "PLUG_DEC" in phdr:
+        dec = float(phdr["PLUG_DEC"])
+    source_id = object_id_from_fits_header(phdr, source_id_col, hdu_index=0)
     meta = {
         "z":       float(phdr.get("Z", 0.0)),
         "z_err":   float(phdr.get("Z_ERR", 0.0)),
@@ -346,6 +360,7 @@ def _read_sdss_boss(hdul: fits.HDUList) -> tuple[list[SpectrumRecord], dict]:
 def _read_desi_with_desispec(
     path: Path,
     with_resolution: bool = False,
+    source_id_col: str | None = None,
 ) -> tuple[list[SpectrumRecord], dict, list[np.ndarray] | None, np.ndarray | None]:
     """
     Read a DESI coadd-*.fits file using desispec.
@@ -416,7 +431,13 @@ def _read_desi_with_desispec(
         row = fmap[i]
         ra  = float(_fmap_col(row, "TARGET_RA",  "RA_TARGET",  "FIBER_RA",  default=0.0))
         dec = float(_fmap_col(row, "TARGET_DEC", "DEC_TARGET", "FIBER_DEC", default=0.0))
-        source_id = int(row["TARGETID"])
+        sid_key = source_id_col or "TARGETID"
+        if sid_key not in fmap.colnames:
+            raise KeyError(
+                f"Fibermap column {sid_key!r} not found for object ID. "
+                f"Available: {list(fmap.colnames)[:30]}"
+            )
+        source_id = int(row[sid_key])
         meta = {
             "z":       float(_fmap_col(row, "Z",    default=0.0)),
             "z_err":   float(_fmap_col(row, "ZERR", default=0.0)),
@@ -435,7 +456,14 @@ def _read_desi_with_desispec(
     return records, wcs_attrs, res_diags, res_offsets
 
 
-def _read_generic_1d(hdul: fits.HDUList, image_hdu: int = 0) -> tuple[list[SpectrumRecord], dict]:
+def _read_generic_1d(
+    hdul: fits.HDUList,
+    image_hdu: int = 0,
+    *,
+    source_id_col: str | None = None,
+    ra_col: str = "RA",
+    dec_col: str = "DEC",
+) -> tuple[list[SpectrumRecord], dict]:
     """
     Read a generic 1-D FITS spectrum (spectral WCS in primary header).
 
@@ -456,11 +484,13 @@ def _read_generic_1d(hdul: fits.HDUList, image_hdu: int = 0) -> tuple[list[Spect
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
+    base_id = object_id_from_fits_header(header, source_id_col, hdu_index=image_hdu)
+    base_ra, base_dec = sky_from_fits_header(header, ra_col, dec_col)
+
     records: list[SpectrumRecord] = []
     for i in range(n_spec):
-        ra  = float(header.get("RA",  header.get("CRVAL2", 0.0)))
-        dec = float(header.get("DEC", header.get("CRVAL3", 0.0)))
-        source_id = int(header.get("FIBERID", header.get("OBJID", i)))
+        ra, dec = base_ra, base_dec
+        source_id = base_id if n_spec == 1 else base_id + i
         meta = {
             "z":       float(header.get("Z", 0.0)),
             "z_err":   float(header.get("Z_ERR", 0.0)),
@@ -545,6 +575,7 @@ def ingest_spectra_from_fits(
     ra_col: str = "RA",
     dec_col: str = "DEC",
     norder: int = 5,
+    source_id_col: str | None = None,
     wavelength_mode: str = "shared",
     mask_dtype: np.dtype | type = _DEFAULT_MASK_DTYPE,
     fmt: str | None = None,
@@ -565,7 +596,11 @@ def ingest_spectra_from_fits(
     survey_name:
         Survey identifier.
     ra_col / dec_col:
-        Header keywords for sky coordinates (used only for generic format).
+        Header keywords for sky coordinates (generic format; SDSS plug RA/Dec
+        fallbacks when the named keys are absent).
+    source_id_col:
+        Header keyword or DESI fibermap column for object ID (e.g. ``TARGETID``).
+        Must match the catalog ID column.  DESI coadds default to ``TARGETID``.
     norder:
         HEALPix partitioning order.
     wavelength_mode:
@@ -614,7 +649,9 @@ def ingest_spectra_from_fits(
 
     if detected_fmt == "desi_coadd":
         records, wcs_attrs, res_diags, res_offsets = _read_desi_with_desispec(
-            source_path, with_resolution=with_resolution
+            source_path,
+            with_resolution=with_resolution,
+            source_id_col=source_id_col,
         )
     else:
         if with_resolution:
@@ -624,9 +661,19 @@ def ingest_spectra_from_fits(
             )
         with fits.open(str(source_path), memmap=True) as hdul:
             if detected_fmt == "sdss_boss":
-                records, wcs_attrs = _read_sdss_boss(hdul)
+                records, wcs_attrs = _read_sdss_boss(
+                    hdul,
+                    source_id_col=source_id_col,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
             else:
-                records, wcs_attrs = _read_generic_1d(hdul)
+                records, wcs_attrs = _read_generic_1d(
+                    hdul,
+                    source_id_col=source_id_col,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
 
     if not records:
         log.warning("No spectra extracted from %s", source_path.name)
@@ -846,6 +893,11 @@ try:
     @click.option("--survey", "survey_name", required=True, help="Short survey name.")
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
+    @click.option(
+        "--source-id-col",
+        default=None,
+        help="Object ID: FITS header keyword (generic/SDSS) or fibermap column (DESI).",
+    )
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
     @click.option("--wavelength-mode",
@@ -888,6 +940,7 @@ try:
         survey_name: str,
         ra_col: str,
         dec_col: str,
+        source_id_col: str | None,
         norder: int | None,
         wavelength_mode: str | None,
         mask_dtype: str | None,
@@ -916,6 +969,7 @@ try:
             survey_name=survey_name,
             ra_col=ra_col,
             dec_col=dec_col,
+            source_id_col=source_id_col,
             norder=resolved_norder,
             wavelength_mode=pick(wavelength_mode,
                                  cfg.defaults.wavelength_mode if cfg else None,
@@ -940,6 +994,7 @@ try:
                     source_id_to_index=index_map,
                     kind="spectrum",
                     norder=resolved_norder,
+                    source_id_col=source_id_col,
                 )
                 click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:

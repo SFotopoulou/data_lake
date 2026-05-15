@@ -245,6 +245,11 @@ try:
     @click.option("--survey", "survey_name", required=True)
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
+    @click.option(
+        "--source-id-col",
+        default=None,
+        help="FITS header keyword for object ID (e.g. TARGETID); must match catalog.",
+    )
     @click.option("--image-hdu", "image_hdu_index", default=0, type=int, show_default=True)
     @click.option("--band-axis", default=None, type=int)
     @click.option("--norder", default=None, type=int)
@@ -283,6 +288,7 @@ try:
         survey_name: str,
         ra_col: str,
         dec_col: str,
+        source_id_col: str | None,
         image_hdu_index: int,
         band_axis: int | None,
         norder: int | None,
@@ -317,6 +323,7 @@ try:
                 survey_name=survey_name,
                 ra_col=ra_col,
                 dec_col=dec_col,
+                source_id_col=source_id_col,
                 image_hdu_index=image_hdu_index,
                 band_axis=band_axis,
                 band_names=bn,
@@ -347,6 +354,7 @@ try:
                     source_id_to_index=total_index_map,
                     kind="cutout",
                     norder=n,
+                    source_id_col=source_id_col,
                 )
                 click.echo(f"Patched _cutout_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:

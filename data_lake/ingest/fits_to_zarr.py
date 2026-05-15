@@ -29,7 +29,12 @@ import zarr.codecs
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+from data_lake.ingest.fits_to_parquet import (
+    assign_healpix,
+    healpix_dir,
+    object_id_from_fits_header,
+    sky_from_fits_header,
+)
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +208,7 @@ def ingest_cutouts_from_fits(
     band_axis: int | None = None,
     band_names: list[str] | None = None,
     norder: int = 5,
+    source_id_col: str | None = None,
     dtype: np.dtype | type = _DEFAULT_DTYPE,
     on_duplicate_source_id: Literal["append", "error", "skip"] = "append",
 ) -> dict[int, int]:
@@ -219,7 +225,11 @@ def ingest_cutouts_from_fits(
     survey_name:
         Survey identifier.
     ra_col / dec_col:
-        Header keywords that store RA/Dec of the cutout centre.
+        Header keywords that store RA/Dec of the cutout centre (degrees).
+    source_id_col:
+        Header keyword for the integer object ID (e.g. ``TARGETID`` for DESI).
+        Must match the catalog's ID column.  When omitted, keywords are tried in
+        order (``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, …) then HDU index.
     image_hdu_index:
         Primary HDU index (0-based).  For multi-band MEF files, set
         ``band_axis`` to the extension axis.
@@ -248,7 +258,10 @@ def ingest_cutouts_from_fits(
     index_map: dict[int, int] = {}
 
     with fits.open(str(source_path), memmap=True) as hdul:
-        records = _extract_records_from_hdul(hdul, ra_col, dec_col, image_hdu_index, band_axis, dtype)
+        records = _extract_records_from_hdul(
+            hdul, ra_col, dec_col, image_hdu_index, band_axis, dtype,
+            source_id_col=source_id_col,
+        )
 
     if not records:
         log.warning("No records extracted from %s", source_path.name)
@@ -329,6 +342,7 @@ def _extract_records_from_hdul(
     image_hdu_index: int,
     band_axis: int | None,
     dtype: np.dtype,
+    source_id_col: str | None = None,
 ) -> list[CutoutRecord]:
     """Extract CutoutRecord list from an open HDUList."""
     records: list[CutoutRecord] = []
@@ -340,9 +354,10 @@ def _extract_records_from_hdul(
             continue
 
         header = hdu.header
-        ra = float(header.get(ra_col, header.get("RA_TARG", header.get("CRVAL1", 0.0))))
-        dec = float(header.get(dec_col, header.get("DEC_TARG", header.get("CRVAL2", 0.0))))
-        source_id = int(header.get("SOURCE_ID", header.get("OBJ_ID", hdu_idx)))
+        ra, dec = sky_from_fits_header(header, ra_col, dec_col)
+        source_id = object_id_from_fits_header(
+            header, source_id_col, hdu_index=hdu_idx,
+        )
 
         data = np.array(hdu.data, dtype=np.float64)
 
@@ -443,6 +458,11 @@ try:
     @click.option("--survey", "survey_name", required=True)
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
+    @click.option(
+        "--source-id-col",
+        default=None,
+        help="FITS header keyword for object ID (e.g. TARGETID); must match catalog.",
+    )
     @click.option("--image-hdu", "image_hdu_index", default=0, type=int, show_default=True)
     @click.option("--band-axis", default=None, type=int)
     @click.option("--norder", default=None, type=int,
@@ -478,6 +498,7 @@ try:
         survey_name: str,
         ra_col: str,
         dec_col: str,
+        source_id_col: str | None,
         image_hdu_index: int,
         band_axis: int | None,
         norder: int | None,
@@ -509,6 +530,7 @@ try:
             survey_name=survey_name,
             ra_col=ra_col,
             dec_col=dec_col,
+            source_id_col=source_id_col,
             image_hdu_index=image_hdu_index,
             band_axis=band_axis,
             band_names=bn,
@@ -526,6 +548,7 @@ try:
                     source_id_to_index=index_map,
                     kind="cutout",
                     norder=resolved_norder,
+                    source_id_col=source_id_col,
                 )
                 click.echo(f"Patched _cutout_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:

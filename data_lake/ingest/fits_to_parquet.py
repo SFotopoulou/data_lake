@@ -72,6 +72,12 @@ def healpix_dir(norder: int, npix: int) -> str:
 
 _COMMON_ID_COLUMNS = ("TARGETID", "targetid", "OBJID", "objid", "SOURCE_ID", "source_id")
 
+# Header keywords tried for Zarr ingest when --source-id-col is not set (in order).
+_FITS_HEADER_ID_KEYWORDS = (
+    "SOURCE_ID", "OBJ_ID", "OBJID", "TARGETID", "targetid",
+    "FIBERID", "fiberid", "source_id",
+)
+
 # float64 only represents integers exactly up to 2**53; DESI TARGETIDs exceed that.
 _FLOAT64_SAFE_INTEGER = 2**53
 
@@ -111,6 +117,57 @@ def normalize_object_id(value: object) -> int:
     if out < np.iinfo(np.int64).min or out > np.iinfo(np.int64).max:
         raise ValueError(f"object ID {out} is outside int64 range")
     return out
+
+
+def object_id_from_fits_header(
+    header,
+    source_id_col: str | None = None,
+    *,
+    hdu_index: int = 0,
+) -> int:
+    """Read one integer object ID from a FITS header for cutout/spectrum ingest.
+
+    When *source_id_col* is set, only that keyword is used (same convention as
+    catalog ``--source-id-col``).  Otherwise a fixed fallback chain ending in
+    *hdu_index* when no ID keyword is present.
+    """
+    if source_id_col:
+        if source_id_col not in header:
+            keys = [k for k in header.keys() if k and not str(k).startswith("HISTORY")]
+            raise KeyError(
+                f"Header keyword {source_id_col!r} not found for object ID. "
+                f"Sample keys: {keys[:25]}{'…' if len(keys) > 25 else ''}"
+            )
+        return normalize_object_id(header[source_id_col])
+
+    for key in _FITS_HEADER_ID_KEYWORDS:
+        if key in header:
+            return normalize_object_id(header[key])
+
+    log.warning(
+        "No object-ID keyword in FITS header (tried %s); using HDU index %d. "
+        "Pass --source-id-col to match the catalog (e.g. TARGETID).",
+        _FITS_HEADER_ID_KEYWORDS,
+        hdu_index,
+    )
+    return int(hdu_index)
+
+
+def sky_from_fits_header(
+    header,
+    ra_col: str,
+    dec_col: str,
+) -> tuple[float, float]:
+    """Return (RA, Dec) in degrees from a cutout/spectrum image header."""
+    ra = float(header.get(
+        ra_col,
+        header.get("RA_TARG", header.get("TARGET_RA", header.get("CRVAL1", 0.0))),
+    ))
+    dec = float(header.get(
+        dec_col,
+        header.get("DEC_TARG", header.get("TARGET_DEC", header.get("CRVAL2", 0.0))),
+    ))
+    return ra, dec
 
 
 def warn_if_id_column_unsafe(
