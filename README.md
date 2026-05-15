@@ -7,32 +7,6 @@ A local-first data lake for multi-survey astronomy catalogs, galaxy image cutout
 - **1-D spectra** (SDSS/BOSS, DESI, generic): stored as sharded Zarr v3 stacks alongside cutouts — flux, IVAR, mask, shared or per-source wavelength, per-source scalar metadata.
 - FITS is kept as the **ingest/export** format for observatory interoperability; it is not used as internal storage.
 
-## Two layers: library vs. deployment
-
-This repository is the **library**: a generic Python package (`data_lake`)
-that you install once. Your actual data and configuration live in a
-**deployment** directory — a thin instance that depends on the library:
-
-```
-github.com/SFotopoulou/data_lake       (this repo — the library, published)
-        |
-        | pip install -e ...
-        v
-~/projects/<your_lake_name>/           (the deployment, private)
-    lake_config.toml                   (single source of truth)
-    data/                              (actual Parquet / Zarr tiles)
-    notebooks/  scripts/               (your own)
-```
-
-The library never knows the name of your lake or where its data lives;
-all that is captured by one `lake_config.toml` in the deployment. The
-`dl-init` CLI creates a deployment scaffold; the `dl-ingest-*` CLIs read
-the config automatically (via `$DATA_LAKE_CONFIG` or `--config`).
-
-This separation lets you publish a clean reusable library, while keeping
-your private data, parameters, and notebooks isolated and free to
-diverge.
-
 ## Quick-start
 
 We recommend [`uv`](https://docs.astral.sh/uv/) for environment management - it is
