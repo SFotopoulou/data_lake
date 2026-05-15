@@ -310,6 +310,32 @@ class TestUpdateIndexColumnSourceId:
 # build_index_map_from_zarr + update roundtrip
 # ---------------------------------------------------------------------------
 
+class TestUpdateIndexFromZarrTiles:
+    def test_patches_catalog_without_full_index_map(self, tmp_path: Path) -> None:
+        """Per-tile Zarr scan patches catalog without a global source_id dict."""
+        from data_lake.ingest.update_catalog_indices import (
+            update_index_column_from_zarr_tiles,
+        )
+
+        ids = [5_000_001, 5_000_002, 5_000_003]
+        ra = [50.0, 60.0, 70.0]
+        dec = [20.0, -20.0, 5.0]
+        _write_mini_catalog(tmp_path, "desi_tile_patch", "TARGETID", ids, ra, dec)
+        _write_mini_spectra_zarr(tmp_path, "desi_tile_patch", ids, ra, dec)
+
+        n_modified = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name="desi_tile_patch",
+            kind="spectrum",
+        )
+        assert n_modified > 0
+
+        tiles = list((tmp_path / "catalogs" / "desi_tile_patch").rglob("Npix=*.parquet"))
+        merged = pa.concat_tables([pq.ParquetFile(str(t)).read() for t in tiles])
+        spec_idx = merged.column("_spectrum_index").to_pylist()
+        assert all(v >= 0 for v in spec_idx)
+
+
 class TestBuildIndexMapFromZarr:
     def test_roundtrip_via_zarr_scan(self, tmp_path: Path) -> None:
         """Simulate a lake where spectra exist but catalog was never patched.

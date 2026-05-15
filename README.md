@@ -307,9 +307,10 @@ dl-ingest-spectra-batch \
 
 Key properties:
 
-- **Resumable** — completed file paths are persisted to a JSON checkpoint
-  (default `<output>/spectra/<survey>/.ingest_checkpoint.json`); restarts
-  skip them.
+- **Resumable** — completed file paths are appended to
+  `<output>/spectra/<survey>/.ingest_checkpoint.json.jsonl` (one path per
+  line; legacy `.ingest_checkpoint.json` arrays are still read on resume).
+  Restarts skip completed paths without rewriting a multi‑MB JSON file.
 - **Error-isolated** — per-file failures are appended to a JSONL log
   (default `<output>/spectra/<survey>/.ingest_failures.jsonl`) and the
   run continues.  At 10k-file scale a small percentage of corrupt
@@ -336,6 +337,14 @@ Rough timing on a single workstation for 10 000 DESI coadd files
 | 32 | 20–35 min (SSD I/O may dominate beyond this) |
 
 Disk footprint: ~120–170 GB compressed for ~5 M spectra at ~8 000 px.
+
+**Large runs (10k+ coadds) and memory:** If the terminal exits with no
+Python traceback (often just `Killed`), check the OOM killer:
+`dmesg | tail -20`.  Mitigations: lower `--n-workers`, use
+`--on-duplicate skip` when resuming, and inspect
+`<output>/spectra/<survey>/.ingest.log` (logs are not printed on stderr).
+Catalog patching scans Zarr tiles one at a time (bounded RAM); for a
+manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 
 #### Duplicate / resume flags by command
 

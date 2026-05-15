@@ -11,7 +11,7 @@ ZarrDuplicateMode = Literal["append", "error", "skip"]
 
 def zarr_row_keep_mask(
     source_ids: np.ndarray,
-    existing_source_ids: set[int],
+    existing_source_ids: set[int] | np.ndarray,
     on_duplicate: ZarrDuplicateMode,
 ) -> np.ndarray:
     """Return a boolean mask of rows to append for one tile batch.
@@ -35,6 +35,19 @@ def zarr_row_keep_mask(
 
     if on_duplicate == "append":
         return np.ones(n, dtype=bool)
+
+    if isinstance(existing_source_ids, np.ndarray):
+        existing_arr = np.asarray(existing_source_ids, dtype=np.int64)
+        if existing_arr.size == 0:
+            return np.ones(n, dtype=bool)
+        dup = np.isin(sids, existing_arr, assume_unique=False)
+        if on_duplicate == "error" and dup.any():
+            first = int(sids[np.argmax(dup)])
+            raise ValueError(
+                f"source_id {first} already exists in this tile's Zarr; "
+                f"use on_duplicate='skip' or 'append'."
+            )
+        return ~dup if on_duplicate == "skip" else np.ones(n, dtype=bool)
 
     keep = np.ones(n, dtype=bool)
     for i, sid in enumerate(sids.tolist()):

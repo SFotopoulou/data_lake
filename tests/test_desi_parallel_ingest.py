@@ -22,6 +22,7 @@ from data_lake.ingest.desi_parallel_ingest import (
     WorkerResult,
     _atomic_write_json,
     _canonical_fits_path,
+    _checkpoint_jsonl_path,
     _load_checkpoint,
     _recover_stale_parallel_commit,
     _truncate_spectrum_tile_row_arrays,
@@ -138,6 +139,7 @@ class TestParallelIngestBasic:
             show_progress=False,
             decoder=_fake_decoder,
             executor_factory=_thread_executor,
+            track_index_map=True,
         )
 
         assert result["n_files_succeeded"] == 3
@@ -238,9 +240,11 @@ class TestCheckpoint:
         assert any("fileB" in s for s in seen)
         assert any("fileC" in s for s in seen)
 
-        # Final checkpoint has all three files
-        ckpt_data = json.loads(ckpt.read_text())
-        assert len(ckpt_data["completed"]) == 3
+        # Final checkpoint records all three files (append-only JSONL)
+        assert len(_load_checkpoint(ckpt)) == 3
+        jsonl = _checkpoint_jsonl_path(ckpt)
+        assert jsonl.exists()
+        assert len(jsonl.read_text().strip().splitlines()) >= 2
 
         inflight = tmp_path / "lake" / "spectra" / "syn" / ".ingest_inflight.json"
         assert inflight.exists()
@@ -265,6 +269,15 @@ class TestCheckpoint:
         redundant = str(tmp_path / "d" / "." / "x.fits")
         _atomic_write_json(ckpt, {"completed": [redundant]})
         assert _load_checkpoint(ckpt) == {_canonical_fits_path(f)}
+
+    def test_load_checkpoint_jsonl(self, tmp_path: Path):
+        """Append-only JSONL sidecar is merged with any legacy JSON checkpoint."""
+        f = tmp_path / "a.fits"
+        f.touch()
+        ckpt = tmp_path / "ckpt.json"
+        canon = _canonical_fits_path(f)
+        _checkpoint_jsonl_path(ckpt).write_text(canon + "\n")
+        assert _load_checkpoint(ckpt) == {canon}
 
     def test_paths_from_file_list_relative_to_list_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -348,6 +361,9 @@ class TestInflightJournal:
 
         p_a = _canonical_fits_path(fake_files[0])
         _atomic_write_json(ckpt, {"completed": []})
+        jsonl = _checkpoint_jsonl_path(ckpt)
+        if jsonl.exists():
+            jsonl.unlink()
         _atomic_write_json(
             inflight,
             {

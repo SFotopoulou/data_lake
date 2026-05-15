@@ -50,7 +50,8 @@ from concurrent.futures import (
     Executor,
     Future,
     ProcessPoolExecutor,
-    as_completed,
+    wait,
+    FIRST_COMPLETED,
 )
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,7 +76,7 @@ ZarrDuplicateMode = Literal["append", "error", "skip"]
 
 def _filter_tile_batch(
     batch: "TileBatch",
-    existing_source_ids: set[int],
+    existing_source_ids: np.ndarray,
     on_duplicate: ZarrDuplicateMode,
 ) -> "TileBatch | None":
     """Apply ``--on-duplicate`` policy before appending one parallel worker batch."""
@@ -257,25 +258,45 @@ def _configure_file_logging(log_file: Path, *, verbose: bool) -> None:
     )
 
 
+def _checkpoint_jsonl_path(checkpoint_path: Path) -> Path:
+    """Append-only completion log (one path per line) for large batch runs."""
+    return checkpoint_path.with_suffix(checkpoint_path.suffix + ".jsonl")
+
+
+def _append_checkpoint_path(checkpoint_path: Path, path_done: str) -> None:
+    """Record one completed FITS path without rewriting a giant JSON array."""
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with _checkpoint_jsonl_path(checkpoint_path).open("a", encoding="utf-8") as fh:
+        fh.write(path_done + "\n")
+
+
 def _load_checkpoint(path: Path | None) -> set[str]:
-    if path is None or not path.exists():
+    if path is None:
         return set()
-    try:
-        data = json.loads(path.read_text())
-        raw = data.get("completed", [])
-        out: set[str] = set()
-        for item in raw:
-            if not item or not isinstance(item, str):
+    out: set[str] = set()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            for item in data.get("completed", []):
+                if not item or not isinstance(item, str):
+                    continue
+                try:
+                    out.add(_canonical_fits_path(item))
+                except OSError:
+                    out.add(item)
+        except Exception:
+            log.warning("Could not parse checkpoint %s; ignoring JSON body.", path)
+    jsonl = _checkpoint_jsonl_path(path)
+    if jsonl.exists():
+        for line in jsonl.read_text().splitlines():
+            line = line.strip()
+            if not line:
                 continue
             try:
-                out.add(_canonical_fits_path(item))
+                out.add(_canonical_fits_path(line))
             except OSError:
-                # Broken symlinks / odd paths: keep literal so we do not drop entries
-                out.add(item)
-        return out
-    except Exception:
-        log.warning("Could not parse checkpoint %s; starting fresh.", path)
-        return set()
+                out.add(line)
+    return out
 
 
 # Row-aligned arrays in a spectrum tile (2-D source axis + wavelength metadata).
@@ -411,6 +432,8 @@ def ingest_spectra_parallel(
     worker_verbose: bool = False,
     inflight_path: Path | str | None = None,
     on_duplicate_source_id: ZarrDuplicateMode = "append",
+    track_index_map: bool = False,
+    max_in_flight: int | None = None,
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -455,6 +478,14 @@ def ingest_spectra_parallel(
     on_duplicate_source_id:
         ``append`` (default), ``error``, or ``skip`` when a ``TARGETID`` is already
         in a tile's Zarr (same as ``dl-ingest-spectra --on-duplicate``).
+    track_index_map:
+        When True, accumulate ``{source_id: local_index}`` in RAM for the return
+        value and optional catalog patch.  Default False — for millions of spectra
+        this dict can exhaust memory (use :func:`update_index_column_from_zarr_tiles`
+        after ingest instead).
+    max_in_flight:
+        Max decoder futures in flight (default ``2 * n_workers``).  Lower if workers
+        are killed by the OOM killer.
 
     Returns
     -------
@@ -514,6 +545,16 @@ def ingest_spectra_parallel(
         log.info("Checkpoint has %d/%d files; resuming with %d pending.",
                  n_skipped, n_requested, len(pending))
 
+    if max_in_flight is None:
+        max_in_flight = max(2 * n_workers, n_workers + 4)
+    if len(pending) > 500 and track_index_map:
+        log.warning(
+            "track_index_map=True with %d pending files can use many GB of RAM "
+            "for the returned index map; prefer track_index_map=False and "
+            "update_index_column_from_zarr_tiles() after ingest.",
+            len(pending),
+        )
+
     if not pending:
         return {
             "n_files_requested": n_requested,
@@ -571,138 +612,151 @@ def ingest_spectra_parallel(
         )
         os.environ[PARALLEL_WORKER_VERBOSE_ENV] = "1" if worker_verbose else "0"
 
+    path_iter = iter(pending)
+    in_flight: dict[Future, str] = {}
+
+    def _submit_more(pool: Executor) -> None:
+        while len(in_flight) < max_in_flight:
+            try:
+                p = next(path_iter)
+            except StopIteration:
+                break
+            fut = pool.submit(decoder, p, norder)
+            in_flight[fut] = p
+
+    def _process_result(path_str: str, res: WorkerResult) -> None:
+        nonlocal n_files_ok, n_files_fail, n_spectra_written, n_pix_known, wcs_attrs_known
+
+        if not res.ok:
+            n_files_fail += 1
+            fail_entry = {
+                "path": res.path,
+                "error": res.error,
+                "traceback": res.tb,
+            }
+            failures.append(fail_entry)
+            log.warning("FAIL %s: %s", res.path, res.error)
+            if failures_log is not None:
+                with failures_log.open("a") as fh:
+                    fh.write(json.dumps(fail_entry) + "\n")
+                    fh.flush()
+            return
+
+        if not res.batches:
+            n_files_ok += 1
+            completed.add(res.path)
+            if checkpoint_path is not None:
+                _append_checkpoint_path(checkpoint_path, res.path)
+            _clear_parallel_inflight(resolved_inflight)
+            return
+
+        if n_pix_known is None:
+            n_pix_known = res.n_pix
+            wcs_attrs_known = res.wcs_attrs
+        elif res.n_pix != n_pix_known:
+            fail_entry = {
+                "path": res.path,
+                "error": (
+                    f"n_pix={res.n_pix} differs from established "
+                    f"grid n_pix={n_pix_known}; file rejected."
+                ),
+                "traceback": None,
+            }
+            failures.append(fail_entry)
+            n_files_fail += 1
+            if failures_log is not None:
+                with failures_log.open("a") as fh:
+                    fh.write(json.dumps(fail_entry) + "\n")
+            return
+
+        snap: dict[int, int] = {}
+        for b in res.batches:
+            tile_dir = survey_root / healpix_dir(norder, b.npix)
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            tile_path = tile_dir / f"Npix={b.npix}.zarr"
+            if b.npix not in tile_groups:
+                tile_groups[b.npix] = _open_or_create_spectrum_tile(
+                    tile_path, n_pix_known, "shared",
+                    np.dtype(np.uint8), wcs_attrs_known,
+                )
+            root = tile_groups[b.npix]
+            snap[b.npix] = int(root["flux"].shape[0])
+
+        _atomic_write_json(
+            resolved_inflight,
+            {
+                "commit": {
+                    "path": res.path,
+                    "tiles": {str(k): v for k, v in snap.items()},
+                    "norder": int(norder),
+                },
+            },
+        )
+
+        for b in res.batches:
+            root = tile_groups[b.npix]
+            n_existing = int(root["source_id"].shape[0])
+            existing_arr = (
+                np.asarray(root["source_id"][:], dtype=np.int64)
+                if n_existing > 0
+                else np.array([], dtype=np.int64)
+            )
+            filtered = _filter_tile_batch(
+                b, existing_arr, on_duplicate_source_id,
+            )
+            if filtered is None:
+                continue
+            b = filtered
+            start_idx = root["flux"].shape[0]
+
+            root["flux"].append(b.flux)
+            root["ivar"].append(b.ivar)
+            root["mask"].append(b.mask)
+            root["source_id"].append(b.source_ids)
+            meta_arr = np.frombuffer(
+                b.meta_bytes,
+                dtype="|V" + str(_META_DTYPE.itemsize),
+            )
+            root["meta"].append(meta_arr)
+
+            if start_idx == 0 and res.wavelength is not None:
+                root["wavelength"][:] = res.wavelength.astype(np.float64)
+
+            if track_index_map:
+                for i, sid in enumerate(b.source_ids.tolist()):
+                    index_map[int(sid)] = start_idx + i
+            n_spectra_written += int(b.source_ids.size)
+
+        n_files_ok += 1
+        completed.add(res.path)
+        if checkpoint_path is not None:
+            _append_checkpoint_path(checkpoint_path, res.path)
+        _clear_parallel_inflight(resolved_inflight)
+
     try:
         with executor_factory(n_workers) as pool:
-            futures: dict[Future, str] = {
-                pool.submit(decoder, p, norder): p for p in pending
-            }
+            _submit_more(pool)
             with tqdm(
-                total=len(futures),
+                total=len(pending),
                 disable=not show_progress,
                 unit="file",
                 desc="ingest",
             ) as pbar:
-                for fut in as_completed(futures):
-                    path_str = futures[fut]
-                    try:
-                        res: WorkerResult = fut.result()
-                    except Exception as exc:
-                        res = WorkerResult(
-                            path=path_str, ok=False,
-                            error=f"executor: {type(exc).__name__}: {exc}",
-                            tb=traceback.format_exc(),
-                        )
-
-                    pbar.update(1)
-
-                    if not res.ok:
-                        n_files_fail += 1
-                        fail_entry = {
-                            "path": res.path,
-                            "error": res.error,
-                            "traceback": res.tb,
-                        }
-                        failures.append(fail_entry)
-                        log.warning("FAIL %s: %s", res.path, res.error)
-                        if failures_log is not None:
-                            with failures_log.open("a") as fh:
-                                fh.write(json.dumps(fail_entry) + "\n")
-                                fh.flush()
-                        continue
-
-                    if not res.batches:
-                        n_files_ok += 1
-                        completed.add(res.path)
-                        if checkpoint_path is not None:
-                            _atomic_write_json(
-                                checkpoint_path, {"completed": sorted(completed)}
+                while in_flight:
+                    done_set, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done_set:
+                        path_str = in_flight.pop(fut)
+                        try:
+                            res = fut.result()
+                        except Exception as exc:
+                            res = WorkerResult(
+                                path=path_str, ok=False,
+                                error=f"executor: {type(exc).__name__}: {exc}",
+                                tb=traceback.format_exc(),
                             )
-                        _clear_parallel_inflight(resolved_inflight)
-                        continue
-
-                    # First successful file fixes the wavelength grid & WCS
-                    if n_pix_known is None:
-                        n_pix_known = res.n_pix
-                        wcs_attrs_known = res.wcs_attrs
-                    elif res.n_pix != n_pix_known:
-                        fail_entry = {
-                            "path": res.path,
-                            "error": (
-                                f"n_pix={res.n_pix} differs from established "
-                                f"grid n_pix={n_pix_known}; file rejected."
-                            ),
-                            "traceback": None,
-                        }
-                        failures.append(fail_entry)
-                        n_files_fail += 1
-                        if failures_log is not None:
-                            with failures_log.open("a") as fh:
-                                fh.write(json.dumps(fail_entry) + "\n")
-                        continue
-
-                    snap: dict[int, int] = {}
-                    for b in res.batches:
-                        tile_dir = survey_root / healpix_dir(norder, b.npix)
-                        tile_dir.mkdir(parents=True, exist_ok=True)
-                        tile_path = tile_dir / f"Npix={b.npix}.zarr"
-                        if b.npix not in tile_groups:
-                            tile_groups[b.npix] = _open_or_create_spectrum_tile(
-                                tile_path, n_pix_known, "shared",
-                                np.dtype(np.uint8), wcs_attrs_known,
-                            )
-                        root = tile_groups[b.npix]
-                        snap[b.npix] = int(root["flux"].shape[0])
-
-                    _atomic_write_json(
-                        resolved_inflight,
-                        {
-                            "commit": {
-                                "path": res.path,
-                                "tiles": {str(k): v for k, v in snap.items()},
-                                "norder": int(norder),
-                            },
-                        },
-                    )
-
-                    for b in res.batches:
-                        root = tile_groups[b.npix]
-                        existing_ids: set[int] = set()
-                        if int(root["source_id"].shape[0]) > 0:
-                            existing_ids = set(
-                                np.asarray(root["source_id"][:]).tolist()
-                            )
-                        filtered = _filter_tile_batch(
-                            b, existing_ids, on_duplicate_source_id,
-                        )
-                        if filtered is None:
-                            continue
-                        b = filtered
-                        start_idx = root["flux"].shape[0]
-
-                        root["flux"].append(b.flux)
-                        root["ivar"].append(b.ivar)
-                        root["mask"].append(b.mask)
-                        root["source_id"].append(b.source_ids)
-                        meta_arr = np.frombuffer(
-                            b.meta_bytes,
-                            dtype="|V" + str(_META_DTYPE.itemsize),
-                        )
-                        root["meta"].append(meta_arr)
-
-                        if start_idx == 0 and res.wavelength is not None:
-                            root["wavelength"][:] = res.wavelength.astype(np.float64)
-
-                        for i, sid in enumerate(b.source_ids.tolist()):
-                            index_map[int(sid)] = start_idx + i
-                        n_spectra_written += int(b.source_ids.size)
-
-                    n_files_ok += 1
-                    completed.add(res.path)
-                    if checkpoint_path is not None:
-                        _atomic_write_json(
-                            checkpoint_path, {"completed": sorted(completed)}
-                        )
-                    _clear_parallel_inflight(resolved_inflight)
+                        _process_result(path_str, res)
+                        pbar.update(1)
+                        _submit_more(pool)
 
     finally:
         if uses_parallel_subprocess_workers:
@@ -909,22 +963,23 @@ try:
         if result["n_files_failed"]:
             click.echo(f"See failures log: {failures_log}")
 
-        # Optional catalog patch
-        if update_catalog and result["index_map"]:
+        # Optional catalog patch (scan Zarr tiles; avoids a multi-GB in-memory index map)
+        if update_catalog:
             try:
-                from data_lake.ingest.update_catalog_indices import update_index_column
-                n_modified = update_index_column(
+                from data_lake.ingest.update_catalog_indices import (
+                    update_index_column_from_zarr_tiles,
+                )
+                n_modified = update_index_column_from_zarr_tiles(
                     lake_root=resolved_output,
                     survey_name=survey_name,
-                    source_id_to_index=result["index_map"],
                     kind="spectrum",
                     norder=resolved_norder,
                 )
                 click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
                 log.info(
-                    "No catalog found for survey %r — skipping _spectrum_index patch.",
-                    survey_name,
+                    "Skipping _spectrum_index patch (%s).",
+                    exc,
                 )
 
 except ImportError:

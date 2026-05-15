@@ -39,6 +39,147 @@ _INDEX_COL: dict[str, str] = {
     "cutout":   "_cutout_index",
     "spectrum": "_spectrum_index",
 }
+_KIND_DIR: dict[str, str] = {"spectrum": "spectra", "cutout": "cutouts"}
+
+
+def _patch_catalog_parquet_file(
+    tile_file: Path,
+    source_id_to_index: dict[int, int],
+    *,
+    sid_col: str,
+    index_col: str,
+) -> bool:
+    """Patch one catalog Parquet tile; return True if the file was rewritten."""
+    table = pq.ParquetFile(str(tile_file)).read()
+    if sid_col not in table.schema.names:
+        log.warning(
+            "Source-ID column %r not found in %s. "
+            "Check survey name, catalog ingest, or pass --source-id-col.",
+            sid_col, tile_file.name,
+        )
+        return False
+
+    warn_if_id_column_unsafe(
+        sid_col, table.schema.field(sid_col).type, context="catalog",
+    )
+
+    tile_ids = [normalize_object_id(x) for x in table.column(sid_col).to_pylist()]
+    source_id_set = set(source_id_to_index.keys())
+    matches = [sid for sid in tile_ids if sid in source_id_set]
+    if not matches:
+        return False
+
+    if index_col in table.schema.names:
+        idx_arr = np.array(table.column(index_col).to_pylist(), dtype=np.int64)
+    else:
+        idx_arr = np.full(len(table), -1, dtype=np.int64)
+        log.debug("Adding missing column %s to %s", index_col, tile_file.name)
+
+    id_to_row: dict[int, list[int]] = {}
+    for row_i, sid in enumerate(tile_ids):
+        id_to_row.setdefault(sid, []).append(row_i)
+
+    for sid in matches:
+        for row_i in id_to_row[sid]:
+            idx_arr[row_i] = source_id_to_index[sid]
+
+    if index_col in table.schema.names:
+        col_pos = table.schema.get_field_index(index_col)
+        table = table.set_column(col_pos, index_col, pa.array(idx_arr, type=pa.int64()))
+    else:
+        table = table.append_column(index_col, pa.array(idx_arr, type=pa.int64()))
+
+    pq.write_table(
+        table,
+        str(tile_file),
+        compression="zstd",
+        compression_level=_ZSTD_LEVEL,
+        write_statistics=True,
+        use_dictionary=True,
+    )
+    log.debug("Updated %d rows in %s", len(matches), tile_file.name)
+    return True
+
+
+def _npix_from_tile_name(name: str) -> int:
+    return int(name.split("=")[-1].split(".")[0])
+
+
+def update_index_column_from_zarr_tiles(
+    lake_root: Path | str,
+    survey_name: str,
+    kind: IndexKind = "spectrum",
+    norder: int = 5,
+    source_id_col: str | None = None,
+) -> int:
+    """Patch catalog indices one Zarr tile at a time (bounded memory).
+
+    For large surveys (millions of spectra), building a single in-memory
+    ``{source_id: index}`` map can exhaust RAM.  This walks each
+    ``Npix=*.zarr``, patches the matching catalog Parquet tile, and discards
+    the per-tile map before opening the next Zarr group.
+    """
+    import zarr
+
+    lake_root = Path(lake_root)
+    catalog_root = lake_root / "catalogs" / survey_name
+    if not catalog_root.exists():
+        raise FileNotFoundError(f"Catalog not found: {catalog_root}")
+
+    zarr_root = lake_root / _KIND_DIR[kind] / survey_name
+    if not zarr_root.exists():
+        raise FileNotFoundError(f"No {kind} tiles found at {zarr_root}")
+
+    index_col = _INDEX_COL[kind]
+    schema_names: list[str] | None = None
+    sample_parquet = next(catalog_root.rglob("Npix=*.parquet"), None)
+    if sample_parquet is not None:
+        schema_names = pq.read_schema(str(sample_parquet)).names
+    sid_col = resolve_source_id_column(
+        catalog_root, schema_names=schema_names, override=source_id_col,
+    )
+
+    n_modified = 0
+    tile_paths = sorted(zarr_root.rglob("Npix=*.zarr"))
+    for tile_path in tile_paths:
+        try:
+            root = zarr.open_group(
+                store=zarr.storage.LocalStore(str(tile_path)),
+                mode="r",
+                zarr_format=3,
+            )
+            if "source_id" not in root:
+                continue
+            sids = np.asarray(root["source_id"][:], dtype=np.int64)
+            partial_map = {
+                normalize_object_id(int(sid)): int(i)
+                for i, sid in enumerate(sids.tolist())
+            }
+        except Exception as exc:
+            log.warning("Could not read Zarr tile %s: %s", tile_path.name, exc)
+            continue
+
+        npix = _npix_from_tile_name(tile_path.name)
+        catalog_tile = (
+            catalog_root / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
+        )
+        if not catalog_tile.exists():
+            continue
+        if _patch_catalog_parquet_file(
+            catalog_tile,
+            partial_map,
+            sid_col=sid_col,
+            index_col=index_col,
+        ):
+            n_modified += 1
+
+    log.info(
+        "Patched %s from %d Zarr tile(s) for survey=%r (id_col=%r)",
+        index_col, n_modified, survey_name, sid_col,
+    )
+    if n_modified > 0:
+        _regenerate_metadata(catalog_root)
+    return n_modified
 
 
 def update_index_column(
@@ -99,74 +240,18 @@ def update_index_column(
         log.warning("No Parquet tiles found in %s", catalog_root)
         return 0
 
-    # Normalize keys once so Zarr/catalog IDs match regardless of numpy scalar type.
     source_id_to_index = {
         normalize_object_id(k): int(v) for k, v in source_id_to_index.items()
     }
-    source_id_set = set(source_id_to_index.keys())
     n_modified = 0
-    _warned_missing_col = False
-    _warned_id_dtype = False
-
     for tile_file in all_parquet:
-        # Use ParquetFile.read() to avoid PyArrow's Hive partition discovery,
-        # which would inject Norder/Dir path-based columns into the table and
-        # corrupt the schema when the tile is rewritten.
-        table = pq.ParquetFile(str(tile_file)).read()
-        if sid_col not in table.schema.names:
-            if not _warned_missing_col:
-                log.warning(
-                    "Source-ID column %r not found in %s (and possibly other tiles). "
-                    "Check survey name, catalog ingest, or pass --source-id-col.",
-                    sid_col, tile_file.name,
-                )
-                _warned_missing_col = True
-            continue
-
-        if not _warned_id_dtype:
-            warn_if_id_column_unsafe(
-                sid_col, table.schema.field(sid_col).type, context="catalog",
-            )
-            _warned_id_dtype = True
-
-        tile_ids = [normalize_object_id(x) for x in table.column(sid_col).to_pylist()]
-        matches = [sid for sid in tile_ids if sid in source_id_set]
-        if not matches:
-            continue
-
-        # Materialise the index column as a mutable numpy array
-        if index_col in table.schema.names:
-            idx_arr = np.array(table.column(index_col).to_pylist(), dtype=np.int64)
-        else:
-            idx_arr = np.full(len(table), -1, dtype=np.int64)
-            log.debug("Adding missing column %s to %s", index_col, tile_file.name)
-
-        # Apply the updates
-        id_to_row: dict[int, list[int]] = {}
-        for row_i, sid in enumerate(tile_ids):
-            id_to_row.setdefault(sid, []).append(row_i)
-
-        for sid in matches:
-            for row_i in id_to_row[sid]:
-                idx_arr[row_i] = source_id_to_index[sid]
-
-        # Replace / add column and rewrite
-        if index_col in table.schema.names:
-            col_pos = table.schema.get_field_index(index_col)
-            table = table.set_column(col_pos, index_col, pa.array(idx_arr, type=pa.int64()))
-        else:
-            table = table.append_column(index_col, pa.array(idx_arr, type=pa.int64()))
-
-        pq.write_table(
-            table,
-            str(tile_file),
-            compression="zstd",
-            compression_level=_ZSTD_LEVEL,
-            write_statistics=True,
-            use_dictionary=True,
-        )
-        n_modified += 1
-        log.debug("Updated %d rows in %s", len(matches), tile_file.name)
+        if _patch_catalog_parquet_file(
+            tile_file,
+            source_id_to_index,
+            sid_col=sid_col,
+            index_col=index_col,
+        ):
+            n_modified += 1
 
     log.info(
         "Updated %s in %d tile file(s) for survey=%s (%d sources, id_col=%r)",
@@ -229,7 +314,6 @@ def build_index_map_from_zarr(
     """
     import zarr
 
-    _KIND_DIR: dict[str, str] = {"spectrum": "spectra", "cutout": "cutouts"}
     lake_root = Path(lake_root)
     zarr_root = lake_root / _KIND_DIR[kind] / survey_name
     if not zarr_root.exists():
@@ -313,20 +397,9 @@ try:
         resolved_root = require_output_root(lake_root, cfg)
 
         click.echo(f"Scanning {kind} tiles for survey={survey_name!r} …")
-        index_map = build_index_map_from_zarr(
+        n_modified = update_index_column_from_zarr_tiles(
             lake_root=resolved_root,
             survey_name=survey_name,
-            kind=kind,  # type: ignore[arg-type]
-        )
-        if not index_map:
-            click.echo("No source IDs found in Zarr tiles — nothing to patch.")
-            return
-
-        click.echo(f"Found {len(index_map)} source IDs.  Patching catalog …")
-        n_modified = update_index_column(
-            lake_root=resolved_root,
-            survey_name=survey_name,
-            source_id_to_index=index_map,
             kind=kind,  # type: ignore[arg-type]
             norder=norder,
             source_id_col=source_id_col,
