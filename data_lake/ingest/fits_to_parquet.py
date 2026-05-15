@@ -45,6 +45,150 @@ def healpix_dir(norder: int, npix: int) -> str:
     return f"Norder={norder}/Dir={dir_index}"
 
 
+_COMMON_ID_COLUMNS = ("TARGETID", "targetid", "OBJID", "objid", "SOURCE_ID", "source_id")
+
+# float64 only represents integers exactly up to 2**53; DESI TARGETIDs exceed that.
+_FLOAT64_SAFE_INTEGER = 2**53
+
+
+def normalize_object_id(value: object) -> int:
+    """Coerce one catalog/Zarr object ID to a Python ``int`` (int64 range).
+
+    All cross-store matching (catalog Parquet ↔ Zarr ``source_id`` ↔
+    ``index_map`` keys) should use this so ``numpy.int64``, ``int``, and
+    accidental string forms compare consistently.
+
+    Raises ``ValueError`` for ``None``, booleans, floats (precision loss), and
+    out-of-range values.  String digits are accepted (no scientific notation).
+    """
+    if value is None:
+        raise ValueError("object ID is None")
+    if isinstance(value, bool):
+        raise ValueError(f"invalid object ID (bool): {value!r}")
+
+    if isinstance(value, (int, np.integer)):
+        out = int(value)
+    elif isinstance(value, (float, np.floating)):
+        raise ValueError(
+            f"object ID {value!r} is floating-point; DESI-scale TARGETIDs "
+            f"(> {_FLOAT64_SAFE_INTEGER}) lose precision in float64. "
+            f"Re-ingest the catalog with the ID column stored as int64."
+        )
+    elif isinstance(value, (str, bytes)):
+        text = value.decode("ascii", errors="strict") if isinstance(value, bytes) else value
+        text = text.strip()
+        if not text or not text.lstrip("+-").isdigit():
+            raise ValueError(f"object ID string is not an integer: {value!r}")
+        out = int(text)
+    else:
+        raise TypeError(f"unsupported object ID type {type(value).__name__}: {value!r}")
+
+    if out < np.iinfo(np.int64).min or out > np.iinfo(np.int64).max:
+        raise ValueError(f"object ID {out} is outside int64 range")
+    return out
+
+
+def warn_if_id_column_unsafe(
+    column_name: str,
+    arrow_type: pa.DataType,
+    *,
+    context: str = "catalog",
+) -> None:
+    """Log when an ID column is not stored as int64 (risk for large TARGETIDs)."""
+    if pa.types.is_integer(arrow_type):
+        return
+    if pa.types.is_floating(arrow_type):
+        log.warning(
+            "%s ID column %r has floating Arrow type %s; values above 2**53 "
+            "cannot be represented exactly. Casting to int64 may corrupt "
+            "TARGETIDs — re-ingest from FITS with an integer column.",
+            context, column_name, arrow_type,
+        )
+        return
+    if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+        log.warning(
+            "%s ID column %r is stored as string; matching still works but "
+            "prefer int64 at ingest for performance and type safety.",
+            context, column_name,
+        )
+
+
+def resolve_source_id_column(
+    catalog_root: Path | str,
+    *,
+    schema_names: list[str] | None = None,
+    override: str | None = None,
+) -> str:
+    """Return the column name used as the object identifier in a catalog.
+
+    Reads ``source_id_mode`` from ``catalog_info.json``:
+
+    * ``"sequential"``      → ``"source_id"``  (auto-generated integer)
+    * ``"column:COLNAME"``  → ``"COLNAME"``    (native FITS column, e.g. ``TARGETID``)
+
+    When ``schema_names`` is supplied (or can be read from the first Parquet
+    tile), the first candidate that actually exists in the schema is returned.
+    This covers catalogs where ``catalog_info.json`` is missing or still says
+    ``sequential`` but tiles store ``TARGETID`` from a DESI ingest.
+
+    Parameters
+    ----------
+    override:
+        If set, use this column name when it appears in ``schema_names``
+        (or unconditionally when no schema is available).
+    """
+    catalog_root = Path(catalog_root)
+
+    if override:
+        if schema_names is None or override in schema_names:
+            return override
+        raise KeyError(
+            f"Requested source-ID column {override!r} not in catalog schema. "
+            f"Available: {sorted(schema_names)[:30]}"
+            f"{'…' if len(schema_names) > 30 else ''}"
+        )
+
+    candidates: list[str] = []
+    info_path = catalog_root / "catalog_info.json"
+    if info_path.exists():
+        with open(info_path) as fh:
+            mode = json.load(fh).get("source_id_mode", "sequential")
+        if isinstance(mode, str) and mode.startswith("column:"):
+            candidates.append(mode[len("column:"):])
+        else:
+            candidates.append("source_id")
+    else:
+        candidates.append("source_id")
+
+    for name in _COMMON_ID_COLUMNS:
+        if name not in candidates:
+            candidates.append(name)
+
+    if schema_names is None:
+        first_tile = next(catalog_root.rglob("Npix=*.parquet"), None)
+        if first_tile is not None:
+            schema_names = pq.read_schema(str(first_tile)).names
+
+    if schema_names is not None:
+        names_set = set(schema_names)
+        for col in candidates:
+            if col in names_set:
+                if col != candidates[0]:
+                    log.info(
+                        "Resolved catalog ID column to %r "
+                        "(catalog_info.json preferred %r, not in Parquet schema).",
+                        col, candidates[0],
+                    )
+                return col
+        raise KeyError(
+            f"No source-ID column found in catalog under {catalog_root}. "
+            f"Tried {candidates!r}; Parquet columns include: "
+            f"{sorted(schema_names)[:25]}{'…' if len(schema_names) > 25 else ''}"
+        )
+
+    return candidates[0]
+
+
 def assign_healpix(
     ra_deg: np.ndarray,
     dec_deg: np.ndarray,
@@ -275,7 +419,19 @@ def ingest_catalog(
 
     # Ensure a stable source_id column
     if source_id_col and source_id_col in table.schema.names:
-        if table.schema.field(source_id_col).type != pa.int64():
+        sid_field = table.schema.field(source_id_col)
+        if sid_field.type != pa.int64():
+            warn_if_id_column_unsafe(source_id_col, sid_field.type)
+            if pa.types.is_floating(sid_field.type):
+                col_np = table.column(source_id_col).to_numpy(zero_copy_only=False)
+                finite = col_np[np.isfinite(col_np)]
+                if finite.size and np.max(np.abs(finite)) > _FLOAT64_SAFE_INTEGER:
+                    raise ValueError(
+                        f"Column {source_id_col!r} contains values above 2**53 "
+                        f"but is stored as {sid_field.type}; casting to int64 would "
+                        f"corrupt TARGETIDs. Fix the FITS dtype or read as int64 "
+                        f"before ingest."
+                    )
             table = table.set_column(
                 table.schema.get_field_index(source_id_col),
                 source_id_col,

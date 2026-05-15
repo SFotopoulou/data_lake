@@ -220,6 +220,8 @@ Key properties:
 - **Automatic catalog patch** — after ingest the run patches
   `_spectrum_index` in the Parquet catalog (`--no-update-catalog` to
   skip; silently no-ops if no catalog exists yet for the survey).
+  The ID column is read from `catalog_info.json` so DESI catalogs
+  ingested with `--source-id-col TARGETID` are handled correctly.
 - **`--n-workers` is required** — no implicit default; pick consciously
   (typical: `cpu_count - 1` to keep one core for the writer / OS).
 - **Threads do not help here**: `read_spectra` is mostly Python under
@@ -245,6 +247,9 @@ dl-ingest-catalog-from-list cat_files.txt --survey my_survey --ra-col RA --dec-c
 find /data/cutouts -name '*.fits' > cutout_files.txt
 dl-ingest-cutouts-from-list cutout_files.txt --survey my_cutouts \
   --band-names r,i,z --on-duplicate skip
+
+# Both commands above also patch _cutout_index in the catalog automatically.
+# Use --no-update-catalog to skip the patch (e.g. if the catalog doesn't exist yet).
 ```
 
 Checkpoints default to ``catalogs/<survey>/.ingest_checkpoint.json`` or
@@ -360,7 +365,29 @@ Lookup uses the catalog's `_spectrum_index` column when available
 (O(catalog SQL) batched), otherwise falls back to a vectorised tile
 scan (one `source_id` array read per tile + `np.isin`).
 
-### Update catalog with spectrum index
+### Update catalog with spectrum / cutout index
+
+The `dl-ingest-spectra`, `dl-ingest-cutouts`, and `dl-ingest-cutouts-from-list`
+CLIs patch the catalog automatically after each ingest run (`--no-update-catalog`
+to skip).  The ID column is resolved from `catalog_info.json`, so surveys
+ingested with `--source-id-col TARGETID` (or any other native column) work
+without extra configuration.
+
+To backfill an existing lake where spectra or cutouts were ingested without
+catalog patching (no FITS re-ingestion needed):
+
+```bash
+# Register console scripts after pulling this feature (once per env):
+pip install -e .
+
+dl-rebuild-catalog-indices --survey desi_dr1 --kind spectrum
+dl-rebuild-catalog-indices --survey desi_dr1 --kind cutout   # if cutouts exist
+
+# Without reinstalling, use the module directly:
+python -m data_lake.ingest.update_catalog_indices --survey desi_dr1 --kind spectrum
+```
+
+For manual / Python-API use:
 
 ```python
 from data_lake.ingest.update_catalog_indices import update_index_column
@@ -385,7 +412,7 @@ data_lake/
     fits_to_zarr.py           FITS cutouts → Zarr v3 sharded stacks
     fits_to_spectra_zarr.py   FITS 1-D spectra → Zarr v3 sharded stacks
     desi_parallel_ingest.py   Multi-process batch ingest of many DESI coadd files
-    update_catalog_indices.py Patch _cutout_index / _spectrum_index in Parquet tiles
+    update_catalog_indices.py Patch _cutout_index / _spectrum_index in Parquet tiles; dl-rebuild-catalog-indices backfill CLI
   io/
     catalog.py           DuckDB-backed Parquet accessor
     cutouts.py           Zarr cutout accessor (O(1) source_id lookup)

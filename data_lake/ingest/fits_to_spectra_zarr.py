@@ -875,6 +875,11 @@ try:
                       "Requires DESI coadd input and wavelength-mode=shared. "
                       "Overrides config; default false."
                   ))
+    @click.option(
+        "--update-catalog/--no-update-catalog", default=True, show_default=True,
+        help="Patch _spectrum_index in the Parquet catalog after ingest "
+             "(skipped silently if no catalog exists for this survey).",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         source_path: Path,
@@ -890,6 +895,7 @@ try:
         on_length_mismatch: str,
         on_duplicate: str,
         with_resolution: bool | None,
+        update_catalog: bool,
         verbose: bool,
     ) -> None:
         """Ingest 1-D FITS spectra into sharded Zarr v3 stacks.
@@ -902,15 +908,15 @@ try:
         configure_warning_filters()
         cfg = load_optional_config(config_path)
         resolved_output = require_output_root(output_root, cfg, kind="spectra")
+        resolved_norder = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
 
-        ingest_spectra_from_fits(
+        index_map = ingest_spectra_from_fits(
             source_path=source_path,
             output_root=resolved_output,
             survey_name=survey_name,
             ra_col=ra_col,
             dec_col=dec_col,
-            norder=pick(norder,
-                        cfg.partitioning.hats_order if cfg else None, 5),
+            norder=resolved_norder,
             wavelength_mode=pick(wavelength_mode,
                                  cfg.defaults.wavelength_mode if cfg else None,
                                  "shared"),
@@ -924,6 +930,23 @@ try:
                                  cfg.defaults.with_resolution if cfg else None,
                                  False),
         )
+
+        if update_catalog and index_map:
+            try:
+                from data_lake.ingest.update_catalog_indices import update_index_column
+                n_modified = update_index_column(
+                    lake_root=resolved_output,
+                    survey_name=survey_name,
+                    source_id_to_index=index_map,
+                    kind="spectrum",
+                    norder=resolved_norder,
+                )
+                click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
+            except FileNotFoundError:
+                log.info(
+                    "No catalog found for survey %r — skipping _spectrum_index patch.",
+                    survey_name,
+                )
 
 except ImportError:
     cli = None  # type: ignore[assignment]

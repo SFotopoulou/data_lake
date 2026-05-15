@@ -465,6 +465,11 @@ try:
         show_default=True,
         help="If source_id already exists in a tile, append (default), raise, or skip rows.",
     )
+    @click.option(
+        "--update-catalog/--no-update-catalog", default=True, show_default=True,
+        help="Patch _cutout_index in the Parquet catalog after ingest "
+             "(skipped silently if no catalog exists for this survey).",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         source_path: Path,
@@ -479,6 +484,7 @@ try:
         band_names: str | None,
         dtype: str,
         on_duplicate: str,
+        update_catalog: bool,
         verbose: bool,
     ) -> None:
         """Ingest FITS cutouts into sharded Zarr v3 stacks.
@@ -493,10 +499,11 @@ try:
         configure_warning_filters()
         cfg = load_optional_config(config_path)
         resolved_output = require_output_root(output_root, cfg, kind="cutouts")
+        resolved_norder = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
 
         bn = [x.strip() for x in band_names.split(",")] if band_names else None
 
-        ingest_cutouts_from_fits(
+        index_map = ingest_cutouts_from_fits(
             source_path=source_path,
             output_root=resolved_output,
             survey_name=survey_name,
@@ -505,11 +512,27 @@ try:
             image_hdu_index=image_hdu_index,
             band_axis=band_axis,
             band_names=bn,
-            norder=pick(norder,
-                        cfg.partitioning.hats_order if cfg else None, 5),
+            norder=resolved_norder,
             dtype=np.dtype(dtype),
             on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
         )
+
+        if update_catalog and index_map:
+            try:
+                from data_lake.ingest.update_catalog_indices import update_index_column
+                n_modified = update_index_column(
+                    lake_root=resolved_output,
+                    survey_name=survey_name,
+                    source_id_to_index=index_map,
+                    kind="cutout",
+                    norder=resolved_norder,
+                )
+                click.echo(f"Patched _cutout_index in {n_modified} catalog tile(s).")
+            except FileNotFoundError:
+                log.info(
+                    "No catalog found for survey %r — skipping _cutout_index patch.",
+                    survey_name,
+                )
 
 except ImportError:
     cli = None  # type: ignore[assignment]

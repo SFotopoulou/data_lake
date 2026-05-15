@@ -253,6 +253,11 @@ try:
     @click.option("--failures-log", type=click.Path(path_type=Path), default=None)
     @click.option("--no-progress", is_flag=True)
     @click.option("--no-skip-completed", is_flag=True)
+    @click.option(
+        "--update-catalog/--no-update-catalog", default=True, show_default=True,
+        help="Patch _cutout_index in the Parquet catalog after ingest "
+             "(skipped silently if no catalog exists for this survey).",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli_cutout_list(
         paths_file: Path,
@@ -271,6 +276,7 @@ try:
         failures_log: Path | None,
         no_progress: bool,
         no_skip_completed: bool,
+        update_catalog: bool,
         verbose: bool,
     ) -> None:
         """Sequential cutout ingest from a text file list (one FITS path per line)."""
@@ -284,8 +290,11 @@ try:
         bn = [x.strip() for x in band_names.split(",")] if band_names else None
         default_ck = lake / "cutouts" / survey_name / ".ingest_checkpoint.json"
 
+        # Accumulate index_map across all files so we patch the catalog once.
+        total_index_map: dict[int, int] = {}
+
         def one(p: Path) -> None:
-            ingest_cutouts_from_fits(
+            m = ingest_cutouts_from_fits(
                 source_path=p,
                 output_root=lake,
                 survey_name=survey_name,
@@ -298,6 +307,7 @@ try:
                 dtype=np.dtype(dtype),
                 on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
             )
+            total_index_map.update(m)
 
         code = _run_file_list(
             paths_file=paths_file,
@@ -310,6 +320,24 @@ try:
             ingest_one=one,
             default_checkpoint=default_ck,
         )
+
+        if update_catalog and total_index_map:
+            try:
+                from data_lake.ingest.update_catalog_indices import update_index_column
+                n_modified = update_index_column(
+                    lake_root=lake,
+                    survey_name=survey_name,
+                    source_id_to_index=total_index_map,
+                    kind="cutout",
+                    norder=n,
+                )
+                click.echo(f"Patched _cutout_index in {n_modified} catalog tile(s).")
+            except FileNotFoundError:
+                log.info(
+                    "No catalog found for survey %r — skipping _cutout_index patch.",
+                    survey_name,
+                )
+
         sys.exit(code)
 
 except ImportError:

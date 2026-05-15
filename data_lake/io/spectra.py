@@ -488,6 +488,7 @@ class SpectrumAccessor:
             try:
                 cat_cols = self._catalog.columns
                 hp_col = f"_healpix_norder{self._catalog.norder}"
+                sid_col = self._catalog.source_id_column
                 if "_spectrum_index" in cat_cols and hp_col in cat_cols:
                     batch_size = 10_000
                     for start in tqdm(
@@ -499,8 +500,8 @@ class SpectrumAccessor:
                         chunk = requested_int[start : start + batch_size]
                         ids_csv = ",".join(str(int(s)) for s in chunk)
                         sql = (
-                            f"SELECT source_id, {hp_col}, _spectrum_index "
-                            f"FROM catalog WHERE source_id IN ({ids_csv}) "
+                            f"SELECT {sid_col}, {hp_col}, _spectrum_index "
+                            f"FROM catalog WHERE {sid_col} IN ({ids_csv}) "
                             f"AND _spectrum_index >= 0"
                         )
                         rows = self._catalog._con.execute(sql).fetchall()

@@ -24,6 +24,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+
 log = logging.getLogger(__name__)
 
 ReturnFormat = Literal["polars", "astropy", "arrow"]
@@ -90,6 +92,10 @@ class CatalogAccessor:
 
         self._info = self._load_info()
         self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
+        self._source_id_column: str = resolve_source_id_column(
+            self._catalog_root,
+            schema_names=list(self.schema.names) if self._catalog_root.exists() else None,
+        )
 
         # DuckDB in-process connection (no file, memory only)
         self._con = duckdb.connect(database=":memory:")
@@ -112,6 +118,11 @@ class CatalogAccessor:
     @property
     def info(self) -> dict:
         return self._info
+
+    @property
+    def source_id_column(self) -> str:
+        """Column name that holds the integer object identifier (e.g. ``TARGETID`` for DESI)."""
+        return self._source_id_column
 
     @property
     def schema(self) -> pa.Schema:
@@ -225,10 +236,11 @@ class CatalogAccessor:
         columns: list[str] | None = None,
         fmt: ReturnFormat = "polars",
     ):
-        """Fetch rows by a list of source_ids."""
+        """Fetch rows by a list of source_ids (using the catalog's actual ID column)."""
         col_expr = ", ".join(columns) if columns else "*"
         id_list = ", ".join(str(i) for i in source_ids)
-        sql = f"SELECT {col_expr} FROM catalog WHERE source_id IN ({id_list})"
+        sid_col = self._source_id_column
+        sql = f"SELECT {col_expr} FROM catalog WHERE {sid_col} IN ({id_list})"
         return self.query(sql, fmt=fmt)
 
     def get_tile_index(
@@ -242,7 +254,7 @@ class CatalogAccessor:
         Parameters
         ----------
         source_id:
-            Source identifier.
+            Source identifier (value of the catalog's ID column, e.g. ``TARGETID``).
         kind:
             Which index column to return: ``"cutout"`` (default) reads
             ``_cutout_index``; ``"spectrum"`` reads ``_spectrum_index``.
@@ -253,6 +265,7 @@ class CatalogAccessor:
             raise ValueError(f"kind must be 'cutout' or 'spectrum', got {kind!r}")
         index_col = f"_{kind}_index"
         hp_col = f"_healpix_norder{self.norder}"
+        sid_col = self._source_id_column
 
         # _spectrum_index may not exist in catalogs ingested before this change
         cols_available = self.columns
@@ -262,7 +275,7 @@ class CatalogAccessor:
                 f"Re-run catalog ingest or call update_index_column() first."
             )
 
-        sql = f"SELECT {hp_col}, {index_col} FROM catalog WHERE source_id = {source_id} LIMIT 1"
+        sql = f"SELECT {hp_col}, {index_col} FROM catalog WHERE {sid_col} = {source_id} LIMIT 1"
         result = self._con.execute(sql).fetchone()
         if result is None:
             raise KeyError(f"source_id={source_id} not found in catalog")
