@@ -37,6 +37,9 @@ log = logging.getLogger(__name__)
 
 _HATS_DIR_STRIDE = 10_000  # tiles per Dir= folder (HATS convention)
 _ZSTD_LEVEL = 3             # default balance of speed vs ratio (catalog ingest)
+# ``string`` uses int32 offsets (2 GiB UTF-8 cap per column chunk). Dense tiles
+# (e.g. DESI zall-pix) can exceed that when narrowing ``large_string``.
+_MAX_ROWS_STRING_SHRINK = 2_000_000
 
 
 @dataclass(frozen=True)
@@ -473,13 +476,36 @@ def _filter_table_columns(
 
 
 def _shrink_tile_table_for_disk(table: pa.Table) -> pa.Table:
-    """Use ``string`` (32-bit offsets) per tile — safe when each tile has ≪2M rows."""
+    """Narrow ``large_string`` → ``string`` per tile when safe (smaller on disk).
+
+    Skips narrowing when the tile is very large or PyArrow reports the UTF-8
+    payload would exceed the 2 GiB ``string`` offset limit (common on dense
+    DESI HEALPix tiles with many string columns).
+    """
+    if table.num_rows > _MAX_ROWS_STRING_SHRINK:
+        log.info(
+            "Keeping large_string columns for tile with %d rows "
+            "(>%d row shrink threshold).",
+            table.num_rows, _MAX_ROWS_STRING_SHRINK,
+        )
+        return table
+
     arrays: list[pa.Array] = []
     for name in table.schema.names:
         col = table.column(name)
-        if pa.types.is_large_string(col.type):
+        if not pa.types.is_large_string(col.type):
+            arrays.append(col)
+            continue
+        try:
             arrays.append(pc.cast(col, pa.string()))
-        else:
+        except pa.ArrowInvalid as exc:
+            if "too large" not in str(exc).lower():
+                raise
+            log.warning(
+                "Column %r: cannot narrow large_string to string for %d-row tile "
+                "(%s); keeping large_string on disk.",
+                name, table.num_rows, exc,
+            )
             arrays.append(col)
     return pa.Table.from_arrays(arrays, names=table.schema.names)
 

@@ -179,6 +179,28 @@ class TestAstropyToArrow:
 # ---------------------------------------------------------------------------
 
 
+class TestShrinkTileStrings:
+    def test_shrink_small_tile(self):
+        from data_lake.ingest.fits_to_parquet import _shrink_tile_table_for_disk
+
+        tbl = pa.table({"s": pa.array(["QSO", "STAR"], type=pa.large_string())})
+        out = _shrink_tile_table_for_disk(tbl)
+        assert out.schema.field("s").type == pa.string()
+
+    def test_shrink_skips_huge_row_count(self, monkeypatch):
+        from data_lake.ingest.fits_to_parquet import (
+            _MAX_ROWS_STRING_SHRINK,
+            _shrink_tile_table_for_disk,
+        )
+
+        tbl = pa.table({"s": pa.array(["x"], type=pa.large_string())})
+        monkeypatch.setattr(
+            "data_lake.ingest.fits_to_parquet._MAX_ROWS_STRING_SHRINK", 0,
+        )
+        out = _shrink_tile_table_for_disk(tbl)
+        assert out.schema.field("s").type == pa.large_string()
+
+
 class TestFormatDetection:
     def test_reads_fits_with_multidim_column(self, tmp_path: Path):
         from data_lake.ingest.fits_to_parquet import _read_source_table
