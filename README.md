@@ -258,6 +258,31 @@ dl-ingest-cutouts cutout_9876543210123456.fits --survey desi_dr1 \
 
 Single-file and file-list CLIs accept the same flags.
 
+#### Generate cutout FITS from a catalog + band images
+
+If you start from full-field (or tile) images rather than pre-cut stamps, use
+``dl-generate-cutout-fits`` to write one multi-band FITS per catalog row
+(shape ``N_bands × N_pix × N_pix``, band order = image list order):
+
+```bash
+# bands.txt: one path per line (r.fits, then i.fits, then z.fits)
+dl-generate-cutout-fits targets.parquet /data/stamps \\
+  --images-file bands.txt \\
+  --size 64 \\
+  --id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
+  --id-hdu-key TARGETID --ra-hdu-key TARGET_RA --dec-hdu-key TARGET_DEC \\
+  --band-names r,i,z
+
+find /data/stamps -name 'cutout_*.fits' | sort > cutout_files.txt
+dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \\
+  --source-id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
+  --band-names r,i,z
+```
+
+Band images must share a consistent astrometric grid (2-D WCS per FITS). Cutouts
+use ``astropy.nddata.Cutout2D`` with ``mode='partial'`` (edge sources may include
+``NaN`` fills).
+
 ### Ingest spectra
 
 **DESI** ingest requires the `desispec` optional extra (uses `read_spectra` +
