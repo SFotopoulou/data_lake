@@ -54,7 +54,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 
@@ -69,6 +69,37 @@ from data_lake.ingest.fits_to_spectra_zarr import (
 )
 
 log = logging.getLogger(__name__)
+
+ZarrDuplicateMode = Literal["append", "error", "skip"]
+
+
+def _filter_tile_batch(
+    batch: "TileBatch",
+    existing_source_ids: set[int],
+    on_duplicate: ZarrDuplicateMode,
+) -> "TileBatch | None":
+    """Apply ``--on-duplicate`` policy before appending one parallel worker batch."""
+    from data_lake.ingest.duplicate_policy import zarr_row_keep_mask
+
+    keep = zarr_row_keep_mask(batch.source_ids, existing_source_ids, on_duplicate)
+    if not keep.any():
+        return None
+    if keep.all():
+        return batch
+    idx = np.nonzero(keep)[0]
+    itemsize = _META_DTYPE.itemsize
+    meta_parts = [
+        batch.meta_bytes[int(i) * itemsize : int(i) * itemsize + itemsize]
+        for i in idx.tolist()
+    ]
+    return TileBatch(
+        npix=batch.npix,
+        flux=batch.flux[idx],
+        ivar=batch.ivar[idx],
+        mask=batch.mask[idx],
+        source_ids=batch.source_ids[idx],
+        meta_bytes=b"".join(meta_parts),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +410,7 @@ def ingest_spectra_parallel(
     worker_log_file: Path | str | None = None,
     worker_verbose: bool = False,
     inflight_path: Path | str | None = None,
+    on_duplicate_source_id: ZarrDuplicateMode = "append",
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -420,6 +452,9 @@ def ingest_spectra_parallel(
     inflight_path:
         JSON journal used for crash-safe per-file commits (default
         ``<survey_root>/.ingest_inflight.json``).  Pass ``None`` for that default.
+    on_duplicate_source_id:
+        ``append`` (default), ``error``, or ``skip`` when a ``TARGETID`` is already
+        in a tile's Zarr (same as ``dl-ingest-spectra --on-duplicate``).
 
     Returns
     -------
@@ -631,6 +666,17 @@ def ingest_spectra_parallel(
 
                     for b in res.batches:
                         root = tile_groups[b.npix]
+                        existing_ids: set[int] = set()
+                        if int(root["source_id"].shape[0]) > 0:
+                            existing_ids = set(
+                                np.asarray(root["source_id"][:]).tolist()
+                            )
+                        filtered = _filter_tile_batch(
+                            b, existing_ids, on_duplicate_source_id,
+                        )
+                        if filtered is None:
+                            continue
+                        b = filtered
                         start_idx = root["flux"].shape[0]
 
                         root["flux"].append(b.flux)
@@ -756,6 +802,13 @@ try:
              "Default: <output>/spectra/<survey>/.ingest.log",
     )
     @click.option(
+        "--on-duplicate",
+        type=click.Choice(["append", "error", "skip"]),
+        default="append",
+        show_default=True,
+        help="If TARGETID already exists in a tile Zarr: append, raise, or skip.",
+    )
+    @click.option(
         "--update-catalog/--no-update-catalog", default=True, show_default=True,
         help="Patch _spectrum_index in the Parquet catalog at end "
              "(skipped silently if no catalog exists for this survey).",
@@ -774,6 +827,7 @@ try:
         checkpoint_path: Path | None,
         failures_log: Path | None,
         log_file_path: Path | None,
+        on_duplicate: str,
         update_catalog: bool,
         verbose: bool,
     ) -> None:
@@ -842,6 +896,7 @@ try:
             failures_log=failures_log,
             worker_log_file=log_file_path,
             worker_verbose=verbose,
+            on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
         )
 
         click.echo(

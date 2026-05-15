@@ -365,6 +365,114 @@ try:
 
         sys.exit(code)
 
+    @click.command("dl-ingest-spectra-from-list")
+    @click.argument("paths_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+    @click.argument("output_root", type=click.Path(path_type=Path), required=False)
+    @config_option
+    @click.option("--survey", "survey_name", required=True)
+    @click.option("--ra-col", default="RA", show_default=True)
+    @click.option("--dec-col", default="DEC", show_default=True)
+    @click.option("--source-id-col", default=None)
+    @click.option("--norder", default=None, type=int)
+    @click.option(
+        "--fmt",
+        default=None,
+        type=click.Choice(["sdss_boss", "desi_coadd", "generic"]),
+        help="Force FITS format (default: auto-detect).",
+    )
+    @click.option(
+        "--on-duplicate",
+        type=click.Choice(["append", "error", "skip"]),
+        default="append",
+        show_default=True,
+        help="If source_id already exists in a tile Zarr, append, raise, or skip.",
+    )
+    @click.option("--checkpoint", type=click.Path(path_type=Path), default=None)
+    @click.option("--failures-log", type=click.Path(path_type=Path), default=None)
+    @click.option("--no-progress", is_flag=True)
+    @click.option("--no-skip-completed", is_flag=True)
+    @click.option(
+        "--update-catalog/--no-update-catalog", default=True, show_default=True,
+        help="Patch _spectrum_index in the Parquet catalog after ingest.",
+    )
+    @click.option("-v", "--verbose", is_flag=True)
+    def cli_spectra_list(
+        paths_file: Path,
+        output_root: Path | None,
+        config_path: Path | None,
+        survey_name: str,
+        ra_col: str,
+        dec_col: str,
+        source_id_col: str | None,
+        norder: int | None,
+        fmt: str | None,
+        on_duplicate: str,
+        checkpoint: Path | None,
+        failures_log: Path | None,
+        no_progress: bool,
+        no_skip_completed: bool,
+        update_catalog: bool,
+        verbose: bool,
+    ) -> None:
+        """Sequential spectrum ingest from a text file list (one FITS path per line)."""
+        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        configure_warning_filters()
+        cfg = load_optional_config(config_path)
+        lake = require_output_root(output_root, cfg, kind="spectra")
+        n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
+        default_ck = lake / "spectra" / survey_name / ".ingest_checkpoint.json"
+
+        from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
+
+        total_index_map: dict[int, int] = {}
+
+        def one(p: Path) -> None:
+            m = ingest_spectra_from_fits(
+                source_path=p,
+                output_root=lake,
+                survey_name=survey_name,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                source_id_col=source_id_col,
+                norder=n,
+                fmt=fmt,
+                on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
+            )
+            total_index_map.update(m)
+
+        code = _run_file_list(
+            paths_file=paths_file,
+            survey_name=survey_name,
+            lake_root=lake,
+            checkpoint=checkpoint,
+            failures_log=failures_log,
+            show_progress=not no_progress,
+            skip_completed=not no_skip_completed,
+            ingest_one=one,
+            default_checkpoint=default_ck,
+        )
+
+        if update_catalog and total_index_map:
+            try:
+                from data_lake.ingest.update_catalog_indices import update_index_column
+                n_modified = update_index_column(
+                    lake_root=lake,
+                    survey_name=survey_name,
+                    source_id_to_index=total_index_map,
+                    kind="spectrum",
+                    norder=n,
+                    source_id_col=source_id_col,
+                )
+                click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
+            except FileNotFoundError:
+                log.info(
+                    "No catalog found for survey %r — skipping _spectrum_index patch.",
+                    survey_name,
+                )
+
+        sys.exit(code)
+
 except ImportError:
     cli_catalog_list = None  # type: ignore[assignment,misc]
     cli_cutout_list = None  # type: ignore[assignment,misc]
+    cli_spectra_list = None  # type: ignore[assignment,misc]

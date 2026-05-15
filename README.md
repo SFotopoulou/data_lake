@@ -337,7 +337,23 @@ Rough timing on a single workstation for 10 000 DESI coadd files
 
 Disk footprint: ~120–170 GB compressed for ~5 M spectra at ~8 000 px.
 
-#### Sequential file-list ingest (catalogs & cutouts)
+#### Duplicate / resume flags by command
+
+| Command | Flag | Values | Notes |
+|---------|------|--------|--------|
+| `dl-ingest-catalog` | `--on-duplicate-id` | `skip`, `error`, `last` | Only when `--tile-mode append` (Parquet rows) |
+| `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
+| `dl-ingest-cutouts` | `--on-duplicate` | `append`, `error`, `skip` | Per `source_id` in each `Npix=*.zarr` |
+| `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
+| `dl-ingest-spectra` | `--on-duplicate` | same | same |
+| `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Sequential non-DESI / mixed FITS lists |
+| `dl-ingest-spectra-batch` | `--on-duplicate` | same | DESI parallel batch (was missing before) |
+
+For **resumable** file-list or batch re-runs, use **`--on-duplicate skip`** on cutout/spectrum
+ingest (and **`--tile-mode skip`** on catalog). Default is **`append`**, which can add duplicate
+Zarr rows if you re-ingest the same objects.
+
+#### Sequential file-list ingest (catalogs, cutouts, spectra)
 
 ```bash
 find /data/cats -name '*.fits' > cat_files.txt
@@ -348,8 +364,15 @@ dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \
   --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
   --band-names r,i,z --on-duplicate skip
 
-# Both commands above patch _cutout_index / _spectrum_index when --update-catalog (default).
-# Use --no-update-catalog to skip the patch (e.g. if the catalog doesn't exist yet).
+ls coadds.txt  # one DESI coadd path per line
+dl-ingest-spectra-batch --survey desi_dr1 --file-list coadds.txt --n-workers 16 \
+  --on-duplicate skip
+
+# Generic / SDSS spectra (sequential, not parallel DESI batch):
+dl-ingest-spectra-from-list spec_files.txt --survey sdss_dr17 \
+  --on-duplicate skip
+
+# Patch _cutout_index / _spectrum_index when --update-catalog (default).
 ```
 
 Checkpoints default to ``catalogs/<survey>/.ingest_checkpoint.json`` or

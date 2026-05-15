@@ -172,25 +172,13 @@ def _filter_tile_records_duplicates(
     on_duplicate: Literal["append", "error", "skip"],
 ) -> list[CutoutRecord]:
     """Enforce duplicate policy for one tile's incoming batch vs Zarr contents."""
-    seen_batch: set[int] = set()
-    for r in tile_records:
-        if r.source_id in seen_batch:
-            raise ValueError(
-                f"Duplicate source_id {r.source_id} within a single ingest batch for one tile"
-            )
-        seen_batch.add(r.source_id)
+    from data_lake.ingest.duplicate_policy import zarr_row_keep_mask
 
-    if on_duplicate == "append":
+    if not tile_records:
         return tile_records
-    if on_duplicate == "error":
-        for r in tile_records:
-            if r.source_id in existing_source_ids:
-                raise ValueError(
-                    f"source_id {r.source_id} already exists in this tile's Zarr; "
-                    f"use on_duplicate_source_id='skip' or 'append'."
-                )
-        return tile_records
-    return [r for r in tile_records if r.source_id not in existing_source_ids]
+    sids = np.array([r.source_id for r in tile_records], dtype=np.int64)
+    keep = zarr_row_keep_mask(sids, existing_source_ids, on_duplicate)
+    return [r for r, k in zip(tile_records, keep.tolist()) if k]
 
 
 # ---------------------------------------------------------------------------
