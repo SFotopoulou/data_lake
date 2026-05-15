@@ -146,7 +146,20 @@ try:
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int)
     @click.option("--source-id-col", default=None)
-    @click.option("--overwrite", is_flag=True)
+    @click.option(
+        "--tile-mode",
+        type=click.Choice(["skip", "overwrite", "append"], case_sensitive=False),
+        default=None,
+        help="Existing Npix tile: skip (default), replace, or append (multi-FITS).",
+    )
+    @click.option(
+        "--on-duplicate-id",
+        type=click.Choice(["skip", "error", "last"], case_sensitive=False),
+        default="skip",
+        show_default=True,
+        help="When --tile-mode=append and an ID column exists.",
+    )
+    @click.option("--overwrite", is_flag=True, help="Deprecated: use --tile-mode overwrite.")
     @click.option(
         "--streaming/--no-streaming", default=False, show_default=True,
         help="FITS-only streaming path (passed through to ingest_catalog).",
@@ -179,6 +192,8 @@ try:
         dec_col: str,
         norder: int | None,
         source_id_col: str | None,
+        tile_mode: str | None,
+        on_duplicate_id: str,
         overwrite: bool,
         streaming: bool,
         checkpoint: Path | None,
@@ -205,6 +220,8 @@ try:
                 norder=n,
                 source_id_col=source_id_col,
                 overwrite=overwrite,
+                tile_mode=tile_mode.lower() if tile_mode else None,  # type: ignore[arg-type]
+                on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
                 streaming=streaming,
             )
 

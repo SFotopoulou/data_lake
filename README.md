@@ -149,6 +149,40 @@ The on-disk Parquet output is identical to the in-memory path
 Trade-off: per-tile scattered I/O makes the streaming path ~1.5–2×
 slower wall-clock; use only when memory is a constraint.
 
+**Disk footprint:** Parquet is often **larger than a compressed FITS** file
+because FITS may use internal compression, while we store a full typed,
+queryable columnar layout (~12k tile files, ZSTD, per-column statistics).
+To reduce size on re-ingest:
+
+```bash
+# Smaller tiles (ZSTD-9, no stats/dictionary, narrow strings per tile)
+dl-ingest-catalog zall-pix-iron.fits --survey desi_dr1 \
+  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+  --streaming --overwrite --compact
+
+# Largest win: drop unused DESI columns (keep what you query/join on)
+dl-ingest-catalog ... --columns TARGETID,TARGET_RA,TARGET_DEC,Z,MAG_G,MAG_R,MAG_Z,SPECTYPE
+```
+
+Expect **~2–4×** smaller than default ingest when combining `--compact` with a
+sensible `--columns` list; exact ratio depends on which FITS columns you keep.
+
+**Multiple FITS into one survey:** by default existing `Npix=*.parquet` tiles are
+**skipped** (`--tile-mode skip`). To add rows from another file into the same
+HEALPix pixel, use **append** (read–concat–write per tile):
+
+```bash
+dl-ingest-catalog-from-list desi_files.txt --survey desi_dr1 \
+  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+  --streaming --tile-mode append
+```
+
+When appending with a native ID column (`TARGETID`), control duplicates with
+`--on-duplicate-id skip|error|last` (default `skip`). Use `--tile-mode overwrite`
+to rebuild a tile from one file only. `--overwrite` is deprecated but still maps
+to `--tile-mode overwrite`. After every ingest, `_metadata` and `catalog_info.json`
+`total_rows` are refreshed from **all** tiles on disk.
+
 ### Ingest cutouts
 
 ```bash

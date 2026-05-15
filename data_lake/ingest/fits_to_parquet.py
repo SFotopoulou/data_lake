@@ -15,12 +15,17 @@ import json
 import logging
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, Literal, Sequence
+
+TileMode = Literal["skip", "overwrite", "append"]
+DuplicateIdMode = Literal["skip", "error", "last"]
 
 import healpy as hp
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from astropy.table import Table
 
@@ -31,7 +36,27 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _HATS_DIR_STRIDE = 10_000  # tiles per Dir= folder (HATS convention)
-_ZSTD_LEVEL = 3             # good balance of speed vs ratio
+_ZSTD_LEVEL = 3             # default balance of speed vs ratio (catalog ingest)
+
+
+@dataclass(frozen=True)
+class CatalogParquetOptions:
+    """Parquet write tuning for HATS catalog tiles."""
+
+    compression_level: int = _ZSTD_LEVEL
+    write_statistics: bool = True
+    use_dictionary: bool = True
+    shrink_strings_for_tiles: bool = True
+
+    @classmethod
+    def compact(cls) -> CatalogParquetOptions:
+        """Smaller on-disk footprint; slower ingest, still ZSTD-compressed."""
+        return cls(
+            compression_level=9,
+            write_statistics=False,
+            use_dictionary=False,
+            shrink_strings_for_tiles=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +381,266 @@ def _add_healpix_columns(
     return table
 
 
+def _filter_table_columns(
+    table: pa.Table,
+    columns: Sequence[str] | None,
+    *,
+    ra_col: str,
+    dec_col: str,
+    source_id_col: str | None,
+    norder: int,
+) -> pa.Table:
+    """Keep only requested columns plus sky, ID, HEALPix, and index placeholders."""
+    if not columns:
+        return table
+    hp_col = f"_healpix_norder{norder}"
+    required = {ra_col, dec_col, hp_col, "_cutout_index", "_spectrum_index"}
+    if source_id_col:
+        required.add(source_id_col)
+    else:
+        required.add("source_id")
+    keep: list[str] = []
+    seen: set[str] = set()
+    for name in list(columns) + sorted(required):
+        if name in table.schema.names and name not in seen:
+            keep.append(name)
+            seen.add(name)
+    missing = required - seen
+    if missing:
+        raise KeyError(
+            f"Required column(s) missing after column filter: {sorted(missing)}. "
+            f"Available: {table.schema.names[:30]}"
+        )
+    log.info("Column subset: keeping %d / %d columns", len(keep), len(table.schema))
+    return table.select(keep)
+
+
+def _shrink_tile_table_for_disk(table: pa.Table) -> pa.Table:
+    """Use ``string`` (32-bit offsets) per tile — safe when each tile has ≪2M rows."""
+    arrays: list[pa.Array] = []
+    for name in table.schema.names:
+        col = table.column(name)
+        if pa.types.is_large_string(col.type):
+            arrays.append(pc.cast(col, pa.string()))
+        else:
+            arrays.append(col)
+    return pa.Table.from_arrays(arrays, names=table.schema.names)
+
+
+def _resolve_tile_mode(
+    tile_mode: TileMode | None,
+    overwrite: bool,
+) -> TileMode:
+    """Map deprecated ``overwrite`` flag to ``tile_mode`` when needed."""
+    if tile_mode is not None:
+        if overwrite and tile_mode != "overwrite":
+            log.warning(
+                "--overwrite is deprecated; --tile-mode=%r takes precedence.",
+                tile_mode,
+            )
+        return tile_mode
+    if overwrite:
+        log.warning("--overwrite is deprecated; use --tile-mode overwrite.")
+        return "overwrite"
+    return "skip"
+
+
+def _read_catalog_tile(path: Path) -> pa.Table:
+    """Read one HATS tile without injecting Hive partition columns."""
+    return pq.ParquetFile(str(path)).read()
+
+
+def _schemas_compatible(existing: pa.Schema, incoming: pa.Schema) -> bool:
+    if existing.names != incoming.names:
+        return False
+    return all(
+        existing.field(i).type.equals(incoming.field(i).type)
+        for i in range(len(existing))
+    )
+
+
+def _id_column_for_dedup(table: pa.Table, source_id_col: str | None) -> str | None:
+    if source_id_col and source_id_col in table.schema.names:
+        return source_id_col
+    if "source_id" in table.schema.names:
+        return "source_id"
+    return None
+
+
+def _object_ids_from_column(table: pa.Table, col: str) -> set[int]:
+    return {normalize_object_id(v) for v in table.column(col).to_pylist()}
+
+
+def _filter_table_exclude_ids(table: pa.Table, col: str, exclude: set[int]) -> pa.Table:
+    if not exclude:
+        return table
+    keep = [
+        normalize_object_id(v) not in exclude
+        for v in table.column(col).to_pylist()
+    ]
+    return table.filter(pa.array(keep, type=pa.bool_()))
+
+
+def _merge_tile_tables(
+    existing: pa.Table,
+    incoming: pa.Table,
+    *,
+    sid_col: str | None,
+    on_duplicate_id: DuplicateIdMode,
+) -> pa.Table:
+    """Concatenate tile tables, optionally deduplicating on an object-ID column."""
+    if not _schemas_compatible(existing.schema, incoming.schema):
+        raise ValueError(
+            "Cannot append catalog tile: schema mismatch between existing tile "
+            f"and incoming rows.\nExisting columns: {existing.schema.names}\n"
+            f"Incoming columns: {incoming.schema.names}"
+        )
+    if sid_col is None:
+        return pa.concat_tables([existing, incoming])
+
+    existing_ids = _object_ids_from_column(existing, sid_col)
+    incoming_ids = _object_ids_from_column(incoming, sid_col)
+    overlap = existing_ids & incoming_ids
+
+    if overlap:
+        if on_duplicate_id == "error":
+            sample = sorted(overlap)[:5]
+            raise ValueError(
+                f"Duplicate object ID(s) when appending catalog tile: "
+                f"{len(overlap)} overlap(s), e.g. {sample}"
+                f"{'…' if len(overlap) > 5 else ''}"
+            )
+        if on_duplicate_id == "skip":
+            incoming = _filter_table_exclude_ids(incoming, sid_col, existing_ids)
+            if incoming.num_rows == 0:
+                return existing
+        else:  # last
+            existing = _filter_table_exclude_ids(existing, sid_col, incoming_ids)
+
+    return pa.concat_tables([existing, incoming])
+
+
+def _write_tile_for_mode(
+    out_file: Path,
+    incoming: pa.Table,
+    *,
+    tile_mode: TileMode,
+    on_duplicate_id: DuplicateIdMode,
+    source_id_col: str | None,
+    parquet_options: CatalogParquetOptions,
+) -> pq.FileMetaData | None:
+    """Write one ``Npix=*.parquet`` tile; return metadata if written, else None."""
+    if not out_file.exists():
+        return _write_catalog_parquet_tile(incoming, out_file, parquet_options)
+
+    if tile_mode == "skip":
+        log.debug("Skip existing tile %s", out_file)
+        return None
+
+    if tile_mode == "overwrite":
+        return _write_catalog_parquet_tile(incoming, out_file, parquet_options)
+
+    existing = _read_catalog_tile(out_file)
+    sid = _id_column_for_dedup(existing, source_id_col)
+    merged = _merge_tile_tables(
+        existing,
+        incoming,
+        sid_col=sid,
+        on_duplicate_id=on_duplicate_id,
+    )
+    if merged.num_rows == existing.num_rows:
+        log.debug("Append left tile unchanged %s", out_file)
+        return None
+    return _write_catalog_parquet_tile(merged, out_file, parquet_options)
+
+
+def _regenerate_metadata_from_all_tiles(catalog_root: Path) -> None:
+    """Rebuild ``_metadata`` from every ``Npix=*.parquet`` under *catalog_root*."""
+    tile_paths = sorted(catalog_root.rglob("Npix=*.parquet"))
+    if not tile_paths:
+        return
+    file_metadata: list[pq.FileMetaData] = []
+    schema: pa.Schema | None = None
+    for path in tile_paths:
+        meta = pq.read_metadata(str(path))
+        file_metadata.append(meta)
+        if schema is None:
+            schema = meta.schema.to_arrow_schema()
+    if schema is not None:
+        _write_aggregate_metadata(catalog_root, file_metadata, schema)
+
+
+def _count_catalog_rows(catalog_root: Path) -> int:
+    return sum(
+        pq.read_metadata(str(p)).num_rows
+        for p in catalog_root.rglob("Npix=*.parquet")
+    )
+
+
+def _finalize_catalog_writes(
+    catalog_root: Path,
+    survey_name: str,
+    norder: int,
+    *,
+    ra_col: str,
+    dec_col: str,
+    source_id_mode: str,
+    streaming: bool,
+    fallback_n_cols: int,
+) -> None:
+    """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles."""
+    catalog_root.mkdir(parents=True, exist_ok=True)
+    tile_paths = sorted(catalog_root.rglob("Npix=*.parquet"))
+    total_rows = _count_catalog_rows(catalog_root)
+    n_cols = (
+        len(pq.read_schema(str(tile_paths[0])))
+        if tile_paths
+        else fallback_n_cols
+    )
+    _regenerate_metadata_from_all_tiles(catalog_root)
+    info_path = catalog_root / "catalog_info.json"
+    if info_path.exists():
+        with open(info_path) as fh:
+            info = json.load(fh)
+        info["total_rows"] = total_rows
+        info["total_columns"] = n_cols
+        info["hats_order"] = norder
+        with open(info_path, "w") as fh:
+            json.dump(info, fh, indent=2)
+    else:
+        _write_catalog_info(
+            catalog_root,
+            survey_name,
+            norder,
+            total_rows,
+            n_cols,
+            ra_column=ra_col,
+            dec_column=dec_col,
+            source_id_mode=source_id_mode,
+            streaming=streaming,
+        )
+
+
+def _write_catalog_parquet_tile(
+    tile_table: pa.Table,
+    out_file: Path,
+    options: CatalogParquetOptions,
+) -> pq.FileMetaData:
+    if options.shrink_strings_for_tiles:
+        tile_table = _shrink_tile_table_for_disk(tile_table)
+    writer = pq.ParquetWriter(
+        str(out_file),
+        tile_table.schema,
+        compression="zstd",
+        compression_level=options.compression_level,
+        write_statistics=options.write_statistics,
+        use_dictionary=options.use_dictionary,
+    )
+    writer.write_table(tile_table)
+    writer.close()
+    return pq.read_metadata(str(out_file))
+
+
 def ingest_catalog(
     source_path: Path | str,
     output_root: Path | str,
@@ -365,7 +650,12 @@ def ingest_catalog(
     norder: int = 5,
     source_id_col: str | None = None,
     overwrite: bool = False,
+    tile_mode: TileMode | None = None,
+    on_duplicate_id: DuplicateIdMode = "skip",
     streaming: bool = False,
+    columns: Sequence[str] | None = None,
+    parquet_options: CatalogParquetOptions | None = None,
+    compact: bool = False,
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -387,7 +677,15 @@ def ingest_catalog(
         If provided, used as the stable ``source_id``; otherwise a sequential ID
         is generated.
     overwrite:
-        If False (default), skip tiles that already exist.
+        Deprecated. Use ``tile_mode`` instead. When True, equivalent to
+        ``tile_mode="overwrite"``.
+    tile_mode:
+        How to handle an existing ``Npix=*.parquet`` tile: ``skip`` (default),
+        ``overwrite`` (replace), or ``append`` (read–concat–write).
+    on_duplicate_id:
+        When ``tile_mode="append"`` and an ID column exists (``source_id_col``
+        or auto ``source_id``): ``skip`` drops incoming duplicates, ``error``
+        fails, ``last`` replaces existing rows with the same ID.
     streaming:
         When ``True`` (FITS input only), memory-map the input and write
         one tile at a time using per-tile fancy indexing.  Memory peak is
@@ -396,10 +694,25 @@ def ingest_catalog(
         ~3× the raw table size in RAM (full copy + sorted copy + per-tile
         slice).  Slightly slower per-tile due to scattered I/O.  See
         :func:`_ingest_catalog_streaming` for the implementation.
+    columns:
+        If set, only these FITS columns (plus required sky/ID/HEALPix/index
+        columns) are written.  Largest win for DESI's ~140-column tables.
+    parquet_options:
+        ZSTD level, statistics, dictionary encoding, and per-tile string
+        narrowing.  Ignored when ``compact=True`` (uses :meth:`CatalogParquetOptions.compact`).
+    compact:
+        Preset for smaller files: ZSTD level 9, no column statistics, no
+        dictionary encoding, narrow string type per tile.
     """
     source_path = Path(source_path)
     output_root = Path(output_root)
     catalog_root = output_root / "catalogs" / survey_name
+    pq_opts = (
+        CatalogParquetOptions.compact()
+        if compact
+        else (parquet_options or CatalogParquetOptions())
+    )
+    resolved_tile_mode = _resolve_tile_mode(tile_mode, overwrite)
 
     if streaming:
         _ingest_catalog_streaming(
@@ -410,7 +723,10 @@ def ingest_catalog(
             dec_col=dec_col,
             norder=norder,
             source_id_col=source_id_col,
-            overwrite=overwrite,
+            tile_mode=resolved_tile_mode,
+            on_duplicate_id=on_duplicate_id,
+            columns=columns,
+            parquet_options=pq_opts,
         )
         return
 
@@ -444,6 +760,10 @@ def ingest_catalog(
         )
 
     table = _add_healpix_columns(table, ra_col, dec_col, norder)
+    table = _filter_table_columns(
+        table, columns, ra_col=ra_col, dec_col=dec_col,
+        source_id_col=source_id_col, norder=norder,
+    )
     hp_col = f"_healpix_norder{norder}"
 
     # Sort by healpix for locality (so per-tile slicing is contiguous and O(1))
@@ -459,7 +779,7 @@ def ingest_catalog(
     group_starts = np.append(group_starts, len(pix_np))
     log.info("Writing %d HEALPix tiles at Norder=%d …", len(unique_pixels), norder)
 
-    writer_meta: list[pq.FileMetaData] = []
+    tiles_written = 0
     t0 = time.perf_counter()
     for g, npix in enumerate(unique_pixels.tolist()):
         s, e = int(group_starts[g]), int(group_starts[g + 1])
@@ -469,43 +789,36 @@ def ingest_catalog(
         out_dir.mkdir(parents=True, exist_ok=True)
         out_file = out_dir / f"Npix={int(npix)}.parquet"
 
-        if out_file.exists() and not overwrite:
-            log.debug("Skip existing tile %s", out_file)
-            continue
-
-        writer = pq.ParquetWriter(
-            str(out_file),
-            tile_table.schema,
-            compression="zstd",
-            compression_level=_ZSTD_LEVEL,
-            write_statistics=True,
-            use_dictionary=True,
-        )
-        writer.write_table(tile_table)
-        writer.close()
-
-        meta = pq.read_metadata(str(out_file))
-        writer_meta.append(meta)
+        if _write_tile_for_mode(
+            out_file,
+            tile_table,
+            tile_mode=resolved_tile_mode,
+            on_duplicate_id=on_duplicate_id,
+            source_id_col=source_id_col,
+            parquet_options=pq_opts,
+        ) is not None:
+            tiles_written += 1
 
     elapsed = time.perf_counter() - t0
-    log.info("Wrote %d tiles in %.1f s", len(unique_pixels), elapsed)
+    log.info(
+        "Processed %d HEALPix tiles (%d written/updated) in %.1f s",
+        len(unique_pixels), tiles_written, elapsed,
+    )
 
-    _write_aggregate_metadata(catalog_root, writer_meta, table.schema)
     sid_mode = (
         f"column:{source_id_col}"
         if source_id_col and source_id_col in table.schema.names
         else "sequential"
     )
-    _write_catalog_info(
+    _finalize_catalog_writes(
         catalog_root,
         survey_name,
         norder,
-        len(table),
-        len(table.schema),
-        ra_column=ra_col,
-        dec_column=dec_col,
+        ra_col=ra_col,
+        dec_col=dec_col,
         source_id_mode=sid_mode,
         streaming=False,
+        fallback_n_cols=len(table.schema),
     )
     log.info("Catalog written to %s", catalog_root)
 
@@ -518,7 +831,10 @@ def _ingest_catalog_streaming(
     dec_col: str,
     norder: int,
     source_id_col: str | None,
-    overwrite: bool,
+    tile_mode: TileMode,
+    on_duplicate_id: DuplicateIdMode = "skip",
+    columns: Sequence[str] | None = None,
+    parquet_options: CatalogParquetOptions | None = None,
 ) -> None:
     """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
     the full catalog as a PyArrow Table in RAM.
@@ -556,6 +872,8 @@ def _ingest_catalog_streaming(
             f"got {source_path.name!r}.  Use the default in-memory path for "
             "Parquet / VOTable / CSV / ECSV inputs."
         )
+
+    pq_opts = parquet_options or CatalogParquetOptions()
 
     log.info("Reading %s as fits (streaming, memmapped) …", source_path.name)
 
@@ -605,8 +923,8 @@ def _ingest_catalog_streaming(
         catalog_root.mkdir(parents=True, exist_ok=True)
         hp_col = f"_healpix_norder{norder}"
 
-        writer_meta: list[pq.FileMetaData] = []
         tile_schema: pa.Schema | None = None
+        tiles_written = 0
         t0 = time.perf_counter()
 
         for g, npix in enumerate(unique_pixels.tolist()):
@@ -645,6 +963,11 @@ def _ingest_catalog_streaming(
                 pa.array(np.full(n_tile, -1, dtype=np.int64), type=pa.int64()),
             )
 
+            tile_table = _filter_table_columns(
+                tile_table, columns, ra_col=ra_col, dec_col=dec_col,
+                source_id_col=source_id_col, norder=norder,
+            )
+
             if tile_schema is None:
                 tile_schema = tile_table.schema
 
@@ -652,46 +975,38 @@ def _ingest_catalog_streaming(
             out_dir.mkdir(parents=True, exist_ok=True)
             out_file = out_dir / f"Npix={int(npix)}.parquet"
 
-            if out_file.exists() and not overwrite:
-                log.debug("Skip existing tile %s", out_file)
-                continue
-
-            writer = pq.ParquetWriter(
-                str(out_file),
-                tile_table.schema,
-                compression="zstd",
-                compression_level=_ZSTD_LEVEL,
-                write_statistics=True,
-                use_dictionary=True,
-            )
-            writer.write_table(tile_table)
-            writer.close()
-
-            writer_meta.append(pq.read_metadata(str(out_file)))
+            if _write_tile_for_mode(
+                out_file,
+                tile_table,
+                tile_mode=tile_mode,
+                on_duplicate_id=on_duplicate_id,
+                source_id_col=source_id_col,
+                parquet_options=pq_opts,
+            ) is not None:
+                tiles_written += 1
 
         elapsed = time.perf_counter() - t0
         log.info(
-            "Wrote %d tiles in %.1f s (streaming, peak ≈ tile-sized)",
-            len(unique_pixels), elapsed,
+            "Processed %d tiles (%d written/updated) in %.1f s "
+            "(streaming, peak ≈ tile-sized)",
+            len(unique_pixels), tiles_written, elapsed,
         )
 
         if tile_schema is not None:
-            _write_aggregate_metadata(catalog_root, writer_meta, tile_schema)
             sid_mode = (
                 f"column:{source_id_col}"
                 if source_id_col and source_id_col in col_names
                 else "sequential"
             )
-            _write_catalog_info(
+            _finalize_catalog_writes(
                 catalog_root,
                 survey_name,
                 norder,
-                n_rows,
-                len(tile_schema),
-                ra_column=ra_col,
-                dec_column=dec_col,
+                ra_col=ra_col,
+                dec_col=dec_col,
                 source_id_mode=sid_mode,
                 streaming=True,
+                fallback_n_cols=len(tile_schema),
             )
         log.info("Catalog written to %s", catalog_root)
 
@@ -753,11 +1068,14 @@ def ingest_catalog_batch(
     norder: int = 5,
     source_id_col: str | None = None,
     overwrite: bool = False,
+    tile_mode: TileMode | None = None,
+    on_duplicate_id: DuplicateIdMode = "skip",
 ) -> None:
     """Ingest multiple source files into the same survey catalog.
 
-    Each file is passed to :func:`ingest_catalog` with the same ``overwrite``
-    flag (default ``False``, matching single-file ingest).
+    Each file is passed to :func:`ingest_catalog` with the same tile policy.
+    For overlapping sky, use ``tile_mode="append"`` (and ``--on-duplicate-id``
+    as needed).
     """
     for path in source_paths:
         ingest_catalog(
@@ -769,6 +1087,8 @@ def ingest_catalog_batch(
             norder=norder,
             source_id_col=source_id_col,
             overwrite=overwrite,
+            tile_mode=tile_mode,
+            on_duplicate_id=on_duplicate_id,
         )
 
 
@@ -797,13 +1117,44 @@ try:
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
     @click.option("--source-id-col", default=None)
-    @click.option("--overwrite", is_flag=True)
+    @click.option(
+        "--tile-mode",
+        type=click.Choice(["skip", "overwrite", "append"], case_sensitive=False),
+        default=None,
+        help="Existing Npix tile: skip (default), replace, or read-concat-write.",
+    )
+    @click.option(
+        "--on-duplicate-id",
+        type=click.Choice(["skip", "error", "last"], case_sensitive=False),
+        default="skip",
+        show_default=True,
+        help="When --tile-mode=append and an ID column exists.",
+    )
+    @click.option("--overwrite", is_flag=True, help="Deprecated: use --tile-mode overwrite.")
     @click.option(
         "--streaming/--no-streaming", default=False, show_default=True,
         help="FITS-only: memmap the input and write one tile at a time. "
              "Bounds memory peak to ~one tile's worth of rows (tens of MB) "
              "instead of holding the full table + sorted copy in RAM. "
              "Recommended for catalogs >~ 50 M rows.",
+    )
+    @click.option(
+        "--columns",
+        default=None,
+        help="Comma-separated FITS columns to keep (sky, ID, HEALPix, and index "
+             "columns are always added). Omit rarely used columns to cut disk use.",
+    )
+    @click.option(
+        "--compact",
+        is_flag=True,
+        help="Smaller Parquet tiles: ZSTD-9, no per-column statistics, no "
+             "dictionary encoding, narrow string type per tile.",
+    )
+    @click.option(
+        "--compression-level",
+        default=None,
+        type=int,
+        help="ZSTD level for catalog tiles (default 3; ignored if --compact).",
     )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
@@ -815,8 +1166,13 @@ try:
         dec_col: str,
         norder: int | None,
         source_id_col: str | None,
+        tile_mode: str | None,
+        on_duplicate_id: str,
         overwrite: bool,
         streaming: bool,
+        columns: str | None,
+        compact: bool,
+        compression_level: int | None,
         verbose: bool,
     ) -> None:
         """Ingest FITS/VOTable SOURCE_PATH into HATS-partitioned Parquet.
@@ -830,6 +1186,11 @@ try:
         cfg = load_optional_config(config_path)
         resolved_output = require_output_root(output_root, cfg, kind="catalogs")
 
+        col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+        pq_opts = None
+        if compression_level is not None and not compact:
+            pq_opts = CatalogParquetOptions(compression_level=compression_level)
+
         ingest_catalog(
             source_path=source_path,
             output_root=resolved_output,
@@ -840,7 +1201,12 @@ try:
                         cfg.partitioning.hats_order if cfg else None, 5),
             source_id_col=source_id_col,
             overwrite=overwrite,
+            tile_mode=tile_mode.lower() if tile_mode else None,  # type: ignore[arg-type]
+            on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
             streaming=streaming,
+            columns=col_list,
+            parquet_options=pq_opts,
+            compact=compact,
         )
 
 except ImportError:

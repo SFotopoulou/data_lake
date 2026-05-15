@@ -56,6 +56,24 @@ def _write_table_as_fits(tbl: Table, path: Path) -> None:
     tbl.write(str(path), format="fits", overwrite=True)
 
 
+def _make_same_pixel_table(targetids: list[int], *, ra: float = 120.0, dec: float = 45.0) -> Table:
+    """Rows that share one HEALPix pixel at Norder=5 (for tile-mode tests)."""
+    n = len(targetids)
+    return Table({
+        "TARGETID": np.array(targetids, dtype=np.int64),
+        "TARGET_RA": np.full(n, ra, dtype=np.float64),
+        "TARGET_DEC": np.full(n, dec, dtype=np.float64),
+        "Z": np.arange(n, dtype=np.float64),
+    })
+
+
+def _read_merged_catalog(lake_root: Path, survey: str) -> tuple[list[Path], pa.Table]:
+    root = lake_root / "catalogs" / survey
+    tiles = sorted(root.rglob("Npix=*.parquet"))
+    merged = pa.concat_tables([pq.ParquetFile(str(p)).read() for p in tiles])
+    return tiles, merged
+
+
 # ---------------------------------------------------------------------------
 # _astropy_table_to_arrow — unit tests on the converter itself
 # ---------------------------------------------------------------------------
@@ -308,9 +326,10 @@ class TestStreamingIngest:
             f = t.schema.field("COEFF").type
             assert isinstance(f, pa.FixedSizeListType) and f.list_size == 10
 
-        # SPECTYPE preserved as large_string in both
+        # SPECTYPE preserved as a string column (large_string in RAM, string per tile on disk)
         for t in (mem_tbl, stream_tbl):
-            assert t.schema.field("SPECTYPE").type == pa.large_string()
+            stype = t.schema.field("SPECTYPE").type
+            assert pa.types.is_string(stype) or pa.types.is_large_string(stype)
 
         # Set-wise value equivalence (order may differ within a tile)
         def by_tid(t):
@@ -367,3 +386,152 @@ class TestStreamingIngest:
         assert merged.num_rows == 4
         assert "source_id" in merged.schema.names
         assert set(np.asarray(merged.column("source_id")).tolist()) == {0, 1, 2, 3}
+
+
+# ---------------------------------------------------------------------------
+# tile_mode: skip | overwrite | append
+# ---------------------------------------------------------------------------
+
+
+class TestTileMode:
+    def _ingest_two(
+        self,
+        tmp_path: Path,
+        ids_a: list[int],
+        ids_b: list[int],
+        *,
+        second_tile_mode: str,
+        on_duplicate_id: str = "skip",
+    ) -> pa.Table:
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        lake = tmp_path / "lake"
+        fits_a = tmp_path / "a.fits"
+        fits_b = tmp_path / "b.fits"
+        _write_table_as_fits(_make_same_pixel_table(ids_a), fits_a)
+        _write_table_as_fits(_make_same_pixel_table(ids_b), fits_b)
+
+        common = dict(
+            output_root=lake,
+            survey_name="tile_test",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+        )
+        ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
+        ingest_catalog(
+            source_path=fits_b,
+            tile_mode=second_tile_mode,
+            on_duplicate_id=on_duplicate_id,
+            **common,
+        )
+        _, merged = _read_merged_catalog(lake, "tile_test")
+        return merged
+
+    def test_append_concatenates_rows(self, tmp_path: Path):
+        merged = self._ingest_two(tmp_path, [1, 2, 3], [4, 5], second_tile_mode="append")
+        assert merged.num_rows == 5
+        assert set(np.asarray(merged.column("TARGETID")).tolist()) == {1, 2, 3, 4, 5}
+
+    def test_skip_leaves_existing_tile(self, tmp_path: Path):
+        merged = self._ingest_two(tmp_path, [1, 2, 3], [4, 5], second_tile_mode="skip")
+        assert merged.num_rows == 3
+        assert set(np.asarray(merged.column("TARGETID")).tolist()) == {1, 2, 3}
+
+    def test_overwrite_replaces_tile(self, tmp_path: Path):
+        merged = self._ingest_two(tmp_path, [1, 2, 3], [4, 5], second_tile_mode="overwrite")
+        assert merged.num_rows == 2
+        assert set(np.asarray(merged.column("TARGETID")).tolist()) == {4, 5}
+
+    def test_append_duplicate_id_error(self, tmp_path: Path):
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        lake = tmp_path / "lake"
+        fits_a = tmp_path / "a.fits"
+        fits_b = tmp_path / "b.fits"
+        _write_table_as_fits(_make_same_pixel_table([1, 2]), fits_a)
+        _write_table_as_fits(_make_same_pixel_table([2, 3]), fits_b)
+        common = dict(
+            output_root=lake,
+            survey_name="dup",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+        )
+        ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
+        with pytest.raises(ValueError, match="Duplicate object ID"):
+            ingest_catalog(
+                source_path=fits_b,
+                tile_mode="append",
+                on_duplicate_id="error",
+                **common,
+            )
+
+    def test_append_duplicate_id_last(self, tmp_path: Path):
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        lake = tmp_path / "lake"
+        fits_a = tmp_path / "a.fits"
+        fits_b = tmp_path / "b.fits"
+        _write_table_as_fits(_make_same_pixel_table([1, 2]), fits_a)
+        _write_table_as_fits(_make_same_pixel_table([2, 3]), fits_b)
+        common = dict(
+            output_root=lake,
+            survey_name="last",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+        )
+        ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
+        ingest_catalog(
+            source_path=fits_b,
+            tile_mode="append",
+            on_duplicate_id="last",
+            **common,
+        )
+        _, merged = _read_merged_catalog(lake, "last")
+        assert merged.num_rows == 3
+        tids = np.asarray(merged.column("TARGETID"))
+        z = np.asarray(merged.column("Z"))
+        by_id = {int(t): float(zv) for t, zv in zip(tids, z)}
+        assert by_id[1] == 0.0
+        assert by_id[2] == 0.0  # second file's row for ID 2 (Z index 0 in 2-row table)
+        assert by_id[3] == 1.0
+
+    def test_metadata_lists_all_on_disk_tiles(self, tmp_path: Path):
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        lake = tmp_path / "lake"
+        # File A: one shared pixel; file B: different sky → second tile
+        _write_table_as_fits(_make_same_pixel_table([1, 2]), tmp_path / "a.fits")
+        tbl_b = Table({
+            "TARGETID": np.array([10, 11], dtype=np.int64),
+            "TARGET_RA": np.array([200.0, 201.0]),
+            "TARGET_DEC": np.array([10.0, 11.0]),
+            "Z": np.array([0.0, 1.0]),
+        })
+        _write_table_as_fits(tbl_b, tmp_path / "b.fits")
+
+        common = dict(
+            output_root=lake,
+            survey_name="meta",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+        )
+        ingest_catalog(source_path=tmp_path / "a.fits", tile_mode="overwrite", **common)
+        ingest_catalog(source_path=tmp_path / "b.fits", tile_mode="append", **common)
+
+        catalog_root = lake / "catalogs" / "meta"
+        n_tiles = len(list(catalog_root.rglob("Npix=*.parquet")))
+        assert n_tiles >= 2
+        combined = pq.read_metadata(str(catalog_root / "_metadata"))
+        assert combined.num_row_groups == n_tiles
+
+        with open(catalog_root / "catalog_info.json") as fh:
+            info = json.load(fh)
+        assert info["total_rows"] == 4
