@@ -44,7 +44,8 @@ transitive deps), and keeps the env isolated from your system Python.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"   # add to your shell rc
 
-# 2. Create a Python 3.11 venv inside the project
+# 2. Clone repo and create a Python 3.11 venv inside the project
+git clone https://github.com/SFotopoulou/data_lake.git
 cd data_lake
 uv venv --python 3.11 .venv
 
@@ -131,8 +132,7 @@ dl-ingest-catalog survey_catalog.fits /data/lake --survey des_dr2 --ra-col RA --
 
 Explicit CLI flags (`--norder`, etc.) override config defaults.
 
-For very large FITS catalogs (≳ 50 M rows, e.g. DESI's `zall-pix-iron.fits`
-at 28 M × 140 cols) pass `--streaming`. The streaming path memory-maps
+For very large FITS catalogs pass `--streaming`. The streaming path memory-maps
 the FITS, sorts only RA/Dec/source_id columns, then writes one HEALPix
 tile at a time via per-tile fancy indexing into the memmap:
 
@@ -198,8 +198,6 @@ Optional flags: ``--band-names r,i,z``, ``--dtype float64``, and ``--on-duplicat
 `coadd_cameras` for correct IVAR-weighted B/R/Z camera combination):
 
 ```bash
-pip install 'data-lake[desi]'
-
 # Single file (debug / smoke-testing).
 # With $DATA_LAKE_CONFIG set, OUTPUT_ROOT is taken from the config.
 dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits --survey desi_edr
@@ -346,7 +344,7 @@ R       = dia_matrix((diags, offsets), shape=(N, N))
 ### Extract a curated subset into one flat Zarr
 
 Once spectra are ingested, you can materialise a self-contained Zarr
-group containing only a user-specified subset of sources (e.g. 129k
+group containing only a user-specified subset of sources (e.g. 100k
 DESI targets out of a fully-ingested release). Reads are batched per
 HEALPix tile via Zarr orthogonal indexing so each source shard is
 decompressed at most once.
@@ -603,13 +601,13 @@ The `schema_version` field in `catalog_info.json` is a plain integer starting at
 
 See `notebooks/` for worked examples:
 
-1. **`01_duckdb_catalog_query.ipynb`** — SQL queries over multi-survey Parquet catalogs
-2. **`02_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
-3. **`03_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
-4. **`04_spectrum_workflow.ipynb`** — Ingest spectra, query, transform, 1-D CNN training loop, FITS export + round-trip
-5. **`05_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`)
-6. **`06_catalog_ingest.ipynb`** — FITS → HEALPix Parquet ingest, validation, and `CatalogAccessor` queries (self-contained temp lake or your paths)
-7. **`07_cutout_ingest.ipynb`** — FITS stamps → Zarr cutout stacks, validation, `CutoutAccessor`, optional `_cutout_index` catalog patch
+1. **`01_catalog_ingest.ipynb`** — FITS → HEALPix Parquet ingest, validation, and `CatalogAccessor` queries (self-contained temp lake or your paths)
+2. **`02_spectrum_workflow.ipynb`** — Ingest spectra, query, transform, 1-D CNN training loop, FITS export + round-trip
+3. **`03_cutout_ingest.ipynb`** — FITS stamps → Zarr cutout stacks, validation, `CutoutAccessor`, optional `_cutout_index` catalog patch
+4. **`04_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`)
+5. **`11_duckdb_catalog_query.ipynb`** — SQL queries over multi-survey Parquet catalogs
+6. **`12_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
+7. **`13_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
 
 ## Key design decisions
 
