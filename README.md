@@ -9,9 +9,9 @@ A local-first data lake for multi-survey astronomy catalogs, galaxy image cutout
 
 ## Quick-start
 
-We recommend [`uv`](https://docs.astral.sh/uv/) for environment management - it is
-fast, resolves the dependency graph correctly (including `desispec` and its
-transitive deps), and keeps the env isolated from your system Python.
+Use [`uv`](https://docs.astral.sh/uv/) for all Python environments in this repo.
+It installs from the pinned `uv.lock`, resolves `desispec` and its transitive
+deps correctly, and keeps the env isolated from system Python.
 
 ```bash
 # 1. Install uv (one-time, per machine)
@@ -23,31 +23,37 @@ git clone https://github.com/SFotopoulou/data_lake.git
 cd data_lake
 uv venv --python 3.11 .venv
 
-# 3. Install the package editable, with whichever extras you need:
-#    [desi] for DESI ingest (pulls in desispec)
-#    [dev]  for tests + notebooks
-uv pip install --python .venv/bin/python -e ".[desi,dev]"
+# 3. Install from the lockfile (editable package + extras):
+#    desi — DESI ingest (pulls in desispec)
+#    dev  — pytest, Jupyter, matplotlib, napari, …
+uv sync --extra desi --extra dev
 
-# 4. Activate the env (or invoke the venv python directly)
+# 4. Activate the env (or use `uv run` / `.venv/bin/python` without activating)
 source .venv/bin/activate
 ```
+
+To add or bump dependencies, edit `pyproject.toml` and run `uv lock`, then
+`uv sync` again.
+
+**Jupyter / notebooks:** register the project kernel once:
+
+```bash
+uv run python -m ipykernel install --user --name=data-lake --display-name "Python (data-lake)"
+```
+
+Select **Python (data-lake)** in JupyterLab. All notebooks under `notebooks/`
+assume this environment.
 
 Smoke test before any large ingest:
 
 ```bash
-.venv/bin/python -m pytest tests/test_desi_ingest.py -v       # unit tests
-.venv/bin/python scripts/dry_run_desi_ingest.py               # end-to-end on 3 DESI files
+uv run python -m pytest tests/test_desi_ingest.py -v       # unit tests
+uv run python scripts/dry_run_desi_ingest.py               # end-to-end on 3 DESI files
 ```
 
 The dry-run script ingests three small DESI coadd files in both
 `--with-resolution` and plain modes, then reads them back to verify shape,
 finiteness, and (for the resolution path) interior row sums ~1.0.
-
-### Plain pip (alternative)
-
-```bash
-pip install -e ".[desi,dev]"
-```
 
 ### Create a deployment
 
@@ -94,7 +100,7 @@ You can have multiple deployments side by side (e.g. `prod`, `staging`,
 
 | Role | Install | `DATA_LAKE_CONFIG` | `LAKE_INGEST_TOKEN` | Data path |
 |------|---------|-------------------|---------------------|-----------|
-| **Analyst** | `pip install data-lake` | Shared deployment config | **Not used** | Read-only mount |
+| **Analyst** | `uv pip install data-lake` (or `uv sync` in a clone) | Shared deployment config | **Not used** | Read-only mount |
 | **Ingest operator** | Same package | Same or writable deployment | **Required** for `dl-ingest-*` | Read-write |
 
 Installing the package only provides scripts and the Python API. It does **not**
@@ -610,14 +616,14 @@ To backfill an existing lake where spectra or cutouts were ingested without
 catalog patching (no FITS re-ingestion needed):
 
 ```bash
-# Register console scripts after pulling this feature (once per env):
-pip install -e .
+# Register console scripts after pulling (once per env):
+uv sync --extra desi --extra dev
 
 dl-rebuild-catalog-indices --survey desi_dr1 --kind spectrum
 dl-rebuild-catalog-indices --survey desi_dr1 --kind cutout   # if cutouts exist
 
 # Without reinstalling, use the module directly:
-python -m data_lake.ingest.update_catalog_indices --survey desi_dr1 --kind spectrum
+uv run python -m data_lake.ingest.update_catalog_indices --survey desi_dr1 --kind spectrum
 ```
 
 For manual / Python-API use:
@@ -800,6 +806,10 @@ The `schema_version` field in `catalog_info.json` is a plain integer starting at
 
 ## Example notebooks
 
+All notebooks expect the **uv** project environment from [Quick-start](#quick-start)
+(`.venv` + `uv sync --extra desi --extra dev`, kernel **Python (data-lake)**).
+Do not use a bare system Python or an ad-hoc `pip install` outside `uv`.
+
 See `notebooks/` for worked examples:
 
 1. **`01_catalog_ingest.ipynb`** — FITS → HEALPix Parquet ingest, validation, and `CatalogAccessor` queries (self-contained temp lake or your paths)
@@ -877,4 +887,5 @@ Core: `pyarrow`, `zarr>=3`, `numcodecs`, `duckdb`, `astropy`, `healpy`, `numpy`,
 
 Catalog queries (`CatalogAccessor.query` and related helpers) return **Polars** DataFrames by default (`fmt="polars"`). Use `fmt="arrow"` or `fmt="astropy"` when you need those types instead.
 
-Optional: `napari`, `matplotlib`, `jupyterlab` (install with `pip install -e ".[dev]"`)
+Optional extras (included in `dev`): `napari`, `matplotlib`, `jupyterlab`, `ipykernel` —
+install via `uv sync --extra dev` (or `uv sync --extra desi --extra dev` for full ingest + notebooks).
