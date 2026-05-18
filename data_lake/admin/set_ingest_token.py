@@ -1,9 +1,7 @@
 """
-`dl-set-ingest-token` – enable or rotate ingest guardrails on an existing deployment.
+`dl-set-ingest-token` – set or rotate the ingest operator token on a deployment.
 
-Writes ``.ingest_token_hash`` (SHA-256 only, mode 0600) and sets
-``guardrails.require_ingest_token`` in ``lake_config.toml``.  Does not touch
-data tiles.
+Writes ``.ingest_token_hash`` (SHA-256 only, mode 0600).  Does not touch data tiles.
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ def set_ingest_token(
     *,
     config_path: Path | None = None,
 ) -> Path:
-    """Enable ingest guardrails for an existing deployment.
+    """Set or rotate the ingest token for an existing deployment.
 
     Parameters
     ----------
@@ -60,8 +58,6 @@ def set_ingest_token(
         raise RuntimeError("loaded config has no source_path")
 
     deployment = cfg.source_path.parent
-    cfg.guardrails.require_ingest_token = True
-    cfg.guardrails.ingest_token_hash = ""
     cfg.write(cfg.source_path)
     write_ingest_token_hash(deployment, token)
     _ensure_gitignore_lists_ingest_hash(deployment)
@@ -78,7 +74,7 @@ def set_ingest_token(
          f"${INGEST_TOKEN_ENV}).",
 )
 def dl_set_ingest_token(config_path: Path | None, ingest_token: str) -> None:
-    """Enable or rotate ingest guardrails on an existing deployment."""
+    """Set or rotate the ingest operator token on an existing deployment."""
     try:
         deployment = set_ingest_token(ingest_token, config_path=config_path)
     except LakeConfigNotFound as exc:
@@ -89,6 +85,6 @@ def dl_set_ingest_token(config_path: Path | None, ingest_token: str) -> None:
     cfg_path = deployment / CONFIG_FILENAME
     click.echo(f"Deployment:         {deployment}")
     click.echo(f"Config updated:     {cfg_path}")
-    click.echo(f"Ingest guardrails:  on ({_INGEST_HASH_GITIGNORE_LINE} written, chmod 600)")
+    click.echo(f"Ingest token hash:  {_INGEST_HASH_GITIGNORE_LINE} (written, chmod 600)")
     click.echo("")
     click.echo(f"  export {INGEST_TOKEN_ENV}='<your ingest token>'  # before dl-ingest-*")

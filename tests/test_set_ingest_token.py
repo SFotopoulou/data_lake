@@ -24,13 +24,13 @@ schema_version = "1"
 name = "existing"
 root = "{(dep / 'data').as_posix()}"
 [guardrails]
-require_ingest_token = false
+ingest_token_file = ".ingest_token_hash"
 """
     )
     return cfg_path
 
 
-def test_set_ingest_token_enables_guardrails(tmp_path: Path) -> None:
+def test_set_ingest_token_writes_sidecar(tmp_path: Path) -> None:
     cfg_path = _write_minimal_config(tmp_path)
     deployment = set_ingest_token("new-secret", config_path=cfg_path)
 
@@ -39,8 +39,6 @@ def test_set_ingest_token_enables_guardrails(tmp_path: Path) -> None:
     assert sidecar.read_text().strip() == hash_ingest_token("new-secret")
 
     cfg = LakeConfig.load(cfg_path)
-    assert cfg.guardrails.require_ingest_token is True
-    assert cfg.guardrails.ingest_token_hash == ""
     require_ingest_permission(cfg, "new-secret")
 
 

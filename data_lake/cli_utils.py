@@ -46,13 +46,13 @@ def ingest_token_option(f: F) -> F:
         "ingest_token",
         default=None,
         envvar=INGEST_TOKEN_ENV,
-        help="Ingest guard token when [guardrails] require_ingest_token is true in "
-             "lake_config.toml (prefer the env var in batch jobs).",
+        help="Ingest operator token (deployment hash in .ingest_token_hash; "
+             f"prefer ${INGEST_TOKEN_ENV} in batch jobs).",
     )(f)
 
 
 def hash_ingest_token(token: str) -> str:
-    """Return the SHA-256 hex digest stored in ``[guardrails] ingest_token_hash``."""
+    """Return the SHA-256 hex digest stored in the deployment ``.ingest_token_hash``."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
@@ -81,11 +81,7 @@ def write_ingest_token_hash(
 
 
 def resolve_expected_ingest_hash(cfg: LakeConfig) -> str:
-    """Expected SHA-256 hex: inline ``ingest_token_hash`` or deployment sidecar."""
-    inline = (cfg.guardrails.ingest_token_hash or "").strip()
-    if inline:
-        return inline.lower()
-
+    """Expected SHA-256 hex from the deployment sidecar next to ``lake_config.toml``."""
     if cfg.source_path is None:
         return ""
 
@@ -104,26 +100,24 @@ def require_ingest_permission(
     cfg: LakeConfig | None,
     ingest_token: str | None = None,
 ) -> None:
-    """Block accidental writes when the deployment opts into ingest guardrails.
+    """Require a valid ingest token before any ``dl-ingest-*`` write.
 
-    This is a **guardrail against mistakes**, not access control: anyone with
-    shell access and the token can still ingest.  Pair with filesystem permissions
-    (read-only lake mount for analysts) for real separation.
-
-    When ``cfg.guardrails.require_ingest_token`` is false or no config is loaded,
-    this is a no-op (legacy CLIs without a deployment config are unchanged).
+    Rudimentary operator authentication only: anyone with shell access, the token,
+    and write permission on the data path can still ingest.  Real separation uses
+    filesystem ACLs (read-only lake for analysts) and future auth integration.
     """
-    if cfg is None or not cfg.guardrails.require_ingest_token:
-        return
+    if cfg is None:
+        raise click.ClickException(
+            "Ingest requires a deployment config.  Set $DATA_LAKE_CONFIG or pass "
+            "--config, then provide an ingest token (dl-init / dl-set-ingest-token)."
+        )
 
     expected = resolve_expected_ingest_hash(cfg)
     if not expected:
         raise click.ClickException(
-            "lake_config.toml has guardrails.require_ingest_token = true but "
-            "no ingest token hash was found.  At init time use:\n"
+            "No ingest token hash found for this deployment.  Run:\n"
             "  dl-init NAME PARENT --ingest-token 'your-secret'\n"
-            "or write .ingest_token_hash in the deployment directory, or set "
-            "guardrails.ingest_token_hash in lake_config.toml."
+            "or: dl-set-ingest-token --ingest-token 'your-secret'"
         )
 
     provided = (ingest_token or os.environ.get(INGEST_TOKEN_ENV) or "").strip()

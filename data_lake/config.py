@@ -37,9 +37,7 @@ Schema (lake_config.toml)
     log_level   = "INFO"                   # standard logging level
 
     [guardrails]
-    require_ingest_token = false           # when true, dl-ingest-* needs $LAKE_INGEST_TOKEN
-    ingest_token_hash  = ""                # SHA-256 hex (optional; prefer .ingest_token_hash)
-    ingest_token_file  = ".ingest_token_hash"  # sidecar next to lake_config.toml (gitignored)
+    ingest_token_file = ".ingest_token_hash"   # SHA-256 hex sidecar (gitignored); set via dl-init
 
 Discovery order
 ---------------
@@ -56,7 +54,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -102,8 +100,6 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
         "log_level":   "INFO",
     },
     "guardrails": {
-        "require_ingest_token": False,
-        "ingest_token_hash": "",
         "ingest_token_file": ".ingest_token_hash",
     },
 }
@@ -150,8 +146,6 @@ class _Ingest:
 
 @dataclass(slots=True)
 class _Guardrails:
-    require_ingest_token: bool = False
-    ingest_token_hash: str = ""
     ingest_token_file: str = ".ingest_token_hash"
 
 
@@ -290,7 +284,8 @@ class LakeConfig:
 
         def _merge(section: str, dc_cls):
             d = {**_DEFAULTS[section], **data.get(section, {})}
-            return dc_cls(**d)
+            valid = {f.name for f in fields(dc_cls)}
+            return dc_cls(**{k: v for k, v in d.items() if k in valid})
 
         try:
             partitioning = _merge("partitioning", _Partitioning)
@@ -351,9 +346,7 @@ class LakeConfig:
             f'log_level   = {_q(self.ingest.log_level)}',
             "",
             "[guardrails]",
-            f"require_ingest_token = {str(self.guardrails.require_ingest_token).lower()}",
-            f"ingest_token_hash  = {_q(self.guardrails.ingest_token_hash)}",
-            f"ingest_token_file  = {_q(self.guardrails.ingest_token_file)}",
+            f"ingest_token_file = {_q(self.guardrails.ingest_token_file)}",
             "",
         ]
         return "\n".join(lines)

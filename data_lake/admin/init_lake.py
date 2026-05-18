@@ -83,8 +83,8 @@ export DATA_LAKE_CONFIG="$(pwd)/lake_config.toml"
 # 3. Run an ingest – output_root, norder, etc. are read from the config
 dl-ingest-spectra my_fits_dir/*.fits --fmt desi
 
-# If you used dl-init --ingest-token, guardrails are already on:
-# export LAKE_INGEST_TOKEN='your-secret'   # before dl-ingest-*
+# Ingest operators only — export before dl-ingest-* (analysts do not need this):
+# export LAKE_INGEST_TOKEN='your-secret'
 ```
 
 ## Updating the library
@@ -129,7 +129,7 @@ def init_lake(
     with_resolution: bool = False,
     num_workers: int | str = "auto",
     log_level: str = "INFO",
-    ingest_token: str | None = None,
+    ingest_token: str,
     force: bool = False,
 ) -> Path:
     """Bootstrap a new deployment.
@@ -150,14 +150,17 @@ def init_lake(
     force:
         If ``True``, overwrite an existing deployment directory.
     ingest_token:
-        If set, enable ingest guardrails and write ``.ingest_token_hash``
-        (SHA-256 only, mode 0600) beside ``lake_config.toml``.
+        Plaintext ingest token (hashed to ``.ingest_token_hash``, mode 0600).
+        Required for all new deployments.
 
     Returns
     -------
     Path
         The absolute path of the new deployment directory.
     """
+    if not ingest_token.strip():
+        raise ValueError("ingest_token must be non-empty")
+
     parent = Path(parent).expanduser().resolve()
     if not parent.exists():
         raise FileNotFoundError(f"Parent directory does not exist: {parent}")
@@ -204,13 +207,11 @@ def init_lake(
         ),
         paths=_Paths(),
         ingest=_Ingest(num_workers=num_workers, log_level=log_level),
-        guardrails=_Guardrails(require_ingest_token=bool(ingest_token)),
+        guardrails=_Guardrails(),
         schema_version=SCHEMA_VERSION,
     )
     cfg.write(deployment / "lake_config.toml")
-
-    if ingest_token:
-        write_ingest_token_hash(deployment, ingest_token)
+    write_ingest_token_hash(deployment, ingest_token)
 
     (deployment / "README.md").write_text(
         _README_TEMPLATE.format(
@@ -265,10 +266,9 @@ def init_lake(
               help="Overwrite an existing deployment directory.")
 @click.option(
     "--ingest-token",
-    default=None,
+    required=True,
     envvar=INGEST_TOKEN_ENV,
-    help="Enable ingest guardrails: write .ingest_token_hash (hash only) and "
-         "set require_ingest_token in lake_config.toml.",
+    help="Ingest operator token (written as .ingest_token_hash; hash only on disk).",
 )
 def dl_init(
     name: str,
@@ -283,7 +283,7 @@ def dl_init(
     num_workers: str,
     log_level: str,
     force: bool,
-    ingest_token: str | None,
+    ingest_token: str,
 ) -> None:
     """Bootstrap a new data lake deployment at PARENT/NAME."""
     # 'num_workers' is a string from the CLI; coerce to int when possible.
@@ -321,11 +321,10 @@ def dl_init(
 
     click.echo(f"Created deployment: {deployment}")
     click.echo(f"Config:             {deployment / 'lake_config.toml'}")
-    if ingest_token:
-        click.echo(f"Ingest guardrails:  on (.ingest_token_hash written, chmod 600)")
+    click.echo(f"Ingest token hash:  {deployment / '.ingest_token_hash'} (chmod 600)")
     click.echo("")
     click.echo("Next steps:")
     click.echo(f"  export DATA_LAKE_CONFIG={deployment / 'lake_config.toml'}")
-    if ingest_token:
-        click.echo(f"  export {INGEST_TOKEN_ENV}='<your ingest token>'  # before dl-ingest-*")
+    click.echo(f"  # Ingest operators only:")
+    click.echo(f"  export {INGEST_TOKEN_ENV}='<your ingest token>'")
     click.echo("  dl-ingest-spectra <fits files>  # output_root etc. come from the config")

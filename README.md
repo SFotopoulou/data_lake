@@ -58,7 +58,8 @@ to scaffold one:
 dl-init my_lake ~/projects \
     --description "Personal multi-survey lake" \
     --root /scratch/my_lake/data \
-    --norder 5
+    --norder 5 \
+    --ingest-token 'your-ingest-secret'
 ```
 
 This creates `~/projects/my_lake/` with:
@@ -89,59 +90,64 @@ You can have multiple deployments side by side (e.g. `prod`, `staging`,
 `personal`) and switch between them by exporting a different
 `DATA_LAKE_CONFIG`.
 
-### Ingest guardrails (accidental-write protection)
+### Roles: analysts vs ingest operators
 
-Production lakes can opt in to a **shared ingest token** so casual
-`dl-ingest-*` runs fail fast unless the operator exports the token.
-This is a **mistake guardrail**, not security: anyone with shell access
-and the token can still write.  Pair it with **filesystem permissions**
-(read-only mount or Unix group for analysts) for real separation between
-ingest operators and read-only users.
+| Role | Install | `DATA_LAKE_CONFIG` | `LAKE_INGEST_TOKEN` | Data path |
+|------|---------|-------------------|---------------------|-----------|
+| **Analyst** | `pip install data-lake` | Shared deployment config | **Not used** | Read-only mount |
+| **Ingest operator** | Same package | Same or writable deployment | **Required** for `dl-ingest-*` | Read-write |
 
-**Recommended:** set the token at deployment init.  Only the SHA-256 hash
-is written to a hidden sidecar (`.ingest_token_hash`, mode `0600`,
-gitignored) next to `lake_config.toml`:
+Installing the package only provides scripts and the Python API. It does **not**
+grant ingest rights. Anyone with shell access can still call ingest CLIs, but
+production lakes should rely on **filesystem permissions** (analysts cannot write
+Zarr tiles) as the real control.
+
+### Ingest token (rudimentary operator authentication)
+
+Every `dl-ingest-*` run **requires**:
+
+1. A deployment config (`$DATA_LAKE_CONFIG` or `--config`).
+2. A matching **ingest token** (`$LAKE_INGEST_TOKEN` or `--ingest-token`).
+
+The deployment stores only a **SHA-256 hash** in `.ingest_token_hash` (mode
+`0600`, gitignored) next to `lake_config.toml`. Plaintext tokens live in the
+operator environment (Slurm secret, vault) — never in git.
+
+**This is minimal security, not a strong boundary.** The token does not stop
+someone who can (a) install this package, (b) obtain the token, and (c) write
+the data directory from corrupting the lake. It is a lightweight “I am an ingest
+operator” check. **Real protection** is correct Unix/NFS ACLs (read-only lake
+for analysts) and future proper authentication.
+
+**Create a deployment** (operators — token required at init):
 
 ```bash
-dl-init mylake ~/projects --ingest-token 'your-secret'
+dl-init mylake ~/projects --ingest-token 'your-secret' --root /scratch/mylake/data
 export DATA_LAKE_CONFIG=~/projects/mylake/lake_config.toml
-export LAKE_INGEST_TOKEN='your-secret'   # plaintext stays in env / Slurm, not on disk
 ```
 
-**Existing deployments** — enable or rotate the token without re-running init:
+**Rotate token** on an existing deployment:
 
 ```bash
-export DATA_LAKE_CONFIG=/path/to/mylake/lake_config.toml
-dl-set-ingest-token --ingest-token 'your-secret'
-export LAKE_INGEST_TOKEN='your-secret'
+dl-set-ingest-token --ingest-token 'new-secret'
 ```
 
-**Manual** — either keep the hash in `lake_config.toml` or in the sidecar:
-
-```toml
-[guardrails]
-require_ingest_token = true
-ingest_token_hash = "<sha256-hex>"   # optional if .ingest_token_hash exists
-ingest_token_file = ".ingest_token_hash"
-```
-
-Generate a hash for a hand-edited config:
+**Run ingest** (operators only):
 
 ```bash
-python -c "from data_lake.cli_utils import hash_ingest_token; print(hash_ingest_token('your-secret'))"
-```
-
-Ingest operators export the token (Slurm, `tmux`, shell rc — not in git):
-
-```bash
-export LAKE_INGEST_TOKEN='your-secret'
+export LAKE_INGEST_TOKEN='your-secret'   # prefer env over --ingest-token (ps visibility)
 dl-ingest-spectra-batch --survey DESI_DR1 --file-list coadds.txt --n-workers 8
 ```
 
-Or pass `--ingest-token` on the CLI (visible in `ps`; prefer the env var).
-Read-only tools (`SpectrumAccessor`, `dl-extract-spectra-subset`,
-`dl-validate-*-ingest`) are unchanged.  Legacy runs without a lake config
-are unchanged.
+**Analysts** point at the shared config and use read APIs only — no token, no
+`dl-init` on the production tree:
+
+```bash
+export DATA_LAKE_CONFIG=/shared/caspian/mylake/lake_config.toml
+# SpectrumAccessor, dl-extract-spectra-subset, notebooks, validators, …
+```
+
+Read-only tools never check the ingest token.
 
 ### Ingest a survey catalog
 
