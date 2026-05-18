@@ -25,9 +25,14 @@ from __future__ import annotations
 import json
 import logging
 import time
+import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
+
+SubsetFormat = Literal["zarr", "parquet", "fits"]
+FitsLayout = Literal["per-file", "catalog"]
 
 import numpy as np
 import zarr
@@ -135,6 +140,22 @@ class Spectrum:
         return dia_matrix(
             (self.resolution, self.resolution_offsets), shape=(n_pix, n_pix)
         )
+
+
+@dataclass
+class _SubsetExtractionPlan:
+    """Resolved tile locations and shapes for a subset extract."""
+
+    by_tile: dict[int, list[tuple[int, int]]]
+    missing_ids: list[int]
+    n_requested: int
+    n_written: int
+    n_pix: int
+    wavelength: np.ndarray
+    flux_dtype: Any
+    ivar_dtype: Any
+    mask_dtype: Any
+    src_wcs: dict[str, Any]
 
 
 def _decode_meta(raw: bytes | np.ndarray) -> dict[str, Any]:
@@ -543,6 +564,255 @@ class SpectrumAccessor:
 
         return result
 
+    def _plan_subset_extraction(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+    ) -> _SubsetExtractionPlan:
+        """Resolve source IDs to tile locations; validate shared-wavelength survey."""
+        if missing not in ("skip", "error"):
+            raise ValueError(f"missing must be 'skip' or 'error', got {missing!r}")
+
+        wave_mode = str(self._info.get("wavelength_mode", "shared"))
+        if wave_mode != "shared":
+            raise NotImplementedError(
+                f"Subset extract supports wavelength_mode='shared' only "
+                f"(survey {self.survey_name!r} uses {wave_mode!r})."
+            )
+
+        requested = np.asarray(source_ids, dtype=np.int64).ravel()
+        if requested.size == 0:
+            raise ValueError("source_ids is empty.")
+        n_requested = int(np.unique(requested).size)
+
+        log.info(
+            "Resolving %d unique source_ids in %s …",
+            n_requested, self.survey_name,
+        )
+        sid_to_loc = self._build_source_id_lookup(requested, show_progress=show_progress)
+
+        by_tile: dict[int, list[tuple[int, int]]] = {}
+        missing_ids: list[int] = []
+        seen: set[int] = set()
+        for sid_raw in requested.tolist():
+            sid = int(sid_raw)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            loc = sid_to_loc.get(sid)
+            if loc is None:
+                missing_ids.append(sid)
+                continue
+            npix, lidx = loc
+            by_tile.setdefault(npix, []).append((lidx, sid))
+
+        if missing == "error" and missing_ids:
+            raise KeyError(
+                f"{len(missing_ids)} source_id(s) not found in lake "
+                f"(first few: {missing_ids[:10]})."
+            )
+
+        n_written = sum(len(v) for v in by_tile.values())
+        if n_written == 0:
+            raise ValueError("None of the requested source_ids were found in the lake.")
+
+        first_npix = next(iter(by_tile))
+        first_store = self._get_tile_store(first_npix)
+        first_root = first_store._open()
+        n_pix = int(first_root["flux"].shape[1])
+        wavelength = np.asarray(first_root["wavelength"][:], dtype=np.float64)
+
+        return _SubsetExtractionPlan(
+            by_tile=by_tile,
+            missing_ids=missing_ids,
+            n_requested=n_requested,
+            n_written=n_written,
+            n_pix=n_pix,
+            wavelength=wavelength,
+            flux_dtype=first_root["flux"].dtype,
+            ivar_dtype=first_root["ivar"].dtype,
+            mask_dtype=first_root["mask"].dtype,
+            src_wcs=dict(first_store.wcs_attrs),
+        )
+
+    @staticmethod
+    def _source_ids_in_plan(plan: _SubsetExtractionPlan) -> np.ndarray:
+        """All source IDs that will be written for this extraction plan."""
+        sids: list[int] = []
+        for items in plan.by_tile.values():
+            sids.extend(int(sid) for _, sid in items)
+        return np.asarray(sids, dtype=np.int64)
+
+    def _build_catalog_redshift_map(
+        self,
+        plan: _SubsetExtractionPlan,
+    ) -> dict[int, float] | None:
+        """Load redshifts from the survey catalog when available."""
+        if self._catalog is None:
+            return None
+        if self._catalog.redshift_column is None:
+            log.warning(
+                "Catalog %r has no redshift column (%s); using spectrum-tile meta.z.",
+                self.survey_name,
+                ", ".join(("Z", "ZCOSMO", "REDSHIFT", "...")),
+            )
+            return None
+        sids = self._source_ids_in_plan(plan)
+        z_map = self._catalog.redshifts_for_source_ids(sids)
+        log.info(
+            "Redshift for %d spectra from catalog column %r.",
+            len(z_map),
+            self._catalog.redshift_column,
+        )
+        return z_map
+
+    @staticmethod
+    def _redshift_batch_for_sources(
+        sorted_sids: np.ndarray,
+        z_map: dict[int, float] | None,
+        meta_raw,
+    ) -> np.ndarray:
+        """Per-row redshift: catalog map when provided, else spectrum tile meta."""
+        if z_map is not None:
+            return np.array(
+                [z_map.get(int(s), np.nan) for s in sorted_sids.tolist()],
+                dtype=np.float32,
+            )
+        z_batch = np.empty(len(sorted_sids), dtype=np.float32)
+        for i, raw in enumerate(meta_raw):
+            z_batch[i] = _decode_meta(raw).get("z", np.nan)
+        return z_batch
+
+    def _iter_subset_tile_batches(
+        self,
+        plan: _SubsetExtractionPlan,
+        *,
+        show_progress: bool,
+        z_map: dict[int, float] | None = None,
+    ):
+        """Yield per-tile (sorted_sids, flux, ivar, mask, redshift) batches."""
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:
+            def tqdm(x, **_kw):
+                return x
+
+        for npix, items in tqdm(
+            plan.by_tile.items(),
+            desc="extract",
+            disable=not show_progress,
+            unit="tile",
+            total=len(plan.by_tile),
+        ):
+            local_idxs = np.fromiter((t[0] for t in items), dtype=np.int64, count=len(items))
+            sids = np.fromiter((t[1] for t in items), dtype=np.int64, count=len(items))
+            order = np.argsort(local_idxs)
+            sorted_local = local_idxs[order]
+            sorted_sids = sids[order]
+
+            t_store = self._get_tile_store(npix)
+            t_root = t_store._open()
+            if int(t_root["flux"].shape[1]) != plan.n_pix:
+                raise ValueError(
+                    f"Tile {npix} has N_pix={t_root['flux'].shape[1]} but expected "
+                    f"{plan.n_pix}; non-uniform wavelength grid is not supported."
+                )
+
+            flux_batch = t_root["flux"].get_orthogonal_selection(
+                (sorted_local, slice(None))
+            )
+            ivar_batch = t_root["ivar"].get_orthogonal_selection(
+                (sorted_local, slice(None))
+            )
+            mask_batch = t_root["mask"].get_orthogonal_selection(
+                (sorted_local, slice(None))
+            )
+
+            meta_raw = t_root["meta"][sorted_local]
+            z_batch = self._redshift_batch_for_sources(sorted_sids, z_map, meta_raw)
+
+            yield sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch
+
+    def _collect_subset_stacks(
+        self,
+        plan: _SubsetExtractionPlan,
+        *,
+        show_progress: bool,
+        z_map: dict[int, float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int]]:
+        """Read all subset rows into contiguous numpy arrays (catalog FITS / Parquet)."""
+        sid_chunks: list[np.ndarray] = []
+        flux_chunks: list[np.ndarray] = []
+        ivar_chunks: list[np.ndarray] = []
+        mask_chunks: list[np.ndarray] = []
+        z_chunks: list[np.ndarray] = []
+        id_to_row: dict[int, int] = {}
+        row_offset = 0
+
+        for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+            plan, show_progress=show_progress, z_map=z_map,
+        ):
+            sid_chunks.append(sorted_sids)
+            flux_chunks.append(flux_batch)
+            ivar_chunks.append(ivar_batch)
+            mask_chunks.append(mask_batch)
+            z_chunks.append(z_batch)
+            for j, sid in enumerate(sorted_sids.tolist()):
+                id_to_row[int(sid)] = row_offset + j
+            row_offset += len(sorted_sids)
+
+        source_id = np.concatenate(sid_chunks)
+        flux = np.concatenate(flux_chunks, axis=0)
+        ivar = np.concatenate(ivar_chunks, axis=0)
+        mask = np.concatenate(mask_chunks, axis=0)
+        redshift = np.concatenate(z_chunks, axis=0)
+        return source_id, flux, ivar, mask, redshift, id_to_row
+
+    def extract_subset(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        output: Path | str,
+        *,
+        fmt: SubsetFormat = "zarr",
+        missing: str = "skip",
+        chunks_per_shard: int = 512,
+        show_progress: bool = True,
+        overwrite: bool = False,
+        fits_filename_template: str = "spec_{source_id}.fits",
+        fits_layout: FitsLayout = "per-file",
+    ) -> dict[str, Any]:
+        """Extract a subset to Zarr, Parquet, or FITS (per-file or catalog)."""
+        if fmt == "zarr":
+            return self.extract_subset_to_zarr(
+                source_ids,
+                output,
+                missing=missing,
+                chunks_per_shard=chunks_per_shard,
+                show_progress=show_progress,
+                overwrite=overwrite,
+            )
+        if fmt == "parquet":
+            return self.extract_subset_to_parquet(
+                source_ids,
+                output,
+                missing=missing,
+                show_progress=show_progress,
+                overwrite=overwrite,
+            )
+        if fmt == "fits":
+            return self.extract_subset_to_fits(
+                source_ids,
+                output,
+                missing=missing,
+                show_progress=show_progress,
+                overwrite=overwrite,
+                filename_template=fits_filename_template,
+                layout=fits_layout,
+            )
+        raise ValueError(f"unknown format {fmt!r}; use zarr, parquet, or fits")
+
     def extract_subset_to_zarr(
         self,
         source_ids: Sequence[int] | np.ndarray,
@@ -570,7 +840,7 @@ class SpectrumAccessor:
               mask/        (N_written, N_pix)  uint8/16 sharded
               wavelength/  (N_pix,)            float64  shared grid
               source_id/   (N_written,)        int64
-              redshift/    (N_written,)        float32  (from per-source meta.z)
+              redshift/    (N_written,)        float32  (from catalog Z when available)
 
         Parameters
         ----------
@@ -608,73 +878,24 @@ class SpectrumAccessor:
           most once per tile.  This is typically 10–50× faster than looping
           ``root["flux"][i]`` per source.
         """
-        if missing not in ("skip", "error"):
-            raise ValueError(f"missing must be 'skip' or 'error', got {missing!r}")
-
         output_zarr = Path(output_zarr)
         if output_zarr.exists():
             if not overwrite:
                 raise FileExistsError(
                     f"{output_zarr} already exists. Pass overwrite=True to replace it."
                 )
-            import shutil
             shutil.rmtree(output_zarr)
 
-        wave_mode = str(self._info.get("wavelength_mode", "shared"))
-        if wave_mode != "shared":
-            raise NotImplementedError(
-                f"extract_subset_to_zarr currently supports wavelength_mode='shared' "
-                f"only (survey {self.survey_name!r} uses {wave_mode!r})."
-            )
-
-        requested = np.asarray(source_ids, dtype=np.int64).ravel()
-        if requested.size == 0:
-            raise ValueError("source_ids is empty.")
-        n_requested = int(np.unique(requested).size)
-
-        log.info(
-            "Resolving %d unique source_ids in %s …",
-            n_requested, self.survey_name,
+        plan = self._plan_subset_extraction(
+            source_ids, missing=missing, show_progress=show_progress,
         )
-        sid_to_loc = self._build_source_id_lookup(requested, show_progress=show_progress)
-
-        # Group hits by HEALPix tile (preserve user request order within a tile only
-        # by virtue of dict insertion order; output rows are contiguous per tile).
-        by_tile: dict[int, list[tuple[int, int]]] = {}
-        missing_ids: list[int] = []
-        seen: set[int] = set()
-        for sid_raw in requested.tolist():
-            sid = int(sid_raw)
-            if sid in seen:
-                continue
-            seen.add(sid)
-            loc = sid_to_loc.get(sid)
-            if loc is None:
-                missing_ids.append(sid)
-                continue
-            npix, lidx = loc
-            by_tile.setdefault(npix, []).append((lidx, sid))
-
-        if missing == "error" and missing_ids:
-            raise KeyError(
-                f"{len(missing_ids)} source_id(s) not found in lake "
-                f"(first few: {missing_ids[:10]})."
-            )
-
-        n_written = sum(len(v) for v in by_tile.values())
-        if n_written == 0:
-            raise ValueError("None of the requested source_ids were found in the lake.")
-
-        # Sample first tile for shape, dtype, wavelength, WCS
-        first_npix = next(iter(by_tile))
-        first_store = self._get_tile_store(first_npix)
-        first_root = first_store._open()
-        n_pix = int(first_root["flux"].shape[1])
-        wavelength = np.asarray(first_root["wavelength"][:], dtype=np.float64)
-        flux_dtype = first_root["flux"].dtype
-        ivar_dtype = first_root["ivar"].dtype
-        mask_dtype = first_root["mask"].dtype
-        src_wcs = dict(first_store.wcs_attrs)
+        z_map = self._build_catalog_redshift_map(plan)
+        n_written = plan.n_written
+        n_pix = plan.n_pix
+        n_requested = plan.n_requested
+        missing_ids = plan.missing_ids
+        wavelength = plan.wavelength
+        src_wcs = plan.src_wcs
 
         # --- Create destination Zarr ---
         store = zarr.storage.LocalStore(str(output_zarr))
@@ -698,9 +919,9 @@ class SpectrumAccessor:
                 fill_value=fill,
             )
 
-        _arr2d("flux", flux_dtype, np.nan)
-        _arr2d("ivar", ivar_dtype, 0.0)
-        _arr2d("mask", mask_dtype, 0)
+        _arr2d("flux", plan.flux_dtype, np.nan)
+        _arr2d("ivar", plan.ivar_dtype, 0.0)
+        _arr2d("mask", plan.mask_dtype, 0)
         out_root.create_array(
             "wavelength", shape=(n_pix,), chunks=(n_pix,), dtype=np.float64, fill_value=0.0,
         )
@@ -735,54 +956,12 @@ class SpectrumAccessor:
         })
         out_root.attrs.update(attrs)
 
-        # --- Stream tile-by-tile, batched reads via fancy indexing ---
-        try:
-            from tqdm.auto import tqdm
-        except ImportError:
-            def tqdm(x, **_kw):
-                return x
-
         id_to_row: dict[int, int] = {}
         write_offset = 0
-        for npix, items in tqdm(
-            by_tile.items(),
-            desc="extract",
-            disable=not show_progress,
-            unit="tile",
-            total=len(by_tile),
+        for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+            plan, show_progress=show_progress, z_map=z_map,
         ):
-            local_idxs = np.fromiter((t[0] for t in items), dtype=np.int64, count=len(items))
-            sids = np.fromiter((t[1] for t in items), dtype=np.int64, count=len(items))
-
-            # Sort local idxs for sequential shard access on the source side
-            order = np.argsort(local_idxs)
-            sorted_local = local_idxs[order]
-            sorted_sids = sids[order]
-
-            t_store = self._get_tile_store(npix)
-            t_root = t_store._open()
-            if int(t_root["flux"].shape[1]) != n_pix:
-                raise ValueError(
-                    f"Tile {npix} has N_pix={t_root['flux'].shape[1]} but expected "
-                    f"{n_pix}; non-uniform wavelength grid is not supported."
-                )
-
-            flux_batch = t_root["flux"].get_orthogonal_selection(
-                (sorted_local, slice(None))
-            )
-            ivar_batch = t_root["ivar"].get_orthogonal_selection(
-                (sorted_local, slice(None))
-            )
-            mask_batch = t_root["mask"].get_orthogonal_selection(
-                (sorted_local, slice(None))
-            )
-
-            meta_raw = t_root["meta"][sorted_local]
-            z_batch = np.empty(len(sorted_local), dtype=np.float32)
-            for i, raw in enumerate(meta_raw):
-                z_batch[i] = _decode_meta(raw).get("z", np.nan)
-
-            k = len(sorted_local)
+            k = len(sorted_sids)
             slc = slice(write_offset, write_offset + k)
             out_root["flux"][slc, :] = flux_batch
             out_root["ivar"][slc, :] = ivar_batch
@@ -796,7 +975,7 @@ class SpectrumAccessor:
 
         log.info(
             "Extracted %d/%d spectra → %s (skipped %d missing across %d tiles)",
-            n_written, n_requested, output_zarr, len(missing_ids), len(by_tile),
+            n_written, n_requested, output_zarr, len(missing_ids), len(plan.by_tile),
         )
 
         return {
@@ -804,7 +983,244 @@ class SpectrumAccessor:
             "n_written": n_written,
             "missing_ids": missing_ids,
             "id_to_row": id_to_row,
+            "output": str(output_zarr),
             "output_zarr": str(output_zarr),
+            "format": "zarr",
+        }
+
+    def extract_subset_to_parquet(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        output_parquet: Path | str,
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Extract a subset into one Parquet file (one row per spectrum)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        output_parquet = Path(output_parquet)
+        if output_parquet.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"{output_parquet} already exists. Pass overwrite=True to replace it."
+                )
+            output_parquet.unlink()
+
+        plan = self._plan_subset_extraction(
+            source_ids, missing=missing, show_progress=show_progress,
+        )
+        z_map = self._build_catalog_redshift_map(plan)
+        n_pix = plan.n_pix
+        mask_pa = pa.uint16() if plan.mask_dtype == np.dtype(np.uint16) else pa.uint8()
+        flt_vec = pa.list_(pa.float32())
+        mask_vec = pa.list_(mask_pa)
+        schema = pa.schema([
+            ("source_id", pa.int64()),
+            ("redshift", pa.float32()),
+            ("flux", flt_vec),
+            ("ivar", flt_vec),
+            ("mask", mask_vec),
+        ]).with_metadata({
+            b"source_survey": self.survey_name.encode(),
+            b"wavelength_mode": b"shared",
+            b"wavelength": json.dumps(plan.wavelength.tolist()).encode(),
+            b"wcs_attrs": json.dumps(plan.src_wcs).encode(),
+            b"n_pix": str(n_pix).encode(),
+        })
+
+        id_to_row: dict[int, int] = {}
+        row_offset = 0
+        writer = pq.ParquetWriter(
+            str(output_parquet), schema, compression="zstd", compression_level=3,
+        )
+        try:
+            for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+                plan, show_progress=show_progress, z_map=z_map,
+            ):
+                table = pa.Table.from_arrays(
+                    [
+                        pa.array(sorted_sids, type=pa.int64()),
+                        pa.array(z_batch, type=pa.float32()),
+                        pa.array(flux_batch.tolist(), type=flt_vec),
+                        pa.array(ivar_batch.tolist(), type=flt_vec),
+                        pa.array(mask_batch.tolist(), type=mask_vec),
+                    ],
+                    schema=schema,
+                )
+                writer.write_table(table)
+                for j, sid in enumerate(sorted_sids.tolist()):
+                    id_to_row[int(sid)] = row_offset + j
+                row_offset += len(sorted_sids)
+        finally:
+            writer.close()
+
+        log.info(
+            "Extracted %d/%d spectra → %s (Parquet)",
+            plan.n_written, plan.n_requested, output_parquet,
+        )
+        return {
+            "n_requested": plan.n_requested,
+            "n_written": plan.n_written,
+            "missing_ids": plan.missing_ids,
+            "id_to_row": id_to_row,
+            "output": str(output_parquet),
+            "output_parquet": str(output_parquet),
+            "format": "parquet",
+        }
+
+    def extract_subset_to_fits(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        output: Path | str,
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+        filename_template: str = "spec_{source_id}.fits",
+        layout: FitsLayout = "per-file",
+    ) -> dict[str, Any]:
+        """Extract a subset to FITS (one file per spectrum or one catalog file)."""
+        if layout == "catalog":
+            return self.extract_subset_to_fits_catalog(
+                source_ids,
+                output,
+                missing=missing,
+                show_progress=show_progress,
+                overwrite=overwrite,
+            )
+        return self._extract_subset_to_fits_per_file(
+            source_ids,
+            output,
+            missing=missing,
+            show_progress=show_progress,
+            overwrite=overwrite,
+            filename_template=filename_template,
+        )
+
+    def extract_subset_to_fits_catalog(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        output_fits: Path | str,
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Extract a subset into one multi-row FITS catalog (BINTABLE + WAVELENGTH HDU)."""
+        from data_lake.export.to_spectrum_fits import write_spectra_catalog_fits
+
+        output_fits = Path(output_fits)
+        plan = self._plan_subset_extraction(
+            source_ids, missing=missing, show_progress=show_progress,
+        )
+        z_map = self._build_catalog_redshift_map(plan)
+        source_id, flux, ivar, mask, redshift, id_to_row = self._collect_subset_stacks(
+            plan, show_progress=show_progress, z_map=z_map,
+        )
+        write_spectra_catalog_fits(
+            output_fits,
+            source_id=source_id,
+            flux=flux,
+            ivar=ivar,
+            mask=mask,
+            wavelength=plan.wavelength,
+            redshift=redshift,
+            wcs_attrs=plan.src_wcs,
+            survey=self.survey_name,
+            overwrite=overwrite,
+        )
+        log.info(
+            "Extracted %d/%d spectra → %s (FITS catalog)",
+            plan.n_written, plan.n_requested, output_fits,
+        )
+        return {
+            "n_requested": plan.n_requested,
+            "n_written": plan.n_written,
+            "missing_ids": plan.missing_ids,
+            "id_to_row": id_to_row,
+            "output": str(output_fits),
+            "output_fits": str(output_fits),
+            "fits_layout": "catalog",
+            "format": "fits",
+        }
+
+    def _extract_subset_to_fits_per_file(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        output_dir: Path | str,
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+        filename_template: str = "spec_{source_id}.fits",
+    ) -> dict[str, Any]:
+        """Extract a subset into one FITS file per spectrum."""
+        from astropy.io import fits
+
+        from data_lake.export.to_spectrum_fits import _build_primary_header, _build_table_hdu
+
+        output_dir = Path(output_dir)
+        if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
+            raise FileExistsError(
+                f"{output_dir} is not empty. Pass overwrite=True to write into it."
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        plan = self._plan_subset_extraction(
+            source_ids, missing=missing, show_progress=show_progress,
+        )
+        z_map = self._build_catalog_redshift_map(plan)
+        wave = plan.wavelength
+        id_to_row: dict[int, int] = {}
+        paths: list[str] = []
+        row_offset = 0
+
+        for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+            plan, show_progress=show_progress, z_map=z_map,
+        ):
+            for j, sid in enumerate(sorted_sids.tolist()):
+                meta = {"z": float(z_batch[j])}
+                sp = Spectrum(
+                    source_id=int(sid),
+                    flux=np.asarray(flux_batch[j], dtype=np.float32),
+                    ivar=np.asarray(ivar_batch[j], dtype=np.float32),
+                    mask=np.asarray(mask_batch[j], dtype=plan.mask_dtype),
+                    wavelength=wave,
+                    meta=meta,
+                    wcs_attrs=plan.src_wcs,
+                )
+                out_path = output_dir / filename_template.format(source_id=sid)
+                if out_path.exists() and not overwrite:
+                    raise FileExistsError(f"{out_path} already exists.")
+                hdul = fits.HDUList([
+                    fits.PrimaryHDU(
+                        data=sp.flux,
+                        header=_build_primary_header(sp, self.survey_name),
+                    ),
+                    _build_table_hdu(sp),
+                ])
+                hdul.writeto(str(out_path), overwrite=overwrite)
+                paths.append(str(out_path))
+                id_to_row[int(sid)] = row_offset + j
+            row_offset += len(sorted_sids)
+
+        log.info(
+            "Extracted %d/%d spectra → %s (%d FITS files)",
+            plan.n_written, plan.n_requested, output_dir, len(paths),
+        )
+        return {
+            "n_requested": plan.n_requested,
+            "n_written": plan.n_written,
+            "missing_ids": plan.missing_ids,
+            "id_to_row": id_to_row,
+            "output": str(output_dir),
+            "output_dir": str(output_dir),
+            "fits_paths": paths,
+            "fits_layout": "per-file",
+            "format": "fits",
         }
 
     def iter_tile(self, npix: int):

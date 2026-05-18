@@ -1,11 +1,10 @@
 """
-spectra_subset – extract a curated subset of spectra into a single flat Zarr.
+spectra_subset – extract a curated subset of spectra into Zarr, Parquet, or FITS.
 
 This module exposes ``dl-extract-spectra-subset``: given an already-ingested
 survey in the data lake and a list of source IDs (a.k.a. TARGETIDs for DESI),
-it writes one self-contained Zarr v3 group containing only the requested
-spectra.  Useful when you want to materialise a curated training set or a
-science sample without copying the full lake.
+it writes only the requested spectra.  Useful when you want to materialise a
+curated training set or a science sample without copying the full lake.
 
 Source-ID list formats supported (auto-detected via
 ``astropy.table.Table.read`` + a Parquet/CSV fallback):
@@ -23,7 +22,15 @@ Example
         --survey desi_dr1 \\
         --target-list zall-pix-iron-qso.fits \\
         --target-id-col TARGETID \\
+        --format zarr \\
         --output /scratch/qso_subset.zarr
+
+    dl-extract-spectra-subset ... --format parquet --output /scratch/qso.parquet
+    dl-extract-spectra-subset ... --format fits --output /scratch/qso_fits/
+
+    # One multi-row FITS catalog (BINTABLE + WAVELENGTH HDU)
+    dl-extract-spectra-subset ... --format fits --fits-layout catalog \\
+        --output /scratch/qso_spectra.fits
 """
 
 from __future__ import annotations
@@ -32,6 +39,8 @@ import logging
 from pathlib import Path
 
 import numpy as np
+
+from data_lake.io.spectra import FitsLayout, SubsetFormat
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +77,39 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
     return np.asarray(tbl[column], dtype=np.int64)
 
 
+def _validate_output_path(
+    output: Path,
+    fmt: SubsetFormat,
+    *,
+    fits_layout: FitsLayout = "per-file",
+) -> None:
+    """Raise if OUTPUT is incompatible with the chosen format."""
+    if fmt == "fits":
+        if fits_layout == "catalog":
+            if output.suffix.lower() not in {".fits", ".fit"}:
+                raise ValueError(
+                    "For --format fits --fits-layout catalog, --output must be "
+                    "a .fits file path."
+                )
+        elif output.suffix.lower() in {".fits", ".fit"}:
+            raise ValueError(
+                "For --format fits --fits-layout per-file, --output must be a "
+                "directory, not a .fits file."
+            )
+        return
+    if fmt == "parquet":
+        if output.suffix.lower() not in {".parquet", ".pq", ""}:
+            log.warning(
+                "Output %s does not end in .parquet; writing Parquet anyway.", output,
+            )
+        return
+    if fmt == "zarr":
+        if output.suffix.lower() not in {".zarr", ""}:
+            log.warning(
+                "Output %s does not end in .zarr; writing Zarr anyway.", output,
+            )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -96,9 +138,26 @@ try:
         help="Column name carrying the source IDs (ignored for plain-text files).",
     )
     @click.option(
-        "--output", "output_zarr", required=True,
+        "--format", "output_format",
+        type=click.Choice(["zarr", "parquet", "fits"], case_sensitive=False),
+        default="zarr", show_default=True,
+        help="Output format: flat Zarr group, single Parquet file, or FITS.",
+    )
+    @click.option(
+        "--output", "output_path", required=True,
         type=click.Path(path_type=Path),
-        help="Destination .zarr directory.",
+        help="Destination: .zarr, .parquet, FITS catalog file, or FITS directory.",
+    )
+    @click.option(
+        "--fits-layout",
+        type=click.Choice(["per-file", "catalog"], case_sensitive=False),
+        default="per-file",
+        show_default=True,
+        help="FITS: one file per spectrum (directory) or one catalog BINTABLE.",
+    )
+    @click.option(
+        "--fits-filename-template", default="spec_{source_id}.fits", show_default=True,
+        help="Per-spectrum FITS name when --format fits --fits-layout per-file.",
     )
     @click.option(
         "--lake-root", default=None,
@@ -119,18 +178,21 @@ try:
     )
     @click.option(
         "--chunks-per-shard", default=512, show_default=True, type=int,
-        help="Output Zarr shard rows.",
+        help="Output Zarr shard rows (ignored for parquet/fits).",
     )
     @click.option(
         "--overwrite/--no-overwrite", default=False, show_default=True,
-        help="Replace OUTPUT if it already exists.",
+        help="Replace existing output.",
     )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         survey_name: str,
         target_list: Path,
         target_id_col: str,
-        output_zarr: Path,
+        output_format: str,
+        output_path: Path,
+        fits_layout: str,
+        fits_filename_template: str,
         lake_root: Path | None,
         config_path: Path | None,
         with_catalog: bool,
@@ -139,14 +201,17 @@ try:
         overwrite: bool,
         verbose: bool,
     ) -> None:
-        """Extract a curated subset of spectra into a single flat Zarr group."""
+        """Extract a curated subset of spectra (Zarr, Parquet, or FITS)."""
         logging.basicConfig(
             level=logging.DEBUG if verbose else logging.INFO,
             format="[%(asctime)s] %(name)-22s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
         )
 
-        # Resolve lake root (CLI > config)
+        fmt: SubsetFormat = output_format.lower()  # type: ignore[assignment]
+        layout: FitsLayout = fits_layout.lower()  # type: ignore[assignment]
+        _validate_output_path(output_path, fmt, fits_layout=layout)
+
         cfg = load_optional_config(config_path)
         if lake_root is None:
             if cfg is None:
@@ -156,13 +221,11 @@ try:
                 )
             lake_root = cfg.lake.root
 
-        # Read source IDs
         log.info("Reading source IDs from %s (column=%s) …", target_list, target_id_col)
         source_ids = _read_target_ids(target_list, target_id_col)
         n_unique = int(np.unique(source_ids).size)
         log.info("Loaded %d source IDs (%d unique).", source_ids.size, n_unique)
 
-        # Wire optional catalog accessor
         catalog_accessor = None
         if with_catalog:
             try:
@@ -183,18 +246,23 @@ try:
             catalog_accessor=catalog_accessor,
         )
 
-        result = acc.extract_subset_to_zarr(
+        result = acc.extract_subset(
             source_ids=source_ids,
-            output_zarr=output_zarr,
+            output=output_path,
+            fmt=fmt,
             missing=missing,
             chunks_per_shard=chunks_per_shard,
             show_progress=True,
             overwrite=overwrite,
+            fits_filename_template=fits_filename_template,
+            fits_layout=layout,
         )
 
+        out = result.get("output", result.get("output_zarr", output_path))
+        fmt_label = f"{fmt}" + (f", {layout}" if fmt == "fits" else "")
         click.echo(
-            f"Wrote {result['n_written']}/{result['n_requested']} spectra to "
-            f"{result['output_zarr']}  (missing: {len(result['missing_ids'])})"
+            f"Wrote {result['n_written']}/{result['n_requested']} spectra "
+            f"({fmt_label}) → {out}  (missing: {len(result['missing_ids'])})"
         )
 
 except ImportError:

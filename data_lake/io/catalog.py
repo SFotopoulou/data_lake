@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 import duckdb
 import numpy as np
@@ -29,6 +29,26 @@ from data_lake.ingest.fits_to_parquet import resolve_source_id_column
 log = logging.getLogger(__name__)
 
 ReturnFormat = Literal["polars", "astropy", "arrow"]
+
+# First match wins (case-insensitive against catalog Parquet columns).
+_REDSHIFT_COLUMN_CANDIDATES: tuple[str, ...] = (
+    "Z",
+    "ZCOSMO",
+    "Z_HP",
+    "Z_PHOT",
+    "REDSHIFT",
+    "Z_QSO",
+    "Z_RED",
+)
+
+
+def resolve_redshift_column(column_names: list[str]) -> str | None:
+    """Return the catalog column name to use for spectroscopic redshift."""
+    by_upper = {n.upper(): n for n in column_names}
+    for cand in _REDSHIFT_COLUMN_CANDIDATES:
+        if cand in by_upper:
+            return by_upper[cand]
+    return None
 
 
 def _arrow_array_to_numpy_or_sequence(arr: pa.Array):
@@ -96,6 +116,7 @@ class CatalogAccessor:
             self._catalog_root,
             schema_names=list(self.schema.names) if self._catalog_root.exists() else None,
         )
+        self._redshift_column: str | None = resolve_redshift_column(self.columns)
 
         # DuckDB in-process connection (no file, memory only)
         self._con = duckdb.connect(database=":memory:")
@@ -123,6 +144,11 @@ class CatalogAccessor:
     def source_id_column(self) -> str:
         """Column name that holds the integer object identifier (e.g. ``TARGETID`` for DESI)."""
         return self._source_id_column
+
+    @property
+    def redshift_column(self) -> str | None:
+        """Catalog column for redshift (e.g. ``Z`` for DESI), or ``None`` if absent."""
+        return self._redshift_column
 
     @property
     def schema(self) -> pa.Schema:
@@ -242,6 +268,51 @@ class CatalogAccessor:
         sid_col = self._source_id_column
         sql = f"SELECT {col_expr} FROM catalog WHERE {sid_col} IN ({id_list})"
         return self.query(sql, fmt=fmt)
+
+    def redshifts_for_source_ids(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        *,
+        redshift_column: str | None = None,
+        batch_size: int = 10_000,
+    ) -> dict[int, float]:
+        """Return ``{source_id: redshift}`` from the survey catalog (not spectrum tiles).
+
+        Parameters
+        ----------
+        source_ids:
+            IDs to look up.  Duplicates are ignored.
+        redshift_column:
+            Override auto-detected column (default: :attr:`redshift_column`).
+        batch_size:
+            Chunk size for ``IN (...)`` SQL queries.
+
+        Raises
+        ------
+        ValueError
+            If no redshift column is available in the catalog schema.
+        """
+        zcol = redshift_column or self._redshift_column
+        if zcol is None:
+            raise ValueError(
+                f"Catalog {self.survey_name!r} has no redshift column.  "
+                f"Tried: {', '.join(_REDSHIFT_COLUMN_CANDIDATES)}.  "
+                f"Available columns include: {self.columns[:20]}"
+            )
+
+        ids = np.unique(np.asarray(source_ids, dtype=np.int64))
+        if ids.size == 0:
+            return {}
+
+        sid_col = self._source_id_column
+        out: dict[int, float] = {}
+        for start in range(0, int(ids.size), batch_size):
+            chunk = ids[start : start + batch_size]
+            ids_csv = ",".join(str(int(s)) for s in chunk)
+            sql = f"SELECT {sid_col}, {zcol} FROM catalog WHERE {sid_col} IN ({ids_csv})"
+            for sid_raw, z_raw in self._con.execute(sql).fetchall():
+                out[int(sid_raw)] = float(z_raw)
+        return out
 
     def get_tile_index(
         self,

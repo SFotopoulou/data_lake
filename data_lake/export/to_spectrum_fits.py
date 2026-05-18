@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 from astropy.io import fits
@@ -151,6 +151,107 @@ def _build_table_hdu(sp: Spectrum) -> fits.BinTableHDU:
     tbl.header["SOURCE_ID"] = sp.source_id
     tbl.header["NPIX"] = n_pix
     return tbl
+
+
+def _wcs_header_from_attrs(wcs_attrs: dict[str, Any], n_pix: int) -> fits.Header:
+    """Build a minimal spectral WCS header from lake WCS attrs."""
+    hdr = fits.Header()
+    hdr["SIMPLE"] = True
+    hdr["BITPIX"] = -32
+    hdr["NAXIS"] = 1
+    hdr["NAXIS1"] = n_pix
+    ctype = str(wcs_attrs.get("ctype", "WAVE")).upper()
+    hdr["CTYPE1"] = ctype
+    hdr["CRVAL1"] = float(wcs_attrs.get("crval", 0.0))
+    hdr["CDELT1"] = float(wcs_attrs.get("cdelt", 1.0))
+    hdr["CRPIX1"] = float(wcs_attrs.get("crpix", 1.0))
+    hdr["CUNIT1"] = str(wcs_attrs.get("unit", "Angstrom"))
+    hdr["DC-FLAG"] = 1 if "LOG" in ctype else 0
+    return hdr
+
+
+def write_spectra_catalog_fits(
+    output_path: Path | str,
+    *,
+    source_id: np.ndarray,
+    flux: np.ndarray,
+    ivar: np.ndarray,
+    mask: np.ndarray,
+    wavelength: np.ndarray,
+    redshift: np.ndarray | None = None,
+    wcs_attrs: dict[str, Any] | None = None,
+    survey: str = "",
+    overwrite: bool = True,
+    table_name: str = "SPECTRA",
+) -> Path:
+    """Write many spectra into one multi-row FITS catalog file.
+
+    Layout
+    ------
+    * HDU 0 ``PRIMARY`` – spectral WCS keywords (shared grid).
+    * HDU 1 ``SPECTRA`` – BINTABLE: ``TARGETID``, ``Z``, ``FLUX``, ``IVAR``,
+      ``MASK`` (fixed-length vector columns, one row per spectrum).
+    * HDU 2 ``WAVELENGTH`` – shared 1-D wavelength grid (Angstrom).
+
+    Parameters
+    ----------
+    source_id, flux, ivar, mask:
+        Arrays with shape ``(N_spec,)`` or ``(N_spec, N_pix)`` for the 2-D fields.
+    wavelength:
+        Shared wavelength grid, shape ``(N_pix,)``.
+    redshift:
+        Per-source redshift; defaults to NaN if omitted.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"{output_path} already exists. Pass overwrite=True.")
+
+    flux = np.asarray(flux, dtype=np.float32)
+    ivar = np.asarray(ivar, dtype=np.float32)
+    mask = np.asarray(mask)
+    source_id = np.asarray(source_id, dtype=np.int64).ravel()
+    wavelength = np.asarray(wavelength, dtype=np.float64).ravel()
+    n_spec, n_pix = flux.shape
+    if ivar.shape != (n_spec, n_pix) or mask.shape != (n_spec, n_pix):
+        raise ValueError("flux, ivar, and mask must share shape (N_spec, N_pix)")
+    if source_id.shape[0] != n_spec:
+        raise ValueError("source_id length must match N_spec")
+
+    if redshift is None:
+        redshift = np.full(n_spec, np.nan, dtype=np.float32)
+    else:
+        redshift = np.asarray(redshift, dtype=np.float32).ravel()
+        if redshift.shape[0] != n_spec:
+            raise ValueError("redshift length must match N_spec")
+
+    wcs = wcs_attrs or {}
+    primary_hdr = _wcs_header_from_attrs(wcs, n_pix)
+    primary_hdr["ORIGIN"] = "data_lake"
+    primary_hdr["SURVEY"] = str(survey)[:8]
+    primary_hdr["NSPEC"] = n_spec
+    primary_hdr["NPIX"] = n_pix
+
+    mask_fmt = "B" if mask.dtype == np.uint8 else "I"
+    cols = [
+        fits.Column("TARGETID", "K", array=source_id),
+        fits.Column("Z", "E", array=redshift),
+        fits.Column("FLUX", f"{n_pix}E", array=flux),
+        fits.Column("IVAR", f"{n_pix}E", array=ivar),
+        fits.Column("MASK", f"{n_pix}{mask_fmt}", array=mask),
+    ]
+    spectra_hdu = fits.BinTableHDU.from_columns(cols, name=table_name)
+    wave_hdu = fits.ImageHDU(
+        data=wavelength.astype(np.float64)[np.newaxis, :],
+        name="WAVELENGTH",
+    )
+    wave_hdu.header["EXTNAME"] = "WAVELENGTH"
+    wave_hdu.header["CUNIT1"] = "Angstrom"
+
+    hdul = fits.HDUList([fits.PrimaryHDU(header=primary_hdr), spectra_hdu, wave_hdu])
+    hdul.writeto(str(output_path), overwrite=overwrite)
+    log.info("Wrote catalog FITS %s (%d spectra, %d pix)", output_path.name, n_spec, n_pix)
+    return output_path
 
 
 # ---------------------------------------------------------------------------

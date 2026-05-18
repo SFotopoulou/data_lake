@@ -524,11 +524,15 @@ Python API:
 ```python
 import numpy as np
 from astropy.table import Table
+from data_lake.io.catalog import CatalogAccessor
 from data_lake.io.spectra import SpectrumAccessor
 
 target_ids = np.asarray(Table.read("zall-pix-iron-qso.fits")["TARGETID"])
 
-acc = SpectrumAccessor("/data/lake", "desi_dr1")
+lake = "/data/lake"
+survey = "desi_dr1"
+cat = CatalogAccessor(lake, survey)   # fast _spectrum_index lookup + catalog Z
+acc = SpectrumAccessor(lake, survey, catalog_accessor=cat)
 result = acc.extract_subset_to_zarr(
     source_ids=target_ids,
     output_zarr="/scratch/qso_subset.zarr",
@@ -537,19 +541,37 @@ result = acc.extract_subset_to_zarr(
 )
 print(result["n_written"], "rows written;",
       len(result["missing_ids"]), "missing")
+# Redshift in the output uses cat.redshift_column (e.g. Z), not spectrum-tile meta.
 ```
 
 Or the CLI:
 
 ```bash
+# Default: single flat Zarr group (--with-catalog: fast index + catalog Z for redshift)
 dl-extract-spectra-subset \
     --survey desi_dr1 \
     --target-list zall-pix-iron-qso.fits \
     --target-id-col TARGETID \
+    --format zarr \
     --output /scratch/qso_subset.zarr
+
+# One Parquet file (one row per spectrum; wavelength in file metadata)
+dl-extract-spectra-subset ... --format parquet --output /scratch/qso_subset.parquet
+
+# One FITS per spectrum (directory)
+dl-extract-spectra-subset ... --format fits --fits-layout per-file \
+    --output /scratch/qso_fits/
+
+# One multi-row FITS catalog (BINTABLE: TARGETID, Z, FLUX, IVAR, MASK + WAVELENGTH HDU)
+dl-extract-spectra-subset ... --format fits --fits-layout catalog \
+    --output /scratch/qso_spectra.fits
 ```
 
-Output layout (single Zarr group, `wavelength_mode="shared"` only):
+`--format` choices: `zarr` (default), `parquet`, `fits`.  For FITS,
+`--fits-layout` is `per-file` (default) or `catalog`.  All require
+`wavelength_mode="shared"` in the source survey.
+
+Output layout for **zarr**:
 
 ```
 qso_subset.zarr/
@@ -558,7 +580,7 @@ qso_subset.zarr/
   mask/        (N_written, N_pix) uint8   sharded
   wavelength/  (N_pix,)           float64 shared grid
   source_id/   (N_written,)       int64
-  redshift/    (N_written,)       float32  (per-source z from meta)
+  redshift/    (N_written,)       float32  (from catalog ``Z`` when catalog is used)
 ```
 
 Rows are written in HEALPix-tile-traversal order for fast contiguous
@@ -566,6 +588,15 @@ writes; the returned `id_to_row` mapping lets you reorder if needed.
 Lookup uses the catalog's `_spectrum_index` column when available
 (O(catalog SQL) batched), otherwise falls back to a vectorised tile
 scan (one `source_id` array read per tile + `np.isin`).
+
+**Redshift provenance** (Zarr `redshift/`, Parquet `redshift`, FITS `Z`):
+when a Parquet catalog is attached (`catalog_accessor` / CLI
+`--with-catalog`, default on), values come from the survey catalog column
+(auto-detected: `Z`, `ZCOSMO`, `Z_HP`, `Z_PHOT`, `REDSHIFT`, …), **not**
+from spectrum-tile `meta.z` (which is only a copy from ingest-time FITS).
+Pass `--no-with-catalog` to skip the catalog entirely (tile scan for IDs,
+`meta.z` for redshift).  If the catalog exists but has no redshift column,
+the code warns and falls back to `meta.z`.
 
 ### Update catalog with spectrum / cutout index
 
@@ -772,7 +803,7 @@ The `schema_version` field in `catalog_info.json` is a plain integer starting at
 See `notebooks/` for worked examples:
 
 1. **`01_catalog_ingest.ipynb`** — FITS → HEALPix Parquet ingest, validation, and `CatalogAccessor` queries (self-contained temp lake or your paths)
-2. **`02_spectrum_workflow.ipynb`** — Ingest spectra, query, transform, 1-D CNN training loop, FITS export + round-trip
+2. **`02_spectrum_workflow.ipynb`** — Ingest spectra, query, transform, subset export (catalog `Z`), ML loop, FITS export + round-trip
 3. **`03_cutout_ingest.ipynb`** — FITS stamps → Zarr cutout stacks, validation, `CutoutAccessor`, optional `_cutout_index` catalog patch
 4. **`04_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`)
 5. **`11_duckdb_catalog_query.ipynb`** — SQL queries over multi-survey Parquet catalogs

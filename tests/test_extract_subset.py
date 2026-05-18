@@ -294,6 +294,168 @@ class TestExtractSubsetToZarr:
                 show_progress=False,
             )
 
+    def test_extract_subset_parquet(self, synthetic_lake: Path):
+        """Parquet export preserves flux encoding per source_id."""
+        import pyarrow.parquet as pq
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        out = synthetic_lake / "subset.parquet"
+        result = acc.extract_subset_to_parquet(
+            source_ids=[101, 103, 201],
+            output_parquet=out,
+            show_progress=False,
+        )
+        assert result["format"] == "parquet"
+        assert result["n_written"] == 3
+        tbl = pq.read_table(str(out))
+        assert tbl.num_rows == 3
+        flux0 = np.asarray(tbl.column("flux")[0].as_py())
+        sid0 = int(tbl.column("source_id")[0].as_py())
+        assert np.all(flux0 == sid0)
+
+    def test_extract_subset_fits(self, synthetic_lake: Path):
+        """FITS export writes one file per spectrum."""
+        from astropy.io import fits
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        out_dir = synthetic_lake / "subset_fits"
+        result = acc.extract_subset_to_fits(
+            source_ids=[101, 201],
+            output=out_dir,
+            show_progress=False,
+        )
+        assert result["format"] == "fits"
+        assert result["n_written"] == 2
+        assert (out_dir / "spec_101.fits").is_file()
+        assert (out_dir / "spec_201.fits").is_file()
+        with fits.open(out_dir / "spec_101.fits") as hdul:
+            flux = np.array(hdul[0].data, dtype=np.float32)
+            assert np.all(flux == 101)
+
+    def test_redshift_from_catalog_not_zarr_meta(self, synthetic_lake: Path) -> None:
+        """When a catalog is present, output redshift uses catalog Z, not tile meta."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+        from data_lake.io.catalog import CatalogAccessor
+        from data_lake.io.spectra import SpectrumAccessor
+
+        catalog_z = {101: 1.11, 103: 1.33, 201: 2.01}
+        cat_root = synthetic_lake / "catalogs" / SURVEY
+        by_tile: dict[int, list[tuple[int, float]]] = {}
+        for sid, z_cat in catalog_z.items():
+            _, ra, dec, _ = next(row for row in SOURCES if row[0] == sid)
+            npix = int(assign_healpix(np.array([ra]), np.array([dec]), NORDER)[0])
+            by_tile.setdefault(npix, []).append((sid, z_cat))
+        for npix, rows in by_tile.items():
+            tile_dir = cat_root / healpix_dir(NORDER, npix)
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            sids, zs = zip(*rows)
+            pq.write_table(
+                pa.table({
+                    "TARGETID": pa.array(sids, type=pa.int64()),
+                    "Z": pa.array(zs, type=pa.float64()),
+                    f"_healpix_norder{NORDER}": pa.array([npix] * len(sids), type=pa.int64()),
+                    "_spectrum_index": pa.array(range(len(sids)), type=pa.int64()),
+                }),
+                tile_dir / f"Npix={npix}.parquet",
+            )
+        (cat_root / "catalog_info.json").write_text(
+            '{"hats_order": 5, "source_id_mode": "native", "source_id_column": "TARGETID"}'
+        )
+
+        cat = CatalogAccessor(synthetic_lake, SURVEY)
+        acc = SpectrumAccessor(synthetic_lake, SURVEY, catalog_accessor=cat)
+        result = acc.extract_subset_to_zarr(
+            source_ids=list(catalog_z.keys()),
+            output_zarr=synthetic_lake / "subset_cat_z.zarr",
+            show_progress=False,
+        )
+        import zarr
+        out = zarr.open_group(
+            store=zarr.storage.LocalStore(str(result["output_zarr"])),
+            mode="r",
+            zarr_format=3,
+        )
+        z_out = np.asarray(out["redshift"][:])
+        for sid, z_exp in catalog_z.items():
+            row = result["id_to_row"][sid]
+            assert abs(z_out[row] - z_exp) < 1e-5, f"sid {sid}: catalog Z expected"
+            z_meta = next(z for s, _, _, z in SOURCES if s == sid)
+            assert abs(z_out[row] - z_meta) > 0.01, f"sid {sid}: should not use tile meta"
+
+    def test_extract_subset_fits_catalog(self, synthetic_lake: Path):
+        """FITS catalog layout: one file, all spectra in SPECTRA BINTABLE."""
+        from astropy.io import fits
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        out = synthetic_lake / "subset_catalog.fits"
+        result = acc.extract_subset_to_fits_catalog(
+            source_ids=[101, 103, 201],
+            output_fits=out,
+            show_progress=False,
+        )
+        assert result["fits_layout"] == "catalog"
+        assert result["n_written"] == 3
+        assert out.is_file()
+        with fits.open(out) as hdul:
+            assert hdul["SPECTRA"].data["TARGETID"][0] == 101
+            flux_row = np.array(hdul["SPECTRA"].data["FLUX"][0], dtype=np.float32)
+            assert np.all(flux_row == 101)
+            wave = np.array(hdul["WAVELENGTH"].data).ravel()
+            np.testing.assert_allclose(wave, np.linspace(3600.0, 9800.0, N_PIX))
+
+    def test_extract_subset_cli_format_parquet(self, synthetic_lake: Path):
+        from click.testing import CliRunner
+
+        from data_lake.export.spectra_subset import cli
+
+        runner = CliRunner()
+        ids_file = synthetic_lake / "ids.txt"
+        ids_file.write_text("101\n103\n")
+        out = synthetic_lake / "cli_subset.parquet"
+        result = runner.invoke(
+            cli,
+            [
+                "--survey", SURVEY,
+                "--target-list", str(ids_file),
+                "--lake-root", str(synthetic_lake),
+                "--format", "parquet",
+                "--output", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert out.is_file()
+
+    def test_fits_catalog_rejects_directory_output(self, synthetic_lake: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.spectra_subset import cli
+
+        runner = CliRunner()
+        ids_file = synthetic_lake / "ids2.txt"
+        ids_file.write_text("101\n")
+        result = runner.invoke(
+            cli,
+            [
+                "--survey", SURVEY,
+                "--target-list", str(ids_file),
+                "--lake-root", str(synthetic_lake),
+                "--format", "fits",
+                "--fits-layout", "catalog",
+                "--output", str(synthetic_lake / "qso_fits_dir"),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "must be a .fits file" in (result.output or str(result.exception))
+
     def test_deduplicates_input(self, synthetic_lake: Path):
         """Duplicate requested IDs collapse to one output row."""
         from data_lake.io.spectra import SpectrumAccessor
