@@ -136,6 +136,14 @@ def init_parallel_ingest_subprocess() -> None:
     """``ProcessPoolExecutor`` initializer: mark process + apply warning filters."""
     os.environ[PARALLEL_INGEST_WORKER_FLAG] = "1"
     configure_warning_filters()
+    # Import desispec once per worker (not once per coadd) and silence TTY loggers.
+    try:
+        from data_lake.ingest.fits_to_spectra_zarr import _import_desispec
+
+        _import_desispec()
+        apply_parallel_worker_logging_after_heavy_imports()
+    except ImportError:
+        pass
 
 
 def apply_parallel_worker_logging_after_heavy_imports() -> None:

@@ -23,6 +23,15 @@ N_DIAG = 11
 _HALF = N_DIAG // 2
 
 
+def test_desi_read_spectra_skip_hdus():
+    from data_lake.ingest.fits_to_spectra_zarr import _desi_read_spectra_skip_hdus
+
+    base = _desi_read_spectra_skip_hdus(with_resolution=False)
+    assert "EXP_FIBERMAP" in base
+    assert "RESOLUTION" in base
+    assert "RESOLUTION" not in _desi_read_spectra_skip_hdus(with_resolution=True)
+
+
 def _make_spectrum(n_pix: int = 100, with_resolution: bool = True):
     """
     Return a minimal Spectrum with or without a resolution matrix.

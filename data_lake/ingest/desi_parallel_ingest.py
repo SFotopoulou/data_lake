@@ -642,7 +642,9 @@ def ingest_spectra_parallel(
     requested = [_canonical_fits_path(p) for p in file_paths]
     n_requested = len(requested)
 
-    pending = [p for p in requested if p not in completed]
+    # Sorted submission improves average read locality on spinning disks when
+    # workers pull the next path from the queue in order.
+    pending = sorted(p for p in requested if p not in completed)
     n_skipped = n_requested - len(pending)
     if n_skipped:
         log.info("Checkpoint has %d/%d files; resuming with %d pending.",

@@ -357,6 +357,14 @@ def _read_sdss_boss(
     return records, wcs_attrs
 
 
+def _desi_read_spectra_skip_hdus(*, with_resolution: bool) -> set[str]:
+    """HDUs we do not need for flux/ivar/mask + fibermap ingest (smaller FITS read)."""
+    skip = {"EXP_FIBERMAP", "SCORES", "EXTRA_CATALOG"}
+    if not with_resolution:
+        skip.add("RESOLUTION")
+    return skip
+
+
 def _read_desi_with_desispec(
     path: Path,
     with_resolution: bool = False,
@@ -388,7 +396,13 @@ def _read_desi_with_desispec(
     """
     desispec = _import_desispec()
 
-    spectra = desispec.io.read_spectra(str(path))
+    # ``single=True``: float32 from disk (matches Zarr).  ``skip_hdus`` avoids
+    # reading EXP_FIBERMAP / SCORES / etc. — often a large fraction of coadd FITS.
+    spectra = desispec.io.read_spectra(
+        str(path),
+        single=True,
+        skip_hdus=_desi_read_spectra_skip_hdus(with_resolution=with_resolution),
+    )
     coadded = desispec.coaddition.coadd_cameras(spectra)
 
     wave_all = np.asarray(coadded.wave["brz"], dtype=np.float64)
