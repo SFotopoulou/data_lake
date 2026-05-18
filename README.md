@@ -338,12 +338,22 @@ Rough timing on a single workstation for 10 000 DESI coadd files
 
 Disk footprint: ~120–170 GB compressed for ~5 M spectra at ~8 000 px.
 
-**Large runs (10k+ coadds) and memory:** If the terminal exits with no
-Python traceback (often just `Killed`), check the OOM killer:
-`dmesg | tail -20`.  Mitigations: lower `--n-workers`, use
-`--on-duplicate skip` when resuming, and inspect
-`<output>/spectra/<survey>/.ingest.log` (logs are not printed on stderr).
-Catalog patching scans Zarr tiles one at a time (bounded RAM); for a
+**Large runs (10k+ coadds) and memory:** Logs go to
+`<output>/spectra/<survey>/.ingest.log`, not the terminal.  If the shell or
+IDE terminal dies with no Python traceback, check **systemd-oomd** (user-session
+memory pressure) as well as the kernel OOM killer:
+`journalctl -u systemd-oomd --since today` or `grep -i oom /var/log/syslog`.
+
+Mitigations built into the batch command:
+
+- Lower **`--n-workers`** (main lever for decoder process RAM).
+- Lower **`--max-in-flight`** (default `n_workers + 2`; caps queued decode results).
+- Keep default **`--max-open-tiles 64`** so the writer does not hold thousands of
+  Zarr tiles open; use `0` only for small tests.
+- Use **`--on-duplicate skip`** when resuming (writer caches IDs per open tile).
+
+Run long jobs under `tmux`/`nohup` so oomd killing the terminal does not stop
+the ingest.  Catalog patching scans Zarr tiles one at a time (bounded RAM); for a
 manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 
 #### Duplicate / resume flags by command

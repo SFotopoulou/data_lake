@@ -167,6 +167,22 @@ class TestParallelIngestBasic:
         for i, sid in enumerate(sids_100.tolist()):
             assert np.all(flux_100[i] == sid), f"flux mismatch for sid {sid}"
 
+    def test_max_open_tiles_eviction_still_writes(self, tmp_path: Path, fake_files):
+        """Writer closes evicted tiles and re-opens them on later writes."""
+        result = ingest_spectra_parallel(
+            file_paths=fake_files,
+            output_root=tmp_path / "lake",
+            survey_name="syn",
+            n_workers=2,
+            max_open_tiles=1,
+            show_progress=False,
+            decoder=_fake_decoder,
+            executor_factory=_thread_executor,
+        )
+        assert result["n_files_succeeded"] == 3
+        assert result["n_spectra"] == 6
+        assert result["n_tiles"] == 3
+
     def test_failure_isolated_and_logged(self, tmp_path: Path):
         """A failing file logs to failures.jsonl but does not abort the run."""
         files = [tmp_path / f"{n}.fits" for n in ("fileA", "BOOM", "fileC")]

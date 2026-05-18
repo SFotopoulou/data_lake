@@ -53,6 +53,7 @@ from concurrent.futures import (
     wait,
     FIRST_COMPLETED,
 )
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
@@ -236,6 +237,102 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
+
+
+@dataclass
+class _OpenTile:
+    """One HEALPix tile Zarr group held open by the parallel writer."""
+    root: Any
+    existing_ids: set[int] | None = None
+
+
+def _close_spectrum_tile_group(root: Any) -> None:
+    """Release Zarr file handles for a tile (best-effort)."""
+    store = getattr(root, "store", None)
+    if store is None:
+        return
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()
+
+
+def _load_tile_source_id_set(root: Any) -> set[int]:
+    """Read ``source_id`` into a set once when a tile is opened for duplicate checks."""
+    n = int(root["source_id"].shape[0])
+    if n == 0:
+        return set()
+    return set(np.asarray(root["source_id"][:], dtype=np.int64).tolist())
+
+
+class _TileGroupCache:
+    """LRU cache of open tile Zarr groups for the single-thread writer.
+
+    Without eviction the writer keeps every tile it has ever touched open for
+    the whole run (file descriptors + metadata).  For all-sky DESI ingest that
+    can mean thousands of open stores and multi-GB of cached ``source_id`` reads
+    when ``--on-duplicate skip``.
+    """
+
+    def __init__(
+        self,
+        *,
+        survey_root: Path,
+        norder: int,
+        n_pix_known: int,
+        wcs_attrs_known: dict,
+        mask_dtype: np.dtype,
+        on_duplicate: ZarrDuplicateMode,
+        max_open: int,
+    ) -> None:
+        self._survey_root = survey_root
+        self._norder = norder
+        self._n_pix_known = n_pix_known
+        self._wcs_attrs_known = wcs_attrs_known
+        self._mask_dtype = mask_dtype
+        self._track_ids = on_duplicate != "append"
+        self._max_open = max_open
+        self._tiles: OrderedDict[int, _OpenTile] = OrderedDict()
+        self.tiles_touched: set[int] = set()
+
+    def get(self, npix: int) -> _OpenTile:
+        if npix in self._tiles:
+            self._tiles.move_to_end(npix)
+            return self._tiles[npix]
+
+        tile_dir = self._survey_root / healpix_dir(self._norder, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        tile_path = tile_dir / f"Npix={npix}.zarr"
+        root = _open_or_create_spectrum_tile(
+            tile_path,
+            self._n_pix_known,
+            "shared",
+            self._mask_dtype,
+            self._wcs_attrs_known,
+        )
+        existing_ids = (
+            _load_tile_source_id_set(root) if self._track_ids else None
+        )
+        entry = _OpenTile(root=root, existing_ids=existing_ids)
+        self._tiles[npix] = entry
+        self.tiles_touched.add(npix)
+        self._evict_if_needed()
+        return entry
+
+    def note_appended(self, npix: int, source_ids: np.ndarray) -> None:
+        entry = self._tiles.get(npix)
+        if entry is None or entry.existing_ids is None:
+            return
+        entry.existing_ids.update(int(s) for s in source_ids.tolist())
+
+    def close_all(self) -> None:
+        for entry in self._tiles.values():
+            _close_spectrum_tile_group(entry.root)
+        self._tiles.clear()
+
+    def _evict_if_needed(self) -> None:
+        while self._max_open > 0 and len(self._tiles) > self._max_open:
+            _npix, oldest = self._tiles.popitem(last=False)
+            _close_spectrum_tile_group(oldest.root)
 
 
 def _configure_file_logging(log_file: Path, *, verbose: bool) -> None:
@@ -434,6 +531,7 @@ def ingest_spectra_parallel(
     on_duplicate_source_id: ZarrDuplicateMode = "append",
     track_index_map: bool = False,
     max_in_flight: int | None = None,
+    max_open_tiles: int = 64,
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -484,8 +582,13 @@ def ingest_spectra_parallel(
         this dict can exhaust memory (use :func:`update_index_column_from_zarr_tiles`
         after ingest instead).
     max_in_flight:
-        Max decoder futures in flight (default ``2 * n_workers``).  Lower if workers
-        are killed by the OOM killer.
+        Max decoder futures in flight (default ``n_workers + 2``).  Lower if the
+        process or terminal is killed under memory pressure (e.g. systemd-oomd).
+    max_open_tiles:
+        Max HEALPix tile Zarr groups kept open in the writer (default 64).
+        Use ``0`` for unlimited (not recommended on 10k+ coadd runs).  Evicted
+        tiles are closed and re-opened on the next write; duplicate-ID sets are
+        reloaded when ``on_duplicate`` is not ``append``.
 
     Returns
     -------
@@ -546,7 +649,7 @@ def ingest_spectra_parallel(
                  n_skipped, n_requested, len(pending))
 
     if max_in_flight is None:
-        max_in_flight = max(2 * n_workers, n_workers + 4)
+        max_in_flight = n_workers + 2
     if len(pending) > 500 and track_index_map:
         log.warning(
             "track_index_map=True with %d pending files can use many GB of RAM "
@@ -581,7 +684,7 @@ def ingest_spectra_parallel(
         executor_factory = _default_executor
 
     # --- Writer state ---
-    tile_groups: dict[int, "object"] = {}  # npix -> zarr.Group
+    tile_cache: _TileGroupCache | None = None
     n_pix_known: int | None = None
     wcs_attrs_known: dict | None = None
     failures: list[dict] = []
@@ -625,7 +728,7 @@ def ingest_spectra_parallel(
             in_flight[fut] = p
 
     def _process_result(path_str: str, res: WorkerResult) -> None:
-        nonlocal n_files_ok, n_files_fail, n_spectra_written, n_pix_known, wcs_attrs_known
+        nonlocal n_files_ok, n_files_fail, n_spectra_written, n_pix_known, wcs_attrs_known, tile_cache
 
         if not res.ok:
             n_files_fail += 1
@@ -669,17 +772,20 @@ def ingest_spectra_parallel(
                     fh.write(json.dumps(fail_entry) + "\n")
             return
 
+        if tile_cache is None:
+            tile_cache = _TileGroupCache(
+                survey_root=survey_root,
+                norder=norder,
+                n_pix_known=n_pix_known,
+                wcs_attrs_known=wcs_attrs_known or {},
+                mask_dtype=np.dtype(np.uint8),
+                on_duplicate=on_duplicate_source_id,
+                max_open=max_open_tiles,
+            )
+
         snap: dict[int, int] = {}
         for b in res.batches:
-            tile_dir = survey_root / healpix_dir(norder, b.npix)
-            tile_dir.mkdir(parents=True, exist_ok=True)
-            tile_path = tile_dir / f"Npix={b.npix}.zarr"
-            if b.npix not in tile_groups:
-                tile_groups[b.npix] = _open_or_create_spectrum_tile(
-                    tile_path, n_pix_known, "shared",
-                    np.dtype(np.uint8), wcs_attrs_known,
-                )
-            root = tile_groups[b.npix]
+            root = tile_cache.get(b.npix).root
             snap[b.npix] = int(root["flux"].shape[0])
 
         _atomic_write_json(
@@ -694,15 +800,15 @@ def ingest_spectra_parallel(
         )
 
         for b in res.batches:
-            root = tile_groups[b.npix]
-            n_existing = int(root["source_id"].shape[0])
-            existing_arr = (
-                np.asarray(root["source_id"][:], dtype=np.int64)
-                if n_existing > 0
-                else np.array([], dtype=np.int64)
-            )
+            open_tile = tile_cache.get(b.npix)
+            root = open_tile.root
+            existing = open_tile.existing_ids
+            if existing is None:
+                existing_for_filter: set[int] | np.ndarray = np.array([], dtype=np.int64)
+            else:
+                existing_for_filter = existing
             filtered = _filter_tile_batch(
-                b, existing_arr, on_duplicate_source_id,
+                b, existing_for_filter, on_duplicate_source_id,
             )
             if filtered is None:
                 continue
@@ -718,6 +824,7 @@ def ingest_spectra_parallel(
                 dtype="|V" + str(_META_DTYPE.itemsize),
             )
             root["meta"].append(meta_arr)
+            tile_cache.note_appended(b.npix, b.source_ids)
 
             if start_idx == 0 and res.wavelength is not None:
                 root["wavelength"][:] = res.wavelength.astype(np.float64)
@@ -759,12 +866,16 @@ def ingest_spectra_parallel(
                         _submit_more(pool)
 
     finally:
+        if tile_cache is not None:
+            tile_cache.close_all()
         if uses_parallel_subprocess_workers:
             for _k, _v in _env_prev_parallel.items():
                 if _v is None:
                     os.environ.pop(_k, None)
                 else:
                     os.environ[_k] = _v
+
+    n_tiles_touched = len(tile_cache.tiles_touched) if tile_cache is not None else 0
 
     if n_pix_known is not None and wcs_attrs_known is not None:
         _write_spectrum_info(
@@ -777,7 +888,7 @@ def ingest_spectra_parallel(
         "Parallel ingest: %d/%d files ok (%d failed, %d skipped from checkpoint), "
         "%d spectra → %d tiles in %.1fs",
         n_files_ok, len(pending), n_files_fail, n_skipped,
-        n_spectra_written, len(tile_groups), elapsed,
+        n_spectra_written, n_tiles_touched, elapsed,
     )
 
     return {
@@ -787,7 +898,7 @@ def ingest_spectra_parallel(
         "n_files_succeeded": n_files_ok,
         "n_files_failed": n_files_fail,
         "n_spectra": n_spectra_written,
-        "n_tiles": len(tile_groups),
+        "n_tiles": n_tiles_touched,
         "index_map": index_map,
         "failures": failures,
         "elapsed_s": elapsed,
@@ -834,6 +945,17 @@ try:
         "--n-workers", required=True, type=int,
         help="Number of worker processes (typically cpu_count - 1).",
     )
+    @click.option(
+        "--max-in-flight", "max_in_flight", default=None, type=int,
+        help="Max coadd decodes queued ahead of the writer "
+             "(default: n_workers + 2).  Lower to reduce peak RAM.",
+    )
+    @click.option(
+        "--max-open-tiles", "max_open_tiles", default=64, show_default=True,
+        type=int,
+        help="Max HEALPix tile Zarr groups open in the writer; "
+             "0 = unlimited (not recommended for large runs).",
+    )
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
     @click.option(
@@ -877,6 +999,8 @@ try:
         coadd_root: Path | None,
         coadd_glob: str,
         n_workers: int,
+        max_in_flight: int | None,
+        max_open_tiles: int,
         norder: int | None,
         checkpoint_path: Path | None,
         failures_log: Path | None,
@@ -903,6 +1027,10 @@ try:
             )
         if n_workers < 1:
             raise click.UsageError("--n-workers must be >= 1")
+        if max_in_flight is not None and max_in_flight < 1:
+            raise click.UsageError("--max-in-flight must be >= 1")
+        if max_open_tiles < 0:
+            raise click.UsageError("--max-open-tiles must be >= 0")
 
         cfg = load_optional_config(config_path)
         resolved_output = require_output_root(output_root, cfg, kind="spectra")
@@ -951,6 +1079,8 @@ try:
             worker_log_file=log_file_path,
             worker_verbose=verbose,
             on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
+            max_in_flight=max_in_flight,
+            max_open_tiles=max_open_tiles,
         )
 
         click.echo(
