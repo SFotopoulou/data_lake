@@ -917,14 +917,17 @@ try:
     from ..cli_utils import (
         config_option,
         configure_warning_filters,
+        ingest_token_option,
         load_optional_config,
         pick,
+        require_ingest_permission,
         require_output_root,
     )
 
     @click.command("dl-ingest-spectra-batch")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @ingest_token_option
     @click.option("--survey", "survey_name", required=True, help="Short survey name.")
     @click.option(
         "--file-list", "file_list", type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -996,6 +999,7 @@ try:
     def cli(
         output_root: Path | None,
         config_path: Path | None,
+        ingest_token: str | None,
         survey_name: str,
         file_list: Path | None,
         coadd_root: Path | None,
@@ -1035,6 +1039,7 @@ try:
             raise click.UsageError("--max-open-tiles must be >= 0")
 
         cfg = load_optional_config(config_path)
+        require_ingest_permission(cfg, ingest_token)
         resolved_output = require_output_root(output_root, cfg, kind="spectra")
         resolved_norder = pick(
             norder, cfg.partitioning.hats_order if cfg else None, 5,

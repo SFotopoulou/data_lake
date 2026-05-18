@@ -9,8 +9,10 @@ defaults for parameters such as ``output_root``, ``norder``,
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -18,6 +20,9 @@ from typing import Any, Callable, TypeVar
 import click
 
 from .config import LakeConfig, LakeConfigNotFound
+
+INGEST_TOKEN_ENV = "LAKE_INGEST_TOKEN"
+INGEST_TOKEN_HASH_FILENAME = ".ingest_token_hash"
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -32,6 +37,105 @@ def config_option(f: F) -> F:
         help="Path to a lake_config.toml (or set $DATA_LAKE_CONFIG). "
              "Provides default values for output_root, norder, etc.",
     )(f)
+
+
+def ingest_token_option(f: F) -> F:
+    """Add ``--ingest-token`` (also reads ``$LAKE_INGEST_TOKEN``) to a write ingest CLI."""
+    return click.option(
+        "--ingest-token",
+        "ingest_token",
+        default=None,
+        envvar=INGEST_TOKEN_ENV,
+        help="Ingest guard token when [guardrails] require_ingest_token is true in "
+             "lake_config.toml (prefer the env var in batch jobs).",
+    )(f)
+
+
+def hash_ingest_token(token: str) -> str:
+    """Return the SHA-256 hex digest stored in ``[guardrails] ingest_token_hash``."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def ingest_token_hash_path(deployment_dir: Path, filename: str | None = None) -> Path:
+    """Path to the hidden sidecar file that stores the expected token hash."""
+    return deployment_dir / (filename or INGEST_TOKEN_HASH_FILENAME)
+
+
+def write_ingest_token_hash(
+    deployment_dir: Path,
+    token: str,
+    *,
+    filename: str | None = None,
+) -> Path:
+    """Write ``.ingest_token_hash`` (mode 0600) next to ``lake_config.toml``.
+
+    Only the digest is stored; the plaintext token is never written to disk.
+    """
+    path = ingest_token_hash_path(deployment_dir, filename)
+    path.write_text(hash_ingest_token(token) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass  # best-effort on non-Unix
+    return path
+
+
+def resolve_expected_ingest_hash(cfg: LakeConfig) -> str:
+    """Expected SHA-256 hex: inline ``ingest_token_hash`` or deployment sidecar."""
+    inline = (cfg.guardrails.ingest_token_hash or "").strip()
+    if inline:
+        return inline.lower()
+
+    if cfg.source_path is None:
+        return ""
+
+    rel = (cfg.guardrails.ingest_token_file or INGEST_TOKEN_HASH_FILENAME).strip()
+    if not rel:
+        return ""
+
+    sidecar = cfg.source_path.parent / rel
+    if not sidecar.is_file():
+        return ""
+
+    return sidecar.read_text(encoding="utf-8").strip().lower()
+
+
+def require_ingest_permission(
+    cfg: LakeConfig | None,
+    ingest_token: str | None = None,
+) -> None:
+    """Block accidental writes when the deployment opts into ingest guardrails.
+
+    This is a **guardrail against mistakes**, not access control: anyone with
+    shell access and the token can still ingest.  Pair with filesystem permissions
+    (read-only lake mount for analysts) for real separation.
+
+    When ``cfg.guardrails.require_ingest_token`` is false or no config is loaded,
+    this is a no-op (legacy CLIs without a deployment config are unchanged).
+    """
+    if cfg is None or not cfg.guardrails.require_ingest_token:
+        return
+
+    expected = resolve_expected_ingest_hash(cfg)
+    if not expected:
+        raise click.ClickException(
+            "lake_config.toml has guardrails.require_ingest_token = true but "
+            "no ingest token hash was found.  At init time use:\n"
+            "  dl-init NAME PARENT --ingest-token 'your-secret'\n"
+            "or write .ingest_token_hash in the deployment directory, or set "
+            "guardrails.ingest_token_hash in lake_config.toml."
+        )
+
+    provided = (ingest_token or os.environ.get(INGEST_TOKEN_ENV) or "").strip()
+    if not provided:
+        raise click.ClickException(
+            "This deployment requires an ingest token.  Export "
+            f"${INGEST_TOKEN_ENV} or pass --ingest-token before running ingest."
+        )
+
+    got = hash_ingest_token(provided).lower()
+    if not secrets.compare_digest(got, expected):
+        raise click.ClickException("Invalid ingest token for this deployment.")
 
 
 def load_optional_config(config_path: Path | None) -> LakeConfig | None:

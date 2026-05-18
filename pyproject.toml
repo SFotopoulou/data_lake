@@ -41,7 +41,8 @@ dev = [
 ]
 
 [project.scripts]
-dl-init            = "data_lake.admin.init_lake:dl_init"
+dl-init                 = "data_lake.admin.init_lake:dl_init"
+dl-set-ingest-token     = "data_lake.admin.set_ingest_token:dl_set_ingest_token"
 dl-ingest-catalog  = "data_lake.ingest.fits_to_parquet:cli"
 dl-ingest-cutouts  = "data_lake.ingest.fits_to_zarr:cli"
 dl-ingest-spectra  = "data_lake.ingest.fits_to_spectra_zarr:cli"

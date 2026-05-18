@@ -89,6 +89,60 @@ You can have multiple deployments side by side (e.g. `prod`, `staging`,
 `personal`) and switch between them by exporting a different
 `DATA_LAKE_CONFIG`.
 
+### Ingest guardrails (accidental-write protection)
+
+Production lakes can opt in to a **shared ingest token** so casual
+`dl-ingest-*` runs fail fast unless the operator exports the token.
+This is a **mistake guardrail**, not security: anyone with shell access
+and the token can still write.  Pair it with **filesystem permissions**
+(read-only mount or Unix group for analysts) for real separation between
+ingest operators and read-only users.
+
+**Recommended:** set the token at deployment init.  Only the SHA-256 hash
+is written to a hidden sidecar (`.ingest_token_hash`, mode `0600`,
+gitignored) next to `lake_config.toml`:
+
+```bash
+dl-init mylake ~/projects --ingest-token 'your-secret'
+export DATA_LAKE_CONFIG=~/projects/mylake/lake_config.toml
+export LAKE_INGEST_TOKEN='your-secret'   # plaintext stays in env / Slurm, not on disk
+```
+
+**Existing deployments** — enable or rotate the token without re-running init:
+
+```bash
+export DATA_LAKE_CONFIG=/path/to/mylake/lake_config.toml
+dl-set-ingest-token --ingest-token 'your-secret'
+export LAKE_INGEST_TOKEN='your-secret'
+```
+
+**Manual** — either keep the hash in `lake_config.toml` or in the sidecar:
+
+```toml
+[guardrails]
+require_ingest_token = true
+ingest_token_hash = "<sha256-hex>"   # optional if .ingest_token_hash exists
+ingest_token_file = ".ingest_token_hash"
+```
+
+Generate a hash for a hand-edited config:
+
+```bash
+python -c "from data_lake.cli_utils import hash_ingest_token; print(hash_ingest_token('your-secret'))"
+```
+
+Ingest operators export the token (Slurm, `tmux`, shell rc — not in git):
+
+```bash
+export LAKE_INGEST_TOKEN='your-secret'
+dl-ingest-spectra-batch --survey DESI_DR1 --file-list coadds.txt --n-workers 8
+```
+
+Or pass `--ingest-token` on the CLI (visible in `ps`; prefer the env var).
+Read-only tools (`SpectrumAccessor`, `dl-extract-spectra-subset`,
+`dl-validate-*-ingest`) are unchanged.  Legacy runs without a lake config
+are unchanged.
+
 ### Ingest a survey catalog
 
 With a deployment config in place (`$DATA_LAKE_CONFIG` set), the

@@ -36,6 +36,11 @@ Schema (lake_config.toml)
     num_workers = "auto"                   # "auto" | <int>
     log_level   = "INFO"                   # standard logging level
 
+    [guardrails]
+    require_ingest_token = false           # when true, dl-ingest-* needs $LAKE_INGEST_TOKEN
+    ingest_token_hash  = ""                # SHA-256 hex (optional; prefer .ingest_token_hash)
+    ingest_token_file  = ".ingest_token_hash"  # sidecar next to lake_config.toml (gitignored)
+
 Discovery order
 ---------------
 ``LakeConfig.discover(explicit_path=None)`` looks for a config in:
@@ -96,6 +101,11 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
         "num_workers": "auto",
         "log_level":   "INFO",
     },
+    "guardrails": {
+        "require_ingest_token": False,
+        "ingest_token_hash": "",
+        "ingest_token_file": ".ingest_token_hash",
+    },
 }
 
 
@@ -139,6 +149,13 @@ class _Ingest:
 
 
 @dataclass(slots=True)
+class _Guardrails:
+    require_ingest_token: bool = False
+    ingest_token_hash: str = ""
+    ingest_token_file: str = ".ingest_token_hash"
+
+
+@dataclass(slots=True)
 class LakeConfig:
     """In-memory representation of a deployment's ``lake_config.toml``."""
 
@@ -147,6 +164,7 @@ class LakeConfig:
     defaults: _Defaults = field(default_factory=_Defaults)
     paths: _Paths = field(default_factory=_Paths)
     ingest: _Ingest = field(default_factory=_Ingest)
+    guardrails: _Guardrails = field(default_factory=_Guardrails)
     schema_version: str = SCHEMA_VERSION
     source_path: Path | None = None
 
@@ -279,6 +297,7 @@ class LakeConfig:
             defaults     = _merge("defaults",     _Defaults)
             paths        = _merge("paths",        _Paths)
             ingest       = _merge("ingest",       _Ingest)
+            guardrails   = _merge("guardrails",   _Guardrails)
         except TypeError as exc:
             raise LakeConfigInvalid(f"Unknown key in {source_path}: {exc}") from exc
 
@@ -288,6 +307,7 @@ class LakeConfig:
             defaults=defaults,
             paths=paths,
             ingest=ingest,
+            guardrails=guardrails,
             schema_version=schema_version,
             source_path=source_path,
         )
@@ -329,6 +349,11 @@ class LakeConfig:
             "[ingest]",
             f'num_workers = {_q(str(self.ingest.num_workers)) if isinstance(self.ingest.num_workers, str) else self.ingest.num_workers}',
             f'log_level   = {_q(self.ingest.log_level)}',
+            "",
+            "[guardrails]",
+            f"require_ingest_token = {str(self.guardrails.require_ingest_token).lower()}",
+            f"ingest_token_hash  = {_q(self.guardrails.ingest_token_hash)}",
+            f"ingest_token_file  = {_q(self.guardrails.ingest_token_file)}",
             "",
         ]
         return "\n".join(lines)

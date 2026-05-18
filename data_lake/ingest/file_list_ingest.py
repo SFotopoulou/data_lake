@@ -130,8 +130,10 @@ try:
     from ..cli_utils import (
         config_option,
         configure_warning_filters,
+        ingest_token_option,
         load_optional_config,
         pick,
+        require_ingest_permission,
         require_output_root,
     )
     from data_lake.ingest.fits_to_parquet import ingest_catalog
@@ -141,6 +143,7 @@ try:
     @click.argument("paths_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @ingest_token_option
     @click.option("--survey", "survey_name", required=True)
     @click.option("--ra-col", default="ra", show_default=True)
     @click.option("--dec-col", default="dec", show_default=True)
@@ -187,6 +190,7 @@ try:
         paths_file: Path,
         output_root: Path | None,
         config_path: Path | None,
+        ingest_token: str | None,
         survey_name: str,
         ra_col: str,
         dec_col: str,
@@ -206,6 +210,7 @@ try:
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
+        require_ingest_permission(cfg, ingest_token)
         lake = require_output_root(output_root, cfg, kind="catalogs")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
         default_ck = lake / "catalogs" / survey_name / ".ingest_checkpoint.json"
@@ -242,6 +247,7 @@ try:
     @click.argument("paths_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @ingest_token_option
     @click.option("--survey", "survey_name", required=True)
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
@@ -285,6 +291,7 @@ try:
         paths_file: Path,
         output_root: Path | None,
         config_path: Path | None,
+        ingest_token: str | None,
         survey_name: str,
         ra_col: str,
         dec_col: str,
@@ -308,6 +315,7 @@ try:
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
+        require_ingest_permission(cfg, ingest_token)
         lake = require_output_root(output_root, cfg, kind="cutouts")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
         bn = [x.strip() for x in band_names.split(",")] if band_names else None
@@ -369,6 +377,7 @@ try:
     @click.argument("paths_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @ingest_token_option
     @click.option("--survey", "survey_name", required=True)
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
@@ -400,6 +409,7 @@ try:
         paths_file: Path,
         output_root: Path | None,
         config_path: Path | None,
+        ingest_token: str | None,
         survey_name: str,
         ra_col: str,
         dec_col: str,
@@ -418,6 +428,7 @@ try:
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
+        require_ingest_permission(cfg, ingest_token)
         lake = require_output_root(output_root, cfg, kind="spectra")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
         default_ck = lake / "spectra" / survey_name / ".ingest_checkpoint.json"

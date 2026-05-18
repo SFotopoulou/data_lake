@@ -884,8 +884,10 @@ try:
     from ..cli_utils import (
         config_option,
         configure_warning_filters,
+        ingest_token_option,
         load_optional_config,
         pick,
+        require_ingest_permission,
         require_output_root,
     )
 
@@ -893,6 +895,7 @@ try:
     @click.argument("source_path", type=click.Path(exists=True, path_type=Path))
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @ingest_token_option
     @click.option("--survey", "survey_name", required=True, help="Short survey name.")
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
@@ -940,6 +943,7 @@ try:
         source_path: Path,
         output_root: Path | None,
         config_path: Path | None,
+        ingest_token: str | None,
         survey_name: str,
         ra_col: str,
         dec_col: str,
@@ -963,6 +967,7 @@ try:
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
+        require_ingest_permission(cfg, ingest_token)
         resolved_output = require_output_root(output_root, cfg, kind="spectra")
         resolved_norder = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
 

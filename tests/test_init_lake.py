@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from data_lake.admin.init_lake import dl_init, init_lake
+from data_lake.cli_utils import hash_ingest_token, require_ingest_permission
 from data_lake.config import LakeConfig
 
 
@@ -79,6 +80,23 @@ def test_init_lake_missing_parent_raises(tmp_path: Path) -> None:
         init_lake(name="x", parent=tmp_path / "does_not_exist")
 
 
+def test_init_lake_ingest_token_writes_sidecar(tmp_path: Path) -> None:
+    deployment = init_lake(
+        name="guarded",
+        parent=tmp_path,
+        ingest_token="deploy-secret",
+    )
+    sidecar = deployment / ".ingest_token_hash"
+    assert sidecar.is_file()
+    assert sidecar.read_text().strip() == hash_ingest_token("deploy-secret")
+    assert ".ingest_token_hash" in (deployment / ".gitignore").read_text()
+
+    cfg = LakeConfig.load(deployment / "lake_config.toml")
+    assert cfg.guardrails.require_ingest_token is True
+    assert cfg.guardrails.ingest_token_hash == ""
+    require_ingest_permission(cfg, "deploy-secret")
+
+
 # ---------------------------------------------------------------------------
 # CLI wrapper
 # ---------------------------------------------------------------------------
@@ -127,6 +145,19 @@ def test_cli_num_workers_invalid(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "must be 'auto' or an integer" in result.output
+
+
+def test_cli_ingest_token(tmp_path: Path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        dl_init,
+        ["guarded_cli", str(tmp_path), "--ingest-token", "cli-secret"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Ingest guardrails" in result.output
+    dep = tmp_path / "guarded_cli"
+    cfg = LakeConfig.load(dep / "lake_config.toml")
+    require_ingest_permission(cfg, "cli-secret")
 
 
 def test_cli_refuses_existing_without_force(tmp_path: Path) -> None:

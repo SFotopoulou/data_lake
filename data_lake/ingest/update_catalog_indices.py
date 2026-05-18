@@ -354,7 +354,13 @@ def build_index_map_from_zarr(
 try:
     import click
 
-    from ..cli_utils import config_option, load_optional_config, require_output_root
+    from ..cli_utils import (
+        config_option,
+        ingest_token_option,
+        load_optional_config,
+        require_ingest_permission,
+        require_output_root,
+    )
 
     @click.command("dl-rebuild-catalog-indices")
     @click.option("--survey", "survey_name", required=True,
@@ -376,6 +382,7 @@ try:
     )
     @click.argument("lake_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @ingest_token_option
     def cli_rebuild(
         survey_name: str,
         kind: str,
@@ -383,6 +390,7 @@ try:
         source_id_col: str | None,
         lake_root: Path | None,
         config_path: Path | None,
+        ingest_token: str | None,
     ) -> None:
         """Rebuild _spectrum_index / _cutout_index in catalog tiles from existing Zarr data.
 
@@ -394,6 +402,7 @@ try:
         logging.basicConfig(level=logging.INFO)
 
         cfg = load_optional_config(config_path)
+        require_ingest_permission(cfg, ingest_token)
         resolved_root = require_output_root(lake_root, cfg)
 
         click.echo(f"Scanning {kind} tiles for survey={survey_name!r} …")
