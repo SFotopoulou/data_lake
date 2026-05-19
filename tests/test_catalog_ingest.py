@@ -30,6 +30,19 @@ from astropy.table import MaskedColumn, Table
 # ---------------------------------------------------------------------------
 
 
+def _make_jname_id_table(n_rows: int = 12) -> Table:
+    """Alphanumeric object names (not parseable as integers)."""
+    rng = np.random.default_rng(11)
+    names = np.array(
+        [f"J{rng.uniform(0, 360):09.2f}{rng.choice(['+', '-'])}{abs(rng.uniform(0, 90)):06.1f}"
+         for _ in range(n_rows)],
+        dtype="U24",
+    )
+    ra = rng.uniform(0.0, 360.0, n_rows).astype(np.float64)
+    dec = rng.uniform(-30.0, +30.0, n_rows).astype(np.float64)
+    return Table({"NAME": names, "RA": ra, "DEC": dec})
+
+
 def _make_string_targetid_table(n_rows: int = 20) -> Table:
     """TARGETID as fixed-width ASCII (typical FITS BINTABLE string column)."""
     rng = np.random.default_rng(7)
@@ -269,6 +282,45 @@ class TestCastObjectIdColumn:
 
 
 class TestIngestCatalogEndToEnd:
+    def test_ingest_jname_label_column(self, tmp_path: Path) -> None:
+        """Non-integer NAME labels: column kept, source_id = stable hash."""
+        import json
+
+        from data_lake.ingest.fits_to_parquet import (
+            ingest_catalog,
+            stable_object_id_from_string,
+        )
+
+        tbl = _make_jname_id_table(n_rows=8)
+        fits_path = tmp_path / "jnames.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        lake_root = tmp_path / "lake"
+        ingest_catalog(
+            source_path=fits_path,
+            output_root=lake_root,
+            survey_name="syn_j",
+            ra_col="RA",
+            dec_col="DEC",
+            source_id_col="NAME",
+            overwrite=True,
+            streaming=False,
+        )
+
+        info = json.loads(
+            (lake_root / "catalogs" / "syn_j" / "catalog_info.json").read_text()
+        )
+        assert info["source_id_mode"] == "label:NAME"
+
+        _, merged = _read_merged_catalog(lake_root, "syn_j")
+        assert pa.types.is_string(merged.schema.field("NAME").type) or pa.types.is_large_string(
+            merged.schema.field("NAME").type
+        )
+        assert merged.schema.field("source_id").type == pa.int64()
+        name0 = str(merged.column("NAME")[0].as_py()).strip()
+        sid0 = int(merged.column("source_id")[0].as_py())
+        assert sid0 == stable_object_id_from_string(name0)
+
     def test_ingest_string_targetid_column(self, tmp_path: Path) -> None:
         """String/object TARGETID in FITS is parsed to int64 in Parquet."""
         from data_lake.ingest.fits_to_parquet import ingest_catalog

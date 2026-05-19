@@ -223,6 +223,41 @@ to rebuild a tile from one file only. `--overwrite` is deprecated but still maps
 to `--tile-mode overwrite`. After every ingest, `_metadata` and `catalog_info.json`
 `total_rows` are refreshed from **all** tiles on disk.
 
+#### Object identifiers (`--source-id-col`)
+
+The lake uses **int64** keys in Zarr ``source_id/`` arrays and for cross-modal
+joins. Catalog ingest normalizes the column you pass with ``--source-id-col``
+according to its contents (recorded in ``catalog_info.json`` as ``source_id_mode``):
+
+| Input type | Example | Parquet result | ``source_id_mode`` |
+|------------|---------|----------------|---------------------|
+| Integer column | DESI ``TARGETID`` | Same column cast to ``int64`` | ``column:TARGETID`` |
+| Decimal string column | ``"39627658462934656"`` in FITS ASCII | Parsed to ``int64`` in place | ``column:TARGETID`` |
+| Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | Label column kept as string; new ``source_id`` = stable hash | ``label:NAME`` |
+| (none) | — | Auto ``source_id`` 0…N−1 | ``sequential`` |
+
+**Whitespace:** leading and trailing spaces are stripped before parsing or
+hashing (common for fixed-width FITS strings). Internal spaces are preserved.
+
+**Alphanumeric labels:** the human-readable name stays in your column (e.g.
+``NAME``). A separate ``source_id`` column is added so spectra/cutouts can
+join on int64. The hash is deterministic (BLAKE2b → 64-bit signed int).
+
+```python
+from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+label = "J000000.00-314627.5"
+sid = normalize_object_id(label)   # same int64 as catalog source_id / Zarr row
+acc.get_spectrum(sid)
+```
+
+SQL on names: ``SELECT * FROM catalog WHERE NAME = 'J000000.00-314627.5'``.
+Use the **same** spelling (after strip) in cutout/spectrum FITS headers via
+``--source-id-col NAME`` so ingest hashes match the catalog.
+
+If no ``--source-id-col`` is given, ingest tries common column names
+(``TARGETID``, ``SOURCE_ID``, …) or generates sequential IDs.
+
 ### Ingest cutouts
 
 Cutouts are stored as **Zarr v3** stacks (one group per HEALPix tile). Each ingested
@@ -253,7 +288,7 @@ so ``update_index_column`` can patch ``_cutout_index``.
 
 | Purpose | CLI flag | Header keyword(s) | Notes |
 |--------|----------|-------------------|--------|
-| Object ID (join to catalog) | ``--source-id-col`` | e.g. ``TARGETID`` | **Required** for production; stored as ``int64`` in Parquet (string/ASCII FITS columns with decimal IDs are parsed at ingest). If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index (not suitable for catalog match). |
+| Object ID (join to catalog) | ``--source-id-col`` | e.g. ``TARGETID``, ``NAME`` | **Required** for production. Must match catalog ingest (int64 or hashed label). See [Object identifiers](#object-identifiers---source-id-col). If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index. |
 | Sky position (tile routing) | ``--ra-col`` / ``--dec-col`` | e.g. ``TARGET_RA``, ``TARGET_DEC`` | Degrees; fallbacks include ``RA_TARG``/``DEC_TARG``, ``CRVAL1``/``CRVAL2``. Should match catalog coordinates. |
 | Astrometry (export) | — | Standard 2-D WCS | ``CTYPE*``, ``CRVAL*``, ``CRPIX*``, ``CD*_*`` (or CDELT/CROTA); stored in ``wcs/`` for FITS round-trip. |
 | Image data | — | Primary or image HDU | 2-D ``(H,W)`` → one band; 3-D → set ``--band-axis``. Fixed ``(H,W)`` per survey tile after the first file. |
@@ -707,7 +742,7 @@ examples/
 ```
 
 Each catalog row carries:
-- `source_id` — stable integer ID
+- `source_id` — stable int64 for Zarr joins (native integer ID, or hash of a label column when ``source_id_mode`` is ``label:…``)
 - `_healpix_norder5` — HEALPix tile pixel (partitioning key)
 - `_cutout_index` — position inside the tile's Zarr cutout array (O(1) lookup)
 - `_spectrum_index` — position inside the tile's Zarr spectrum array (O(1) lookup; -1 = not ingested)
@@ -728,7 +763,7 @@ Shape it for how you query (DuckDB, Polars, ADQL). Typical columns:
 
 | Column | Purpose |
 |--------|--------|
-| Primary `source_id` | Integer key for your “home” survey catalog row |
+| Primary `source_id` | int64 key for your “home” survey catalog row (or hash of a string label; see [Object identifiers](#object-identifiers---source-id-col)) |
 | Partner IDs | e.g. `desi_targetid`, `euclid_source_id` — whatever the other survey stores |
 | `sep_arcsec` | Sky separation from the matcher (optional but good for QA) |
 | `match_rank` / `find` flag | If the matcher can return multiple neighbours, disambiguate |

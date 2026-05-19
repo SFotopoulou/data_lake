@@ -61,8 +61,14 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
     # Parquet
     if suffix in {".parquet", ".pq"}:
         import pyarrow.parquet as pq
+
+        from data_lake.ingest.fits_to_parquet import normalize_object_id
+
         tbl = pq.read_table(str(path), columns=[column])
-        return np.asarray(tbl.column(column).to_numpy(zero_copy_only=False), dtype=np.int64)
+        return np.asarray(
+            [normalize_object_id(v) for v in tbl.column(column).to_pylist()],
+            dtype=np.int64,
+        )
 
     # CSV / TSV / FITS / VOTable / IPAC – let astropy figure it out
     from astropy.table import Table
@@ -74,7 +80,12 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
             f"Column {column!r} not in {path.name}. "
             f"Available columns: {preview}{ellipsis}"
         )
-    return np.asarray(tbl[column], dtype=np.int64)
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    return np.asarray(
+        [normalize_object_id(v) for v in tbl[column]],
+        dtype=np.int64,
+    )
 
 
 def _validate_output_path(

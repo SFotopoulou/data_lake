@@ -451,7 +451,9 @@ def _read_desi_with_desispec(
                 f"Fibermap column {sid_key!r} not found for object ID. "
                 f"Available: {list(fmap.colnames)[:30]}"
             )
-        source_id = int(row[sid_key])
+        from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+        source_id = normalize_object_id(row[sid_key])
         meta = {
             "z":       float(_fmap_col(row, "Z",    default=0.0)),
             "z_err":   float(_fmap_col(row, "ZERR", default=0.0)),

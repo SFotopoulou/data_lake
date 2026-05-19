@@ -11,6 +11,7 @@ Layout produced
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -85,6 +86,32 @@ _FITS_HEADER_ID_KEYWORDS = (
 _FLOAT64_SAFE_INTEGER = 2**53
 
 
+def stable_object_id_from_string(text: str) -> int:
+    """Map an opaque string label (e.g. ``J000000.00-314627.5``) to a stable int64.
+
+  Used when survey catalogs use alphanumeric names instead of numeric
+  ``TARGETID``s.  The same UTF-8 text always yields the same integer for
+  joins between Parquet catalog rows and Zarr ``source_id`` arrays.
+    """
+    normalized = text.strip()
+    if not normalized:
+        raise ValueError("object ID string is empty")
+    digest = hashlib.blake2b(normalized.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def _object_id_text(value: object) -> str:
+    if value is None:
+        raise ValueError("object ID is None")
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
+def _text_is_integer_object_id(text: str) -> bool:
+    return bool(text) and text.lstrip("+-").isdigit()
+
+
 def normalize_object_id(value: object) -> int:
     """Coerce one catalog/Zarr object ID to a Python ``int`` (int64 range).
 
@@ -92,8 +119,11 @@ def normalize_object_id(value: object) -> int:
     ``index_map`` keys) should use this so ``numpy.int64``, ``int``, and
     accidental string forms compare consistently.
 
+    Decimal string digits are parsed as integers.  Other strings (e.g.
+    ``J000000.00-314627.5``) are mapped with :func:`stable_object_id_from_string`.
+
     Raises ``ValueError`` for ``None``, booleans, floats (precision loss), and
-    out-of-range values.  String digits are accepted (no scientific notation).
+    out-of-range integer values.
     """
     if value is None:
         raise ValueError("object ID is None")
@@ -109,11 +139,13 @@ def normalize_object_id(value: object) -> int:
             f"Re-ingest the catalog with the ID column stored as int64."
         )
     elif isinstance(value, (str, bytes)):
-        text = value.decode("ascii", errors="strict") if isinstance(value, bytes) else value
-        text = text.strip()
-        if not text or not text.lstrip("+-").isdigit():
-            raise ValueError(f"object ID string is not an integer: {value!r}")
-        out = int(text)
+        text = _object_id_text(value)
+        if not text:
+            raise ValueError(f"object ID string is empty: {value!r}")
+        if _text_is_integer_object_id(text):
+            out = int(text)
+        else:
+            out = stable_object_id_from_string(text)
     else:
         raise TypeError(f"unsupported object ID type {type(value).__name__}: {value!r}")
 
@@ -173,6 +205,17 @@ def sky_from_fits_header(
     return ra, dec
 
 
+def object_id_column_is_integer_ids(column: pa.Array | pa.ChunkedArray) -> bool:
+    """True if every non-null value in *column* is an integer-like object ID."""
+    if isinstance(column, pa.ChunkedArray):
+        return all(object_id_column_is_integer_ids(chunk) for chunk in column.chunks)
+    for value in column.to_pylist():
+        text = _object_id_text(value)
+        if not _text_is_integer_object_id(text):
+            return False
+    return True
+
+
 def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Array:
     """Cast a catalog object-ID column to Arrow ``int64``.
 
@@ -215,6 +258,94 @@ def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Arr
         f"Cannot convert object-ID column with Arrow type {column.type} to int64; "
         f"expected integer, float, string, or binary."
     )
+
+
+def ensure_catalog_source_ids(
+    table: pa.Table,
+    source_id_col: str | None,
+) -> tuple[pa.Table, str]:
+    """Ensure the table has int64 object IDs for Zarr/spectrum joins.
+
+    Returns ``(table, source_id_mode)`` where *source_id_mode* is written to
+    ``catalog_info.json``:
+
+    * ``sequential`` — auto-generated ``source_id`` column
+    * ``column:COL`` — native integer column *COL* (cast to int64 in place)
+    * ``label:COL`` — human-readable labels stay in *COL*; ``source_id`` is a
+      stable hash of each label (for cross-store matching)
+    """
+    if not source_id_col or source_id_col not in table.schema.names:
+        if "source_id" not in table.schema.names:
+            table = table.append_column(
+                "source_id",
+                pa.array(np.arange(len(table), dtype=np.int64), type=pa.int64()),
+            )
+        return table, "sequential"
+
+    sid_field = table.schema.field(source_id_col)
+    col = table.column(source_id_col)
+
+    if sid_field.type == pa.int64():
+        return table, f"column:{source_id_col}"
+
+    if pa.types.is_integer(sid_field.type):
+        table = table.set_column(
+            table.schema.get_field_index(source_id_col),
+            source_id_col,
+            col.cast(pa.int64()),
+        )
+        return table, f"column:{source_id_col}"
+
+    if pa.types.is_floating(sid_field.type):
+        warn_if_id_column_unsafe(source_id_col, sid_field.type)
+        col_np = col.to_numpy(zero_copy_only=False)
+        finite = col_np[np.isfinite(col_np)]
+        if finite.size and np.max(np.abs(finite)) > _FLOAT64_SAFE_INTEGER:
+            raise ValueError(
+                f"Column {source_id_col!r} contains values above 2**53 "
+                f"but is stored as {sid_field.type}; casting to int64 would "
+                f"corrupt TARGETIDs. Fix the FITS dtype or read as int64 "
+                f"before ingest."
+            )
+        table = table.set_column(
+            table.schema.get_field_index(source_id_col),
+            source_id_col,
+            cast_object_id_column_to_int64(col),
+        )
+        return table, f"column:{source_id_col}"
+
+    if object_id_column_is_integer_ids(col):
+        table = table.set_column(
+            table.schema.get_field_index(source_id_col),
+            source_id_col,
+            cast_object_id_column_to_int64(col),
+        )
+        return table, f"column:{source_id_col}"
+
+    labels = [_object_id_text(v) for v in col.to_pylist()]
+    sample = labels[0] if labels else ""
+    log.warning(
+        "Object-ID column %r has non-integer labels (e.g. %r). Keeping it "
+        "unchanged and adding int64 column source_id (stable hash) for "
+        "spectrum/cutout joins. SQL: filter on %r; Python API: "
+        "normalize_object_id(label) or stable_object_id_from_string(label).",
+        source_id_col,
+        sample,
+        source_id_col,
+    )
+    if source_id_col == "source_id":
+        raise ValueError(
+            "Column 'source_id' cannot hold non-integer labels; use "
+            "--source-id-col with your survey name column (e.g. NAME)."
+        )
+    if "source_id" in table.schema.names:
+        table = table.drop_columns(["source_id"])
+    hashes = pa.array(
+        [stable_object_id_from_string(text) for text in labels],
+        type=pa.int64(),
+    )
+    table = table.append_column("source_id", hashes)
+    return table, f"label:{source_id_col}"
 
 
 def warn_if_id_column_unsafe(
@@ -284,6 +415,8 @@ def resolve_source_id_column(
             mode = json.load(fh).get("source_id_mode", "sequential")
         if isinstance(mode, str) and mode.startswith("column:"):
             candidates.append(mode[len("column:"):])
+        elif isinstance(mode, str) and mode.startswith("label:"):
+            candidates.append("source_id")
         else:
             candidates.append("source_id")
     else:
@@ -587,10 +720,10 @@ def _schemas_compatible(existing: pa.Schema, incoming: pa.Schema) -> bool:
 
 
 def _id_column_for_dedup(table: pa.Table, source_id_col: str | None) -> str | None:
-    if source_id_col and source_id_col in table.schema.names:
-        return source_id_col
     if "source_id" in table.schema.names:
         return "source_id"
+    if source_id_col and source_id_col in table.schema.names:
+        return source_id_col
     return None
 
 
@@ -801,10 +934,11 @@ def ingest_catalog(
     norder:
         HEALPix order for partitioning (default 5 → ~12k tiles of ~3.7 deg²).
     source_id_col:
-        If provided, used as the stable object identifier (stored as ``int64`` in
-        Parquet).  Integer, float, and **string** FITS columns are accepted;
-        string values must be decimal integer text (e.g. DESI ``TARGETID`` written
-        as ASCII).  Otherwise a sequential ID is generated.
+        If provided, used as the object identifier.  Integer columns are stored
+        as ``int64``.  Non-integer string labels (e.g. ``J000000.00-314627.5``)
+        are kept in that column and a ``source_id`` int64 hash column is added
+        for spectrum/cutout joins.  Decimal ASCII strings (DESI ``TARGETID``) are
+        parsed as integers.  Otherwise a sequential ``source_id`` is generated.
     overwrite:
         Deprecated. Use ``tile_mode`` instead. When True, equivalent to
         ``tile_mode="overwrite"``.
@@ -862,31 +996,7 @@ def ingest_catalog(
     table = _read_source_table(source_path)
     log.info("Loaded %d rows × %d columns", len(table), len(table.schema))
 
-    # Ensure a stable source_id column
-    if source_id_col and source_id_col in table.schema.names:
-        sid_field = table.schema.field(source_id_col)
-        if sid_field.type != pa.int64():
-            warn_if_id_column_unsafe(source_id_col, sid_field.type)
-            if pa.types.is_floating(sid_field.type):
-                col_np = table.column(source_id_col).to_numpy(zero_copy_only=False)
-                finite = col_np[np.isfinite(col_np)]
-                if finite.size and np.max(np.abs(finite)) > _FLOAT64_SAFE_INTEGER:
-                    raise ValueError(
-                        f"Column {source_id_col!r} contains values above 2**53 "
-                        f"but is stored as {sid_field.type}; casting to int64 would "
-                        f"corrupt TARGETIDs. Fix the FITS dtype or read as int64 "
-                        f"before ingest."
-                    )
-            table = table.set_column(
-                table.schema.get_field_index(source_id_col),
-                source_id_col,
-                cast_object_id_column_to_int64(table.column(source_id_col)),
-            )
-    else:
-        table = table.append_column(
-            "source_id",
-            pa.array(np.arange(len(table), dtype=np.int64), type=pa.int64()),
-        )
+    table, sid_mode = ensure_catalog_source_ids(table, source_id_col)
 
     table = _add_healpix_columns(table, ra_col, dec_col, norder)
     table = _filter_table_columns(
@@ -934,11 +1044,6 @@ def ingest_catalog(
         len(unique_pixels), tiles_written, elapsed,
     )
 
-    sid_mode = (
-        f"column:{source_id_col}"
-        if source_id_col and source_id_col in table.schema.names
-        else "sequential"
-    )
     _finalize_catalog_writes(
         catalog_root,
         survey_name,
@@ -1052,6 +1157,7 @@ def _ingest_catalog_streaming(
         hp_col = f"_healpix_norder{norder}"
 
         tile_schema: pa.Schema | None = None
+        sid_mode: str | None = None
         tiles_written = 0
         t0 = time.perf_counter()
 
@@ -1066,30 +1172,19 @@ def _ingest_catalog_streaming(
             astropy_chunk = Table(chunk, copy=False)
             tile_table = _astropy_table_to_arrow(astropy_chunk)
 
-            if not sid_in_fits and "source_id" not in tile_table.schema.names:
+            if not sid_in_fits:
+                if sid_mode is None:
+                    sid_mode = "sequential"
                 tile_table = tile_table.append_column(
                     "source_id",
                     pa.array(sids[row_idx], type=pa.int64()),
                 )
-            elif sid_in_fits and tile_table.schema.field(source_id_col).type != pa.int64():
-                sid_field = tile_table.schema.field(source_id_col)
-                warn_if_id_column_unsafe(source_id_col, sid_field.type)
-                if pa.types.is_floating(sid_field.type):
-                    col_np = tile_table.column(source_id_col).to_numpy(zero_copy_only=False)
-                    finite = col_np[np.isfinite(col_np)]
-                    if finite.size and np.max(np.abs(finite)) > _FLOAT64_SAFE_INTEGER:
-                        raise ValueError(
-                            f"Column {source_id_col!r} contains values above 2**53 "
-                            f"but is stored as {sid_field.type}; casting to int64 would "
-                            f"corrupt TARGETIDs. Fix the FITS dtype or read as int64 "
-                            f"before ingest."
-                        )
-                i = tile_table.schema.get_field_index(source_id_col)
-                tile_table = tile_table.set_column(
-                    i,
-                    source_id_col,
-                    cast_object_id_column_to_int64(tile_table.column(source_id_col)),
+            else:
+                tile_table, tile_sid_mode = ensure_catalog_source_ids(
+                    tile_table, source_id_col,
                 )
+                if sid_mode is None:
+                    sid_mode = tile_sid_mode
 
             tile_table = tile_table.append_column(
                 hp_col,
@@ -1134,11 +1229,8 @@ def _ingest_catalog_streaming(
         )
 
         if tile_schema is not None:
-            sid_mode = (
-                f"column:{source_id_col}"
-                if source_id_col and source_id_col in col_names
-                else "sequential"
-            )
+            if sid_mode is None:
+                sid_mode = "sequential"
             _finalize_catalog_writes(
                 catalog_root,
                 survey_name,

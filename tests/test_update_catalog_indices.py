@@ -135,6 +135,17 @@ class TestNormalizeObjectId:
 
         assert normalize_object_id("39627658462934656") == 39627658462934656
 
+    def test_alphanumeric_label_hashed(self) -> None:
+        from data_lake.ingest.fits_to_parquet import (
+            normalize_object_id,
+            stable_object_id_from_string,
+        )
+
+        label = "J000000.00-314627.5"
+        h = stable_object_id_from_string(label)
+        assert normalize_object_id(label) == h
+        assert normalize_object_id(label) == normalize_object_id(label)
+
     def test_float_rejected(self) -> None:
         from data_lake.ingest.fits_to_parquet import normalize_object_id
 
