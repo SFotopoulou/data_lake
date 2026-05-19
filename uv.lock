@@ -805,6 +805,9 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
 ]
+fitsio = [
+    { name = "fitsio" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -812,6 +815,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "desispec", marker = "extra == 'desi'", specifier = ">=0.62" },
     { name = "duckdb", specifier = ">=0.10" },
+    { name = "fitsio", marker = "extra == 'fitsio'", specifier = ">=1.2" },
     { name = "h5py", specifier = ">=3.10" },
     { name = "healpy", specifier = ">=1.16" },
     { name = "ipykernel", marker = "extra == 'dev'" },
@@ -828,7 +832,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.66" },
     { name = "zarr", specifier = ">=3.0" },
 ]
-provides-extras = ["desi", "dev"]
+provides-extras = ["desi", "fitsio", "dev"]
 
 [[package]]
 name = "debugpy"

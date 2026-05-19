@@ -32,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 desi = ["desispec>=0.62"]
+fitsio = ["fitsio>=1.2"]
 dev = [
     "pytest>=8.0",
     "pytest-cov",

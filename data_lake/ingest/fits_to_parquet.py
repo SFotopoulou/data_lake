@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -494,6 +495,11 @@ def _astropy_col_to_pyarrow(col) -> pa.Array:
     from astropy.table import MaskedColumn
 
     data = np.asarray(col)
+    # GALEX / some VO exports: one logical row per source but stored as (N, 1).
+    if data.ndim == 2 and data.shape[1] == 1:
+        data = data.reshape(-1)
+        if isinstance(col, MaskedColumn) and col.mask is not None:
+            col = MaskedColumn(data, mask=np.asarray(col.mask).reshape(-1))
 
     # FITS BINTABLE is big-endian; PyArrow needs native byte-order.
     if data.dtype.kind in "biufc" and data.dtype.byteorder not in ("=", "|", ""):
@@ -557,6 +563,89 @@ def _astropy_table_to_arrow(tbl: Table) -> pa.Table:
                  len(multidim_cols), ", ".join(multidim_cols))
 
     return table
+
+
+_TFORM_REPEAT_RE = re.compile(r"^\d+[A-Za-z]$")
+
+
+def _squeeze_fits_vector_column(arr: np.ndarray) -> np.ndarray:
+    """Flatten GALEX-style ``(1, N)`` / ``(1, N, 1)`` vector columns to 1-D length ``N``."""
+    out = np.asarray(arr)
+    while out.ndim > 1 and out.shape[0] == 1:
+        out = out[0]
+    return np.squeeze(out)
+
+
+def _bintable_hdu_index(hdul) -> int:
+    """Return the index of the first table HDU (skip PRIMARY)."""
+    from astropy.io.fits.hdu.table import _TableLikeHDU
+
+    for idx, hdu in enumerate(hdul):
+        if isinstance(hdu, _TableLikeHDU):
+            return idx
+    raise ValueError("No BINTABLE / table HDU found in FITS file.")
+
+
+def _is_packed_vector_bintable(hdu) -> bool:
+    """True when the table is one FITS row of long per-column vectors (GALEX photoobjall)."""
+    from astropy.io.fits.hdu.table import _TableLikeHDU
+
+    if not isinstance(hdu, _TableLikeHDU) or hdu.columns is None:
+        return False
+    if int(hdu.header.get("NAXIS2", 0)) != 1:
+        return False
+    for col in hdu.columns:
+        fmt = str(col.format).strip()
+        if _TFORM_REPEAT_RE.match(fmt):
+            return True
+        dim = col.dim
+        if dim:
+            parts = [int(x) for x in str(dim).strip("()").split(",") if x.strip()]
+            if len(parts) >= 2 and parts[1] > 1:
+                return True
+    return False
+
+
+def _read_packed_vector_fits(path: Path, *, hdu_index: int) -> Table:
+    """Read one-row vector-packed FITS (e.g. GALEX photoobjall) column-by-column."""
+    try:
+        import fitsio
+    except ImportError as exc:
+        raise ImportError(
+            "This FITS file stores one row of per-source vectors (GALEX photoobjall layout). "
+            "Install the optional fitsio dependency: uv sync --extra fitsio  "
+            "(or pip install fitsio)."
+        ) from exc
+
+    log.info(
+        "Reading %s as packed-vector FITS (NAXIS2=1; column-by-column via fitsio) …",
+        path.name,
+    )
+    cols: dict[str, np.ndarray] = {}
+    with fitsio.FITS(str(path)) as fits:
+        hdu = fits[hdu_index]
+        for name in hdu.get_colnames():
+            cols[name] = _squeeze_fits_vector_column(hdu[name][:])
+    n = len(next(iter(cols.values())))
+    for name, arr in cols.items():
+        if len(arr) != n:
+            raise ValueError(
+                f"Packed FITS column {name!r} has length {len(arr)}, expected {n}."
+            )
+    return Table(cols)
+
+
+def _read_fits_catalog_table(path: Path) -> Table:
+    """Read a catalog FITS BINTABLE, including GALEX packed-vector layout."""
+    from astropy.io import fits
+
+    with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+        idx = _bintable_hdu_index(hdul)
+        hdu = hdul[idx]
+        if _is_packed_vector_bintable(hdu):
+            return _read_packed_vector_fits(path, hdu_index=idx)
+    log.info("Reading %s as FITS …", path.name)
+    return Table.read(str(path), format="fits")
 
 
 def _open_text_for_sniff(path: Path):
@@ -632,7 +721,7 @@ def _read_source_table(path: Path) -> pa.Table:
         return pq.read_table(str(path))
 
     if name.endswith(".fits.gz") or suffix in {".fit", ".fits", ".fz"}:
-        fmt: str | None = "fits"
+        return _astropy_table_to_arrow(_read_fits_catalog_table(path))
     elif suffix in {".xml", ".vot", ".votable"}:
         fmt = "votable"
     elif suffix == ".ecsv":
@@ -658,9 +747,16 @@ def _add_healpix_columns(
     norder: int,
 ) -> pa.Table:
     """Append ``_healpix_order<N>`` and ``_cutout_index`` placeholder columns."""
-    ra = table.column(ra_col).to_pylist()
-    dec = table.column(dec_col).to_pylist()
-    pix = assign_healpix(np.array(ra, dtype=np.float64), np.array(dec, dtype=np.float64), norder)
+
+    def _sky_to_float64(col_name: str) -> np.ndarray:
+        col = table.column(col_name).combine_chunks()
+        if pa.types.is_fixed_size_list(col.type) or pa.types.is_list(col.type):
+            col = pc.list_flatten(col)
+        return np.asarray(col.to_numpy(zero_copy_only=False), dtype=np.float64).reshape(-1)
+
+    ra = _sky_to_float64(ra_col)
+    dec = _sky_to_float64(dec_col)
+    pix = assign_healpix(ra, dec, norder)
     col_name = f"_healpix_norder{norder}"
     table = table.append_column(col_name, pa.array(pix, type=pa.int64()))
     # cutout_index and spectrum_index are filled by the respective ingest steps;

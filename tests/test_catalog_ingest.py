@@ -800,3 +800,34 @@ class TestTileMode:
         with open(catalog_root / "catalog_info.json") as fh:
             info = json.load(fh)
         assert info["total_rows"] == 4
+
+
+class TestPackedVectorFits:
+    """GALEX photoobjall: one FITS row, each column a vector of sources."""
+
+    def test_read_packed_vector_fits(self, tmp_path: Path) -> None:
+        fitsio = pytest.importorskip("fitsio")
+        from data_lake.ingest.fits_to_parquet import _read_fits_catalog_table
+
+        n = 50
+        objid = np.arange(1_000, 1_000 + n, dtype=np.int64)
+        ra = np.linspace(10.0, 20.0, n)
+        dec = np.linspace(-5.0, 5.0, n)
+        path = tmp_path / "packed.fits"
+        # One FITS row; each field is a length-n vector (GALEX-style repeat TFORM).
+        row = np.zeros(
+            1,
+            dtype=[
+                ("objid", "i8", (n,)),
+                ("ra", "f8", (n,)),
+                ("dec", "f8", (n,)),
+            ],
+        )
+        row["objid"][0] = objid
+        row["ra"][0] = ra
+        row["dec"][0] = dec
+        fitsio.write(str(path), row, extname="photoobjall_test")
+
+        tbl = _read_fits_catalog_table(path)
+        assert len(tbl) == n
+        assert int(tbl["objid"][0]) == 1000
