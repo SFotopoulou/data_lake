@@ -564,7 +564,7 @@ def _read_source_table(path: Path) -> pa.Table:
     * ``.xml`` / ``.vot`` / ``.votable``             – VOTable via astropy
     * ``.parquet`` / ``.pq``                         – Parquet via pyarrow (direct)
     * ``.ecsv``                                      – ECSV via astropy
-    * ``.csv`` / ``.tsv``                            – CSV via astropy
+    * ``.csv`` / ``.tsv`` / ``.csv.gz`` / ``.tsv.gz`` – delimited text via astropy
     * anything else                                  – astropy auto-detect
 
     Multidim FITS columns (e.g. DESI ``COEFF``) are preserved as
@@ -583,7 +583,9 @@ def _read_source_table(path: Path) -> pa.Table:
         fmt = "votable"
     elif suffix == ".ecsv":
         fmt = "ascii.ecsv"
-    elif suffix in {".csv", ".tsv"}:
+    elif name.endswith(".csv.gz") or suffix == ".csv":
+        fmt = "ascii.csv"
+    elif name.endswith(".tsv.gz") or suffix == ".tsv":
         fmt = "ascii.csv"
     else:
         fmt = None  # let astropy auto-detect

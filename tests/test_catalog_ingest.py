@@ -14,6 +14,7 @@ Focuses on the FITS → PyArrow conversion path, especially:
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 
@@ -256,7 +257,7 @@ class TestFormatDetection:
         assert arrow_tbl.column_names == ["a", "b"]
         assert arrow_tbl.num_rows == 3
 
-    def test_unknown_suffix_uses_autodetect_not_fits(self, tmp_path: Path):
+    def test_unknown_suffix_uses_autodetect_not_fits(self, tmp_path: Path) -> None:
         """A non-FITS file with an unknown suffix should not be force-read as FITS."""
         from data_lake.ingest.fits_to_parquet import _read_source_table
 
@@ -264,6 +265,42 @@ class TestFormatDetection:
         Table({"a": [1, 2, 3]}).write(str(ecsv), format="ascii.ecsv", overwrite=True)
         arrow_tbl = _read_source_table(ecsv)
         assert arrow_tbl.num_rows == 3
+
+    def test_read_csv_gz(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import _read_source_table
+
+        csv_gz = tmp_path / "cat.csv.gz"
+        with gzip.open(csv_gz, "wt", encoding="utf-8") as fh:
+            fh.write("RAdeg,DEdeg,WISEA\n10.5,-20.3,J000000.00-314627.5\n")
+        arrow_tbl = _read_source_table(csv_gz)
+        assert arrow_tbl.num_rows == 1
+        assert "RAdeg" in arrow_tbl.column_names
+
+    def test_ingest_csv_gz(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        csv_gz = tmp_path / "cat.csv.gz"
+        with gzip.open(csv_gz, "wt", encoding="utf-8") as fh:
+            fh.write(
+                "RAdeg,DEdeg,WISEA\n"
+                "10.0,20.0,J000000.00+085706.6\n"
+                "10.1,20.1,J000001.00+085707.6\n"
+            )
+        lake = tmp_path / "lake"
+        ingest_catalog(
+            source_path=csv_gz,
+            output_root=lake,
+            survey_name="csv_gz_survey",
+            ra_col="RAdeg",
+            dec_col="DEdeg",
+            source_id_col="WISEA",
+            norder=5,
+            overwrite=True,
+        )
+        tiles = list((lake / "catalogs" / "csv_gz_survey").rglob("Npix=*.parquet"))
+        assert tiles
+        _, merged = _read_merged_catalog(lake, "csv_gz_survey")
+        assert merged.num_rows == 2
 
 
 # ---------------------------------------------------------------------------
