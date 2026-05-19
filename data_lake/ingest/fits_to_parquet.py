@@ -11,6 +11,8 @@ Layout produced
 
 from __future__ import annotations
 
+import csv
+import gzip
 import hashlib
 import json
 import logging
@@ -556,6 +558,57 @@ def _astropy_table_to_arrow(tbl: Table) -> pa.Table:
     return table
 
 
+def _open_text_for_sniff(path: Path):
+    """Text read handle; transparent gzip for ``*.gz`` paths."""
+    if path.name.lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "rt", encoding="utf-8", errors="replace")
+
+
+def _sniff_text_delimiter(path: Path, *, default: str = ",") -> str:
+    """Guess field delimiter from the first lines (comma, tab, semicolon, pipe)."""
+    with _open_text_for_sniff(path) as fh:
+        sample = fh.read(65536)
+    lines = [ln for ln in sample.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if not lines:
+        return default
+    header = lines[0]
+    if header.count("\t") > header.count(",") and header.count("\t") >= 1:
+        return "\t"
+    try:
+        dialect = csv.Sniffer().sniff("\n".join(lines[:20]), delimiters=",\t;|")
+        return dialect.delimiter
+    except csv.Error:
+        return default
+
+
+def _read_delimited_text_table(path: Path) -> Table:
+    """Read CSV/TSV (optionally ``.gz``) with delimiter sniffing and a safe fallback."""
+    name = path.name.lower()
+    if name.endswith(".tsv.gz") or name.endswith(".tsv"):
+        delimiter = "\t"
+    else:
+        delimiter = _sniff_text_delimiter(path, default=",")
+
+    log.info("Reading %s as ascii.csv (delimiter=%r) …", path.name, delimiter)
+    read_kwargs: dict = {
+        "format": "ascii.csv",
+        "delimiter": delimiter,
+        "comment": "#",
+        "fast_reader": False,
+    }
+    try:
+        return Table.read(str(path), **read_kwargs)
+    except Exception as first_exc:
+        log.warning(
+            "Delimiter %r failed for %s (%s); retrying with astropy guess=True.",
+            delimiter,
+            path.name,
+            first_exc,
+        )
+        return Table.read(str(path), format="ascii.csv", guess=True, fast_reader=False)
+
+
 def _read_source_table(path: Path) -> pa.Table:
     """Read a catalog file into a PyArrow Table.
 
@@ -583,12 +636,14 @@ def _read_source_table(path: Path) -> pa.Table:
         fmt = "votable"
     elif suffix == ".ecsv":
         fmt = "ascii.ecsv"
-    elif name.endswith(".csv.gz") or suffix == ".csv":
-        fmt = "ascii.csv"
-    elif name.endswith(".tsv.gz") or suffix == ".tsv":
-        fmt = "ascii.csv"
-    else:
-        fmt = None  # let astropy auto-detect
+    elif (
+        name.endswith(".csv.gz")
+        or name.endswith(".tsv.gz")
+        or suffix in {".csv", ".tsv"}
+    ):
+        return _astropy_table_to_arrow(_read_delimited_text_table(path))
+
+    fmt = None  # let astropy auto-detect
 
     log.info("Reading %s as %s …", path.name, fmt or "auto-detect")
     astropy_table = Table.read(str(path)) if fmt is None else Table.read(str(path), format=fmt)

@@ -162,7 +162,8 @@ With a deployment config in place (`$DATA_LAKE_CONFIG` set), the
 
 ```bash
 dl-ingest-catalog survey_catalog.fits --survey des_dr2 --ra-col RA --dec-col DEC
-# Also: .csv, .csv.gz, .tsv, .tsv.gz, .parquet, VOTable (in-memory path; --streaming is FITS-only)
+# Also: .csv, .csv.gz, .tsv, .tsv.gz, .parquet, VOTable (in-memory path; --streaming is FITS-only).
+# Delimited text: auto-detects comma vs tab vs semicolon (tab-in-.csv.gz works for GAIA-style exports).
 ```
 
 Without a config you can still pass the path explicitly (legacy mode):

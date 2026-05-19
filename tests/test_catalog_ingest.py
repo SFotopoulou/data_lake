@@ -276,6 +276,17 @@ class TestFormatDetection:
         assert arrow_tbl.num_rows == 1
         assert "RAdeg" in arrow_tbl.column_names
 
+    def test_read_tab_separated_csv_gz(self, tmp_path: Path) -> None:
+        """Tab-separated tables named .csv.gz (common for GAIA exports)."""
+        from data_lake.ingest.fits_to_parquet import _read_source_table
+
+        path = tmp_path / "gaia_like.csv.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            fh.write("source_id\tra\tdec\n123\t10.5\t-20.3\n")
+        tbl = _read_source_table(path)
+        assert tbl.num_rows == 1
+        assert set(tbl.column_names) >= {"source_id", "ra", "dec"}
+
     def test_ingest_csv_gz(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_parquet import ingest_catalog
 
