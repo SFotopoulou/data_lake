@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -762,8 +763,35 @@ def _resolve_tile_mode(
     return "skip"
 
 
+def _parquet_tile_tmp_path(out_file: Path) -> Path:
+    return out_file.with_name(out_file.name + ".tmp")
+
+
+def _is_valid_parquet_tile(path: Path) -> bool:
+    """Return False for missing, empty, or truncated (aborted) Parquet tiles."""
+    if not path.is_file() or path.stat().st_size < 8:
+        return False
+    try:
+        pq.read_metadata(str(path))
+        return True
+    except Exception:
+        return False
+
+
+def _remove_stale_parquet_tmp_files(catalog_root: Path) -> None:
+    """Drop leftover ``*.parquet.tmp`` from killed ingest jobs."""
+    for tmp in catalog_root.rglob("*.parquet.tmp"):
+        log.warning("Removing stale temporary tile %s", tmp)
+        try:
+            tmp.unlink()
+        except OSError as exc:
+            log.warning("Could not remove %s: %s", tmp, exc)
+
+
 def _read_catalog_tile(path: Path) -> pa.Table:
     """Read one HATS tile without injecting Hive partition columns."""
+    if not _is_valid_parquet_tile(path):
+        raise ValueError(f"Not a valid Parquet tile: {path}")
     return pq.ParquetFile(str(path)).read()
 
 
@@ -904,6 +932,14 @@ def _write_tile_for_mode(
     if tile_mode == "overwrite":
         return _write_catalog_parquet_tile(incoming, out_file, parquet_options)
 
+    if not _is_valid_parquet_tile(out_file):
+        log.warning(
+            "Existing tile %s is missing or corrupt (likely aborted write); "
+            "replacing with incoming rows only.",
+            out_file,
+        )
+        return _write_catalog_parquet_tile(incoming, out_file, parquet_options)
+
     existing = _read_catalog_tile(out_file)
     sid = _id_column_for_dedup(existing, source_id_col)
     merged = _merge_tile_tables(
@@ -918,9 +954,20 @@ def _write_tile_for_mode(
     return _write_catalog_parquet_tile(merged, out_file, parquet_options)
 
 
+def _iter_valid_parquet_tiles(catalog_root: Path) -> list[Path]:
+    """Return ``Npix=*.parquet`` paths that pass a footer read (skip corrupt tiles)."""
+    valid: list[Path] = []
+    for path in sorted(catalog_root.rglob("Npix=*.parquet")):
+        if _is_valid_parquet_tile(path):
+            valid.append(path)
+        else:
+            log.warning("Skipping corrupt/incomplete tile for metadata: %s", path)
+    return valid
+
+
 def _regenerate_metadata_from_all_tiles(catalog_root: Path) -> None:
     """Rebuild ``_metadata`` from every ``Npix=*.parquet`` under *catalog_root*."""
-    tile_paths = sorted(catalog_root.rglob("Npix=*.parquet"))
+    tile_paths = _iter_valid_parquet_tiles(catalog_root)
     if not tile_paths:
         return
     file_metadata: list[pq.FileMetaData] = []
@@ -937,7 +984,7 @@ def _regenerate_metadata_from_all_tiles(catalog_root: Path) -> None:
 def _count_catalog_rows(catalog_root: Path) -> int:
     return sum(
         pq.read_metadata(str(p)).num_rows
-        for p in catalog_root.rglob("Npix=*.parquet")
+        for p in _iter_valid_parquet_tiles(catalog_root)
     )
 
 
@@ -954,7 +1001,7 @@ def _finalize_catalog_writes(
 ) -> None:
     """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles."""
     catalog_root.mkdir(parents=True, exist_ok=True)
-    tile_paths = sorted(catalog_root.rglob("Npix=*.parquet"))
+    tile_paths = _iter_valid_parquet_tiles(catalog_root)
     total_rows = _count_catalog_rows(catalog_root)
     n_cols = (
         len(pq.read_schema(str(tile_paths[0])))
@@ -990,18 +1037,38 @@ def _write_catalog_parquet_tile(
     out_file: Path,
     options: CatalogParquetOptions,
 ) -> pq.FileMetaData:
+    """Write one tile atomically (``*.parquet.tmp`` then ``os.replace``)."""
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     if options.shrink_strings_for_tiles:
         tile_table = _shrink_tile_table_for_disk(tile_table)
-    writer = pq.ParquetWriter(
-        str(out_file),
-        tile_table.schema,
-        compression="zstd",
-        compression_level=options.compression_level,
-        write_statistics=options.write_statistics,
-        use_dictionary=options.use_dictionary,
-    )
-    writer.write_table(tile_table)
-    writer.close()
+    tmp = _parquet_tile_tmp_path(out_file)
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    try:
+        writer = pq.ParquetWriter(
+            str(tmp),
+            tile_table.schema,
+            compression="zstd",
+            compression_level=options.compression_level,
+            write_statistics=options.write_statistics,
+            use_dictionary=options.use_dictionary,
+        )
+        try:
+            writer.write_table(tile_table)
+        finally:
+            writer.close()
+        os.replace(tmp, out_file)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
     return pq.read_metadata(str(out_file))
 
 
@@ -1074,6 +1141,8 @@ def ingest_catalog(
     source_path = Path(source_path)
     output_root = Path(output_root)
     catalog_root = output_root / "catalogs" / survey_name
+    catalog_root.mkdir(parents=True, exist_ok=True)
+    _remove_stale_parquet_tmp_files(catalog_root)
     pq_opts = (
         CatalogParquetOptions.compact()
         if compact

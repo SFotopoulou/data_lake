@@ -592,6 +592,44 @@ class TestStreamingIngest:
 # ---------------------------------------------------------------------------
 
 
+class TestParquetTileIntegrity:
+    def test_corrupt_tile_recovered_on_append(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import (
+            _write_catalog_parquet_tile,
+            _write_tile_for_mode,
+            CatalogParquetOptions,
+        )
+
+        out = tmp_path / "tiles" / "Npix=42.parquet"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"not-parquet")
+        incoming = pa.table({"TARGETID": [1], "TARGET_RA": [10.0], "TARGET_DEC": [20.0]})
+        meta = _write_tile_for_mode(
+            out,
+            incoming,
+            tile_mode="append",
+            on_duplicate_id="skip",
+            source_id_col="TARGETID",
+            parquet_options=CatalogParquetOptions(),
+        )
+        assert meta is not None
+        assert pq.read_metadata(str(out)).num_rows == 1
+
+    def test_atomic_write_leaves_no_tmp(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import (
+            _parquet_tile_tmp_path,
+            _write_catalog_parquet_tile,
+            CatalogParquetOptions,
+        )
+
+        out = tmp_path / "tile.parquet"
+        tbl = pa.table({"a": [1, 2, 3]})
+        _write_catalog_parquet_tile(tbl, out, CatalogParquetOptions())
+        tmp = _parquet_tile_tmp_path(out)
+        assert not tmp.exists()
+        pq.read_metadata(str(out))
+
+
 class TestTileMode:
     def _ingest_two(
         self,
