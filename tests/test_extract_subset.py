@@ -315,6 +315,30 @@ class TestExtractSubsetToZarr:
         sid0 = int(tbl.column("source_id")[0].as_py())
         assert np.all(flux0 == sid0)
 
+    def test_extract_subset_hdf5(self, synthetic_lake: Path):
+        """HDF5 export preserves flux encoding per source_id."""
+        import h5py
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        out = synthetic_lake / "subset.h5"
+        result = acc.extract_subset_to_hdf5(
+            source_ids=[101, 103, 201],
+            output_hdf5=out,
+            show_progress=False,
+        )
+        assert result["format"] == "hdf5"
+        assert result["n_written"] == 3
+        with h5py.File(out, "r") as f:
+            assert f.attrs["source_survey"] == SURVEY
+            assert f.attrs["wavelength_mode"] == "shared"
+            assert f["flux"].shape == (3, N_PIX)
+            sids = np.asarray(f["source_id"][:])
+            flux0 = np.asarray(f["flux"][0, :])
+            assert int(sids[0]) == 101
+            assert np.all(flux0 == 101)
+
     def test_extract_subset_fits(self, synthetic_lake: Path):
         """FITS export writes one file per spectrum."""
         from astropy.io import fits

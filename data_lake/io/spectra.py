@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
-SubsetFormat = Literal["zarr", "parquet", "fits"]
+SubsetFormat = Literal["zarr", "parquet", "fits", "hdf5"]
 FitsLayout = Literal["per-file", "catalog"]
 
 import numpy as np
@@ -801,6 +801,14 @@ class SpectrumAccessor:
                 show_progress=show_progress,
                 overwrite=overwrite,
             )
+        if fmt == "hdf5":
+            return self.extract_subset_to_hdf5(
+                source_ids,
+                output,
+                missing=missing,
+                show_progress=show_progress,
+                overwrite=overwrite,
+            )
         if fmt == "fits":
             return self.extract_subset_to_fits(
                 source_ids,
@@ -811,7 +819,7 @@ class SpectrumAccessor:
                 filename_template=fits_filename_template,
                 layout=fits_layout,
             )
-        raise ValueError(f"unknown format {fmt!r}; use zarr, parquet, or fits")
+        raise ValueError(f"unknown format {fmt!r}; use zarr, parquet, hdf5, or fits")
 
     def extract_subset_to_zarr(
         self,
@@ -1069,6 +1077,112 @@ class SpectrumAccessor:
             "output": str(output_parquet),
             "output_parquet": str(output_parquet),
             "format": "parquet",
+        }
+
+    def extract_subset_to_hdf5(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        output_hdf5: Path | str,
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+        compression: str | None = "gzip",
+    ) -> dict[str, Any]:
+        """Extract a subset into one HDF5 file (stacked arrays, shared wavelength).
+
+        Output layout (single file, root-level datasets)::
+
+            flux         (N_written, N_pix)  float32
+            ivar         (N_written, N_pix)  float32
+            mask         (N_written, N_pix)  uint8/uint16
+            wavelength   (N_pix,)            float64
+            source_id    (N_written,)        int64
+            redshift     (N_written,)        float32
+
+        Root attributes mirror the flat Zarr subset (survey name, WCS JSON, etc.).
+        """
+        import h5py
+
+        output_hdf5 = Path(output_hdf5)
+        if output_hdf5.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"{output_hdf5} already exists. Pass overwrite=True to replace it."
+                )
+            output_hdf5.unlink()
+
+        plan = self._plan_subset_extraction(
+            source_ids, missing=missing, show_progress=show_progress,
+        )
+        z_map = self._build_catalog_redshift_map(plan)
+        n_written = plan.n_written
+        n_pix = plan.n_pix
+        dset_kw: dict[str, Any] = {}
+        if compression:
+            dset_kw = {
+                "compression": compression,
+                "compression_opts": 4,
+                "shuffle": True,
+            }
+
+        id_to_row: dict[int, int] = {}
+        with h5py.File(output_hdf5, "w") as f:
+            f.attrs["source_survey"] = self.survey_name
+            f.attrs["source_lake_root"] = str(self.lake_root)
+            f.attrs["wavelength_mode"] = "shared"
+            f.attrs["n_sources"] = n_written
+            f.attrs["n_pix"] = n_pix
+            f.attrs["n_requested"] = plan.n_requested
+            f.attrs["n_missing"] = len(plan.missing_ids)
+            f.attrs["extract_created_utc"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(),
+            )
+            f.attrs["schema_version"] = "1"
+            f.attrs["wcs_attrs"] = json.dumps(plan.src_wcs)
+            f.create_dataset("wavelength", data=plan.wavelength, dtype=np.float64)
+
+            flux_ds = f.create_dataset(
+                "flux", shape=(n_written, n_pix), dtype=plan.flux_dtype, **dset_kw,
+            )
+            ivar_ds = f.create_dataset(
+                "ivar", shape=(n_written, n_pix), dtype=plan.ivar_dtype, **dset_kw,
+            )
+            mask_ds = f.create_dataset(
+                "mask", shape=(n_written, n_pix), dtype=plan.mask_dtype, **dset_kw,
+            )
+            sid_ds = f.create_dataset("source_id", shape=(n_written,), dtype=np.int64)
+            z_ds = f.create_dataset("redshift", shape=(n_written,), dtype=np.float32)
+
+            write_offset = 0
+            for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in (
+                self._iter_subset_tile_batches(
+                    plan, show_progress=show_progress, z_map=z_map,
+                )
+            ):
+                k = len(sorted_sids)
+                slc = slice(write_offset, write_offset + k)
+                flux_ds[slc, :] = flux_batch
+                ivar_ds[slc, :] = ivar_batch
+                mask_ds[slc, :] = mask_batch
+                sid_ds[slc] = sorted_sids
+                z_ds[slc] = z_batch
+                for j, sid in enumerate(sorted_sids.tolist()):
+                    id_to_row[int(sid)] = write_offset + j
+                write_offset += k
+
+        log.info(
+            "Extracted %d/%d spectra → %s (HDF5)",
+            n_written, plan.n_requested, output_hdf5,
+        )
+        return {
+            "n_requested": plan.n_requested,
+            "n_written": n_written,
+            "missing_ids": plan.missing_ids,
+            "id_to_row": id_to_row,
+            "output": str(output_hdf5),
+            "output_hdf5": str(output_hdf5),
+            "format": "hdf5",
         }
 
     def extract_subset_to_fits(

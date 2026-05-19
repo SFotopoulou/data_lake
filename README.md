@@ -687,6 +687,9 @@ dl-extract-spectra-subset \
 # One Parquet file (one row per spectrum; wavelength in file metadata)
 dl-extract-spectra-subset ... --format parquet --output /scratch/qso_subset.parquet
 
+# One HDF5 file (stacked flux/ivar/mask + shared wavelength; gzip-compressed)
+dl-extract-spectra-subset ... --format hdf5 --output /scratch/qso_subset.h5
+
 # One FITS per spectrum (directory)
 dl-extract-spectra-subset ... --format fits --fits-layout per-file \
     --output /scratch/qso_fits/
@@ -696,7 +699,7 @@ dl-extract-spectra-subset ... --format fits --fits-layout catalog \
     --output /scratch/qso_spectra.fits
 ```
 
-`--format` choices: `zarr` (default), `parquet`, `fits`.  For FITS,
+`--format` choices: `zarr` (default), `parquet`, `hdf5`, `fits`.  For FITS,
 `--fits-layout` is `per-file` (default) or `catalog`.  All require
 `wavelength_mode="shared"` in the source survey.
 

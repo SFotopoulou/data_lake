@@ -24,6 +24,7 @@ dependencies = [
     # ML
     "torch>=2.2",
     "numpy>=1.26",
+    "h5py>=3.10",
     # Utilities
     "tqdm>=4.66",
     "click>=8.1",

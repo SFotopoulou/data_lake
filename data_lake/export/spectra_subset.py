@@ -1,5 +1,5 @@
 """
-spectra_subset – extract a curated subset of spectra into Zarr, Parquet, or FITS.
+spectra_subset – extract a curated subset of spectra into Zarr, Parquet, HDF5, or FITS.
 
 This module exposes ``dl-extract-spectra-subset``: given an already-ingested
 survey in the data lake and a list of source IDs (a.k.a. TARGETIDs for DESI),
@@ -26,6 +26,7 @@ Example
         --output /scratch/qso_subset.zarr
 
     dl-extract-spectra-subset ... --format parquet --output /scratch/qso.parquet
+    dl-extract-spectra-subset ... --format hdf5 --output /scratch/qso_subset.h5
     dl-extract-spectra-subset ... --format fits --output /scratch/qso_fits/
 
     # One multi-row FITS catalog (BINTABLE + WAVELENGTH HDU)
@@ -114,6 +115,12 @@ def _validate_output_path(
                 "Output %s does not end in .parquet; writing Parquet anyway.", output,
             )
         return
+    if fmt == "hdf5":
+        if output.suffix.lower() not in {".h5", ".hdf5", ".hdf"}:
+            log.warning(
+                "Output %s does not end in .h5/.hdf5; writing HDF5 anyway.", output,
+            )
+        return
     if fmt == "zarr":
         if output.suffix.lower() not in {".zarr", ""}:
             log.warning(
@@ -150,14 +157,14 @@ try:
     )
     @click.option(
         "--format", "output_format",
-        type=click.Choice(["zarr", "parquet", "fits"], case_sensitive=False),
+        type=click.Choice(["zarr", "parquet", "hdf5", "fits"], case_sensitive=False),
         default="zarr", show_default=True,
-        help="Output format: flat Zarr group, single Parquet file, or FITS.",
+        help="Output format: flat Zarr group, Parquet, HDF5, or FITS.",
     )
     @click.option(
         "--output", "output_path", required=True,
         type=click.Path(path_type=Path),
-        help="Destination: .zarr, .parquet, FITS catalog file, or FITS directory.",
+        help="Destination: .zarr, .parquet, .h5, FITS catalog file, or FITS directory.",
     )
     @click.option(
         "--fits-layout",
@@ -212,7 +219,7 @@ try:
         overwrite: bool,
         verbose: bool,
     ) -> None:
-        """Extract a curated subset of spectra (Zarr, Parquet, or FITS)."""
+        """Extract a curated subset of spectra (Zarr, Parquet, HDF5, or FITS)."""
         logging.basicConfig(
             level=logging.DEBUG if verbose else logging.INFO,
             format="[%(asctime)s] %(name)-22s %(levelname)-7s %(message)s",
