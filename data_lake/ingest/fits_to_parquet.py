@@ -719,6 +719,47 @@ def _schemas_compatible(existing: pa.Schema, incoming: pa.Schema) -> bool:
     )
 
 
+def _schema_type_mismatches(existing: pa.Schema, incoming: pa.Schema) -> list[str]:
+    """Human-readable per-column type diffs (same names required)."""
+    mismatches: list[str] = []
+    for i, name in enumerate(existing.names):
+        ex_t = existing.field(i).type
+        in_t = incoming.field(i).type
+        if not ex_t.equals(in_t):
+            mismatches.append(f"  {name!r}: on disk {ex_t} vs incoming {in_t}")
+    return mismatches
+
+
+def _align_incoming_to_schema(incoming: pa.Table, target: pa.Schema) -> pa.Table:
+    """Cast *incoming* columns to match an existing on-disk tile schema.
+
+    Handles common re-ingest drift (e.g. ``large_string`` in RAM vs ``string``
+    written by :func:`_shrink_tile_table_for_disk`).
+    """
+    if incoming.schema.names != target.names:
+        raise ValueError(
+            "Cannot align tables: column name mismatch.\n"
+            f"On disk: {target.names}\nIncoming: {incoming.schema.names}"
+        )
+    arrays: list[pa.Array] = []
+    for i, name in enumerate(target.names):
+        col = incoming.column(name).combine_chunks()
+        tgt_type = target.field(i).type
+        if col.type.equals(tgt_type):
+            arrays.append(col)
+        else:
+            try:
+                arrays.append(pc.cast(col, tgt_type))
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+                diffs = _schema_type_mismatches(target, incoming.schema)
+                detail = "\n".join(diffs) if diffs else str(exc)
+                raise ValueError(
+                    "Cannot append catalog tile: incompatible column types.\n"
+                    f"{detail}"
+                ) from exc
+    return pa.Table.from_arrays(arrays, schema=target)
+
+
 def _id_column_for_dedup(table: pa.Table, source_id_col: str | None) -> str | None:
     if "source_id" in table.schema.names:
         return "source_id"
@@ -750,10 +791,16 @@ def _merge_tile_tables(
 ) -> pa.Table:
     """Concatenate tile tables, optionally deduplicating on an object-ID column."""
     if not _schemas_compatible(existing.schema, incoming.schema):
+        incoming = _align_incoming_to_schema(incoming, existing.schema)
+    if not _schemas_compatible(existing.schema, incoming.schema):
+        diffs = _schema_type_mismatches(existing.schema, incoming.schema)
         raise ValueError(
             "Cannot append catalog tile: schema mismatch between existing tile "
-            f"and incoming rows.\nExisting columns: {existing.schema.names}\n"
-            f"Incoming columns: {incoming.schema.names}"
+            "and incoming rows.\n"
+            + ("\n".join(diffs) if diffs else (
+                f"Existing columns: {existing.schema.names}\n"
+                f"Incoming columns: {incoming.schema.names}"
+            ))
         )
     if sid_col is None:
         return pa.concat_tables([existing, incoming])

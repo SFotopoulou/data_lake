@@ -620,6 +620,34 @@ class TestTileMode:
                 **common,
             )
 
+    def test_reingest_same_file_append_skip_is_idempotent(self, tmp_path: Path) -> None:
+        """Second ingest of the same catalog: append + skip duplicates → no change."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        tbl = _make_jname_id_table(n_rows=8)
+        fits_path = tmp_path / "same.fits"
+        _write_table_as_fits(tbl, fits_path)
+        lake = tmp_path / "lake"
+        common = dict(
+            output_root=lake,
+            survey_name="reingest",
+            ra_col="RA",
+            dec_col="DEC",
+            norder=5,
+            source_id_col="NAME",
+            tile_mode="append",
+            on_duplicate_id="skip",
+        )
+        ingest_catalog(source_path=fits_path, overwrite=True, **common)
+        _, first = _read_merged_catalog(lake, "reingest")
+        ingest_catalog(source_path=fits_path, **common)
+        _, second = _read_merged_catalog(lake, "reingest")
+        assert second.num_rows == first.num_rows
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(second.column("source_id"))),
+            np.sort(np.asarray(first.column("source_id"))),
+        )
+
     def test_append_duplicate_id_last(self, tmp_path: Path):
         from data_lake.ingest.fits_to_parquet import ingest_catalog
 

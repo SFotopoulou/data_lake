@@ -218,9 +218,12 @@ dl-ingest-catalog-from-list desi_files.txt --survey desi_dr1 \
 ```
 
 When appending with a native ID column (`TARGETID`), control duplicates with
-`--on-duplicate-id skip|error|last` (default `skip`). Use `--tile-mode overwrite`
-to rebuild a tile from one file only. `--overwrite` is deprecated but still maps
-to `--tile-mode overwrite`. After every ingest, `_metadata` and `catalog_info.json`
+`--on-duplicate-id skip|error|last` (default `skip`). Re-ingesting the **same**
+FITS with ``append`` + ``skip`` is idempotent: rows already on disk (matched by
+``source_id``) are dropped per tile; unchanged tiles are not rewritten. Use
+``--tile-mode overwrite`` to rebuild a tile from one file only. ``--overwrite`` is
+deprecated but still maps to ``--tile-mode overwrite``. After every ingest,
+`_metadata` and `catalog_info.json`
 `total_rows` are refreshed from **all** tiles on disk.
 
 #### Choosing HEALPix order (`--norder` / `hats_order`)
