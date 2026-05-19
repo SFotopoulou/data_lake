@@ -223,6 +223,69 @@ to rebuild a tile from one file only. `--overwrite` is deprecated but still maps
 to `--tile-mode overwrite`. After every ingest, `_metadata` and `catalog_info.json`
 `total_rows` are refreshed from **all** tiles on disk.
 
+#### Choosing HEALPix order (`--norder` / `hats_order`)
+
+Catalogs, cutouts, and spectra for a survey share one **HEALPix nested** order
+(`assign_healpix` in ingest). Each non-empty sky pixel becomes one on-disk shard
+(`Norder=<N>/Dir=<D>/Npix=<P>.parquet` or `.zarr`). **Disk footprint and inode
+count scale with the number of shard files**, not only with row count — sparse
+all-sky catalogs at high order can be much larger than the source FITS.
+
+**Mean tile area on the full sphere** (equal-area pixels; same convention as
+`healpy.order2nside` / this repo’s `--norder`):
+
+| `--norder` | `nside` | Max tiles (full sky) | Mean tile area |
+|------------|---------|----------------------|----------------|
+| 0 | 1 | 12 | 3438 deg² |
+| 1 | 2 | 48 | 859 deg² |
+| 2 | 4 | 192 | 215 deg² |
+| 3 | 8 | 768 | 53.7 deg² |
+| 4 | 16 | 3 072 | 13.4 deg² |
+| 5 | 32 | 12 288 | **3.36 deg²** (default) |
+| 6 | 64 | 49 152 | 0.84 deg² |
+| 7 | 128 | 196 608 | 0.21 deg² |
+| 8 | 256 | 786 432 | 0.052 deg² |
+| 9 | 512 | 3 145 728 | 0.013 deg² |
+| 10 | 1024 | 12 582 912 | 0.0033 deg² |
+
+Only tiles that contain at least one source are written, but for a **sparse
+all-sky** catalog the number of files still grows quickly with order (often
+approaching one file per object at very high order).
+
+**How to choose**
+
+1. **Target rows per shard** — for TB-scale catalogs, aim for roughly **10⁴–10⁵
+   rows per non-empty** `Npix=*.parquet` file. Too many tiny files → metadata and
+   filesystem overhead (e.g. multi‑MB on-disk size from a 2 MB FITS when order is
+   too high); too few huge tiles → slow append and heavy single-tile RAM.
+
+2. **Survey density, not survey name** — use a **lower** order for sparse
+   all-sky tables; keep **5** for dense survey footprints (DESI, deep drills)
+   and Rubin/LSST **lsdb** interoperability.
+
+3. **One order per survey** — set `--norder` (or `catalog_info.json`
+   `hats_order`) per catalog ingest. Spectra/cutouts for that survey must use the
+   **same** order. Different surveys in one lake **may** use different orders;
+   tile-aligned cross-match in this repo expects the **same** order on both sides
+   (otherwise join on sky position or via a master association table).
+
+4. **Benchmark before TB ingests** — ingest a subset or use RA/Dec to count
+   distinct pixels at candidate orders, then check `find … -name 'Npix=*.parquet' | wc -l`
+   and `du -sh catalogs/<survey>`.
+
+| Catalog type | Typical `--norder` | Why |
+|--------------|-------------------|-----|
+| Sparse all-sky (10⁶–10⁷ rows, full sphere) | **3–4** | Fewer, larger Parquet tiles; smaller inode footprint |
+| Dense survey footprint (DESI, deep fields) | **5** (default) | ~3.4 deg² tiles; matches common HATS/LSST practice |
+| Very local, high density | **6–7** | Only if tiles still hold many rows per file |
+
+Override the deployment default per run:
+
+```bash
+dl-ingest-catalog sparse_allsky.fits --survey my_sparse --norder 4 \
+  --ra-col RA --dec-col DEC --source-id-col ID --streaming
+```
+
 #### Object identifiers (`--source-id-col`)
 
 The lake uses **int64** keys in Zarr ``source_id/`` arrays and for cross-modal
@@ -860,7 +923,7 @@ See `notebooks/` for worked examples:
 | Decision | Choice | Rationale |
 |---|---|---|
 | Catalog format | Parquet v2 + Zstd | No column limit; columnar projection; column stats for pushdown |
-| Catalog partitioning | HEALPix Norder=5 HATS | ~3.7 deg² tiles; interop with Rubin/LSST tooling (lsdb) |
+| Catalog partitioning | HEALPix HATS (`--norder`, default 5) | Default ~3.4 deg² tiles; see [Choosing HEALPix order](#choosing-healpix-order---norder--hats_order) |
 | Cutout format | Zarr v3, sharded | Avoids file-per-cutout; sequential shard reads for ML |
 | Cutout dtype | float32 | Full science precision; halve to float16 only for ML-only mirrors |
 | Spectra format | Zarr v3, sharded (flux/ivar/mask) | Symmetric with cutout layer; shared wavelength saves ~30% space |
@@ -883,7 +946,7 @@ root        = "/abs/path/to/data"   # where catalogs/spectra/cutouts live
 created_utc = "2026-05-13T11:43:00Z"
 
 [partitioning]
-hats_order       = 5                # default HEALPix order (Norder=5 → ~3.7 deg² tiles)
+hats_order       = 5                # default HEALPix order; see README “Choosing HEALPix order” (~3.36 deg²/tile at 5)
 chunks_per_shard = 512              # rows per Zarr shard
 
 [defaults]
