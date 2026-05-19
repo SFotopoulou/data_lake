@@ -173,6 +173,50 @@ def sky_from_fits_header(
     return ra, dec
 
 
+def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Array:
+    """Cast a catalog object-ID column to Arrow ``int64``.
+
+    Integer columns are cast directly.  String, binary, and Python-object
+    columns are parsed with :func:`normalize_object_id` (digit strings and
+    DESI-scale integers).  Floating columns are cast with Arrow (caller should
+    run the >2**53 safety check first via :func:`warn_if_id_column_unsafe`).
+    """
+    if isinstance(column, pa.ChunkedArray):
+        if column.num_chunks == 0:
+            return pa.array([], type=pa.int64())
+        if column.num_chunks == 1:
+            return cast_object_id_column_to_int64(column.chunk(0))
+        return pa.chunked_array(
+            [cast_object_id_column_to_int64(chunk) for chunk in column.chunks]
+        ).combine_chunks()
+
+    if column.type == pa.int64():
+        return column
+
+    if pa.types.is_integer(column.type):
+        return column.cast(pa.int64())
+
+    if pa.types.is_floating(column.type):
+        return column.cast(pa.int64())
+
+    if (
+        pa.types.is_string(column.type)
+        or pa.types.is_large_string(column.type)
+        or pa.types.is_binary(column.type)
+        or pa.types.is_large_binary(column.type)
+    ):
+        out = [normalize_object_id(v) for v in column.to_pylist()]
+        return pa.array(out, type=pa.int64())
+
+    if pa.types.is_null(column.type):
+        return pa.array([], type=pa.int64())
+
+    raise TypeError(
+        f"Cannot convert object-ID column with Arrow type {column.type} to int64; "
+        f"expected integer, float, string, or binary."
+    )
+
+
 def warn_if_id_column_unsafe(
     column_name: str,
     arrow_type: pa.DataType,
@@ -757,8 +801,10 @@ def ingest_catalog(
     norder:
         HEALPix order for partitioning (default 5 → ~12k tiles of ~3.7 deg²).
     source_id_col:
-        If provided, used as the stable ``source_id``; otherwise a sequential ID
-        is generated.
+        If provided, used as the stable object identifier (stored as ``int64`` in
+        Parquet).  Integer, float, and **string** FITS columns are accepted;
+        string values must be decimal integer text (e.g. DESI ``TARGETID`` written
+        as ASCII).  Otherwise a sequential ID is generated.
     overwrite:
         Deprecated. Use ``tile_mode`` instead. When True, equivalent to
         ``tile_mode="overwrite"``.
@@ -834,7 +880,7 @@ def ingest_catalog(
             table = table.set_column(
                 table.schema.get_field_index(source_id_col),
                 source_id_col,
-                table.column(source_id_col).cast(pa.int64()),
+                cast_object_id_column_to_int64(table.column(source_id_col)),
             )
     else:
         table = table.append_column(
@@ -988,7 +1034,6 @@ def _ingest_catalog_streaming(
 
         if source_id_col and source_id_col in col_names:
             sid_in_fits = True
-            sids = np.asarray(data[source_id_col], dtype=np.int64)
         else:
             sid_in_fits = False
             sids = np.arange(n_rows, dtype=np.int64)
@@ -1027,10 +1072,23 @@ def _ingest_catalog_streaming(
                     pa.array(sids[row_idx], type=pa.int64()),
                 )
             elif sid_in_fits and tile_table.schema.field(source_id_col).type != pa.int64():
+                sid_field = tile_table.schema.field(source_id_col)
+                warn_if_id_column_unsafe(source_id_col, sid_field.type)
+                if pa.types.is_floating(sid_field.type):
+                    col_np = tile_table.column(source_id_col).to_numpy(zero_copy_only=False)
+                    finite = col_np[np.isfinite(col_np)]
+                    if finite.size and np.max(np.abs(finite)) > _FLOAT64_SAFE_INTEGER:
+                        raise ValueError(
+                            f"Column {source_id_col!r} contains values above 2**53 "
+                            f"but is stored as {sid_field.type}; casting to int64 would "
+                            f"corrupt TARGETIDs. Fix the FITS dtype or read as int64 "
+                            f"before ingest."
+                        )
                 i = tile_table.schema.get_field_index(source_id_col)
                 tile_table = tile_table.set_column(
-                    i, source_id_col,
-                    tile_table.column(source_id_col).cast(pa.int64()),
+                    i,
+                    source_id_col,
+                    cast_object_id_column_to_int64(tile_table.column(source_id_col)),
                 )
 
             tile_table = tile_table.append_column(

@@ -30,6 +30,23 @@ from astropy.table import MaskedColumn, Table
 # ---------------------------------------------------------------------------
 
 
+def _make_string_targetid_table(n_rows: int = 20) -> Table:
+    """TARGETID as fixed-width ASCII (typical FITS BINTABLE string column)."""
+    rng = np.random.default_rng(7)
+    targetid = np.array(
+        [f"{39627658462934656 + i:>20}" for i in range(n_rows)],
+        dtype="U20",
+    )
+    ra = rng.uniform(0.0, 360.0, n_rows).astype(np.float64)
+    dec = rng.uniform(-30.0, +30.0, n_rows).astype(np.float64)
+    return Table({
+        "TARGETID": targetid,
+        "TARGET_RA": ra,
+        "TARGET_DEC": dec,
+        "Z": rng.uniform(0.0, 3.0, n_rows).astype(np.float64),
+    })
+
+
 def _make_desi_like_table(n_rows: int = 20) -> Table:
     """A synthetic table mimicking the offending DESI zall-pix columns."""
     rng = np.random.default_rng(42)
@@ -241,7 +258,67 @@ class TestFormatDetection:
 # ---------------------------------------------------------------------------
 
 
+class TestCastObjectIdColumn:
+    def test_string_column_to_int64(self) -> None:
+        from data_lake.ingest.fits_to_parquet import cast_object_id_column_to_int64
+
+        col = pa.array(["39627658462934656", "39627658462934657"], type=pa.large_string())
+        out = cast_object_id_column_to_int64(col)
+        assert out.type == pa.int64()
+        assert out.to_pylist() == [39627658462934656, 39627658462934657]
+
+
 class TestIngestCatalogEndToEnd:
+    def test_ingest_string_targetid_column(self, tmp_path: Path) -> None:
+        """String/object TARGETID in FITS is parsed to int64 in Parquet."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        tbl = _make_string_targetid_table(n_rows=12)
+        fits_path = tmp_path / "string_ids.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        lake_root = tmp_path / "lake"
+        ingest_catalog(
+            source_path=fits_path,
+            output_root=lake_root,
+            survey_name="syn_str",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+            overwrite=True,
+            streaming=False,
+        )
+
+        _, merged = _read_merged_catalog(lake_root, "syn_str")
+        assert merged.schema.field("TARGETID").type == pa.int64()
+        tids = np.asarray(merged.column("TARGETID"))
+        expected = np.array([int(s) for s in tbl["TARGETID"]], dtype=np.int64)
+        np.testing.assert_array_equal(np.sort(tids), np.sort(expected))
+
+    def test_ingest_string_targetid_streaming(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        tbl = _make_string_targetid_table(n_rows=16)
+        fits_path = tmp_path / "string_ids.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        lake_root = tmp_path / "lake"
+        ingest_catalog(
+            source_path=fits_path,
+            output_root=lake_root,
+            survey_name="syn_str",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+            overwrite=True,
+            streaming=True,
+        )
+
+        _, merged = _read_merged_catalog(lake_root, "syn_str")
+        assert merged.schema.field("TARGETID").type == pa.int64()
+
     def test_ingest_preserves_multidim_column_on_disk(self, tmp_path: Path):
         """Ingest a DESI-like FITS catalog and verify COEFF survives on disk."""
         from data_lake.ingest.fits_to_parquet import ingest_catalog
