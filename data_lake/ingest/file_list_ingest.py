@@ -185,6 +185,28 @@ try:
         is_flag=True,
         help="Ignore checkpoint when deciding which files to run.",
     )
+    @click.option(
+        "--columns",
+        default=None,
+        help="Comma-separated columns to keep (parallel path only when --n-workers > 1).",
+    )
+    @click.option(
+        "--compact", is_flag=True,
+        help="Smaller Parquet tiles (parallel path when --n-workers > 1).",
+    )
+    @click.option(
+        "--n-workers",
+        default=1,
+        show_default=True,
+        type=int,
+        help="Decode workers; >1 uses parallel decode + single writer (no --streaming).",
+    )
+    @click.option(
+        "--max-in-flight",
+        default=None,
+        type=int,
+        help="Max decoded files buffered when --n-workers > 1 (default: n_workers + 2).",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli_catalog_list(
         paths_file: Path,
@@ -204,9 +226,13 @@ try:
         failures_log: Path | None,
         no_progress: bool,
         no_skip_completed: bool,
+        columns: str | None,
+        compact: bool,
+        n_workers: int,
+        max_in_flight: int | None,
         verbose: bool,
     ) -> None:
-        """Sequential catalog ingest from a text file list (one FITS path per line)."""
+        """Catalog ingest from a text file list (sequential or parallel decode)."""
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
@@ -214,6 +240,41 @@ try:
         lake = require_output_root(output_root, cfg, kind="catalogs")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
         default_ck = lake / "catalogs" / survey_name / ".ingest_checkpoint.json"
+        col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+
+        if n_workers < 1:
+            raise click.UsageError("--n-workers must be >= 1")
+        if n_workers > 1 and streaming:
+            raise click.UsageError(
+                "--streaming is not supported with --n-workers > 1; "
+                "use sequential ingest or dl-ingest-catalog-batch."
+            )
+
+        if n_workers > 1:
+            from data_lake.ingest.catalog_parallel_ingest import ingest_catalogs_parallel
+
+            paths = paths_from_file_list_file(paths_file)
+            result = ingest_catalogs_parallel(
+                paths,
+                output_root=lake,
+                survey_name=survey_name,
+                n_workers=n_workers,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                norder=n,
+                source_id_col=source_id_col,
+                columns=col_list,
+                tile_mode=(tile_mode or "append").lower(),  # type: ignore[arg-type]
+                on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
+                overwrite=overwrite,
+                compact=compact,
+                checkpoint_path=checkpoint or default_ck,
+                failures_log=failures_log,
+                show_progress=not no_progress,
+                skip_completed=not no_skip_completed,
+                max_in_flight=max_in_flight,
+            )
+            sys.exit(0 if result["n_files_failed"] == 0 else 1)
 
         def one(p: Path) -> None:
             ingest_catalog(
@@ -228,6 +289,8 @@ try:
                 tile_mode=tile_mode.lower() if tile_mode else None,  # type: ignore[arg-type]
                 on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
                 streaming=streaming,
+                columns=col_list,
+                compact=compact,
             )
 
         code = _run_file_list(

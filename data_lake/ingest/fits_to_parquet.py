@@ -1230,6 +1230,58 @@ def ingest_catalog(
     log.info("Catalog written to %s", catalog_root)
 
 
+def catalog_table_to_tile_batches(
+    table: pa.Table,
+    norder: int,
+) -> list[tuple[int, pa.Table]]:
+    """Split a prepared catalog table into per-HEALPix ``(npix, slice)`` pairs."""
+    hp_col = f"_healpix_norder{norder}"
+    if hp_col not in table.schema.names:
+        raise KeyError(f"Table missing {hp_col!r}; call _add_healpix_columns first.")
+
+    sort_indices = pa.compute.sort_indices(table, sort_keys=[(hp_col, "ascending")])
+    table = table.take(sort_indices)
+    pix_np = np.asarray(table.column(hp_col))
+    unique_pixels, group_starts = np.unique(pix_np, return_index=True)
+    group_starts = np.append(group_starts, len(pix_np))
+
+    batches: list[tuple[int, pa.Table]] = []
+    for g, npix in enumerate(unique_pixels.tolist()):
+        s, e = int(group_starts[g]), int(group_starts[g + 1])
+        batches.append((int(npix), table.slice(s, e - s)))
+    return batches
+
+
+def decode_catalog_file_to_batches(
+    source_path: Path | str,
+    *,
+    ra_col: str,
+    dec_col: str,
+    norder: int,
+    source_id_col: str | None = None,
+    columns: Sequence[str] | None = None,
+) -> tuple[list[tuple[int, pa.Table]], str, int]:
+    """Read one catalog file and partition rows by HEALPix tile (in-memory).
+
+    Returns ``(tile_batches, source_id_mode, n_rows)``.  Used by the parallel
+    file-list ingest; each worker holds one full file in RAM.
+    """
+    source_path = Path(source_path)
+    table = _read_source_table(source_path)
+    table, sid_mode = ensure_catalog_source_ids(table, source_id_col)
+    table = _add_healpix_columns(table, ra_col, dec_col, norder)
+    table = _filter_table_columns(
+        table,
+        columns,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        source_id_col=source_id_col,
+        norder=norder,
+    )
+    batches = catalog_table_to_tile_batches(table, norder)
+    return batches, sid_mode, int(table.num_rows)
+
+
 def _ingest_catalog_streaming(
     source_path: Path,
     catalog_root: Path,

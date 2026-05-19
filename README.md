@@ -531,6 +531,7 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 |---------|------|--------|--------|
 | `dl-ingest-catalog` | `--on-duplicate-id` | `skip`, `error`, `last` | Only when `--tile-mode append` (Parquet rows) |
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
+| `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append` |
 | `dl-ingest-cutouts` | `--on-duplicate` | `append`, `error`, `skip` | Per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
@@ -540,6 +541,25 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 For **resumable** file-list or batch re-runs, use **`--on-duplicate skip`** on cutout/spectrum
 ingest (and **`--tile-mode skip`** on catalog). Default is **`append`**, which can add duplicate
 Zarr rows if you re-ingest the same objects.
+
+#### Parallel catalog batch (large file lists)
+
+For surveys shipped as **many catalog files** (e.g. Gaia `GaiaSource_*.csv.gz`), use
+parallel decode with a **single-thread Parquet writer** so overlapping HEALPix tiles
+are merged safely:
+
+```bash
+dl-ingest-catalog-batch gaia_files.txt --survey GAIA_DR3_source \
+  --ra-col ra --dec-col dec --source-id-col source_id --norder 5 \
+  --tile-mode append --on-duplicate-id skip --n-workers 8
+```
+
+Same flags on `dl-ingest-catalog-from-list` when `--n-workers > 1` (default `1` =
+sequential). **`--streaming` is not supported** on the parallel path.
+
+Peak RAM scales roughly as **`O(n_workers × largest catalog file)`** — each worker
+holds one full decoded table before the writer commits tiles. Lower `--n-workers`
+or `--max-in-flight` (default `n_workers + 2`) if memory is tight.
 
 #### Sequential file-list ingest (catalogs, cutouts, spectra)
 
