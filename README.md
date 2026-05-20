@@ -924,11 +924,98 @@ partitioning — see `data_lake/io/crossmatch.py`).
    join to the master on `source_id`, optionally join to partner catalogs or
    open Zarr using `npix` + row indices. A minimal end-to-end pattern lives in
    `examples/cross_survey_lsst_desi_euclid/` (synthetic tiles + `query.sql`).
+   Step-by-step examples: **`notebooks/11_duckdb_catalog_query.ipynb` §9**.
 
 **After STILTS:** if you ingest new spectra or cutouts for matched IDs, call
 `update_index_column` so `_spectrum_index` / `_cutout_index` on the **native**
 survey catalog stay in sync; the master table can carry partner IDs and
 separations while the lake catalog keeps machine indices for fast accessors.
+
+### Fast retrieval with DuckDB (ID list → master → catalogs)
+
+Cross-matching is **by sky position**; partner catalogs may use **different**
+`--norder` values. Retrieval is keyed on **native object IDs** in the master
+and in each `catalogs/<survey>/` tree — not on matching HEALPix orders between
+surveys.
+
+**Master file** — flat Parquet, e.g. `<lake_root>/associations/master_desi_euclid.parquet`:
+
+| Column | Purpose |
+|--------|---------|
+| `desi_targetid` (example) | Primary key for your science sample |
+| `euclid_source_id`, … | Partner survey IDs from the matcher |
+| `sep_arcsec` | Match separation (QA) |
+| `desi_norder`, `desi_npix` | Optional; **that** survey’s tile path for Zarr / single-tile reads |
+
+**Register catalogs** (same glob as `CatalogAccessor`):
+
+```sql
+CREATE VIEW desi AS
+SELECT * FROM parquet_scan('catalogs/DESI_DR1/Norder=5/**/*.parquet', hive_partitioning=false);
+
+CREATE VIEW euclid AS
+SELECT * FROM parquet_scan('catalogs/EUCLID_DR1/Norder=6/**/*.parquet', hive_partitioning=false);
+
+CREATE VIEW master AS
+SELECT * FROM read_parquet('associations/master_desi_euclid.parquet');
+```
+
+**ID list** — prefer a small table over a huge literal `IN (...)`:
+
+```sql
+CREATE TEMP TABLE want (id BIGINT);
+-- INSERT from read_csv('my_ids.csv') or register from Python (see notebook §9)
+```
+
+**Join** (only listed columns are read from Parquet):
+
+```sql
+SELECT
+    w.id,
+    m.euclid_source_id,
+    m.sep_arcsec,
+    d.Z,
+    d.MAG_G,
+    d.MAG_R,
+    e.SOURCE_ID
+FROM want AS w
+INNER JOIN master AS m ON m.desi_targetid = w.id
+INNER JOIN desi AS d ON d.TARGETID = w.id
+INNER JOIN euclid AS e ON e.SOURCE_ID = m.euclid_source_id;
+```
+
+Replace `TARGETID` / `SOURCE_ID` with the real ID columns (`CatalogAccessor(...).source_id_column`).
+
+**Python** — single survey, batched `IN` queries:
+
+```python
+from data_lake.io.catalog import CatalogAccessor
+
+cat = CatalogAccessor(lake_root, "DESI_DR1")
+df = cat.get_sources_by_id(
+    target_ids,
+    columns=["TARGETID", "Z", "MAG_G", "MAG_R", "MAG_Z"],
+)
+```
+
+**Multi-survey** — `MultiCatalogAccessor` + `want` + `master` (full example in
+`notebooks/11_duckdb_catalog_query.ipynb` §9).
+
+**Optional: one Parquet tile** when the master stores `desi_npix` at DESI’s order:
+
+```sql
+SELECT d.TARGETID, d.Z
+FROM want w
+JOIN master m ON m.desi_targetid = w.id
+JOIN read_parquet(
+  'catalogs/DESI_DR1/Norder=' || m.desi_norder::VARCHAR
+  || '/Dir=' || ((m.desi_npix // 10000) * 10000)::VARCHAR
+  || '/Npix=' || m.desi_npix::VARCHAR || '.parquet'
+) AS d ON d.TARGETID = w.id;
+```
+
+**Avoid** scanning full survey globs when you only need columns for a fixed ID
+list — filter `want` first, join `master`, then partner catalogs on IDs.
 
 ## Schema versioning policy
 
@@ -955,7 +1042,7 @@ See `notebooks/` for worked examples:
 2. **`02_spectrum_workflow.ipynb`** — Ingest spectra, query, transform, subset export (catalog `Z`), ML loop, FITS export + round-trip
 3. **`03_cutout_ingest.ipynb`** — FITS stamps → Zarr cutout stacks, validation, `CutoutAccessor`, optional `_cutout_index` catalog patch
 4. **`04_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`)
-5. **`11_duckdb_catalog_query.ipynb`** — SQL queries over multi-survey Parquet catalogs
+5. **`11_duckdb_catalog_query.ipynb`** — SQL over Parquet catalogs; §9 master table + ID-list joins
 6. **`12_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
 7. **`13_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
 
