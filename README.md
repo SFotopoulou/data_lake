@@ -281,9 +281,9 @@ approaching one file per object at very high order).
    tile-aligned cross-match in this repo expects the **same** order on both sides
    (otherwise join on sky position or via a master association table).
 
-4. **Benchmark before TB ingests** — ingest a subset or use RA/Dec to count
-   distinct pixels at candidate orders, then check `find … -name 'Npix=*.parquet' | wc -l`
-   and `du -sh catalogs/<survey>`.
+4. **Benchmark before TB ingests** — use **`dl-recommend-catalog-norder`** (quick
+   FITS scan of RA/Dec only) or ingest a subset, then check tile counts and
+   `du -sh catalogs/<survey>`.
 
 | Catalog type | Typical `--norder` | Why |
 |--------------|-------------------|-----|
@@ -297,6 +297,23 @@ Override the deployment default per run:
 dl-ingest-catalog sparse_allsky.fits --survey my_sparse --norder 4 \
   --ra-col RA --dec-col DEC --source-id-col ID --streaming
 ```
+
+**Pre-ingest norder scan** (reads FITS headers + a subsample of RA/Dec; no Parquet write):
+
+```bash
+# One file or directory of FITS
+dl-recommend-catalog-norder /path/to/catalogs/*.fits \
+  --ra-col TARGET_RA --dec-col TARGET_DEC
+
+# File list (same paths as batch ingest)
+dl-recommend-catalog-norder --file-list allwise_files.txt \
+  --ra-col ra --dec-col dec --max-files 32 --sample-rows 500000
+```
+
+Prints a table of candidate orders with estimated **rows/tile**, **tile count**, and
+**pixel_sky_frac**, and highlights a recommended `--norder` near 10⁴–10⁵ rows per
+occupied pixel (default target 50 000). Re-run with more `--sample-rows` for large,
+clustered footprints.
 
 #### Object identifiers (`--source-id-col`)
 
