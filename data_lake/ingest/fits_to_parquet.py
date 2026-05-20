@@ -891,6 +891,84 @@ def _read_catalog_tile(path: Path) -> pa.Table:
     return pq.ParquetFile(str(path)).read()
 
 
+def canonical_arrow_type(dtype: pa.DataType) -> pa.DataType:
+    """Map a column type to the catalog-wide canonical numeric storage type."""
+    if pa.types.is_floating(dtype):
+        return pa.float64()
+    if pa.types.is_integer(dtype) or pa.types.is_unsigned_integer(dtype):
+        return pa.int64()
+    if pa.types.is_boolean(dtype):
+        return pa.bool_()
+    if pa.types.is_fixed_size_list(dtype):
+        inner = canonical_arrow_type(dtype.value_type)
+        if inner.equals(dtype.value_type):
+            return dtype
+        return pa.list_(inner, dtype.list_size)
+    return dtype
+
+
+def _canonical_merge_types(existing: pa.DataType, incoming: pa.DataType) -> pa.DataType:
+    """Pick one Arrow type for append when two files disagree (e.g. float32 vs float64)."""
+    if existing.equals(incoming):
+        return canonical_arrow_type(existing)
+    ce, ci = canonical_arrow_type(existing), canonical_arrow_type(incoming)
+    if ce.equals(ci):
+        return ce
+    if pa.types.is_floating(existing) and pa.types.is_floating(incoming):
+        return pa.float64()
+    if (
+        pa.types.is_integer(existing) or pa.types.is_unsigned_integer(existing)
+    ) and (pa.types.is_integer(incoming) or pa.types.is_unsigned_integer(incoming)):
+        return pa.int64()
+    return ce
+
+
+def normalize_catalog_table_types(table: pa.Table) -> pa.Table:
+    """Coerce numeric columns to float64 / int64 so multi-file ingest shares one schema.
+
+    Survey batches (AllWISE, GALEX, …) often ship the same column as ``E`` (float32)
+    in one FITS file and ``D`` (float64) in another.  Normalizing on ingest avoids
+    append failures and stops the first file from locking a narrower Parquet type.
+    """
+    if table.num_rows == 0:
+        return table
+    fields: list[pa.Field] = []
+    arrays: list[pa.Array] = []
+    for field in table.schema:
+        canon = canonical_arrow_type(field.type)
+        col = table.column(field.name).combine_chunks()
+        if not col.type.equals(canon):
+            col = pc.cast(col, canon)
+        arrays.append(col)
+        fields.append(pa.field(field.name, canon, nullable=field.nullable))
+    return pa.Table.from_arrays(
+        arrays,
+        schema=pa.schema(fields, metadata=table.schema.metadata),
+    )
+
+
+def _unified_append_schema(existing: pa.Schema, incoming: pa.Schema) -> pa.Schema:
+    """Build a target schema that can hold both *existing* and *incoming* tiles."""
+    if existing.names != incoming.names:
+        raise ValueError(
+            "Cannot align tables: column name mismatch.\n"
+            f"On disk: {existing.names}\nIncoming: {incoming.names}"
+        )
+    fields: list[pa.Field] = []
+    for name in existing.names:
+        ex_f = existing.field(name)
+        in_f = incoming.field(name)
+        merged_type = _canonical_merge_types(ex_f.type, in_f.type)
+        fields.append(
+            pa.field(
+                name,
+                merged_type,
+                nullable=ex_f.nullable or in_f.nullable,
+            )
+        )
+    return pa.schema(fields, metadata=incoming.metadata)
+
+
 def _schemas_compatible(existing: pa.Schema, incoming: pa.Schema) -> bool:
     if existing.names != incoming.names:
         return False
@@ -912,10 +990,10 @@ def _schema_type_mismatches(existing: pa.Schema, incoming: pa.Schema) -> list[st
 
 
 def _align_incoming_to_schema(incoming: pa.Table, target: pa.Schema) -> pa.Table:
-    """Cast *incoming* columns to match an existing on-disk tile schema.
+    """Cast *incoming* columns to match a target tile schema.
 
     Handles common re-ingest drift (e.g. ``large_string`` in RAM vs ``string``
-    written by :func:`_shrink_tile_table_for_disk`).
+    written by :func:`_shrink_tile_table_for_disk`, or float32 vs float64).
     """
     if incoming.schema.names != target.names:
         raise ValueError(
@@ -971,8 +1049,10 @@ def _merge_tile_tables(
     on_duplicate_id: DuplicateIdMode,
 ) -> pa.Table:
     """Concatenate tile tables, optionally deduplicating on an object-ID column."""
-    if not _schemas_compatible(existing.schema, incoming.schema):
-        incoming = _align_incoming_to_schema(incoming, existing.schema)
+    incoming = normalize_catalog_table_types(incoming)
+    target = _unified_append_schema(existing.schema, incoming.schema)
+    existing = _align_incoming_to_schema(existing, target)
+    incoming = _align_incoming_to_schema(incoming, target)
     if not _schemas_compatible(existing.schema, incoming.schema):
         diffs = _schema_type_mismatches(existing.schema, incoming.schema)
         raise ValueError(
@@ -1018,6 +1098,7 @@ def _write_tile_for_mode(
     parquet_options: CatalogParquetOptions,
 ) -> pq.FileMetaData | None:
     """Write one ``Npix=*.parquet`` tile; return metadata if written, else None."""
+    incoming = normalize_catalog_table_types(incoming)
     if not out_file.exists():
         return _write_catalog_parquet_tile(incoming, out_file, parquet_options)
 

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from collections import deque
@@ -57,10 +59,20 @@ class CatalogTileBatch:
 
 
 @dataclass
+class CatalogTileBatchRef:
+    """Lightweight IPC handle: tile Parquet written in the worker temp dir."""
+
+    npix: int
+    spool_path: str
+
+
+@dataclass
 class CatalogWorkerResult:
     path: str
     ok: bool
     batches: list[CatalogTileBatch] = field(default_factory=list)
+    batch_refs: list[CatalogTileBatchRef] = field(default_factory=list)
+    spool_dir: str | None = None
     n_rows: int = 0
     source_id_mode: str = "sequential"
     error: str | None = None
@@ -86,11 +98,27 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
         source_id_col=config.source_id_col,
         columns=cols,
     )
-    batches = [CatalogTileBatch(npix=npix, table=tbl) for npix, tbl in batches_raw]
+    # Do not pickle pa.Table across processes (ALLWISE/Gaia-scale tables OOM the
+    # worker or parent). Spool per-tile fragments in the worker; writer reads them.
+    import pyarrow.parquet as pq
+
+    spool_dir = tempfile.mkdtemp(prefix="dl_catalog_spool_")
+    batch_refs: list[CatalogTileBatchRef] = []
+    try:
+        for npix, tbl in batches_raw:
+            spool_path = Path(spool_dir) / f"Npix={npix}.parquet"
+            pq.write_table(tbl, spool_path, compression="zstd", compression_level=3)
+            batch_refs.append(CatalogTileBatchRef(npix=npix, spool_path=str(spool_path)))
+    except Exception:
+        shutil.rmtree(spool_dir, ignore_errors=True)
+        raise
+    del batches_raw
+
     return CatalogWorkerResult(
         path=path_str,
         ok=True,
-        batches=batches,
+        batch_refs=batch_refs,
+        spool_dir=spool_dir,
         n_rows=n_rows,
         source_id_mode=sid_mode,
         elapsed_s=time.perf_counter() - t0,
@@ -196,7 +224,9 @@ def ingest_catalogs_parallel(
         }
 
     if max_in_flight is None:
-        max_in_flight = n_workers + 2
+        # Keep low: writer reads one spooled file at a time; extra in-flight
+        # futures only add worker RAM (full decode still in each child).
+        max_in_flight = n_workers
 
     if executor_factory is None:
         from data_lake.cli_utils import init_parallel_ingest_subprocess as _init
@@ -289,11 +319,28 @@ def ingest_catalogs_parallel(
 
         if sid_mode is None:
             sid_mode = res.source_id_mode
-        if res.batches:
-            fallback_n_cols = len(res.batches[0].table.schema)
+        try:
+            if res.batch_refs:
+                import pyarrow.parquet as pq
 
-        for batch in res.batches:
-            _write_batch(batch)
+                if res.batches:
+                    fallback_n_cols = len(res.batches[0].table.schema)
+                elif res.batch_refs:
+                    fallback_n_cols = len(
+                        pq.read_schema(res.batch_refs[0].spool_path)
+                    )
+                for ref in res.batch_refs:
+                    _write_batch(
+                        CatalogTileBatch(npix=ref.npix, table=pq.read_table(ref.spool_path))
+                    )
+            else:
+                if res.batches:
+                    fallback_n_cols = len(res.batches[0].table.schema)
+                for batch in res.batches:
+                    _write_batch(batch)
+        finally:
+            if res.spool_dir:
+                shutil.rmtree(res.spool_dir, ignore_errors=True)
 
         n_rows += res.n_rows
         n_files_ok += 1

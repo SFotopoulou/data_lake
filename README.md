@@ -228,6 +228,13 @@ deprecated but still maps to ``--tile-mode overwrite``. After every ingest,
 `_metadata` and `catalog_info.json`
 `total_rows` are refreshed from **all** tiles on disk.
 
+**Mixed numeric dtypes across files** (common in AllWISE/GALEX batches): the same
+column may be ``E`` (float32) in one FITS and ``D`` (float64) in another. Ingest
+promotes floats to **float64**, integers to **int64**, and inner elements of
+``FixedSizeList`` columns likewise, before writing or appending tiles — so append
+no longer fails on dtype mismatch and the first file no longer locks a narrower
+Parquet type.
+
 #### Choosing HEALPix order (`--norder` / `hats_order`)
 
 Catalogs, cutouts, and spectra for a survey share one **HEALPix nested** order
@@ -558,14 +565,14 @@ Same flags on `dl-ingest-catalog-from-list` when `--n-workers > 1` (default `1` 
 sequential). **`--streaming` is not supported** on the parallel path.
 
 Peak RAM scales roughly as **`O(n_workers × largest catalog file)`** — each worker
-holds one full decoded table before the writer commits tiles. Lower `--n-workers`
-or `--max-in-flight` (default `n_workers + 2`) if memory is tight. Very wide FITS
-(e.g. ALLWISE full-catalog columns) often need **`--columns …`** plus **fewer workers**.
+still decodes a full file in memory, but tile tables are **spooled to temp Parquet
+in the worker** (not pickled back to the parent). Lower `--n-workers` and use
+`--columns` on wide surveys (ALLWISE). Default **`--max-in-flight`** is **`n_workers`**
+(not `n_workers + 2` like spectra batch).
 
-If the OS kills a worker (**OOM**), you may see `BrokenProcessPool` in logs; the
-batch tool **restarts the pool** and re-queues in-flight files so the run can continue
-(subject to an internal recovery cap). Persistent failures mean reduce parallelism
-or column set.
+If the OS kills a worker (**OOM**), you may see `BrokenProcessPool`; the batch tool
+**restarts the pool** and re-queues in-flight files. Persistent OOM → fewer workers
+and a smaller `--columns` set.
 
 #### Sequential file-list ingest (catalogs, cutouts, spectra)
 

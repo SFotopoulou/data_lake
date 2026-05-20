@@ -630,6 +630,47 @@ class TestParquetTileIntegrity:
         pq.read_metadata(str(out))
 
 
+class TestNumericTypeNormalization:
+    """AllWISE/GALEX: same column as float32 in one file and float64 in another."""
+
+    def test_append_float32_then_float64_same_column(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        ra, dec = 120.0, 45.0
+        tbl_a = Table({
+            "TARGETID": np.array([1, 2], dtype=np.int64),
+            "TARGET_RA": np.full(2, ra, dtype=np.float64),
+            "TARGET_DEC": np.full(2, dec, dtype=np.float64),
+            "MAG": np.array([18.0, 19.0], dtype=np.float32),
+        })
+        tbl_b = Table({
+            "TARGETID": np.array([3, 4], dtype=np.int64),
+            "TARGET_RA": np.full(2, ra, dtype=np.float64),
+            "TARGET_DEC": np.full(2, dec, dtype=np.float64),
+            "MAG": np.array([20.0, 21.0], dtype=np.float64),
+        })
+        fits_a, fits_b = tmp_path / "a.fits", tmp_path / "b.fits"
+        _write_table_as_fits(tbl_a, fits_a)
+        _write_table_as_fits(tbl_b, fits_b)
+        lake = tmp_path / "lake"
+        common = dict(
+            output_root=lake,
+            survey_name="dtype_mix",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+        )
+        ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
+        ingest_catalog(source_path=fits_b, tile_mode="append", **common)
+
+        _, merged = _read_merged_catalog(lake, "dtype_mix")
+        assert merged.num_rows == 4
+        assert merged.schema.field("MAG").type == pa.float64()
+        mags = np.asarray(merged.column("MAG"))
+        assert np.allclose(mags, [18.0, 19.0, 20.0, 21.0])
+
+
 class TestTileMode:
     def _ingest_two(
         self,
