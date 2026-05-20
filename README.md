@@ -1025,6 +1025,37 @@ dl-describe-survey ALLWISE --rebuild
 3. ``dl-describe-survey <partner>`` for each catalog; ``--modality spectra`` if needed
 4. DuckDB ``want → master → catalog`` (``notebooks/11_duckdb_catalog_query.ipynb`` §9–§10)
 
+### SQL builder from master (P3)
+
+After column discovery, generate join SQL from ``<master>.meta.json`` and your column picks:
+
+```python
+from data_lake.query_from_master import build_select_from_master, parse_column_picks
+
+plan = build_select_from_master(
+    lake_root,
+    lake_root / "associations" / "master_desi_euclid.parquet",
+    primary_survey="DESI_DR1",
+    columns={
+        "DESI_DR1": ["Z", "MAG_G", "MAG_R"],
+        "EUCLID_DR1": ["SOURCE_ID"],
+    },
+)
+print(plan.all_sql())  # CREATE VIEW … + SELECT want → master → catalogs
+```
+
+CLI (same logic):
+
+```bash
+dl-build-query-from-master associations/master.parquet /data/lake \
+  --primary-survey DESI_DR1 \
+  --column DESI_DR1:Z,MAG_G,MAG_R \
+  --column EUCLID_DR1:SOURCE_ID
+```
+
+Register ``want`` in DuckDB (or ``MultiCatalogAccessor._con.register("want", df)``), run
+``plan.view_ddls`` then ``plan.sql``.
+
 ### Fast retrieval with DuckDB (ID list → master → catalogs)
 
 Cross-matching is **by sky position**; partner catalogs may use **different**
