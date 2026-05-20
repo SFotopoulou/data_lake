@@ -948,6 +948,23 @@ partitioning — see `data_lake/io/crossmatch.py`).
 survey catalog stay in sync; the master table can carry partner IDs and
 separations while the lake catalog keeps machine indices for fast accessors.
 
+### Schema registry (column discovery)
+
+Each ingested catalog gets **`catalogs/<survey>/schema_manifest.json`** at finalize
+(ingest or batch end): every column name, Arrow dtype, heuristic **role**
+(`id`, `sky`, `redshift`, `photometry`, `healpix`, `index`, …), join columns, and
+prefix **column_groups** (e.g. `MAG` → `MAG_G`, `MAG_R`).
+
+```bash
+dl-describe-survey DESI_DR1
+dl-describe-survey EUCLID_DR1 --role photometry
+dl-describe-survey ALLWISE --rebuild   # refresh manifest from on-disk Parquet
+dl-describe-survey DESI_DR1 --json     # full manifest for tooling
+```
+
+Use this to pick columns before joining a **master association** table (see below).
+The master file should stay ID-centric; science columns come from per-survey catalogs.
+
 ### Fast retrieval with DuckDB (ID list → master → catalogs)
 
 Cross-matching is **by sky position**; partner catalogs may use **different**
@@ -1060,6 +1077,8 @@ See `notebooks/` for worked examples:
 3. **`03_cutout_ingest.ipynb`** — FITS stamps → Zarr cutout stacks, validation, `CutoutAccessor`, optional `_cutout_index` catalog patch
 4. **`04_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`)
 5. **`11_duckdb_catalog_query.ipynb`** — SQL over Parquet catalogs; §9 master table + ID-list joins
+
+Use **`dl-describe-survey <name>`** (or the manifest JSON) to choose columns before building joins.
 6. **`12_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
 7. **`13_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
 

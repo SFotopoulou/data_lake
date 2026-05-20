@@ -1208,6 +1208,19 @@ def _finalize_catalog_writes(
             streaming=streaming,
         )
 
+    if tile_paths:
+        from data_lake.schema_registry import write_catalog_schema_manifest
+
+        write_catalog_schema_manifest(
+            catalog_root,
+            survey_name,
+            hats_order=norder,
+            ra_column=ra_col,
+            dec_column=dec_col,
+            source_id_mode=source_id_mode,
+            total_rows=total_rows,
+        )
+
 
 def _write_catalog_parquet_tile(
     tile_table: pa.Table,
