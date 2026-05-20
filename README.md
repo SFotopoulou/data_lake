@@ -559,7 +559,13 @@ sequential). **`--streaming` is not supported** on the parallel path.
 
 Peak RAM scales roughly as **`O(n_workers × largest catalog file)`** — each worker
 holds one full decoded table before the writer commits tiles. Lower `--n-workers`
-or `--max-in-flight` (default `n_workers + 2`) if memory is tight.
+or `--max-in-flight` (default `n_workers + 2`) if memory is tight. Very wide FITS
+(e.g. ALLWISE full-catalog columns) often need **`--columns …`** plus **fewer workers**.
+
+If the OS kills a worker (**OOM**), you may see `BrokenProcessPool` in logs; the
+batch tool **restarts the pool** and re-queues in-flight files so the run can continue
+(subject to an internal recovery cap). Persistent failures mean reduce parallelism
+or column set.
 
 #### Sequential file-list ingest (catalogs, cutouts, spectra)
 

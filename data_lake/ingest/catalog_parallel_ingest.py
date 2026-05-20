@@ -15,7 +15,9 @@ import logging
 import sys
 import time
 import traceback
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Executor, Future, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -215,16 +217,44 @@ def ingest_catalogs_parallel(
         failures_log.parent.mkdir(parents=True, exist_ok=True)
 
     t_start = time.perf_counter()
-    path_iter = iter(pending)
+    work_queue: deque[str] = deque(sorted(pending))
     in_flight: dict[Future, str] = {}
+    pool_recoveries = 0
+    # Cap recoveries so a pathological loop cannot run forever.
+    max_pool_recoveries = max(len(pending) * 8, 512)
 
-    def _submit_more(pool: Executor) -> None:
-        while len(in_flight) < max_in_flight:
-            try:
-                p = next(path_iter)
-            except StopIteration:
-                break
-            in_flight[pool.submit(decoder, p, decode_cfg)] = p
+    pool_cm = executor_factory(n_workers)
+    pool: Executor = pool_cm.__enter__()
+
+    def _recycle_pool_after_broken() -> None:
+        """Worker died (often OOM): shut down pool, re-create, clear in_flight futures."""
+        nonlocal pool, pool_cm, pool_recoveries
+        pool_recoveries += 1
+        if pool_recoveries > max_pool_recoveries:
+            raise RuntimeError(
+                f"Process pool broke more than {max_pool_recoveries} times; aborting. "
+                "Try --n-workers 1–2, lower --max-in-flight, and/or --columns to cut RAM."
+            ) from None
+        log.warning(
+            "Process pool broke (worker terminated abruptly — often OOM while decoding "
+            "a large FITS). Recreating pool (recovery #%d / %d). "
+            "Re-queuing %d in-flight file(s). Consider fewer --n-workers, "
+            "smaller --max-in-flight, or --columns.",
+            pool_recoveries,
+            max_pool_recoveries,
+            len(in_flight),
+        )
+        try:
+            pool_cm.__exit__(None, None, None)
+        except Exception:
+            log.exception("While shutting down broken process pool")
+        pool_cm = executor_factory(n_workers)
+        pool = pool_cm.__enter__()
+        in_flight.clear()
+
+    def _requeue_in_flight_paths() -> None:
+        for _fut, path_str in list(in_flight.items()):
+            work_queue.appendleft(path_str)
 
     def _write_batch(batch: CatalogTileBatch) -> None:
         out_dir = catalog_root / healpix_dir(norder, batch.npix)
@@ -275,37 +305,61 @@ def ingest_catalogs_parallel(
     except ImportError:
         tqdm = None
 
+    pbar = (
+        tqdm(total=len(pending), disable=not show_progress, unit="file", desc="ingest")
+        if tqdm is not None
+        else None
+    )
     try:
-        with executor_factory(n_workers) as pool:
-            _submit_more(pool)
-            pbar = (
-                tqdm(total=len(pending), disable=not show_progress, unit="file", desc="ingest")
-                if tqdm is not None
-                else None
-            )
-            try:
-                while in_flight:
-                    done_set, _ = wait(in_flight, return_when=FIRST_COMPLETED)
-                    for fut in done_set:
-                        path_str = in_flight.pop(fut)
-                        try:
-                            res = fut.result()
-                        except Exception as exc:
-                            res = CatalogWorkerResult(
-                                path=path_str,
-                                ok=False,
-                                error=f"executor: {type(exc).__name__}: {exc}",
-                                tb=traceback.format_exc(),
-                            )
-                        _process_result(res)
-                        if pbar is not None:
-                            pbar.update(1)
-                        _submit_more(pool)
-            finally:
+        while work_queue or in_flight:
+            submit_broken = False
+            while len(in_flight) < max_in_flight and work_queue:
+                p = work_queue.popleft()
+                try:
+                    in_flight[pool.submit(decoder, p, decode_cfg)] = p
+                except BrokenProcessPool:
+                    work_queue.appendleft(p)
+                    _requeue_in_flight_paths()
+                    _recycle_pool_after_broken()
+                    submit_broken = True
+                    break
+            if submit_broken:
+                continue
+
+            if not in_flight:
+                break
+
+            done_set, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+            result_broken = False
+            for fut in done_set:
+                path_str = in_flight.pop(fut)
+                try:
+                    res = fut.result()
+                except BrokenProcessPool:
+                    work_queue.appendleft(path_str)
+                    _requeue_in_flight_paths()
+                    _recycle_pool_after_broken()
+                    result_broken = True
+                    break
+                except Exception as exc:
+                    res = CatalogWorkerResult(
+                        path=path_str,
+                        ok=False,
+                        error=f"executor: {type(exc).__name__}: {exc}",
+                        tb=traceback.format_exc(),
+                    )
+                _process_result(res)
                 if pbar is not None:
-                    pbar.close()
+                    pbar.update(1)
+            if result_broken:
+                continue
     finally:
-        pass
+        if pbar is not None:
+            pbar.close()
+        try:
+            pool_cm.__exit__(None, None, None)
+        except Exception:
+            log.exception("While shutting down catalog ingest process pool")
 
     if sid_mode is None:
         sid_mode = "sequential"
