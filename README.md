@@ -965,6 +965,40 @@ dl-describe-survey DESI_DR1 --json     # full manifest for tooling
 Use this to pick columns before joining a **master association** table (see below).
 The master file should stay ID-centric; science columns come from per-survey catalogs.
 
+### Lake registry and master metadata (P1)
+
+**Lake index** — scan what is deployed:
+
+```bash
+dl-refresh-lake-registry              # write shared/registry/surveys.parquet
+dl-describe-lake                      # print survey × modality summary
+dl-describe-lake --refresh            # rebuild then print
+```
+
+**Master association** — map master ID columns to catalog join keys. Keep the
+master Parquet thin; store mapping in a sidecar ``<master>.meta.json``:
+
+```json
+{
+  "meta_version": "1",
+  "master_parquet": "associations/master_desi_euclid.parquet",
+  "primary_survey": "DESI_DR1",
+  "partners": [
+    {"survey": "DESI_DR1", "master_column": "desi_targetid", "catalog_id_column": "TARGETID"},
+    {"survey": "EUCLID_DR1", "master_column": "euclid_source_id", "catalog_id_column": "SOURCE_ID"}
+  ]
+}
+```
+
+```bash
+dl-describe-master associations/master.parquet
+dl-describe-master associations/master.parquet --write-meta   # save guessed .meta.json
+```
+
+If ``.meta.json`` is missing, columns are matched heuristically against on-disk
+``schema_manifest.json`` files (run ``dl-describe-survey <name> --rebuild`` first
+for surveys without a manifest).
+
 ### Fast retrieval with DuckDB (ID list → master → catalogs)
 
 Cross-matching is **by sky position**; partner catalogs may use **different**

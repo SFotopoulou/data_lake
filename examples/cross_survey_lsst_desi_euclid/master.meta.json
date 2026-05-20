@@ -1,0 +1,22 @@
+{
+  "meta_version": "1",
+  "master_parquet": "associations/lsst_desi_euclid_master.parquet",
+  "primary_survey": "lsst_dc2_photometry",
+  "partners": [
+    {
+      "survey": "lsst_dc2_photometry",
+      "master_column": "lsst_source_id",
+      "catalog_id_column": "source_id"
+    },
+    {
+      "survey": "desi_dr1_spectra",
+      "master_column": "desi_targetid",
+      "catalog_id_column": "source_id"
+    },
+    {
+      "survey": "euclid_dr1_cutouts",
+      "master_column": "euclid_source_id",
+      "catalog_id_column": "source_id"
+    }
+  ]
+}
