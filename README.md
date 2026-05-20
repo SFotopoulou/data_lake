@@ -149,7 +149,7 @@ dl-ingest-spectra-batch --survey DESI_DR1 --file-list coadds.txt --n-workers 8
 `dl-init` on the production tree:
 
 ```bash
-export DATA_LAKE_CONFIG=/shared/caspian/mylake/lake_config.toml
+export DATA_LAKE_CONFIG=/path/to/mylake/lake_config.toml
 # SpectrumAccessor, dl-extract-spectra-subset, notebooks, validators, …
 ```
 
