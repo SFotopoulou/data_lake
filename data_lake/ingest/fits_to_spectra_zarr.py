@@ -874,6 +874,12 @@ def _write_spectrum_info(
     spectra_survey_root.mkdir(parents=True, exist_ok=True)
     with open(spectra_survey_root / "spectrum_info.json", "w") as fh:
         json.dump(info, fh, indent=2)
+    try:
+        from data_lake.schema_registry import write_spectra_schema_manifest
+
+        write_spectra_schema_manifest(spectra_survey_root, survey_name)
+    except Exception as exc:
+        log.warning("Could not write spectra schema_manifest.json: %s", exc)
 
 
 # ---------------------------------------------------------------------------

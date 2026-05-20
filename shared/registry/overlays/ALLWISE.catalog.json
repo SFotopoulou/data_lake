@@ -1,0 +1,14 @@
+{
+  "columns": {
+    "w1mpro": {
+      "unit": "mag (Vega)",
+      "description": "WISE W1 profile-fit magnitude",
+      "homogenized_ab_offset": 2.699
+    },
+    "w2mpro": {
+      "unit": "mag (Vega)",
+      "description": "WISE W2 profile-fit magnitude",
+      "homogenized_ab_offset": 3.339
+    }
+  }
+}

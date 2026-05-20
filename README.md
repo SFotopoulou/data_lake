@@ -958,11 +958,13 @@ prefix **column_groups** (e.g. `MAG` → `MAG_G`, `MAG_R`).
 ```bash
 dl-describe-survey DESI_DR1
 dl-describe-survey EUCLID_DR1 --role photometry
-dl-describe-survey ALLWISE --rebuild   # refresh manifest from on-disk Parquet
+dl-describe-survey DESI_DR1 --modality spectra
+dl-describe-survey ALLWISE --rebuild   # refresh manifest from on-disk data
 dl-describe-survey DESI_DR1 --json     # full manifest for tooling
 ```
 
 Use this to pick columns before joining a **master association** table (see below).
+Spectra/cutout manifests are written at ingest finalize; catalogs also get manifests from Parquet schema.
 The master file should stay ID-centric; science columns come from per-survey catalogs.
 
 ### Lake registry and master metadata (P1)
@@ -998,6 +1000,30 @@ dl-describe-master associations/master.parquet --write-meta   # save guessed .me
 If ``.meta.json`` is missing, columns are matched heuristically against on-disk
 ``schema_manifest.json`` files (run ``dl-describe-survey <name> --rebuild`` first
 for surveys without a manifest).
+
+### Spectra, cutouts, and column overlays (P2)
+
+**Spectra and cutout layers** get ``schema_manifest.json`` at ingest finalize
+(from ``spectrum_info.json`` / ``cutout_info.json``): Zarr array names, dtypes,
+roles (`flux`, `ivar`, `mask`, `wavelength`, `image`, `metadata`, …).
+
+```bash
+dl-describe-survey DESI_DR1 --modality catalog    # default
+dl-describe-survey DESI_DR1 --modality spectra
+dl-describe-survey LSST_DR1 --modality cutout
+dl-describe-survey ALLWISE --rebuild
+```
+
+**Optional overlays** — analyst JSON under ``shared/registry/overlays/``
+(see ``shared/registry/overlays/README.md``). Merged at describe time with
+``unit``, ``description``, and homogenization hints (e.g. WISE Vega → AB offset).
+
+**Discovery workflow** (master → columns → SQL):
+
+1. ``dl-refresh-lake-registry`` then ``dl-describe-lake``
+2. ``dl-describe-master associations/master.parquet`` (``--write-meta`` once)
+3. ``dl-describe-survey <partner>`` for each catalog; ``--modality spectra`` if needed
+4. DuckDB ``want → master → catalog`` (``notebooks/11_duckdb_catalog_query.ipynb`` §9–§10)
 
 ### Fast retrieval with DuckDB (ID list → master → catalogs)
 

@@ -11,15 +11,21 @@ from astropy.table import Table
 from data_lake.ingest.fits_to_parquet import ingest_catalog
 from data_lake.schema_registry import (
     MANIFEST_FILENAME,
+    MODALITY_SPECTRA,
+    ROLE_FLUX,
     ROLE_ID,
     ROLE_PHOTOMETRY,
     ROLE_REDSHIFT,
     ROLE_SKY,
     build_catalog_schema_manifest,
+    build_spectra_schema_manifest,
     format_manifest_table,
     infer_column_role,
     load_catalog_schema_manifest,
+    load_column_overlay,
+    merge_column_overlays,
     write_catalog_schema_manifest,
+    write_spectra_schema_manifest,
 )
 
 
@@ -147,3 +153,49 @@ def test_build_and_format_manifest(tmp_path: Path) -> None:
 def test_load_missing_manifest_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_catalog_schema_manifest(tmp_path / "nope")
+
+
+def test_spectra_schema_manifest(tmp_path: Path) -> None:
+    spectra_root = tmp_path / "lake" / "spectra" / "DESI_TEST"
+    spectra_root.mkdir(parents=True)
+    info = {
+        "survey_name": "DESI_TEST",
+        "hats_order": 5,
+        "n_pix": 100,
+        "wavelength_mode": "shared",
+        "meta_fields": ["z", "z_err"],
+        "has_resolution": False,
+    }
+    (spectra_root / "spectrum_info.json").write_text(json.dumps(info))
+
+    manifest = build_spectra_schema_manifest(spectra_root, "DESI_TEST")
+    assert manifest["modality"] == MODALITY_SPECTRA
+    assert manifest["n_pix"] == 100
+    names = [c["name"] for c in manifest["columns"]]
+    assert "flux" in names
+    assert "meta.z" in names
+
+    write_spectra_schema_manifest(spectra_root, "DESI_TEST")
+    assert (spectra_root / MANIFEST_FILENAME).is_file()
+
+    text = format_manifest_table(manifest, role=ROLE_FLUX)
+    assert "flux" in text
+
+
+def test_column_overlay_merge(tmp_path: Path) -> None:
+    overlay_dir = tmp_path / "lake" / "shared" / "registry" / "overlays"
+    overlay_dir.mkdir(parents=True)
+    (overlay_dir / "WISE.catalog.json").write_text(
+        json.dumps({"columns": {"MAG_W1": {"unit": "mag", "description": "W1 Vega"}}})
+    )
+    manifest = {
+        "survey": "WISE",
+        "modality": "catalog",
+        "columns": [{"name": "MAG_W1", "dtype": "float64", "role": "photometry"}],
+    }
+    loaded = load_column_overlay(tmp_path / "lake", "WISE", "catalog")
+    merged = merge_column_overlays(manifest, loaded)
+    col = merged["columns"][0]
+    assert col["unit"] == "mag"
+    assert col["description"] == "W1 Vega"
+    assert merged["has_column_overlay"]

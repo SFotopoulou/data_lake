@@ -19,9 +19,14 @@ import pyarrow.parquet as pq
 
 from data_lake.schema_registry import (
     MANIFEST_FILENAME,
+    MODALITY_CUTOUT,
+    MODALITY_SPECTRA,
     format_manifest_table,
     load_catalog_schema_manifest,
+    load_schema_manifest,
     write_catalog_schema_manifest,
+    write_cutout_schema_manifest,
+    write_spectra_schema_manifest,
 )
 
 log = logging.getLogger(__name__)
@@ -266,6 +271,27 @@ def _catalog_registry_row(
     }
 
 
+def _load_layer_manifest_or_none(
+    survey_root: Path,
+    survey: str,
+    modality: str,
+) -> dict[str, Any] | None:
+    path = survey_root / MANIFEST_FILENAME
+    if path.is_file():
+        return load_schema_manifest(survey_root)
+    try:
+        if modality == MODALITY_SPECTRA:
+            write_spectra_schema_manifest(survey_root, survey)
+        elif modality == MODALITY_CUTOUT:
+            write_cutout_schema_manifest(survey_root, survey)
+        else:
+            return None
+        return load_schema_manifest(survey_root)
+    except Exception as exc:
+        log.warning("Could not build %s manifest for %s: %s", modality, survey, exc)
+        return None
+
+
 def _info_registry_row(
     lake_root: Path,
     survey: str,
@@ -278,18 +304,29 @@ def _info_registry_row(
         return None
     with open(info_path) as fh:
         info = json.load(fh)
+
+    manifest_rel = None
+    n_columns = None
+    source_id = "source_id"
+    manifest_path = survey_root / MANIFEST_FILENAME
+    manifest = _load_layer_manifest_or_none(survey_root, survey, modality)
+    if manifest is not None:
+        manifest_rel = str(manifest_path.relative_to(lake_root))
+        n_columns = manifest.get("n_columns")
+        source_id = manifest.get("source_id_column") or source_id
+
     return {
         "survey": survey,
         "modality": modality,
         "path": str(survey_root.relative_to(lake_root)),
         "hats_order": info.get("hats_order"),
-        "source_id_column": None,
+        "source_id_column": source_id,
         "ra_column": info.get("ra_column"),
         "dec_column": info.get("dec_column"),
-        "n_columns": None,
+        "n_columns": n_columns,
         "total_rows": None,
-        "manifest_path": str(info_path.relative_to(lake_root)),
-        "has_schema_manifest": False,
+        "manifest_path": manifest_rel or str(info_path.relative_to(lake_root)),
+        "has_schema_manifest": manifest_path.is_file(),
     }
 
 

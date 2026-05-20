@@ -422,6 +422,12 @@ def _write_cutout_info(
     cutout_root.mkdir(parents=True, exist_ok=True)
     with open(cutout_root / "cutout_info.json", "w") as fh:
         json.dump(info, fh, indent=2)
+    try:
+        from data_lake.schema_registry import write_cutout_schema_manifest
+
+        write_cutout_schema_manifest(cutout_root, survey_name)
+    except Exception as exc:
+        log.warning("Could not write cutout schema_manifest.json: %s", exc)
 
 
 # ---------------------------------------------------------------------------
