@@ -78,3 +78,32 @@ def test_sparse_allsky_lower_norder_than_dense_patch(tmp_path: Path) -> None:
 def test_no_files_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         recommend_catalog_norder([tmp_path / "missing.fits"])
+
+
+def test_bintable_extension_and_merged_sky_columns(tmp_path: Path) -> None:
+    """EUCLID-style: sky columns on extension 1 BINTABLE, not PRIMARY."""
+    from astropy.io import fits
+
+    n = 2_000
+    rng = np.random.default_rng(0)
+    ra = rng.uniform(50.0, 51.0, n)
+    dec = rng.uniform(-10.0, -9.0, n)
+    cols = fits.ColDefs([
+        fits.Column(name="alpha_j2000_merged", format="D", array=ra),
+        fits.Column(name="delta_j2000_merged", format="D", array=dec),
+    ])
+    tbl_hdu = fits.BinTableHDU.from_columns(cols)
+    hdul = fits.HDUList([fits.PrimaryHDU(), tbl_hdu])
+    path = tmp_path / "euclid_like.fits"
+    hdul.writeto(path, overwrite=True)
+
+    rec = recommend_catalog_norder(
+        [path],
+        ra_col="alpha_j2000_merged",
+        dec_col="delta_j2000_merged",
+        sample_rows=n,
+        norder_min=3,
+        norder_max=7,
+    )
+    assert rec.sample_rows == n
+    assert rec.ra_col == "alpha_j2000_merged"

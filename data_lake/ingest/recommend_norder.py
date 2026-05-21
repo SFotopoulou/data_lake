@@ -96,6 +96,39 @@ def _fits_row_count(path: Path) -> int:
         return _bintable_nrows(hdu)
 
 
+def _resolve_column_name(available: Sequence[str], requested: str) -> str:
+    """Match FITS column name exactly or case-insensitively."""
+    names = list(available)
+    if requested in names:
+        return requested
+    by_upper = {n.upper(): n for n in names}
+    hit = by_upper.get(requested.upper())
+    if hit is not None:
+        return hit
+    preview = ", ".join(names[:12])
+    if len(names) > 12:
+        preview += f", … (+{len(names) - 12} more)"
+    raise KeyError(
+        f"Column {requested!r} not in FITS BINTABLE. Available: {preview}"
+    )
+
+
+def _bintable_column_names(path: Path) -> list[str]:
+    """Return column names from the catalog BINTABLE HDU (for error hints)."""
+    from astropy.io import fits
+
+    with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+        idx = _bintable_hdu_index(hdul)
+        hdu = hdul[idx]
+        if _is_packed_vector_bintable(hdu):
+            tbl = _read_packed_vector_fits(path, hdu_index=idx)
+            return list(tbl.colnames)
+        data = hdu.data
+        if data is None or data.dtype.names is None:
+            return []
+        return list(data.dtype.names)
+
+
 def _read_ra_dec_fits(
     path: Path,
     ra_col: str,
@@ -105,18 +138,25 @@ def _read_ra_dec_fits(
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray]:
     from astropy.io import fits
-    from astropy.table import Table
 
     with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
         idx = _bintable_hdu_index(hdul)
-        if _is_packed_vector_bintable(hdul):
+        hdu = hdul[idx]
+        if _is_packed_vector_bintable(hdu):
             tbl = _read_packed_vector_fits(path, hdu_index=idx)
-            ra = np.asarray(tbl[ra_col], dtype=np.float64)
-            dec = np.asarray(tbl[dec_col], dtype=np.float64)
+            ra_name = _resolve_column_name(tbl.colnames, ra_col)
+            dec_name = _resolve_column_name(tbl.colnames, dec_col)
+            ra = np.asarray(tbl[ra_name], dtype=np.float64)
+            dec = np.asarray(tbl[dec_name], dtype=np.float64)
         else:
-            tbl = Table.read(str(path), format="fits", memmap=True)
-            ra = np.asarray(tbl[ra_col], dtype=np.float64)
-            dec = np.asarray(tbl[dec_col], dtype=np.float64)
+            data = hdu.data
+            if data is None:
+                raise ValueError(f"Empty BINTABLE in {path.name}")
+            col_names = list(data.dtype.names or ())
+            ra_name = _resolve_column_name(col_names, ra_col)
+            dec_name = _resolve_column_name(col_names, dec_col)
+            ra = np.ascontiguousarray(np.asarray(data[ra_name], dtype=np.float64))
+            dec = np.ascontiguousarray(np.asarray(data[dec_name], dtype=np.float64))
 
     n = ra.size
     if max_rows is not None and n > max_rows:
@@ -221,8 +261,21 @@ def recommend_catalog_norder(
         rows_left -= ra.size
 
     if not ra_parts:
+        hint = ""
+        if files:
+            try:
+                cols = _bintable_column_names(files[0])
+                if cols:
+                    hint = (
+                        f" First file ({files[0].name}) BINTABLE columns include: "
+                        f"{', '.join(cols[:15])}"
+                        f"{'…' if len(cols) > 15 else ''}."
+                    )
+            except Exception:
+                pass
         raise ValueError(
             f"Could not read RA/Dec from any file (columns {ra_col!r}, {dec_col!r})."
+            f"{hint} Use -v to see per-file skip reasons."
         )
 
     ra_all = np.concatenate(ra_parts)
