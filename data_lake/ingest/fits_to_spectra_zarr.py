@@ -296,6 +296,37 @@ def _open_or_create_spectrum_tile(
 # ---------------------------------------------------------------------------
 
 
+def _fits_bintable_column(
+    data: np.ndarray,
+    *candidates: str,
+    dtype: np.dtype | type | None = None,
+    default: np.ndarray | None = None,
+) -> np.ndarray:
+    """Read a column from a FITS BINTABLE ``data`` recarray (not a dict).
+
+    Tries each name case-insensitively (``AND_MASK`` vs ``and_mask``).  Returns
+    *default* when no candidate exists and *default* is provided.
+    """
+    names = data.dtype.names
+    if not names:
+        if default is not None:
+            return np.asarray(default)
+        raise KeyError("FITS BINTABLE has no named columns")
+    by_lower = {n.lower(): n for n in names}
+    for cand in candidates:
+        key = by_lower.get(cand.lower())
+        if key is not None:
+            out = np.asarray(data[key])
+            if dtype is not None:
+                out = out.astype(dtype, copy=False)
+            return out
+    if default is not None:
+        return np.asarray(default)
+    raise KeyError(
+        f"None of {candidates!r} in FITS BINTABLE; available: {list(names)}"
+    )
+
+
 def _read_sdss_boss(
     hdul: fits.HDUList,
     *,
@@ -314,11 +345,17 @@ def _read_sdss_boss(
     coadd_hdu = hdul["COADD"]
     data = coadd_hdu.data
 
-    flux = np.array(data["flux"], dtype=np.float32)
-    ivar = np.array(data["ivar"], dtype=np.float32)
-    mask = np.array(data.get("and_mask", data.get("mask", np.zeros(len(flux), np.uint8))),
-                    dtype=np.uint8)
-    loglam = np.array(data["loglam"], dtype=np.float64)
+    flux = _fits_bintable_column(data, "flux", dtype=np.float32)
+    ivar = _fits_bintable_column(data, "ivar", dtype=np.float32)
+    loglam = _fits_bintable_column(data, "loglam", dtype=np.float64)
+    mask = _fits_bintable_column(
+        data,
+        "and_mask",
+        "mask",
+        "or_mask",
+        dtype=np.uint8,
+        default=np.zeros(len(flux), dtype=np.uint8),
+    )
     wavelength = 10.0 ** loglam
 
     # Object-level header
