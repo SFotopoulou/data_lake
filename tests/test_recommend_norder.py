@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from astropy.table import Table
 
+from data_lake.ingest.fits_to_parquet import read_catalog_sky_columns
 from data_lake.ingest.recommend_norder import (
     format_recommendation_report,
     recommend_catalog_norder,
@@ -107,3 +108,26 @@ def test_bintable_extension_and_merged_sky_columns(tmp_path: Path) -> None:
     )
     assert rec.sample_rows == n
     assert rec.ra_col == "alpha_j2000_merged"
+
+
+def test_read_catalog_sky_columns_matches_ingest_reader(tmp_path: Path) -> None:
+    """Sky reader uses the same FITS Table path as catalog ingest."""
+    from data_lake.ingest.fits_to_parquet import _read_fits_catalog_table
+
+    n = 500
+    rng = np.random.default_rng(1)
+    ra = rng.uniform(50.0, 51.0, n)
+    dec = rng.uniform(-10.0, -9.0, n)
+    path = tmp_path / "sky.fits"
+    Table({
+        "alpha_j2000_merged": ra,
+        "delta_j2000_merged": dec,
+    }).write(path, overwrite=True)
+
+    tbl = _read_fits_catalog_table(path)
+    ra_ingest = np.asarray(tbl["alpha_j2000_merged"], dtype=np.float64)
+    ra_read, dec_read = read_catalog_sky_columns(
+        path, "alpha_j2000_merged", "delta_j2000_merged"
+    )
+    assert np.array_equal(ra_read, ra_ingest)
+    assert dec_read.shape == (n,)

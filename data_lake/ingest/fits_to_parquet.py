@@ -635,6 +635,103 @@ def _read_packed_vector_fits(path: Path, *, hdu_index: int) -> Table:
     return Table(cols)
 
 
+def is_catalog_fits_path(path: Path | str) -> bool:
+    """True for suffixes handled by the FITS catalog ingest path."""
+    path = Path(path)
+    name = path.name.lower()
+    return name.endswith(".fits.gz") or path.suffix.lower() in {".fit", ".fits", ".fz"}
+
+
+def resolve_catalog_column_name(available: Sequence[str], requested: str) -> str:
+    """Match catalog column name exactly or case-insensitively."""
+    names = list(available)
+    if requested in names:
+        return requested
+    by_upper = {n.upper(): n for n in names}
+    hit = by_upper.get(requested.upper())
+    if hit is not None:
+        return hit
+    preview = ", ".join(names[:12])
+    if len(names) > 12:
+        preview += f", … (+{len(names) - 12} more)"
+    raise KeyError(
+        f"Column {requested!r} not in catalog. Available: {preview}"
+    )
+
+
+def _sky_arrays_to_float64(arr) -> np.ndarray:
+    out = np.asarray(arr, dtype=np.float64).reshape(-1)
+    if isinstance(out, np.ma.MaskedArray):
+        out = out.filled(np.nan)
+    return out
+
+
+def read_catalog_sky_columns(
+    path: Path | str,
+    ra_col: str,
+    dec_col: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Read RA/Dec arrays the same way catalog ingest does.
+
+    FITS: uses the catalog BINTABLE HDU and astropy column scaling (BSCALE/TZERO).
+    Other formats: full read via :func:`_read_source_table` then sky columns.
+    """
+    path = Path(path)
+    if is_catalog_fits_path(path):
+        from astropy.io import fits
+
+        with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+            idx = _bintable_hdu_index(hdul)
+            hdu = hdul[idx]
+            if _is_packed_vector_bintable(hdu):
+                tbl = _read_packed_vector_fits(path, hdu_index=idx)
+            else:
+                # Same reader as ingest: correct HDU + FITS BSCALE/TZERO handling.
+                tbl = Table.read(hdul, hdu=idx, format="fits", memmap=True)
+            ra_name = resolve_catalog_column_name(tbl.colnames, ra_col)
+            dec_name = resolve_catalog_column_name(tbl.colnames, dec_col)
+            return (
+                _sky_arrays_to_float64(tbl[ra_name]),
+                _sky_arrays_to_float64(tbl[dec_name]),
+            )
+
+    table = _read_source_table(path)
+    names = list(table.schema.names)
+    ra_name = resolve_catalog_column_name(names, ra_col)
+    dec_name = resolve_catalog_column_name(names, dec_col)
+
+    def _arrow_sky(name: str) -> np.ndarray:
+        col = table.column(name).combine_chunks()
+        if pa.types.is_fixed_size_list(col.type) or pa.types.is_list(col.type):
+            col = pc.list_flatten(col)
+        return np.asarray(col.to_numpy(zero_copy_only=False), dtype=np.float64).reshape(-1)
+
+    return _arrow_sky(ra_name), _arrow_sky(dec_name)
+
+
+def catalog_source_row_count(path: Path | str) -> int:
+    """Row count for a catalog input file (FITS header or Parquet footer)."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    name = path.name.lower()
+    if suffix in {".parquet", ".pq"}:
+        return int(pq.read_metadata(str(path)).num_rows)
+    if is_catalog_fits_path(path):
+        from astropy.io import fits
+
+        with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+            idx = _bintable_hdu_index(hdul)
+            hdu = hdul[idx]
+            if _is_packed_vector_bintable(hdu):
+                return len(_read_packed_vector_fits(path, hdu_index=idx))
+            data = hdu.data
+            if data is not None:
+                return len(data)
+            return int(hdu.header.get("NAXIS2", 0))
+    return len(_read_source_table(path))
+
+
 def _read_fits_catalog_table(path: Path) -> Table:
     """Read a catalog FITS BINTABLE, including GALEX packed-vector layout."""
     from astropy.io import fits
@@ -644,8 +741,8 @@ def _read_fits_catalog_table(path: Path) -> Table:
         hdu = hdul[idx]
         if _is_packed_vector_bintable(hdu):
             return _read_packed_vector_fits(path, hdu_index=idx)
-    log.info("Reading %s as FITS …", path.name)
-    return Table.read(str(path), format="fits")
+        log.info("Reading %s as FITS (HDU %d) …", path.name, idx)
+        return Table.read(hdul, hdu=idx, format="fits", memmap=True)
 
 
 def _open_text_for_sniff(path: Path):
