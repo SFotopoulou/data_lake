@@ -459,6 +459,20 @@ try:
         show_default=True,
         help="If source_id already exists in a tile Zarr, append, raise, or skip.",
     )
+    @click.option(
+        "--wavelength-mode",
+        type=click.Choice(["shared", "per_source"]),
+        default=None,
+        help="Wavelength storage (overrides config; SDSS auto-uses per_source).",
+    )
+    @click.option(
+        "--on-length-mismatch",
+        type=click.Choice(["error", "pad", "truncate"]),
+        default="error",
+        show_default=True,
+        help="When pixel count differs from tile n_pix: error, pad, or truncate "
+             "(SDSS ingest defaults to pad when left at error).",
+    )
     @click.option("--checkpoint", type=click.Path(path_type=Path), default=None)
     @click.option("--failures-log", type=click.Path(path_type=Path), default=None)
     @click.option("--no-progress", is_flag=True)
@@ -480,6 +494,8 @@ try:
         norder: int | None,
         fmt: str | None,
         on_duplicate: str,
+        wavelength_mode: str | None,
+        on_length_mismatch: str,
         checkpoint: Path | None,
         failures_log: Path | None,
         no_progress: bool,
@@ -510,6 +526,12 @@ try:
                 source_id_col=source_id_col,
                 norder=n,
                 fmt=fmt,
+                wavelength_mode=pick(
+                    wavelength_mode,
+                    cfg.defaults.wavelength_mode if cfg else None,
+                    "shared",
+                ),
+                on_length_mismatch=on_length_mismatch,
                 on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
             )
             total_index_map.update(m)

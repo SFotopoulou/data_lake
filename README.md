@@ -567,7 +567,7 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-cutouts` | `--on-duplicate` | `append`, `error`, `skip` | Per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
-| `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Sequential non-DESI / mixed FITS lists |
+| `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Also ``--on-length-mismatch``, ``--wavelength-mode`` (like ``dl-ingest-spectra``) |
 | `dl-ingest-spectra-batch` | `--on-duplicate` | same | DESI parallel batch (was missing before) |
 
 For **resumable** file-list or batch re-runs, use **`--on-duplicate skip`** on cutout/spectrum
@@ -616,7 +616,11 @@ dl-ingest-spectra-batch --survey desi_dr1 --file-list coadds.txt --n-workers 16 
 
 # Generic / SDSS spectra (sequential, not parallel DESI batch):
 dl-ingest-spectra-from-list spec_files.txt --survey sdss_dr17 \
-  --on-duplicate skip
+  --source-id-col SPECOBJID --on-duplicate skip
+
+SDSS spec lists: pixel lengths differ slightly; ingest auto-pads when format is
+``sdss_boss``. Override with ``--on-length-mismatch pad`` or ``truncate`` (same as
+``dl-ingest-spectra``).
 
 # Patch _cutout_index / _spectrum_index when --update-catalog (default).
 ```
