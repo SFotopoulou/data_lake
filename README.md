@@ -476,6 +476,8 @@ dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits /data/lake --survey desi
 
 # SDSS/BOSS (no extra dependency needed)
 # Match catalog specObj: SPECOBJID lives in the SPALL HDU (HDU 2), not the primary header.
+# Pixel count varies slightly file-to-file; ingest uses per_source wavelength and pads
+# to the tile's n_pix (override with --on-length-mismatch truncate).
 dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
   --source-id-col SPECOBJID
 ```

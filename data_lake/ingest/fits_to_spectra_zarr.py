@@ -807,16 +807,30 @@ def ingest_spectra_from_fits(
         log.warning("No spectra extracted from %s", source_path.name)
         return index_map
 
-    n_pix = len(records[0].flux)
+    # SDSS/BOSS spec files: per-object loglam grids and pixel counts differ slightly.
+    wavelength_mode_effective = wavelength_mode
+    length_policy = on_length_mismatch
+    if detected_fmt == "sdss_boss":
+        if wavelength_mode == "shared":
+            log.info(
+                "SDSS/BOSS spec: using wavelength_mode='per_source' "
+                "(each file has its own loglam vector; tile storage pads to a "
+                "common n_pix)."
+            )
+        wavelength_mode_effective = "per_source"
+        if length_policy == "error":
+            length_policy = "pad"
+
+    n_pix = max(len(r.flux) for r in records)
     if n_pix_expected is not None and n_pix != n_pix_expected:
         msg = (
             f"Spectrum length {n_pix} != expected {n_pix_expected} in {source_path.name}. "
             f"Pass on_length_mismatch='pad' or 'truncate' to suppress this error."
         )
-        if on_length_mismatch == "error":
+        if length_policy == "error":
             raise ValueError(msg)
         log.warning(msg)
-        records = _fix_length(records, n_pix_expected, on_length_mismatch)
+        records = _fix_length(records, n_pix_expected, length_policy)
         n_pix = n_pix_expected
 
     # Derive resolution dimensions once (same for all sources in a file)
@@ -840,10 +854,20 @@ def ingest_spectra_from_fits(
         tile_dir.mkdir(parents=True, exist_ok=True)
         tile_path = tile_dir / f"Npix={npix}.zarr"
 
+        batch_max_pix = max(len(r.flux) for r in tile_records)
+        tile_exists = tile_path.exists() and (tile_path / "zarr.json").exists()
+        create_n_pix = batch_max_pix if not tile_exists else max(n_pix, batch_max_pix)
+
         root = _open_or_create_spectrum_tile(
-            tile_path, n_pix, wavelength_mode, mask_dtype, wcs_attrs,
-            n_diag=n_diag, resolution_offsets=res_offsets,
+            tile_path,
+            create_n_pix,
+            wavelength_mode_effective,
+            mask_dtype,
+            wcs_attrs,
+            n_diag=n_diag,
+            resolution_offsets=res_offsets,
         )
+        tile_n_pix = int(root["flux"].shape[1])
 
         n_existing = int(root["source_id"].shape[0])
         existing: set[int] = set()
@@ -855,6 +879,24 @@ def ingest_spectra_from_fits(
         )
         if not tile_records:
             continue
+
+        mismatched = [r for r in tile_records if len(r.flux) != tile_n_pix]
+        if mismatched:
+            if length_policy == "error":
+                lengths = sorted({len(r.flux) for r in tile_records})
+                raise ValueError(
+                    f"Spectrum pixel lengths {lengths} disagree with tile "
+                    f"Npix={npix} n_pix={tile_n_pix} in {source_path.name}. "
+                    f"Use --on-length-mismatch pad or truncate."
+                )
+            log.info(
+                "Aligning %d spectrum(s) to n_pix=%d for tile Npix=%s (%s)",
+                len(mismatched),
+                tile_n_pix,
+                npix,
+                length_policy,
+            )
+            tile_records = _fix_length(tile_records, tile_n_pix, length_policy)
 
         start_idx = root["flux"].shape[0]
 
@@ -873,17 +915,29 @@ def ingest_spectra_from_fits(
         root["source_id"].append(batch_ids)
         root["meta"].append(batch_meta)
 
-        if wavelength_mode == "per_source":
+        if wavelength_mode_effective == "per_source":
             batch_wave = np.stack([
                 r.wavelength.astype(np.float32)
                 if r.wavelength is not None
-                else np.zeros(n_pix, dtype=np.float32)
+                else np.zeros(tile_n_pix, dtype=np.float32)
                 for r in tile_records
             ])
             root["wavelength"].append(batch_wave)
         elif start_idx == 0 and tile_records[0].wavelength is not None:
             # Write shared wavelength once (first time the tile is created)
-            root["wavelength"][:] = tile_records[0].wavelength.astype(np.float64)
+            shared_wave = tile_records[0].wavelength.astype(np.float64)
+            if len(shared_wave) != tile_n_pix:
+                if length_policy == "error":
+                    raise ValueError(
+                        f"Shared wavelength length {len(shared_wave)} != tile "
+                        f"n_pix {tile_n_pix}"
+                    )
+                shared_wave = (
+                    shared_wave[:tile_n_pix]
+                    if len(shared_wave) > tile_n_pix
+                    else np.pad(shared_wave, (0, tile_n_pix - len(shared_wave)))
+                )
+            root["wavelength"][:] = shared_wave
 
         if res_diags is not None:
             batch_res = np.stack([
@@ -898,7 +952,7 @@ def ingest_spectra_from_fits(
     _write_spectrum_info(
         output_root / "spectra" / survey_name,
         survey_name, norder, n_pix,
-        wavelength_mode, str(mask_dtype), wcs_attrs,
+        wavelength_mode_effective, str(mask_dtype), wcs_attrs,
         has_resolution=has_resolution,
         resolution_n_diag=n_diag,
         resolution_offsets=res_offsets.tolist() if res_offsets is not None else None,

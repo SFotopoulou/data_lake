@@ -97,3 +97,54 @@ class TestReadSdssBoss:
         from data_lake.ingest.fits_to_parquet import normalize_object_id
 
         assert records[0].source_id == normalize_object_id(specobjid)
+
+
+class TestSdssVariableLengthIngest:
+    """Real spec files in data/ differ by one pixel (4628 vs 4627)."""
+
+    @pytest.fixture
+    def sdss_spec_paths(self) -> list[Path]:
+        repo = Path(__file__).resolve().parents[1]
+        paths = sorted((repo / "data").glob("spec-*.fits"))
+        if len(paths) < 2:
+            pytest.skip("Need two spec-*.fits files under data/")
+        return paths
+
+    def test_ingest_two_lengths_same_tile(self, tmp_path: Path, sdss_spec_paths: list[Path]) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
+        from data_lake.io.spectra import SpectrumAccessor
+
+        lake = tmp_path / "lake"
+        survey = "sdss_test"
+        for p in sdss_spec_paths:
+            ingest_spectra_from_fits(
+                p,
+                lake,
+                survey,
+                source_id_col="SPECOBJID",
+                norder=5,
+            )
+
+        acc = SpectrumAccessor(lake, survey)
+        info_path = lake / "spectra" / survey / "spectrum_info.json"
+        info = __import__("json").loads(info_path.read_text())
+        assert info["wavelength_mode"] == "per_source"
+
+        # Both files share HEALPix Npix=519 at norder 5
+        tile = lake / "spectra" / survey / "Norder=5" / "Dir=0" / "Npix=519.zarr"
+        assert tile.is_dir()
+        import zarr
+
+        root = zarr.open_group(str(tile), mode="r")
+        assert root["flux"].shape[0] == 2
+        tile_n_pix = root["flux"].shape[1]
+        assert tile_n_pix >= 4627
+
+        ids = set(int(x) for x in root["source_id"][:])
+        assert len(ids) == 2
+
+        for sid in ids:
+            sp = acc.get_spectrum(sid)
+            assert sp.flux.shape[0] == tile_n_pix
+            assert sp.wavelength.shape[0] == tile_n_pix
+            assert sp.flux.shape[0] >= 4627
