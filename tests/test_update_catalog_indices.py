@@ -158,6 +158,21 @@ class TestNormalizeObjectId:
         with pytest.raises(ValueError, match="None"):
             normalize_object_id(None)
 
+    def test_sdss_uint64_range_objid(self) -> None:
+        from data_lake.ingest.fits_to_parquet import (
+            cast_object_id_column_to_int64,
+            normalize_object_id,
+            storage_int64_from_integer,
+        )
+
+        v = 9223372435012999168
+        expected = int(np.int64(np.uint64(v)))
+        assert storage_int64_from_integer(v) == expected
+        assert normalize_object_id(str(v)) == expected
+        assert normalize_object_id(np.uint64(v)) == expected
+        col = pa.array([v], type=pa.uint64())
+        assert cast_object_id_column_to_int64(col).to_pylist() == [expected]
+
 
 class TestResolveSourceIdColumn:
     def test_targetid_catalog(self, tmp_path: Path) -> None:

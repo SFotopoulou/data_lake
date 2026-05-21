@@ -320,6 +320,17 @@ class TestFormatDetection:
 
 
 class TestCastObjectIdColumn:
+    def test_vector_source_id_col_rejected(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import ensure_catalog_source_ids
+
+        tbl = pa.table({
+            "OBJID": pa.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], type=pa.list_(pa.int64(), 5)),
+            "objid": pa.array([100, 200], type=pa.int64()),
+            "RA": pa.array([0.0, 1.0], type=pa.float64()),
+        })
+        with pytest.raises(ValueError, match="vector column"):
+            ensure_catalog_source_ids(tbl, "OBJID")
+
     def test_string_column_to_int64(self) -> None:
         from data_lake.ingest.fits_to_parquet import cast_object_id_column_to_int64
 
@@ -669,6 +680,30 @@ class TestNumericTypeNormalization:
         assert merged.schema.field("MAG").type == pa.float64()
         mags = np.asarray(merged.column("MAG"))
         assert np.allclose(mags, [18.0, 19.0, 20.0, 21.0])
+
+    def test_metadata_regen_after_mixed_float_tiles(self, tmp_path: Path) -> None:
+        """Legacy tiles: float32 vs float64 across different Npix files break _metadata."""
+        from data_lake.ingest.fits_to_parquet import (
+            _regenerate_metadata_from_all_tiles,
+            healpix_dir,
+        )
+
+        catalog_root = tmp_path / "catalogs" / "legacy_mix"
+        norder = 5
+        for npix, flux_type in ((100, pa.float32()), (10_500, pa.float64())):
+            tile_dir = catalog_root / healpix_dir(norder, npix)
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            tbl = pa.table({
+                "source_id": pa.array([npix], type=pa.int64()),
+                f"_healpix_norder{norder}": pa.array([npix], type=pa.int64()),
+                "flux": pa.array([1.0], type=flux_type),
+            })
+            pq.write_table(tbl, tile_dir / f"Npix={npix}.parquet")
+
+        _regenerate_metadata_from_all_tiles(catalog_root)
+        assert (catalog_root / "_metadata").is_file()
+        for path in catalog_root.rglob("Npix=*.parquet"):
+            assert pq.read_schema(str(path)).field("flux").type == pa.float64()
 
 
 class TestTileMode:

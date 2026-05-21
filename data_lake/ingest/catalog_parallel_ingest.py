@@ -36,6 +36,7 @@ from data_lake.ingest.fits_to_parquet import (
     _write_tile_for_mode,
     decode_catalog_file_to_batches,
     healpix_dir,
+    normalize_catalog_table_types,
 )
 
 log = logging.getLogger(__name__)
@@ -107,7 +108,12 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
     try:
         for npix, tbl in batches_raw:
             spool_path = Path(spool_dir) / f"Npix={npix}.parquet"
-            pq.write_table(tbl, spool_path, compression="zstd", compression_level=3)
+            pq.write_table(
+                normalize_catalog_table_types(tbl),
+                spool_path,
+                compression="zstd",
+                compression_level=3,
+            )
             batch_refs.append(CatalogTileBatchRef(npix=npix, spool_path=str(spool_path)))
     except Exception:
         shutil.rmtree(spool_dir, ignore_errors=True)

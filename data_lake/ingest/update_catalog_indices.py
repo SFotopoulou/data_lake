@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import (
     _ZSTD_LEVEL,
+    _regenerate_metadata_from_all_tiles,
     healpix_dir,
     normalize_object_id,
     resolve_source_id_column,
@@ -268,27 +269,13 @@ def update_index_column(
 
     # Regenerate aggregate _metadata
     if n_modified > 0:
-        _regenerate_metadata(catalog_root)
+        try:
+            _regenerate_metadata_from_all_tiles(catalog_root)
+            log.debug("Regenerated _metadata for %s", catalog_root.name)
+        except Exception as exc:
+            log.warning("Could not regenerate _metadata: %s", exc)
 
     return n_modified
-
-
-def _regenerate_metadata(catalog_root: Path) -> None:
-    """Rebuild the aggregate Parquet ``_metadata`` file after tile rewrites."""
-    try:
-        file_metas = [
-            pq.read_metadata(str(p))
-            for p in sorted(catalog_root.rglob("Npix=*.parquet"))
-        ]
-        if not file_metas:
-            return
-        combined = file_metas[0]
-        for m in file_metas[1:]:
-            combined.append_row_groups(m)
-        combined.write_metadata_file(str(catalog_root / "_metadata"))
-        log.debug("Regenerated _metadata for %s", catalog_root.name)
-    except Exception as exc:
-        log.warning("Could not regenerate _metadata: %s", exc)
 
 
 def build_index_map_from_zarr(

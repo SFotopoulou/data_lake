@@ -88,6 +88,9 @@ _FITS_HEADER_ID_KEYWORDS = (
 
 # float64 only represents integers exactly up to 2**53; DESI TARGETIDs exceed that.
 _FLOAT64_SAFE_INTEGER = 2**53
+_INT64_MAX = int(np.iinfo(np.int64).max)
+_INT64_MIN = int(np.iinfo(np.int64).min)
+_UINT64_MAX = int(np.iinfo(np.uint64).max)
 
 
 def stable_object_id_from_string(text: str) -> int:
@@ -116,18 +119,39 @@ def _text_is_integer_object_id(text: str) -> bool:
     return bool(text) and text.lstrip("+-").isdigit()
 
 
+def storage_int64_from_integer(value: int) -> int:
+    """Map a logical integer object ID to int64 storage for Parquet/Zarr.
+
+    Values in ``[0, 2**63-1]`` are stored as-is.  SDSS-style ``objid`` and other
+    **uint64** IDs above ``2**63-1`` are stored by **bit pattern** in signed
+    int64 (same convention as ``numpy.int64(numpy.uint64(x))``) so joins stay
+    stable and unique.
+    """
+    if _INT64_MIN <= value <= _INT64_MAX:
+        return value
+    if 0 <= value <= _UINT64_MAX:
+        return int.from_bytes(
+            value.to_bytes(8, byteorder="little", signed=False),
+            byteorder="little",
+            signed=True,
+        )
+    raise ValueError(f"object ID {value} is outside uint64 range")
+
+
 def normalize_object_id(value: object) -> int:
-    """Coerce one catalog/Zarr object ID to a Python ``int`` (int64 range).
+    """Coerce one catalog/Zarr object ID to int64 **storage** (signed int64 column).
 
     All cross-store matching (catalog Parquet ↔ Zarr ``source_id`` ↔
     ``index_map`` keys) should use this so ``numpy.int64``, ``int``, and
     accidental string forms compare consistently.
 
-    Decimal string digits are parsed as integers.  Other strings (e.g.
+    Decimal string digits are parsed as integers.  Values above ``2**63-1``
+    (SDSS ``objid`` / uint64 IDs) are stored by **bit pattern** via
+    :func:`storage_int64_from_integer`.  Other strings (e.g.
     ``J000000.00-314627.5``) are mapped with :func:`stable_object_id_from_string`.
 
     Raises ``ValueError`` for ``None``, booleans, floats (precision loss), and
-    out-of-range integer values.
+    integers outside uint64 range.
     """
     if value is None:
         raise ValueError("object ID is None")
@@ -135,7 +159,11 @@ def normalize_object_id(value: object) -> int:
         raise ValueError(f"invalid object ID (bool): {value!r}")
 
     if isinstance(value, (int, np.integer)):
-        out = int(value)
+        if isinstance(value, (np.bool_,)):
+            raise ValueError(f"invalid object ID (bool): {value!r}")
+        if isinstance(value, np.unsignedinteger):
+            return storage_int64_from_integer(int(value))
+        return storage_int64_from_integer(int(value))
     elif isinstance(value, (float, np.floating)):
         raise ValueError(
             f"object ID {value!r} is floating-point; DESI-scale TARGETIDs "
@@ -147,15 +175,10 @@ def normalize_object_id(value: object) -> int:
         if not text:
             raise ValueError(f"object ID string is empty: {value!r}")
         if _text_is_integer_object_id(text):
-            out = int(text)
-        else:
-            out = stable_object_id_from_string(text)
+            return storage_int64_from_integer(int(text))
+        return stable_object_id_from_string(text)
     else:
         raise TypeError(f"unsupported object ID type {type(value).__name__}: {value!r}")
-
-    if out < np.iinfo(np.int64).min or out > np.iinfo(np.int64).max:
-        raise ValueError(f"object ID {out} is outside int64 range")
-    return out
 
 
 def object_id_from_fits_header(
@@ -220,6 +243,15 @@ def object_id_column_is_integer_ids(column: pa.Array | pa.ChunkedArray) -> bool:
     return True
 
 
+def _cast_uint64_arrow_to_int64(column: pa.Array) -> pa.Array:
+    """Bit-cast Arrow unsigned integers to int64 (PyArrow ``cast`` rejects > INT64_MAX)."""
+    arr = np.asarray(column.to_numpy(zero_copy_only=False), dtype=np.uint64)
+    out = arr.view(np.int64)
+    if column.null_count:
+        return pa.array(out, type=pa.int64(), mask=pc.is_null(column).to_numpy(zero_copy_only=False))
+    return pa.array(out, type=pa.int64())
+
+
 def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Array:
     """Cast a catalog object-ID column to Arrow ``int64``.
 
@@ -239,6 +271,9 @@ def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Arr
 
     if column.type == pa.int64():
         return column
+
+    if pa.types.is_unsigned_integer(column.type):
+        return _cast_uint64_arrow_to_int64(column)
 
     if pa.types.is_integer(column.type):
         return column.cast(pa.int64())
@@ -289,14 +324,43 @@ def ensure_catalog_source_ids(
     sid_field = table.schema.field(source_id_col)
     col = table.column(source_id_col)
 
+    if pa.types.is_fixed_size_list(sid_field.type) or pa.types.is_list(sid_field.type):
+        hints = [
+            n
+            for n in table.schema.names
+            if n != source_id_col
+            and n.lower() in ("objid", "obj_id", "bestobjid", "targetid", "thingid", "source_id")
+        ]
+        raise ValueError(
+            f"Column {source_id_col!r} is a vector column ({sid_field.type}); "
+            f"--source-id-col must name a scalar integer ID column. "
+            f"For SDSS specObj use the scalar ``objid`` field, not the "
+            f"multidim ``OBJID`` array. "
+            f"Other scalar ID-like columns in this table: {hints[:12]}"
+            f"{'…' if len(hints) > 12 else ''}"
+        )
+
     if sid_field.type == pa.int64():
+        return table, f"column:{source_id_col}"
+
+    if pa.types.is_unsigned_integer(sid_field.type):
+        log.info(
+            "Object-ID column %r is unsigned; storing values as int64 bit patterns "
+            "(SDSS-style objid > 2**63-1).",
+            source_id_col,
+        )
+        table = table.set_column(
+            table.schema.get_field_index(source_id_col),
+            source_id_col,
+            cast_object_id_column_to_int64(col),
+        )
         return table, f"column:{source_id_col}"
 
     if pa.types.is_integer(sid_field.type):
         table = table.set_column(
             table.schema.get_field_index(source_id_col),
             source_id_col,
-            col.cast(pa.int64()),
+            cast_object_id_column_to_int64(col),
         )
         return table, f"column:{source_id_col}"
 
@@ -359,6 +423,13 @@ def warn_if_id_column_unsafe(
     context: str = "catalog",
 ) -> None:
     """Log when an ID column is not stored as int64 (risk for large TARGETIDs)."""
+    if pa.types.is_unsigned_integer(arrow_type):
+        log.info(
+            "%s ID column %r is unsigned integer; values above 2**63-1 are stored "
+            "as int64 bit patterns at ingest (SDSS objid).",
+            context, column_name,
+        )
+        return
     if pa.types.is_integer(arrow_type):
         return
     if pa.types.is_floating(arrow_type):
@@ -1044,6 +1115,58 @@ def normalize_catalog_table_types(table: pa.Table) -> pa.Table:
     )
 
 
+def _schema_needs_canonicalization(schema: pa.Schema) -> bool:
+    """True when any column is not already at catalog-wide canonical dtypes."""
+    return any(
+        not field.type.equals(canonical_arrow_type(field.type))
+        for field in schema
+    )
+
+
+def _reconcile_catalog_tile_dtypes(
+    tile_path: Path,
+    parquet_options: CatalogParquetOptions,
+) -> bool:
+    """Rewrite one tile when on-disk dtypes are not canonical (e.g. float32 ``flux``).
+
+    Returns True if the file was rewritten.
+    """
+    schema = pq.read_schema(str(tile_path))
+    if not _schema_needs_canonicalization(schema):
+        return False
+    table = _read_catalog_tile(tile_path)
+    normalized = normalize_catalog_table_types(table)
+    _write_catalog_parquet_tile(normalized, tile_path, parquet_options)
+    return True
+
+
+def reconcile_catalog_tile_dtypes(
+    catalog_root: Path | str,
+    *,
+    parquet_options: CatalogParquetOptions | None = None,
+) -> int:
+    """Rewrite tiles whose Parquet dtypes are not canonical so ``_metadata`` can be built.
+
+    Multi-file ingest normalizes **incoming** rows before each tile write, but tiles
+    that were never appended again (or were written before normalization) can still
+    store float32 while newer tiles use float64.  ``_regenerate_metadata_from_all_tiles``
+    calls this automatically; use directly to repair an existing survey directory.
+    """
+    catalog_root = Path(catalog_root)
+    pq_opts = parquet_options or CatalogParquetOptions()
+    n_rewritten = 0
+    for path in _iter_valid_parquet_tiles(catalog_root):
+        if _reconcile_catalog_tile_dtypes(path, pq_opts):
+            n_rewritten += 1
+    if n_rewritten:
+        log.info(
+            "Reconciled dtypes on %d catalog tile(s) under %s",
+            n_rewritten,
+            catalog_root,
+        )
+    return n_rewritten
+
+
 def _unified_append_schema(existing: pa.Schema, incoming: pa.Schema) -> pa.Schema:
     """Build a target schema that can hold both *existing* and *incoming* tiles."""
     if existing.names != incoming.names:
@@ -1146,6 +1269,7 @@ def _merge_tile_tables(
     on_duplicate_id: DuplicateIdMode,
 ) -> pa.Table:
     """Concatenate tile tables, optionally deduplicating on an object-ID column."""
+    existing = normalize_catalog_table_types(existing)
     incoming = normalize_catalog_table_types(incoming)
     target = _unified_append_schema(existing.schema, incoming.schema)
     existing = _align_incoming_to_schema(existing, target)
@@ -1241,6 +1365,7 @@ def _iter_valid_parquet_tiles(catalog_root: Path) -> list[Path]:
 
 def _regenerate_metadata_from_all_tiles(catalog_root: Path) -> None:
     """Rebuild ``_metadata`` from every ``Npix=*.parquet`` under *catalog_root*."""
+    reconcile_catalog_tile_dtypes(catalog_root)
     tile_paths = _iter_valid_parquet_tiles(catalog_root)
     if not tile_paths:
         return
@@ -1249,8 +1374,11 @@ def _regenerate_metadata_from_all_tiles(catalog_root: Path) -> None:
     for path in tile_paths:
         meta = pq.read_metadata(str(path))
         file_metadata.append(meta)
+        arrow_schema = meta.schema.to_arrow_schema()
         if schema is None:
-            schema = meta.schema.to_arrow_schema()
+            schema = arrow_schema
+        else:
+            schema = _unified_append_schema(schema, arrow_schema)
     if schema is not None:
         _write_aggregate_metadata(catalog_root, file_metadata, schema)
 
@@ -1565,6 +1693,7 @@ def decode_catalog_file_to_batches(
         source_id_col=source_id_col,
         norder=norder,
     )
+    table = normalize_catalog_table_types(table)
     batches = catalog_table_to_tile_batches(table, norder)
     return batches, sid_mode, int(table.num_rows)
 

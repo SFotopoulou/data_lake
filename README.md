@@ -233,7 +233,9 @@ column may be ``E`` (float32) in one FITS and ``D`` (float64) in another. Ingest
 promotes floats to **float64**, integers to **int64**, and inner elements of
 ``FixedSizeList`` columns likewise, before writing or appending tiles — so append
 no longer fails on dtype mismatch and the first file no longer locks a narrower
-Parquet type.
+Parquet type.  When rebuilding ``_metadata``, any tiles still on legacy dtypes
+(e.g. float32 ``flux`` in one ``Npix=`` file and float64 in another) are rewritten
+automatically before the aggregate footer is written.
 
 #### Choosing HEALPix order (`--norder` / `hats_order`)
 
@@ -324,7 +326,9 @@ according to its contents (recorded in ``catalog_info.json`` as ``source_id_mode
 | Input type | Example | Parquet result | ``source_id_mode`` |
 |------------|---------|----------------|---------------------|
 | Integer column | DESI ``TARGETID`` | Same column cast to ``int64`` | ``column:TARGETID`` |
+| Unsigned / uint64 column | SDSS ``objid`` (> ``2**63-1``) | Bit pattern in ``int64`` (same as CAS) | ``column:objid`` |
 | Decimal string column | ``"39627658462934656"`` in FITS ASCII | Parsed to ``int64`` in place | ``column:TARGETID`` |
+| Vector ID column | SDSS ``OBJID`` shape ``(5,)`` | **Error** — use scalar ``objid`` | — |
 | Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | Label column kept as string; new ``source_id`` = stable hash | ``label:NAME`` |
 | (none) | — | Auto ``source_id`` 0…N−1 | ``sequential`` |
 
