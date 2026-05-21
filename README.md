@@ -475,7 +475,9 @@ dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits \
 dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits /data/lake --survey desi_edr
 
 # SDSS/BOSS (no extra dependency needed)
-dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17
+# Match catalog specObj: SPECOBJID lives in the SPALL HDU (HDU 2), not the primary header.
+dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
+  --source-id-col SPECOBJID
 ```
 
 #### Parallel batch ingest (many coadd files)

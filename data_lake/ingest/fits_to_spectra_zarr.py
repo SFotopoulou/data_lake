@@ -327,6 +327,92 @@ def _fits_bintable_column(
     )
 
 
+def _fits_header_keyword(header, name: str) -> object | None:
+    """Return a primary-header keyword value (case-insensitive), or None."""
+    target = name.upper()
+    for key in header.keys():
+        if key and str(key).upper() == target:
+            return header[key]
+    return None
+
+
+def _sdss_spall_hdu(hdul: fits.HDUList) -> fits.BinTableHDU | None:
+    """HDU 2 ``SPALL`` (one spAll/specObj row per spec file), if present."""
+    for hdu in hdul:
+        if (hdu.name or "").strip().upper() == "SPALL" and isinstance(hdu, fits.BinTableHDU):
+            if hdu.data is not None and len(hdu.data) > 0:
+                return hdu
+    if len(hdul) > 2:
+        hdu = hdul[2]
+        if isinstance(hdu, fits.BinTableHDU) and hdu.data is not None and len(hdu.data) > 0:
+            return hdu
+    return None
+
+
+def _fits_bintable_scalar(data: np.ndarray, row_index: int, *candidates: str) -> object | None:
+    """Scalar value from one row of a FITS BINTABLE ``data`` recarray."""
+    names = data.dtype.names
+    if not names:
+        return None
+    by_lower = {n.lower(): n for n in names}
+    for cand in candidates:
+        key = by_lower.get(cand.lower())
+        if key is not None:
+            return data[key][row_index]
+    return None
+
+
+def _sdss_source_id(hdul: fits.HDUList, source_id_col: str | None) -> int:
+    """Resolve object ID for ``spec-PLATE-MJD-FIBER.fits`` (header + SPALL HDU).
+
+    ``SPECOBJID`` and most spAll columns live in the **SPALL** BINTABLE (HDU 2),
+    not in the primary header.  ``THING_ID`` is often duplicated on HDU 0.
+    """
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    phdr = hdul[0].header
+    spall = _sdss_spall_hdu(hdul)
+
+    candidates: list[str] = []
+    if source_id_col:
+        candidates.append(source_id_col)
+    for name in (
+        "SPECOBJID",
+        "SPEC_OBJID",
+        "OBJID",
+        "THING_ID",
+        "TARGETID",
+        "SOURCE_ID",
+    ):
+        if name.lower() not in {c.lower() for c in candidates}:
+            candidates.append(name)
+
+    for cand in candidates:
+        val = _fits_header_keyword(phdr, cand)
+        if val is not None:
+            return normalize_object_id(val)
+
+    if spall is not None:
+        for cand in candidates:
+            val = _fits_bintable_scalar(spall.data, 0, cand)
+            if val is not None:
+                return normalize_object_id(val)
+
+    hdr_keys = [k for k in phdr.keys() if k and not str(k).startswith("HISTORY")]
+    spall_names = list(spall.data.dtype.names or ()) if spall is not None else []
+    raise KeyError(
+        "Could not resolve SDSS spectrum object ID"
+        + (f" (requested {source_id_col!r})" if source_id_col else "")
+        + ". Looked in the primary header and SPALL (HDU 2). "
+        f"Header sample: {hdr_keys[:25]}{'…' if len(hdr_keys) > 25 else ''}"
+        + (
+            f"; SPALL columns: {spall_names[:25]}{'…' if len(spall_names) > 25 else ''}"
+            if spall_names
+            else "; SPALL missing or empty"
+        )
+    )
+
+
 def _read_sdss_boss(
     hdul: fits.HDUList,
     *,
@@ -365,7 +451,7 @@ def _read_sdss_boss(
         ra = float(phdr["PLUG_RA"])
     if dec_col not in phdr and "PLUG_DEC" in phdr:
         dec = float(phdr["PLUG_DEC"])
-    source_id = object_id_from_fits_header(phdr, source_id_col, hdu_index=0)
+    source_id = _sdss_source_id(hdul, source_id_col)
     meta = {
         "z":       float(phdr.get("Z", 0.0)),
         "z_err":   float(phdr.get("Z_ERR", 0.0)),

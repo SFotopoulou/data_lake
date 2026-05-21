@@ -15,8 +15,10 @@ def _write_sdss_spec_fits(
     n_pix: int = 32,
     include_and_mask: bool = False,
     mask_name: str = "and_mask",
+    specobjid: int | None = None,
+    header_objid: int | None = 1234567890123456789,
 ) -> None:
-    """Minimal BOSS-style spec file: primary header + COADD BINTABLE."""
+    """Minimal BOSS-style spec file: primary header + COADD [+ SPALL]."""
     loglam = np.linspace(3.5, 3.6, n_pix)
     flux = np.ones(n_pix, dtype=np.float32) * 100.0
     ivar = np.ones(n_pix, dtype=np.float32) * 0.01
@@ -37,9 +39,17 @@ def _write_sdss_spec_fits(
     phdu = fits.PrimaryHDU()
     phdu.header["PLUG_RA"] = 120.0
     phdu.header["PLUG_DEC"] = 45.0
-    phdu.header["OBJID"] = 1234567890123456789
+    if header_objid is not None:
+        phdu.header["OBJID"] = header_objid
     phdu.header["Z"] = 0.1
-    fits.HDUList([phdu, coadd]).writeto(path, overwrite=True)
+    hdus: list = [phdu, coadd]
+    if specobjid is not None:
+        spall = fits.BinTableHDU.from_columns(
+            [fits.Column(name="SPECOBJID", format="K", array=np.array([specobjid], dtype=np.uint64))],
+            name="SPALL",
+        )
+        hdus.append(spall)
+    fits.HDUList(hdus).writeto(path, overwrite=True)
 
 
 class TestReadSdssBoss:
@@ -70,3 +80,20 @@ class TestReadSdssBoss:
         path = tmp_path / "spec-test.fits"
         _write_sdss_spec_fits(path)
         assert _detect_format_from_path(path) == "sdss_boss"
+
+    def test_specobjid_from_spall_not_primary_header(self, tmp_path: Path) -> None:
+        """SPECOBJID is in SPALL (HDU 2) on real SDSS spec files, not HDU 0."""
+        from data_lake.ingest.fits_to_spectra_zarr import _read_sdss_boss
+
+        specobjid = 9223372435012999168
+        path = tmp_path / "spec-spall.fits"
+        _write_sdss_spec_fits(
+            path,
+            specobjid=specobjid,
+            header_objid=None,
+        )
+        with fits.open(path) as hdul:
+            records, _ = _read_sdss_boss(hdul, source_id_col="SPECOBJID")
+        from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+        assert records[0].source_id == normalize_object_id(specobjid)
