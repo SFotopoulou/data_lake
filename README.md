@@ -482,6 +482,37 @@ dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
   --source-id-col SPECOBJID
 ```
 
+#### SDSS spPlate ingest (640 fibers per file)
+
+``spPlate-PLATE-MJD.fits`` holds plate-run spectra for all fibers; there is **no
+SPECOBJID** in the FITS file.  Ingest joins each fiber to your specObj catalog via
+**(survey, PLATE, MJD, FIBERID)** and stores normalized ``SPECOBJID`` in Zarr
+``source_id`` (same as ``spec-*.fits`` ingest).
+
+```bash
+# Sidecar Parquet/CSV: columns survey, PLATE, MJD, FIBERID, SPECOBJID
+dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
+  --format sdss_spplate \
+  --specobj-lookup /path/to/specobj_lookup.parquet
+
+# BOSS spPlates use the same reader with a BOSS specObj survey name
+dl-ingest-spectra spPlate-5695-56191.fits --survey boss_dr12 \
+  --format sdss_spplate \
+  --specobj-lookup /path/to/boss_specobj_lookup.parquet
+
+# Or resolve IDs from an ingested lake catalog (catalogs/<survey>/)
+dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
+  --format sdss_spplate --specobj-lookup-from-catalog
+
+dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
+  --format sdss_spplate --specobj-lookup /path/to/lookup.parquet \
+  --on-duplicate skip
+```
+
+Export specObj rows with a constant ``survey`` column when merging multiple releases
+into one lookup file.  spPlate wavelength grids (~3859 px, ``COEFF0``/``COEFF1``) differ
+from per-object ``spec-*.fits`` coadds (~4628 px); do not expect pixel-identical spectra.
+
 #### Parallel batch ingest (many coadd files)
 
 For survey-scale jobs (e.g. ~10 000 DESI coadd files) use the parallel
@@ -618,9 +649,13 @@ dl-ingest-spectra-batch --survey desi_dr1 --file-list coadds.txt --n-workers 16 
 dl-ingest-spectra-from-list spec_files.txt --survey sdss_dr17 \
   --source-id-col SPECOBJID --on-duplicate skip
 
+# spPlate file lists (same flags as dl-ingest-spectra):
+dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
+  --format sdss_spplate --specobj-lookup /path/to/lookup.parquet --on-duplicate skip
+
 SDSS spec lists: pixel lengths differ slightly; ingest auto-pads when format is
-``sdss_boss``. Override with ``--on-length-mismatch pad`` or ``truncate`` (same as
-``dl-ingest-spectra``).
+``sdss_boss`` or ``sdss_spplate``. Override with ``--on-length-mismatch pad`` or
+``truncate`` (same as ``dl-ingest-spectra``).
 
 # Patch _cutout_index / _spectrum_index when --update-catalog (default).
 ```

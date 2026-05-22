@@ -5,6 +5,9 @@ Supported input formats
 -----------------------
 * **SDSS/BOSS** ``spec-*.fits``  – COADD binary table HDU (FLUX/IVAR/AND_MASK/LOGLAM).
   Uses raw ``astropy.io.fits``; no extra dependency required.
+* **SDSS spPlate** ``spPlate-*.fits`` – 640 fiber spectra per plate (2-D flux HDUs +
+  per-fiber metadata table).  Requires a specObj lookup (``--specobj-lookup`` or lake
+  catalog) keyed by ``(survey, PLATE, MJD, FIBERID)`` → ``SPECOBJID``.
 * **DESI**      ``coadd-*.fits`` – Uses ``desispec.io.read_spectra`` +
   ``desispec.coaddition.coadd_cameras`` for IVAR-weighted camera combination of
   the B/R/Z arms onto a single monotonic BRZ wavelength grid.
@@ -480,6 +483,149 @@ def _read_sdss_boss(
     return records, wcs_attrs
 
 
+def _spplate_fiber_table_hdu(hdul: fits.HDUList) -> fits.BinTableHDU | None:
+    """Per-fiber metadata BINTABLE (typically HDU 5 on classic spPlate files)."""
+    for hdu in hdul:
+        if isinstance(hdu, fits.BinTableHDU) and hdu.data is not None and len(hdu.data) > 0:
+            names = hdu.data.dtype.names or ()
+            if "FIBERID" in names or "fiberid" in {n.lower() for n in names}:
+                return hdu
+    return None
+
+
+def _read_sdss_spplate(
+    hdul: fits.HDUList,
+    *,
+    path: Path | None,
+    fiber_to_specobjid: dict[int, int],
+    ra_col: str = "RA",
+    dec_col: str = "DEC",
+    skip_unmatched: bool = True,
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read an SDSS/BOSS ``spPlate-PLATE-MJD.fits`` file (up to 640 fibers).
+
+    ``fiber_to_specobjid`` maps 1-based ``FIBERID`` → normalized ``SPECOBJID``.
+    Fibers without a lookup entry are skipped when ``skip_unmatched`` is True.
+    """
+    from data_lake.ingest.sdss_specobj_lookup import spplate_plate_mjd_from_hdul
+
+    plate, mjd = spplate_plate_mjd_from_hdul(hdul, path)
+    phdr = hdul[0].header
+    if "COEFF0" not in phdr or "COEFF1" not in phdr:
+        raise KeyError("spPlate primary header missing COEFF0/COEFF1 wavelength calibration")
+    coeff0 = float(phdr["COEFF0"])
+    coeff1 = float(phdr["COEFF1"])
+
+    flux_hdu = hdul[0]
+    if flux_hdu.data is None or flux_hdu.data.ndim != 2:
+        raise ValueError("spPlate HDU 0 must be a 2-D flux array (n_fiber, n_pix)")
+    n_fiber, n_pix = flux_hdu.data.shape
+    flux_2d = np.asarray(flux_hdu.data, dtype=np.float32)
+
+    sigma_2d: np.ndarray | None = None
+    if len(hdul) > 1 and hdul[1].data is not None and getattr(hdul[1].data, "ndim", 0) == 2:
+        if hdul[1].data.shape == flux_2d.shape:
+            sigma_2d = np.asarray(hdul[1].data, dtype=np.float32)
+
+    mask_or: np.ndarray | None = None
+    mask_and: np.ndarray | None = None
+    for idx in (2, 3):
+        if len(hdul) > idx and hdul[idx].data is not None:
+            arr = hdul[idx].data
+            if getattr(arr, "ndim", 0) == 2 and arr.shape == flux_2d.shape:
+                if mask_or is None:
+                    mask_or = np.asarray(arr, dtype=np.int32)
+                else:
+                    mask_and = np.asarray(arr, dtype=np.int32)
+
+    pix = np.arange(n_pix, dtype=np.float64)
+    loglam = coeff0 + coeff1 * pix
+    wavelength = (10.0 ** loglam).astype(np.float64)
+
+    ftable = _spplate_fiber_table_hdu(hdul)
+    if ftable is None:
+        raise ValueError("spPlate: no per-fiber BINTABLE with FIBERID column found")
+
+    fdata = ftable.data
+    fiber_col = _fits_bintable_column(fdata, "fiberid", "FIBERID")
+    ra_arr = _fits_bintable_column(fdata, ra_col.lower(), ra_col, "RA")
+    dec_arr = _fits_bintable_column(fdata, dec_col.lower(), dec_col, "DEC")
+
+    wcs_attrs = {
+        "ctype": "WAVE-LOG",
+        "crval": float(loglam[0]),
+        "cdelt": float(coeff1),
+        "crpix": 1.0,
+        "unit": "Angstrom",
+        "air_or_vacuum": "vacuum",
+        "n_pix": int(n_pix),
+    }
+
+    records: list[SpectrumRecord] = []
+    n_table = len(fdata)
+    for row_i in range(min(n_fiber, n_table)):
+        fiber_id = int(fiber_col[row_i])
+        source_id = fiber_to_specobjid.get(fiber_id)
+        if source_id is None:
+            if skip_unmatched:
+                continue
+            raise KeyError(
+                f"No SPECOBJID lookup for survey plate={plate} mjd={mjd} fiber={fiber_id}"
+            )
+
+        flux = np.asarray(flux_2d[row_i], dtype=np.float32)
+        if not np.any(np.isfinite(flux)) or np.all(flux == 0):
+            continue
+
+        if sigma_2d is not None:
+            sigma = np.asarray(sigma_2d[row_i], dtype=np.float32)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ivar = np.where(sigma > 0, 1.0 / (sigma * sigma), 0.0).astype(np.float32)
+        else:
+            ivar = np.ones(n_pix, dtype=np.float32)
+
+        mask = np.zeros(n_pix, dtype=np.uint8)
+        if mask_or is not None:
+            m = np.asarray(mask_or[row_i], dtype=np.int32)
+            mask = np.clip(m, 0, 255).astype(np.uint8)
+        if mask_and is not None:
+            m = np.asarray(mask_and[row_i], dtype=np.int32)
+            mask = np.clip(mask | np.clip(m, 0, 255), 0, 255).astype(np.uint8)
+
+        meta = {
+            "z": 0.0,
+            "z_err": 0.0,
+            "snr": 0.0,
+            "exptime": float(phdr.get("EXPTIME", 0.0)),
+            "R": float(phdr.get("SPEC_RES", 2000.0)),
+            "instr": "SDSS",
+            "plate": plate,
+            "mjd": mjd,
+            "fiber": fiber_id,
+        }
+        records.append(SpectrumRecord(
+            source_id=source_id,
+            ra=float(ra_arr[row_i]),
+            dec=float(dec_arr[row_i]),
+            flux=flux,
+            ivar=ivar,
+            mask=mask,
+            wavelength=wavelength.copy(),
+            meta=meta,
+        ))
+
+    if not records:
+        log.warning(
+            "spPlate %s: no spectra after lookup (plate=%s mjd=%s; %d fibers in file)",
+            path.name if path else "file",
+            plate,
+            mjd,
+            n_table,
+        )
+    return records, wcs_attrs
+
+
 def _desi_read_spectra_skip_hdus(*, with_resolution: bool) -> set[str]:
     """HDUs we do not need for flux/ivar/mask + fibermap ingest (smaller FITS read)."""
     skip = {"EXP_FIBERMAP", "SCORES", "EXTRA_CATALOG"}
@@ -656,12 +802,19 @@ def _detect_format_from_path(path: Path) -> str:
     Opens the file with ``lazy_load_hdus=True`` so no data are read,
     then closes it immediately.
     """
+    stem = path.stem.lower()
+    if stem.startswith("spplate-"):
+        return "sdss_spplate"
     with fits.open(str(path), lazy_load_hdus=True) as hdul:
         names = [h.name.upper() for h in hdul]
-    if "COADD" in names:
-        return "sdss_boss"
-    if any(arm + "_FLUX" in names for arm in ("B", "R", "Z")):
-        return "desi_coadd"
+        if "COADD" in names:
+            return "sdss_boss"
+        if any(arm + "_FLUX" in names for arm in ("B", "R", "Z")):
+            return "desi_coadd"
+        phdr = hdul[0].header
+        naxis2 = int(phdr.get("NAXIS2", 0) or 0)
+        if naxis2 == 640 and ("PLATEID" in phdr or "PLATE" in phdr) and "MJD" in phdr:
+            return "sdss_spplate"
     return "generic"
 
 
@@ -711,6 +864,9 @@ def ingest_spectra_from_fits(
     on_length_mismatch: str = "error",
     with_resolution: bool = False,
     on_duplicate_source_id: Literal["append", "error", "skip"] = "append",
+    specobj_lookup: Path | str | None = None,
+    specobj_lookup_survey: str | None = None,
+    specobj_lookup_from_catalog: bool = False,
 ) -> dict[int, int]:
     """
     Ingest 1-D spectra from a FITS file into HEALPix-partitioned Zarr v3 stacks.
@@ -737,8 +893,18 @@ def ingest_spectra_from_fits(
     mask_dtype:
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
-        Force format detection: ``"sdss_boss"``, ``"desi_coadd"``, ``"generic"``.
-        Auto-detected from HDU names if ``None``.
+        Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
+        ``"generic"``.  Auto-detected from HDU names if ``None``.
+    specobj_lookup:
+        Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
+        ``SPECOBJID`` for spPlate ingest.  Mutually exclusive with
+        ``specobj_lookup_from_catalog``.
+    specobj_lookup_survey:
+        When the sidecar has no survey column, use this string to scope rows
+        (defaults to ``survey_name``).
+    specobj_lookup_from_catalog:
+        If True, build fiber→SPECOBJID from ``catalogs/<survey_name>/`` under
+        ``output_root`` instead of a sidecar file.
     n_pix_expected:
         If set, enforce that all spectra have this pixel count.
     on_length_mismatch:
@@ -795,6 +961,37 @@ def ingest_spectra_from_fits(
                     ra_col=ra_col,
                     dec_col=dec_col,
                 )
+            elif detected_fmt == "sdss_spplate":
+                if specobj_lookup and specobj_lookup_from_catalog:
+                    raise ValueError(
+                        "Pass only one of specobj_lookup= or specobj_lookup_from_catalog=True"
+                    )
+                if not specobj_lookup and not specobj_lookup_from_catalog:
+                    raise ValueError(
+                        "sdss_spplate ingest requires specobj_lookup= (sidecar Parquet/CSV) "
+                        "or specobj_lookup_from_catalog=True (lake catalogs/<survey>/)."
+                    )
+                from data_lake.ingest.sdss_specobj_lookup import (
+                    build_fiber_to_specobjid_map,
+                    spplate_plate_mjd_from_hdul,
+                )
+
+                plate, mjd = spplate_plate_mjd_from_hdul(hdul, source_path)
+                fiber_map = build_fiber_to_specobjid_map(
+                    survey_name,
+                    plate,
+                    mjd,
+                    lookup_path=specobj_lookup,
+                    catalog_root=output_root if specobj_lookup_from_catalog else None,
+                    lookup_survey=specobj_lookup_survey,
+                )
+                records, wcs_attrs = _read_sdss_spplate(
+                    hdul,
+                    path=source_path,
+                    fiber_to_specobjid=fiber_map,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -810,12 +1007,12 @@ def ingest_spectra_from_fits(
     # SDSS/BOSS spec files: per-object loglam grids and pixel counts differ slightly.
     wavelength_mode_effective = wavelength_mode
     length_policy = on_length_mismatch
-    if detected_fmt == "sdss_boss":
+    if detected_fmt in ("sdss_boss", "sdss_spplate"):
         if wavelength_mode == "shared":
             log.info(
-                "SDSS/BOSS spec: using wavelength_mode='per_source' "
-                "(each file has its own loglam vector; tile storage pads to a "
-                "common n_pix)."
+                "SDSS (%s): using wavelength_mode='per_source' "
+                "(per-object or per-plate loglam; tile storage pads to common n_pix).",
+                detected_fmt,
             )
         wavelength_mode_effective = "per_source"
         if length_policy == "error":
@@ -1100,8 +1297,25 @@ try:
                   default=None,
                   help="Mask dtype (overrides config; default 'uint8').")
     @click.option("--fmt", default=None,
-                  type=click.Choice(["sdss_boss", "desi_coadd", "generic"]),
+                  type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic"]),
                   help="Force input format (auto-detected by default).")
+    @click.option(
+        "--specobj-lookup",
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        default=None,
+        help="Parquet/CSV: survey, PLATE, MJD, FIBERID, SPECOBJID (spPlate only).",
+    )
+    @click.option(
+        "--specobj-lookup-from-catalog/--no-specobj-lookup-from-catalog",
+        default=False,
+        show_default=True,
+        help="Resolve SPECOBJID from catalogs/<survey>/ instead of --specobj-lookup.",
+    )
+    @click.option(
+        "--specobj-lookup-survey",
+        default=None,
+        help="Sidecar survey filter when the lookup file has no SURVEY column.",
+    )
     @click.option("--on-length-mismatch",
                   type=click.Choice(["error", "pad", "truncate"]),
                   default="error", show_default=True)
@@ -1137,6 +1351,9 @@ try:
         wavelength_mode: str | None,
         mask_dtype: str | None,
         fmt: str | None,
+        specobj_lookup: Path | None,
+        specobj_lookup_from_catalog: bool,
+        specobj_lookup_survey: str | None,
         on_length_mismatch: str,
         on_duplicate: str,
         with_resolution: bool | None,
@@ -1176,8 +1393,12 @@ try:
             with_resolution=pick(with_resolution,
                                  cfg.defaults.with_resolution if cfg else None,
                                  False),
+            specobj_lookup=specobj_lookup,
+            specobj_lookup_from_catalog=specobj_lookup_from_catalog,
+            specobj_lookup_survey=specobj_lookup_survey,
         )
 
+        sid_col = source_id_col or "SPECOBJID"
         if update_catalog and index_map:
             try:
                 from data_lake.ingest.update_catalog_indices import update_index_column
@@ -1187,7 +1408,7 @@ try:
                     source_id_to_index=index_map,
                     kind="spectrum",
                     norder=resolved_norder,
-                    source_id_col=source_id_col,
+                    source_id_col=sid_col,
                 )
                 click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:

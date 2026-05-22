@@ -449,9 +449,21 @@ try:
     @click.option(
         "--fmt",
         default=None,
-        type=click.Choice(["sdss_boss", "desi_coadd", "generic"]),
+        type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic"]),
         help="Force FITS format (default: auto-detect).",
     )
+    @click.option(
+        "--specobj-lookup",
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        default=None,
+        help="Parquet/CSV sidecar for spPlate (survey, PLATE, MJD, FIBERID, SPECOBJID).",
+    )
+    @click.option(
+        "--specobj-lookup-from-catalog/--no-specobj-lookup-from-catalog",
+        default=False,
+        show_default=True,
+    )
+    @click.option("--specobj-lookup-survey", default=None)
     @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
@@ -493,6 +505,9 @@ try:
         source_id_col: str | None,
         norder: int | None,
         fmt: str | None,
+        specobj_lookup: Path | None,
+        specobj_lookup_from_catalog: bool,
+        specobj_lookup_survey: str | None,
         on_duplicate: str,
         wavelength_mode: str | None,
         on_length_mismatch: str,
@@ -533,6 +548,9 @@ try:
                 ),
                 on_length_mismatch=on_length_mismatch,
                 on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
+                specobj_lookup=specobj_lookup,
+                specobj_lookup_from_catalog=specobj_lookup_from_catalog,
+                specobj_lookup_survey=specobj_lookup_survey,
             )
             total_index_map.update(m)
 
@@ -548,6 +566,7 @@ try:
             default_checkpoint=default_ck,
         )
 
+        sid_col = source_id_col or "SPECOBJID"
         if update_catalog and total_index_map:
             try:
                 from data_lake.ingest.update_catalog_indices import update_index_column
@@ -557,7 +576,7 @@ try:
                     source_id_to_index=total_index_map,
                     kind="spectrum",
                     norder=n,
-                    source_id_col=source_id_col,
+                    source_id_col=sid_col,
                 )
                 click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:
