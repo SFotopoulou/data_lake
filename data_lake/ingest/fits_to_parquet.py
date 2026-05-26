@@ -1390,6 +1390,54 @@ def _count_catalog_rows(catalog_root: Path) -> int:
     )
 
 
+def finalize_catalog_survey(
+    catalog_root: Path | str,
+    survey_name: str,
+    norder: int,
+    *,
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    source_id_mode: str | None = None,
+    streaming: bool = False,
+    fallback_n_cols: int = 0,
+) -> bool:
+    """Refresh ``catalog_info.json``, ``_metadata``, and ``schema_manifest.json`` from tiles.
+
+    Merges ``ra``/``dec``/``source_id_mode``/``hats_order`` from existing
+    ``catalog_info.json`` when present.  Returns False when there are no valid tiles.
+    """
+    catalog_root = Path(catalog_root)
+    ra = ra_col
+    dec = dec_col
+    sid = source_id_mode or "sequential"
+    hats_order = norder
+    stream = streaming
+    info_path = catalog_root / "catalog_info.json"
+    if info_path.is_file():
+        with open(info_path) as fh:
+            info = json.load(fh)
+        ra = info.get("ra_column", ra)
+        dec = info.get("dec_column", dec)
+        sid = info.get("source_id_mode", sid)
+        hats_order = int(info.get("hats_order", hats_order))
+        stream = bool(info.get("ingest_streaming", stream))
+
+    if not _iter_valid_parquet_tiles(catalog_root):
+        return False
+
+    _finalize_catalog_writes(
+        catalog_root,
+        survey_name,
+        hats_order,
+        ra_col=ra,
+        dec_col=dec,
+        source_id_mode=sid,
+        streaming=stream,
+        fallback_n_cols=fallback_n_cols,
+    )
+    return True
+
+
 def _finalize_catalog_writes(
     catalog_root: Path,
     survey_name: str,
@@ -1410,7 +1458,14 @@ def _finalize_catalog_writes(
         if tile_paths
         else fallback_n_cols
     )
-    _regenerate_metadata_from_all_tiles(catalog_root)
+    try:
+        _regenerate_metadata_from_all_tiles(catalog_root)
+    except Exception:
+        log.exception(
+            "Could not rebuild catalog _metadata under %s; "
+            "catalog_info and schema_manifest will still be updated",
+            catalog_root,
+        )
     info_path = catalog_root / "catalog_info.json"
     if info_path.exists():
         with open(info_path) as fh:
@@ -2088,5 +2143,40 @@ try:
             compact=compact,
         )
 
+    @click.command("dl-finalize-catalog")
+    @click.argument("output_root", type=click.Path(path_type=Path), required=False)
+    @config_option
+    @click.option("--survey", "survey_name", required=True)
+    @click.option("--ra-col", default="ra", show_default=True)
+    @click.option("--dec-col", default="dec", show_default=True)
+    @click.option("--norder", default=None, type=int)
+    @click.option("-v", "--verbose", is_flag=True)
+    def cli_finalize(
+        output_root: Path | None,
+        config_path: Path | None,
+        survey_name: str,
+        ra_col: str,
+        dec_col: str,
+        norder: int | None,
+        verbose: bool,
+    ) -> None:
+        """Rebuild ``catalog_info.json``, ``_metadata``, and ``schema_manifest.json`` from tiles."""
+        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        configure_warning_filters()
+        cfg = load_optional_config(config_path)
+        lake = require_output_root(output_root, cfg, kind="catalogs")
+        n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
+        catalog_root = lake / "catalogs" / survey_name
+        if not finalize_catalog_survey(
+            catalog_root,
+            survey_name,
+            n,
+            ra_col=ra_col,
+            dec_col=dec_col,
+        ):
+            raise click.ClickException(f"No Parquet tiles under {catalog_root}")
+        click.echo(f"Finalized {catalog_root}")
+
 except ImportError:
     cli = None  # type: ignore[assignment]
+    cli_finalize = None  # type: ignore[assignment]

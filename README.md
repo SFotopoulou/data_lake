@@ -224,9 +224,11 @@ When appending with a native ID column (`TARGETID`), control duplicates with
 FITS with ``append`` + ``skip`` is idempotent: rows already on disk (matched by
 ``source_id``) are dropped per tile; unchanged tiles are not rewritten. Use
 ``--tile-mode overwrite`` to rebuild a tile from one file only. ``--overwrite`` is
-deprecated but still maps to ``--tile-mode overwrite``. After every ingest,
-`_metadata` and `catalog_info.json`
-`total_rows` are refreshed from **all** tiles on disk.
+deprecated but still maps to ``--tile-mode overwrite``. After every ingest (and at
+the end of ``dl-ingest-catalog-batch``), ``_metadata``, ``catalog_info.json``
+(``total_rows``), and ``schema_manifest.json`` are refreshed from **all** tiles on
+disk. If a batch job was killed before finalize, or the manifest is missing after a
+checkpoint-only re-run, use ``dl-finalize-catalog --survey <name>``.
 
 **Mixed numeric dtypes across files** (common in AllWISE/GALEX batches): the same
 column may be ``E`` (float32) in one FITS and ``D`` (float64) in another. Ingest
@@ -594,7 +596,8 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 |---------|------|--------|--------|
 | `dl-ingest-catalog` | `--on-duplicate-id` | `skip`, `error`, `last` | Only when `--tile-mode append` (Parquet rows) |
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
-| `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append` |
+| `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
+| `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
 | `dl-ingest-cutouts` | `--on-duplicate` | `append`, `error`, `skip` | Per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
@@ -619,6 +622,12 @@ dl-ingest-catalog-batch gaia_files.txt --survey GAIA_DR3_source \
 
 Same flags on `dl-ingest-catalog-from-list` when `--n-workers > 1` (default `1` =
 sequential). **`--streaming` is not supported** on the parallel path.
+
+Each batch exit (including when every file is already in the checkpoint) runs
+**finalize**: ``catalog_info.json``, Parquet ``_metadata``, and
+``schema_manifest.json``. If a Slurm job is killed mid-run, tiles may exist without
+a manifest — run ``dl-finalize-catalog --survey <name>`` before
+``dl-refresh-lake-registry``.
 
 Peak RAM scales roughly as **`O(n_workers × largest catalog file)`** — each worker
 still decodes a full file in memory, but tile tables are **spooled to temp Parquet

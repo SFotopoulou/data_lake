@@ -17,7 +17,11 @@ from data_lake.ingest.catalog_parallel_ingest import (
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_lake.ingest.fits_to_parquet import catalog_table_to_tile_batches, decode_catalog_file_to_batches
+from data_lake.ingest.fits_to_parquet import (
+    catalog_table_to_tile_batches,
+    decode_catalog_file_to_batches,
+)
+from data_lake.schema_registry import MANIFEST_FILENAME, load_catalog_schema_manifest
 
 
 def _make_same_pixel_table(targetids: list[int], *, ra: float = 120.0, dec: float = 45.0) -> Table:
@@ -101,6 +105,12 @@ class TestParallelCatalogIngest:
         assert merged.num_rows == 5
         assert set(np.asarray(merged.column("TARGETID")).tolist()) == {1, 2, 3, 4, 5}
 
+        manifest_path = lake / "catalogs" / "par_tile" / MANIFEST_FILENAME
+        assert manifest_path.is_file()
+        manifest = load_catalog_schema_manifest(lake / "catalogs" / "par_tile")
+        assert manifest["survey"] == "par_tile"
+        assert manifest["total_rows"] == 5
+
     def test_checkpoint_skips_completed(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         fits_a = tmp_path / "a.fits"
@@ -137,6 +147,49 @@ class TestParallelCatalogIngest:
         )
         assert result["n_files_processed"] == 0
         assert result["n_files_skipped"] == 1
+
+    def test_checkpoint_skip_still_writes_manifest(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        fits_a = tmp_path / "a.fits"
+        _write_table_as_fits(_make_same_pixel_table([1]), fits_a)
+        ckpt = tmp_path / "ckpt.json"
+        survey_root = lake / "catalogs" / "ck"
+
+        ingest_catalogs_parallel(
+            [fits_a],
+            output_root=lake,
+            survey_name="ck",
+            n_workers=1,
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+            tile_mode="append",
+            checkpoint_path=ckpt,
+            show_progress=False,
+            executor_factory=_thread_executor,
+        )
+        manifest_path = survey_root / MANIFEST_FILENAME
+        assert manifest_path.is_file()
+        manifest_path.unlink()
+
+        ingest_catalogs_parallel(
+            [fits_a],
+            output_root=lake,
+            survey_name="ck",
+            n_workers=1,
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            source_id_col="TARGETID",
+            tile_mode="append",
+            checkpoint_path=ckpt,
+            show_progress=False,
+            executor_factory=_thread_executor,
+        )
+        assert manifest_path.is_file()
+        manifest = load_catalog_schema_manifest(survey_root)
+        assert manifest["total_rows"] == 1
 
     def test_failure_logged(self, tmp_path: Path) -> None:
         from data_lake.ingest.catalog_parallel_ingest import CatalogWorkerResult

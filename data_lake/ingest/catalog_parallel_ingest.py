@@ -30,7 +30,7 @@ from data_lake.ingest.fits_to_parquet import (
     CatalogParquetOptions,
     DuplicateIdMode,
     TileMode,
-    _finalize_catalog_writes,
+    finalize_catalog_survey,
     _remove_stale_parquet_tmp_files,
     _resolve_tile_mode,
     _write_tile_for_mode,
@@ -217,6 +217,15 @@ def ingest_catalogs_parallel(
     n_skipped_ckpt = len(requested) - len(pending)
 
     if not pending:
+        finalize_catalog_survey(
+            catalog_root,
+            survey_name,
+            norder,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            source_id_mode=None,
+            fallback_n_cols=0,
+        )
         return {
             "n_files_requested": len(requested),
             "n_files_processed": 0,
@@ -414,10 +423,7 @@ def ingest_catalogs_parallel(
         except Exception:
             log.exception("While shutting down catalog ingest process pool")
 
-    if sid_mode is None:
-        sid_mode = "sequential"
-
-    _finalize_catalog_writes(
+    finalize_catalog_survey(
         catalog_root,
         survey_name,
         norder,
