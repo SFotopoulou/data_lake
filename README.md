@@ -525,10 +525,26 @@ dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
   --format sdss_spplate --specobj-lookup-from-catalog
 ```
 
-If catalog lookup finds **0 fibers**, check the WARNING lines: they list which
-columns were used and whether the plate or MJD is missing. Photo-only catalogs
-(without plate/mjd/fiber) cannot drive spPlate ingest; use ``--specobj-lookup-from-plate``
-or ingest the specObj table first.
+If catalog lookup finds **0 fibers**, run the debug helper before re-ingesting:
+
+```bash
+# Plate synthesis + lake catalog scan (typical BOSS / DR17 troubleshooting)
+dl-debug-specobj-lookup data/spPlate-3523-55144.fits --survey SDSS_DR17 /path/to/lake
+
+# Plate synthesis only (no catalog)
+dl-debug-specobj-lookup spPlate-287-52251.fits --survey sdss_dr7 --no-catalog
+
+# Sidecar + catalog
+dl-debug-specobj-lookup spPlate-1960-53289.fits --survey sdss_dr17 /path/to/lake \
+  --specobj-lookup /path/to/lookup.parquet
+```
+
+The tool reports plugmap fiber count, resolved catalog columns, row counts for
+plate/mjd, sample ``fiber → specobjid`` pairs, and overlap with the plate file.
+Exit code **1** when every mode maps zero fibers (same failure as ingest).
+
+Photo-only catalogs (without plate/mjd/fiber/specobjid) cannot drive spPlate
+ingest; use ``--specobj-lookup-from-plate`` or ingest the specObj table first.
 
 ```bash
 dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \

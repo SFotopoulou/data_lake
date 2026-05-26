@@ -8,9 +8,10 @@ or scans an ingested lake catalog under ``catalogs/<survey>/``.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 
 SpecObjIdLayout = Literal["auto", "dr7", "dr8plus"]
 
@@ -227,76 +228,123 @@ def _build_from_sidecar(
     return _table_to_fiber_map(filtered)
 
 
-def _build_from_catalog(
+@dataclass
+class CatalogLookupProbe:
+    """Diagnostics from scanning ``catalogs/<survey>/`` for one plate–MJD."""
+
+    catalog_dir: Path
+    tile_count: int = 0
+    sample_schema: list[str] = field(default_factory=list)
+    plate_col: str | None = None
+    mjd_col: str | None = None
+    fiber_col: str | None = None
+    sid_col: str | None = None
+    n_plate_rows: int = 0
+    n_plate_mjd_rows: int = 0
+    mjds_for_plate: list[int] = field(default_factory=list)
+    fiber_map: dict[int, int] = field(default_factory=dict)
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and bool(self.fiber_map)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "catalog_dir": str(self.catalog_dir),
+            "tile_count": self.tile_count,
+            "sample_schema": self.sample_schema,
+            "columns": {
+                "plate": self.plate_col,
+                "mjd": self.mjd_col,
+                "fiber": self.fiber_col,
+                "specobjid": self.sid_col,
+            },
+            "n_plate_rows": self.n_plate_rows,
+            "n_plate_mjd_rows": self.n_plate_mjd_rows,
+            "mjds_for_plate": self.mjds_for_plate,
+            "fiber_map_size": len(self.fiber_map),
+            "error": self.error,
+        }
+
+
+def probe_catalog_specobj_lookup(
     survey_name: str,
     plate: int,
     mjd: int,
     *,
     catalog_root: Path | str,
-) -> dict[int, int]:
+) -> CatalogLookupProbe:
+    """Scan lake catalog tiles and return join stats (same logic as ingest)."""
     root = Path(catalog_root) / "catalogs" / survey_name
+    probe = CatalogLookupProbe(catalog_dir=root)
     if not root.is_dir():
-        raise FileNotFoundError(f"Catalog not found for survey {survey_name!r}: {root}")
+        probe.error = f"Catalog directory not found: {root}"
+        return probe
 
     tile_paths = sorted(root.rglob("Npix=*.parquet"))
+    probe.tile_count = len(tile_paths)
     if not tile_paths:
-        raise FileNotFoundError(f"No Parquet tiles under catalog {root}")
+        probe.error = f"No Parquet tiles under {root}"
+        return probe
 
     plate_col: str | None = None
     mjd_col: str | None = None
     fiber_col: str | None = None
     sid_col: str | None = None
-    out: dict[int, int] = {}
     mjds_for_plate: set[int] = set()
-    n_plate_rows = 0
 
-    for tile_path in tile_paths:
-        schema = pq.read_schema(str(tile_path))
-        names = schema.names
-        if plate_col is None:
-            plate_col = _resolve_column(names, _PLATE_COL_ALIASES)
-            mjd_col = _resolve_column(names, _MJD_COL_ALIASES)
-            fiber_col = _resolve_column(names, _FIBER_COL_ALIASES)
-            sid_col = _resolve_column(names, _SPECOBJID_COL_ALIASES)
-            if not all((plate_col, mjd_col, fiber_col, sid_col)):
-                raise ValueError(
-                    f"Catalog {root} missing plate/mjd/fiber/specObj ID columns; "
-                    f"need one of PLATE/plate, MJD/mjd, FIBERID/fiber, SPECOBJID. "
-                    f"Sample schema: {names[:30]}"
-                )
-            log.info(
-                "spPlate catalog lookup: survey=%s path=%s columns "
-                "plate=%r mjd=%r fiber=%r specobjid=%r",
-                survey_name,
-                root,
-                plate_col,
-                mjd_col,
-                fiber_col,
-                sid_col,
-            )
-        cols = [plate_col, mjd_col, fiber_col, sid_col]  # type: ignore[list-item]
-        chunk = pq.read_table(str(tile_path), columns=cols)
-        plates = _column_as_int64_numpy(chunk.column(plate_col))
-        mjds = _column_as_int64_numpy(chunk.column(mjd_col))
-        plate_sel = plates == int(plate)
-        if not np.any(plate_sel):
-            continue
-        n_plate_rows += int(np.count_nonzero(plate_sel))
-        mjds_for_plate.update(int(x) for x in mjds[plate_sel].tolist())
-        sel = plate_sel & (mjds == int(mjd))
-        if not np.any(sel):
-            continue
-        sub = chunk.filter(pa.array(sel))
-        partial = _table_to_fiber_map(sub)
-        for fid, sid in partial.items():
-            if fid in out:
-                log.warning(
-                    "Duplicate FIBERID %d across catalog tiles (keeping first)", fid,
-                )
+    try:
+        for tile_path in tile_paths:
+            schema = pq.read_schema(str(tile_path))
+            names = schema.names
+            if not probe.sample_schema:
+                probe.sample_schema = list(names[:40])
+            if plate_col is None:
+                plate_col = _resolve_column(names, _PLATE_COL_ALIASES)
+                mjd_col = _resolve_column(names, _MJD_COL_ALIASES)
+                fiber_col = _resolve_column(names, _FIBER_COL_ALIASES)
+                sid_col = _resolve_column(names, _SPECOBJID_COL_ALIASES)
+                probe.plate_col = plate_col
+                probe.mjd_col = mjd_col
+                probe.fiber_col = fiber_col
+                probe.sid_col = sid_col
+                if not all((plate_col, mjd_col, fiber_col, sid_col)):
+                    probe.error = (
+                        "Missing plate/mjd/fiber/SPECOBJID columns "
+                        "(photometric objid is not valid); "
+                        f"sample schema: {names[:30]}"
+                    )
+                    return probe
+
+            cols = [plate_col, mjd_col, fiber_col, sid_col]  # type: ignore[list-item]
+            chunk = pq.read_table(str(tile_path), columns=cols)
+            plates = _column_as_int64_numpy(chunk.column(plate_col))
+            mjds = _column_as_int64_numpy(chunk.column(mjd_col))
+            plate_sel = plates == int(plate)
+            if not np.any(plate_sel):
                 continue
-            out[fid] = sid
+            probe.n_plate_rows += int(np.count_nonzero(plate_sel))
+            mjds_for_plate.update(int(x) for x in mjds[plate_sel].tolist())
+            sel = plate_sel & (mjds == int(mjd))
+            if not np.any(sel):
+                continue
+            probe.n_plate_mjd_rows += int(np.count_nonzero(sel))
+            sub = chunk.filter(pa.array(sel))
+            partial = _table_to_fiber_map(sub)
+            for fid, sid in partial.items():
+                if fid in probe.fiber_map:
+                    log.warning(
+                        "Duplicate FIBERID %d across catalog tiles (keeping first)", fid,
+                    )
+                    continue
+                probe.fiber_map[fid] = sid
+    except Exception as exc:
+        probe.error = str(exc)
+        return probe
 
-    if not out:
+    probe.mjds_for_plate = sorted(mjds_for_plate)
+    if not probe.fiber_map and probe.error is None:
         assert plate_col and mjd_col and fiber_col and sid_col
         _warn_catalog_lookup_miss(
             root,
@@ -307,18 +355,34 @@ def _build_from_catalog(
             mjd_col=mjd_col,
             fiber_col=fiber_col,
             sid_col=sid_col,
-            mjds_for_plate=sorted(mjds_for_plate),
-            n_plate_rows=n_plate_rows,
+            mjds_for_plate=probe.mjds_for_plate,
+            n_plate_rows=probe.n_plate_rows,
         )
-    else:
+    return probe
+
+
+def _build_from_catalog(
+    survey_name: str,
+    plate: int,
+    mjd: int,
+    *,
+    catalog_root: Path | str,
+) -> dict[int, int]:
+    probe = probe_catalog_specobj_lookup(
+        survey_name, int(plate), int(mjd), catalog_root=catalog_root,
+    )
+    if probe.error and not probe.fiber_map:
+        if probe.tile_count == 0 or not probe.catalog_dir.is_dir():
+            raise FileNotFoundError(probe.error)
+        raise ValueError(probe.error)
+    if probe.fiber_map:
         log.info(
             "spPlate catalog lookup: plate=%d mjd=%d → %d fiber ID(s)",
             plate,
             mjd,
-            len(out),
+            len(probe.fiber_map),
         )
-
-    return out
+    return probe.fiber_map
 
 
 def build_fiber_to_specobjid_map(
