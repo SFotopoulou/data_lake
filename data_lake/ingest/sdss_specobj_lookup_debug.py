@@ -231,6 +231,18 @@ def format_debug_report(
 
     if report.inferred_layout:
         lines.append(f"inferred specObjID layout: {report.inferred_layout}")
+    if report.header.get("RUN2D") is not None:
+        lines.append(f"RUN2D used for synthesis: {report.header['RUN2D']!r}")
+        for key in ("VERS2D", "VERSCOMB"):
+            if key in report.header and str(report.header[key]) != str(report.header["RUN2D"]):
+                lines.append(
+                    f"  note: {key}={report.header[key]!r} differs — ignored for specObjID"
+                )
+    elif report.header.get("VERS2D") or report.header.get("VERSCOMB"):
+        lines.append(
+            "warning: VERS2D/VERSCOMB present but RUN2D missing — "
+            "not used for specObjID synthesis"
+        )
     if report.layout_error:
         lines.append(f"layout inference error: {report.layout_error}")
 

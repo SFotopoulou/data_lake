@@ -501,7 +501,8 @@ HDU layout (BOSS example ``spPlate-3523-55144.fits``): primary flux
 ``ORMASK``; ``PLUGMAP`` BINTABLE with ``FIBERID``, ``RA``, ``DEC``.
 
 ```bash
-# Quick ingest without a specObj sidecar (DR8+/BOSS: needs RUN2D v5_* in header)
+# Quick ingest without a specObj sidecar (DR8+/BOSS: primary header RUN2D only;
+# VERS2D/VERSCOMB are pipeline versions, not used for specObjID)
 dl-ingest-spectra data/spPlate-3523-55144.fits --survey boss_dr12 \
   --format sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr8plus
 

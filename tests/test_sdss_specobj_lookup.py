@@ -13,6 +13,7 @@ from data_lake.ingest.fits_to_parquet import normalize_object_id
 from data_lake.ingest.sdss_specobj_lookup import (
     build_fiber_to_specobjid_map,
     encode_sdss_run2d,
+    run2d_from_spplate_header,
     sdss_specobjid_dr7_from_plate_fiber,
     sdss_specobjid_dr8plus_from_plate_fiber,
     sdss_specobjid_from_plate_fiber,
@@ -68,6 +69,14 @@ class TestSpecobjIdEncoding:
     def test_encode_run2d_integer_string(self) -> None:
         assert encode_sdss_run2d("26") == 26
         assert encode_sdss_run2d("v5_13_2") == 1302
+
+    def test_run2d_header_ignores_vers2d(self) -> None:
+        phdr = {"RUN2D": 26, "VERS2D": "v5_13_2", "VERSCOMB": "v5_13_2"}
+        assert run2d_from_spplate_header(phdr) == 26
+        sid_run2d = int(sdss_specobjid_dr8plus_from_plate_fiber(266, 15, 51602, 26))
+        sid_vers2d = int(sdss_specobjid_dr8plus_from_plate_fiber(266, 15, 51602, "v5_13_2"))
+        assert sid_run2d == 299493525265868800
+        assert sid_vers2d != sid_run2d
 
     @pytest.mark.skipif(not _CAS_EXAMPLES.is_file(), reason="CAS fixture missing")
     def test_cas_examples_match_dr8plus_layout(self) -> None:

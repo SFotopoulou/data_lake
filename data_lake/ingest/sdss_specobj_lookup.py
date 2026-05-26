@@ -436,6 +436,25 @@ def build_fiber_to_specobjid_map(
     )
 
 
+def run2d_from_spplate_header(phdr) -> int | str | None:
+    """Return ``RUN2D`` for specObjID encoding (never ``VERS2D`` / ``VERSCOMB``)."""
+    if "RUN2D" not in phdr:
+        return None
+    run2d = phdr["RUN2D"]
+    for key in ("VERS2D", "VERSCOMB"):
+        if key not in phdr:
+            continue
+        other = phdr[key]
+        if str(other).strip() != str(run2d).strip():
+            log.warning(
+                "spPlate header %s=%r ignored for specObjID; using RUN2D=%r only",
+                key,
+                other,
+                run2d,
+            )
+    return run2d
+
+
 def infer_specobjid_layout(
     phdr,
     survey_name: str | None = None,
@@ -457,11 +476,7 @@ def infer_specobjid_layout(
     if "dr7" in survey_key or survey_key.endswith("sdss7"):
         return "dr7"
 
-    run2d = None
-    for key in ("RUN2D", "VERS2D", "VERSCOMB"):
-        if key in phdr:
-            run2d = phdr[key]
-            break
+    run2d = run2d_from_spplate_header(phdr)
 
     if isinstance(run2d, str) and run2d.strip().lower().startswith("v"):
         return "dr8plus"
@@ -575,13 +590,11 @@ def build_fiber_to_specobjid_from_spplate(
 
     run2d = None
     if layout == "dr8plus":
-        for key in ("RUN2D", "VERS2D", "VERSCOMB"):
-            if key in phdr:
-                run2d = phdr[key]
-                break
+        run2d = run2d_from_spplate_header(phdr)
         if run2d is None:
             raise KeyError(
-                "spPlate header missing RUN2D (required for DR8+ specObjID synthesis)"
+                "spPlate header missing RUN2D (required for DR8+ specObjID synthesis; "
+                "VERS2D/VERSCOMB are not used)"
             )
 
     if fiber_ids is None:
