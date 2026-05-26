@@ -336,7 +336,7 @@ try:
     @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
-        default="append",
+        default="skip",
         show_default=True,
         help="How to handle source_id already present in a tile Zarr.",
     )
@@ -465,9 +465,15 @@ try:
     )
     @click.option("--specobj-lookup-survey", default=None)
     @click.option(
+        "--specobj-lookup-from-plate/--no-specobj-lookup-from-plate",
+        default=False,
+        show_default=True,
+        help="Synthesize SPECOBJID from spPlate header (no sidecar).",
+    )
+    @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
-        default="append",
+        default="skip",
         show_default=True,
         help="If source_id already exists in a tile Zarr, append, raise, or skip.",
     )
@@ -508,6 +514,7 @@ try:
         specobj_lookup: Path | None,
         specobj_lookup_from_catalog: bool,
         specobj_lookup_survey: str | None,
+        specobj_lookup_from_plate: bool,
         on_duplicate: str,
         wavelength_mode: str | None,
         on_length_mismatch: str,
@@ -551,6 +558,7 @@ try:
                 specobj_lookup=specobj_lookup,
                 specobj_lookup_from_catalog=specobj_lookup_from_catalog,
                 specobj_lookup_survey=specobj_lookup_survey,
+                specobj_lookup_from_plate=specobj_lookup_from_plate,
             )
             total_index_map.update(m)
 

@@ -198,7 +198,7 @@ def ingest_cutouts_from_fits(
     norder: int = 5,
     source_id_col: str | None = None,
     dtype: np.dtype | type = _DEFAULT_DTYPE,
-    on_duplicate_source_id: Literal["append", "error", "skip"] = "append",
+    on_duplicate_source_id: Literal["append", "error", "skip"] = "skip",
 ) -> dict[int, int]:
     """
     Ingest cutout images from a FITS file (one HDU = one source or one MEF
@@ -231,9 +231,9 @@ def ingest_cutouts_from_fits(
     dtype:
         Storage dtype (float32 default).
     on_duplicate_source_id:
-        ``append`` (default) always appends new rows (may duplicate ``source_id``
-        in a tile if re-run).  ``error`` raises if any incoming ``source_id`` is
-        already present.  ``skip`` drops conflicting rows and only appends new IDs.
+        ``skip`` (default) drops conflicting rows and only appends new IDs.
+        ``error`` raises if any incoming ``source_id`` is already present.
+        ``append`` always appends new rows (may duplicate ``source_id`` on re-run).
 
     Returns
     -------
@@ -478,9 +478,9 @@ try:
     @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
-        default="append",
+        default="skip",
         show_default=True,
-        help="If source_id already exists in a tile, append (default), raise, or skip rows.",
+        help="If source_id already exists in a tile: skip (default), raise, or append rows.",
     )
     @click.option(
         "--update-catalog/--no-update-catalog", default=True, show_default=True,

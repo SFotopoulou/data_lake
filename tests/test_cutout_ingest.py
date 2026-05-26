@@ -41,18 +41,18 @@ def test_ingest_cutouts_writes_zarr_and_passes_validation(tmp_path: Path) -> Non
 
     m1 = ingest_cutouts_from_fits(
         f1, tmp_path, "test_survey", ra_col="RA", dec_col="DEC",
-        norder=3, on_duplicate_source_id="append",
+        norder=3,
     )
     m2 = ingest_cutouts_from_fits(
         f2, tmp_path, "test_survey", ra_col="RA", dec_col="DEC",
-        norder=3, on_duplicate_source_id="append",
+        norder=3,
     )
     assert m1[1001] == 0
     assert m2[1002] == 1
 
     info = json.loads((tmp_path / "cutouts" / "test_survey" / "cutout_info.json").read_text())
     assert info["dtype"] == "float32"
-    assert info["on_duplicate_source_id"] == "append"
+    assert info["on_duplicate_source_id"] == "skip"
 
     rep = run_validation(tmp_path, "test_survey")
     assert rep.ok(strict=False), (rep.errors, rep.warnings)

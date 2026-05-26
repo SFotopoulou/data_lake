@@ -26,7 +26,7 @@ uv venv --python 3.11 .venv
 # 3. Install from the lockfile (editable package + extras):
 #    desi — DESI ingest (pulls in desispec)
 #    dev  — pytest, Jupyter, matplotlib, napari, …
-uv sync --extra desi --extra dev
+uv sync --extra desi --extra dev --extra fitsio
 
 # 4. Activate the env (or use `uv run` / `.venv/bin/python` without activating)
 source .venv/bin/activate
@@ -392,7 +392,7 @@ so ``update_index_column`` can patch ``_cutout_index``.
 | Image data | — | Primary or image HDU | 2-D ``(H,W)`` → one band; 3-D → set ``--band-axis``. Fixed ``(H,W)`` per survey tile after the first file. |
 
 Optional: ``--band-names r,i,z``, ``--dtype float32``, ``--image-hdu N`` (select one
-extension in multi-HDU files), ``--on-duplicate append|error|skip``.
+extension in multi-HDU files), ``--on-duplicate skip|error|append`` (default ``skip``).
 
 #### Minimal DESI-like cutout FITS (example)
 
@@ -484,28 +484,48 @@ dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
   --source-id-col SPECOBJID
 ```
 
-#### SDSS spPlate ingest (640 fibers per file)
+#### SDSS spPlate ingest (640 or 1000 fibers per file)
 
-``spPlate-PLATE-MJD.fits`` holds plate-run spectra for all fibers; there is **no
-SPECOBJID** in the FITS file.  Ingest joins each fiber to your specObj catalog via
-**(survey, PLATE, MJD, FIBERID)** and stores normalized ``SPECOBJID`` in Zarr
-``source_id`` (same as ``spec-*.fits`` ingest).
+``spPlate-PLATE-MJD.fits`` holds plate-run spectra for all fibers (SDSS: 640 rows;
+BOSS: 1000 plugmap rows, typically ~500 with non-zero flux).  There is **no
+SPECOBJID** column in the FITS file.  Ingest maps each **FIBERID** to
+``source_id`` via one of:
+
+1. **Sidecar / catalog** — join on ``(survey, PLATE, MJD, FIBERID)``
+2. **Plate header** — synthesize CAS ``specObjID`` from ``PLATE``, ``MJD``,
+   ``FIBERID``, and ``RUN2D`` (``--specobj-lookup-from-plate``)
+
+HDU layout (BOSS example ``spPlate-3523-55144.fits``): primary flux
+``(n_fiber, n_pix)``; ``IVAR`` (inverse variance, not sigma); ``ANDMASK`` /
+``ORMASK``; ``PLUGMAP`` BINTABLE with ``FIBERID``, ``RA``, ``DEC``.
 
 ```bash
+# Quick ingest without a specObj sidecar (IDs from PLATE/MJD/FIBERID/RUN2D)
+dl-ingest-spectra data/spPlate-3523-55144.fits --survey boss_dr12 \
+  --format sdss_spplate --specobj-lookup-from-plate
+
 # Sidecar Parquet/CSV: columns survey, PLATE, MJD, FIBERID, SPECOBJID
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
   --format sdss_spplate \
   --specobj-lookup /path/to/specobj_lookup.parquet
 
-# BOSS spPlates use the same reader with a BOSS specObj survey name
+# BOSS spPlates with an explicit specObj table
 dl-ingest-spectra spPlate-5695-56191.fits --survey boss_dr12 \
   --format sdss_spplate \
   --specobj-lookup /path/to/boss_specobj_lookup.parquet
 
-# Or resolve IDs from an ingested lake catalog (catalogs/<survey>/)
+# Or resolve IDs from an ingested **specObj** lake catalog (catalogs/<survey>/)
+# Required columns: plate (or PLATEID), mjd, fiber/FIBERID, SPECOBJID (not photo objid)
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
   --format sdss_spplate --specobj-lookup-from-catalog
+```
 
+If catalog lookup finds **0 fibers**, check the WARNING lines: they list which
+columns were used and whether the plate or MJD is missing. Photo-only catalogs
+(without plate/mjd/fiber) cannot drive spPlate ingest; use ``--specobj-lookup-from-plate``
+or ingest the specObj table first.
+
+```bash
 dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
   --format sdss_spplate --specobj-lookup /path/to/lookup.parquet \
   --on-duplicate skip
@@ -598,15 +618,15 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
 | `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
 | `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
-| `dl-ingest-cutouts` | `--on-duplicate` | `append`, `error`, `skip` | Per `source_id` in each `Npix=*.zarr` |
+| `dl-ingest-cutouts` | `--on-duplicate` | `skip`, `error`, `append` | Default **`skip`**; per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
-| `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Also ``--on-length-mismatch``, ``--wavelength-mode`` (like ``dl-ingest-spectra``) |
-| `dl-ingest-spectra-batch` | `--on-duplicate` | same | DESI parallel batch (was missing before) |
+| `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Also ``--on-length-mismatch``, ``--wavelength-mode`` |
+| `dl-ingest-spectra-batch` | `--on-duplicate` | same | DESI parallel batch; default **`skip`** |
 
-For **resumable** file-list or batch re-runs, use **`--on-duplicate skip`** on cutout/spectrum
-ingest (and **`--tile-mode skip`** on catalog). Default is **`append`**, which can add duplicate
-Zarr rows if you re-ingest the same objects.
+Cutout/spectrum ingest defaults to **`--on-duplicate skip`** so file-list and batch re-runs
+are idempotent. Use **`append`** only when you intentionally want duplicate Zarr rows.
+Catalog append uses **`--on-duplicate-id skip`** (default) with **`--tile-mode append`**.
 
 #### Parallel catalog batch (large file lists)
 

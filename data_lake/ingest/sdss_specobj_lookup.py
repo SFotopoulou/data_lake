@@ -24,7 +24,15 @@ log = logging.getLogger(__name__)
 _SURVEY_COL_ALIASES = ("SURVEY", "survey", "SURVEY_NAME", "survey_name")
 _PLATE_COL_ALIASES = ("PLATE", "plate", "PLATEID", "plateid")
 _MJD_COL_ALIASES = ("MJD", "mjd")
-_FIBER_COL_ALIASES = ("FIBERID", "fiberid", "FIBER_ID", "fiber", "FIBER")
+_FIBER_COL_ALIASES = (
+    "FIBERID",
+    "fiberid",
+    "FIBER_ID",
+    "fiberID",
+    "fiber",
+    "FIBER",
+)
+# Do not alias ``objid`` / ``OBJID`` here — that is the photometric ID, not specObjID.
 _SPECOBJID_COL_ALIASES = ("SPECOBJID", "specobjid", "SPEC_OBJID", "spec_objid")
 
 
@@ -112,6 +120,70 @@ def _filter_sidecar_table(
     return table.filter(pc.and_(plate_mask, mjd_mask))
 
 
+def _column_as_int64_numpy(column: pa.ChunkedArray) -> np.ndarray:
+    """Cast a catalog column to int64 for plate/mjd/fiber comparisons."""
+    return np.asarray(
+        column.cast(pa.int64()).to_numpy(zero_copy_only=False),
+        dtype=np.int64,
+    )
+
+
+def _warn_catalog_lookup_miss(
+    catalog_dir: Path,
+    survey_name: str,
+    plate: int,
+    mjd: int,
+    *,
+    plate_col: str,
+    mjd_col: str,
+    fiber_col: str,
+    sid_col: str,
+    mjds_for_plate: list[int] | None,
+    n_plate_rows: int,
+) -> None:
+    if n_plate_rows == 0:
+        log.warning(
+            "Catalog %s has no rows with %s=%d (checked all Parquet tiles). "
+            "spPlate ingest needs a **specObj** catalog with plate/mjd/fiber columns — "
+            "not a photo-only table. For BOSS plates without specObj rows, use "
+            "--specobj-lookup-from-plate.",
+            catalog_dir,
+            plate_col,
+            plate,
+        )
+        return
+    if mjds_for_plate and int(mjd) not in mjds_for_plate:
+        sample = mjds_for_plate[:12]
+        extra = f" … (+{len(mjds_for_plate) - 12} more)" if len(mjds_for_plate) > 12 else ""
+        mjd_list = ", ".join(str(x) for x in sample)
+        log.warning(
+            "Catalog %s has %d row(s) with %s=%d but none with %s=%d. "
+            "MJDs present for this plate include: %s%s. "
+            "Check spPlate header MJD vs catalog, or use --specobj-lookup-from-plate.",
+            catalog_dir,
+            n_plate_rows,
+            plate_col,
+            plate,
+            mjd_col,
+            mjd,
+            mjd_list,
+            extra,
+        )
+        return
+    log.warning(
+        "Catalog %s matched plate=%d mjd=%d using columns "
+        "%s, %s, %s, %s but produced an empty fiber map "
+        "(null IDs or no overlapping FIBERID values).",
+        catalog_dir,
+        plate,
+        mjd,
+        plate_col,
+        mjd_col,
+        fiber_col,
+        sid_col,
+    )
+
+
 def _table_to_fiber_map(table: pa.Table) -> dict[int, int]:
     names = table.schema.names
     fiber_col = _resolve_column(names, _FIBER_COL_ALIASES)
@@ -164,13 +236,19 @@ def _build_from_catalog(
     if not root.is_dir():
         raise FileNotFoundError(f"Catalog not found for survey {survey_name!r}: {root}")
 
+    tile_paths = sorted(root.rglob("Npix=*.parquet"))
+    if not tile_paths:
+        raise FileNotFoundError(f"No Parquet tiles under catalog {root}")
+
     plate_col: str | None = None
     mjd_col: str | None = None
     fiber_col: str | None = None
     sid_col: str | None = None
     out: dict[int, int] = {}
+    mjds_for_plate: set[int] = set()
+    n_plate_rows = 0
 
-    for tile_path in sorted(root.rglob("Npix=*.parquet")):
+    for tile_path in tile_paths:
         schema = pq.read_schema(str(tile_path))
         names = schema.names
         if plate_col is None:
@@ -180,14 +258,30 @@ def _build_from_catalog(
             sid_col = _resolve_column(names, _SPECOBJID_COL_ALIASES)
             if not all((plate_col, mjd_col, fiber_col, sid_col)):
                 raise ValueError(
-                    f"Catalog {root} missing plate/mjd/fiber/SPECOBJID columns; "
-                    f"found schema sample: {names[:25]}"
+                    f"Catalog {root} missing plate/mjd/fiber/specObj ID columns; "
+                    f"need one of PLATE/plate, MJD/mjd, FIBERID/fiber, SPECOBJID. "
+                    f"Sample schema: {names[:30]}"
                 )
+            log.info(
+                "spPlate catalog lookup: survey=%s path=%s columns "
+                "plate=%r mjd=%r fiber=%r specobjid=%r",
+                survey_name,
+                root,
+                plate_col,
+                mjd_col,
+                fiber_col,
+                sid_col,
+            )
         cols = [plate_col, mjd_col, fiber_col, sid_col]  # type: ignore[list-item]
         chunk = pq.read_table(str(tile_path), columns=cols)
-        plates = np.asarray(chunk.column(plate_col).to_numpy(zero_copy_only=False))
-        mjds = np.asarray(chunk.column(mjd_col).to_numpy(zero_copy_only=False))
-        sel = (plates == int(plate)) & (mjds == int(mjd))
+        plates = _column_as_int64_numpy(chunk.column(plate_col))
+        mjds = _column_as_int64_numpy(chunk.column(mjd_col))
+        plate_sel = plates == int(plate)
+        if not np.any(plate_sel):
+            continue
+        n_plate_rows += int(np.count_nonzero(plate_sel))
+        mjds_for_plate.update(int(x) for x in mjds[plate_sel].tolist())
+        sel = plate_sel & (mjds == int(mjd))
         if not np.any(sel):
             continue
         sub = chunk.filter(pa.array(sel))
@@ -200,6 +294,28 @@ def _build_from_catalog(
                 continue
             out[fid] = sid
 
+    if not out:
+        assert plate_col and mjd_col and fiber_col and sid_col
+        _warn_catalog_lookup_miss(
+            root,
+            survey_name,
+            int(plate),
+            int(mjd),
+            plate_col=plate_col,
+            mjd_col=mjd_col,
+            fiber_col=fiber_col,
+            sid_col=sid_col,
+            mjds_for_plate=sorted(mjds_for_plate),
+            n_plate_rows=n_plate_rows,
+        )
+    else:
+        log.info(
+            "spPlate catalog lookup: plate=%d mjd=%d → %d fiber ID(s)",
+            plate,
+            mjd,
+            len(out),
+        )
+
     return out
 
 
@@ -211,6 +327,8 @@ def build_fiber_to_specobjid_map(
     lookup_path: Path | str | None = None,
     catalog_root: Path | str | None = None,
     lookup_survey: str | None = None,
+    spplate_hdul=None,
+    lookup_from_plate: bool = False,
 ) -> dict[int, int]:
     """
     Return ``{fiber_id: specobjid}`` for one plate–MJD within a survey.
@@ -218,9 +336,15 @@ def build_fiber_to_specobjid_map(
     Provide exactly one of ``lookup_path`` (sidecar) or ``catalog_root`` (lake root).
     ``survey_name`` is always required and scopes sidecar rows and catalog directory.
     """
+    if lookup_from_plate:
+        if spplate_hdul is None:
+            raise ValueError("lookup_from_plate=True requires spplate_hdul=")
+        return build_fiber_to_specobjid_from_spplate(spplate_hdul)
+
     if lookup_path is None and catalog_root is None:
         raise ValueError(
-            "spPlate ingest requires specObj lookup: pass lookup_path= or catalog_root="
+            "spPlate ingest requires specObj lookup: pass lookup_path=, catalog_root=, "
+            "or lookup_from_plate=True"
         )
     if lookup_path is not None and catalog_root is not None:
         raise ValueError("Pass only one of lookup_path= or catalog_root=, not both")
@@ -239,6 +363,91 @@ def build_fiber_to_specobjid_map(
         int(mjd),
         catalog_root=catalog_root,  # type: ignore[arg-type]
     )
+
+
+def encode_sdss_run2d(run2d: int | str) -> int:
+    """Encode SDSS-III/IV ``RUN2D`` (e.g. ``v5_13_2``) into the 14-bit specObjID field."""
+    if isinstance(run2d, str):
+        parts = run2d.strip().lstrip("vV").split("_")
+        if len(parts) != 3:
+            raise ValueError(f"RUN2D must look like vN_M_P, got {run2d!r}")
+        major, minor, patch = (int(parts[0]), int(parts[1]), int(parts[2]))
+        return (major - 5) * 10000 + minor * 100 + patch
+    return int(run2d)
+
+
+def sdss_specobjid_from_plate_fiber(
+    plate: int,
+    fiber: int,
+    mjd: int,
+    run2d: int | str,
+    *,
+    line: int = 0,
+) -> int:
+    """CAS-style 64-bit specObjID from plate, fiber, MJD, and RUN2D (DR8+ layout)."""
+    run2d_val = encode_sdss_run2d(run2d)
+    mjd_val = int(mjd) - 50000
+    if mjd_val < 0:
+        raise ValueError(f"MJD must be >= 50000 for specObjID encoding, got {mjd}")
+    raw = (
+        (int(plate) << 50)
+        | (int(fiber) << 38)
+        | (mjd_val << 24)
+        | (run2d_val << 10)
+        | int(line)
+    )
+    return normalize_object_id(raw)
+
+
+def build_fiber_to_specobjid_from_spplate(
+    hdul,
+    path: Path | None = None,
+    *,
+    fiber_ids: Iterable[int] | None = None,
+) -> dict[int, int]:
+    """Build ``{FIBERID: specObjID}`` from spPlate header + PLUGMAP (no specObj sidecar).
+
+    Uses ``PLATEID``/``PLATE``, ``MJD``, ``RUN2D`` from the primary header and each
+    1-based ``FIBERID`` from the plugmap BINTABLE.  IDs match SDSS CAS ``specObjID``
+    for ``line=0`` (SpecObj rows).
+    """
+    phdr = hdul[0].header
+    plate, mjd = spplate_plate_mjd_from_hdul(hdul, path)
+    run2d = None
+    for key in ("RUN2D", "VERS2D", "VERSCOMB"):
+        if key in phdr:
+            run2d = phdr[key]
+            break
+    if run2d is None:
+        raise KeyError(
+            "spPlate header missing RUN2D (needed to synthesize specObjID without a lookup)"
+        )
+
+    if fiber_ids is None:
+        from data_lake.ingest.fits_to_spectra_zarr import _spplate_fiber_table_hdu
+
+        ftable = _spplate_fiber_table_hdu(hdul)
+        if ftable is None:
+            raise ValueError("spPlate: no PLUGMAP / FIBERID BINTABLE for specObjID synthesis")
+        fiber_ids = [int(x) for x in _fits_fiber_column(ftable.data)]
+
+    out: dict[int, int] = {}
+    for fiber in fiber_ids:
+        fid = int(fiber)
+        if fid in out:
+            continue
+        out[fid] = sdss_specobjid_from_plate_fiber(plate, fid, mjd, run2d)
+    return out
+
+
+def _fits_fiber_column(fdata: np.ndarray) -> np.ndarray:
+    names = fdata.dtype.names or ()
+    by_lower = {n.lower(): n for n in names}
+    for cand in ("fiberid", "fiber_id", "fiber"):
+        key = by_lower.get(cand)
+        if key is not None:
+            return np.asarray(fdata[key])
+    raise KeyError(f"No FIBERID column in plugmap; columns: {list(names)}")
 
 
 def spplate_plate_mjd_from_hdul(hdul, path: Path | None = None) -> tuple[int, int]:

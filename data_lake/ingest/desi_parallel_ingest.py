@@ -528,7 +528,7 @@ def ingest_spectra_parallel(
     worker_log_file: Path | str | None = None,
     worker_verbose: bool = False,
     inflight_path: Path | str | None = None,
-    on_duplicate_source_id: ZarrDuplicateMode = "append",
+    on_duplicate_source_id: ZarrDuplicateMode = "skip",
     track_index_map: bool = False,
     max_in_flight: int | None = None,
     max_open_tiles: int = 64,
@@ -985,9 +985,9 @@ try:
     @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
-        default="append",
+        default="skip",
         show_default=True,
-        help="If TARGETID already exists in a tile Zarr: append, raise, or skip.",
+        help="If TARGETID already exists in a tile Zarr: skip (default), raise, or append.",
     )
     @click.option(
         "--update-catalog/--no-update-catalog", default=True, show_default=True,

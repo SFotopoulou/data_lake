@@ -9,11 +9,20 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_lake.ingest.fits_to_parquet import normalize_object_id
-from data_lake.ingest.sdss_specobj_lookup import build_fiber_to_specobjid_map
+from data_lake.ingest.sdss_specobj_lookup import (
+    build_fiber_to_specobjid_map,
+    sdss_specobjid_from_plate_fiber,
+)
 
 
 def _write_lookup(path: Path, rows: list[dict]) -> None:
     pq.write_table(pa.Table.from_pylist(rows), path)
+
+
+class TestSpecobjIdEncoding:
+    def test_dr8_reference_value(self) -> None:
+        sid = sdss_specobjid_from_plate_fiber(4055, 408, 55359, "v5_7_0")
+        assert sid == normalize_object_id(4565636362342690816)
 
 
 class TestSpecobjLookupSurveyScope:
@@ -84,3 +93,49 @@ class TestSpecobjLookupSurveyScope:
                 lookup_path="a.parquet",
                 catalog_root="/tmp/lake",
             )
+
+
+class TestCatalogLookup:
+    def test_catalog_requires_specobjid_not_objid(self, tmp_path: Path) -> None:
+        """Photometric ``objid`` must not be used as the spPlate join key."""
+        lake = tmp_path / "lake"
+        cat_dir = lake / "catalogs" / "sdss_spec"
+        tile_dir = cat_dir / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "plate": pa.array([3523], type=pa.int32()),
+                "mjd": pa.array([55144], type=pa.int64()),
+                "fiber": pa.array([501], type=pa.int16()),
+                "objid": pa.array([9001], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        with pytest.raises(ValueError, match="SPECOBJID"):
+            build_fiber_to_specobjid_map(
+                "sdss_spec",
+                3523,
+                55144,
+                catalog_root=lake,
+            )
+
+    def test_catalog_with_specobjid_column(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "sdss_spec" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "plate": pa.array([3523, 3523], type=pa.int32()),
+                "mjd": pa.array([55144.0, 55144.0], type=pa.float64()),
+                "fiber": pa.array([501, 502], type=pa.int16()),
+                "specobjid": pa.array([9001, 9002], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        m = build_fiber_to_specobjid_map(
+            "sdss_spec",
+            3523,
+            55144,
+            catalog_root=lake,
+        )
+        assert m == {501: normalize_object_id(9001), 502: normalize_object_id(9002)}

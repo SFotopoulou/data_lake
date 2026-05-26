@@ -484,13 +484,102 @@ def _read_sdss_boss(
 
 
 def _spplate_fiber_table_hdu(hdul: fits.HDUList) -> fits.BinTableHDU | None:
-    """Per-fiber metadata BINTABLE (typically HDU 5 on classic spPlate files)."""
+    """Per-fiber metadata BINTABLE (typically HDU 5 PLUGMAP on spPlate files)."""
     for hdu in hdul:
         if isinstance(hdu, fits.BinTableHDU) and hdu.data is not None and len(hdu.data) > 0:
             names = hdu.data.dtype.names or ()
             if "FIBERID" in names or "fiberid" in {n.lower() for n in names}:
                 return hdu
     return None
+
+
+def _spplate_hdu_by_name(hdul: fits.HDUList, name: str) -> fits.ImageHDU | None:
+    target = name.upper()
+    for hdu in hdul:
+        if (hdu.name or "").strip().upper() == target and hdu.data is not None:
+            return hdu  # type: ignore[return-value]
+    return None
+
+
+def _spplate_2d_as_fiber_by_pix(data: np.ndarray, phdr: fits.Header) -> np.ndarray:
+    """Ensure a 2-D spPlate image is ``(n_fiber, n_pix)`` (one spectrum per row)."""
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"spPlate 2-D HDU must be rank 2, got shape {arr.shape}")
+    naxis1 = int(phdr.get("NAXIS1", 0) or 0)
+    naxis2 = int(phdr.get("NAXIS2", 0) or 0)
+    if naxis1 and naxis2:
+        if arr.shape == (naxis2, naxis1):
+            return arr
+        if arr.shape == (naxis1, naxis2):
+            return arr.T
+    # Heuristic: spectral axis is the longer dimension (~3800 px).
+    if arr.shape[0] > arr.shape[1] and arr.shape[1] in (500, 640, 1000):
+        return arr.T
+    return arr
+
+
+def _spplate_flux_and_calib_hdus(
+    hdul: fits.HDUList,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Return ``(flux, ivar, and_mask, or_mask)`` each shaped ``(n_fiber, n_pix)``."""
+    phdr = hdul[0].header
+    flux_2d = _spplate_2d_as_fiber_by_pix(hdul[0].data, phdr)
+
+    ivar_2d: np.ndarray | None = None
+    sigma_2d: np.ndarray | None = None
+    ivar_hdu = _spplate_hdu_by_name(hdul, "IVAR")
+    if ivar_hdu is not None:
+        ivar_2d = _spplate_2d_as_fiber_by_pix(ivar_hdu.data, ivar_hdu.header)
+    elif len(hdul) > 1 and hdul[1].data is not None and getattr(hdul[1].data, "ndim", 0) == 2:
+        h1 = hdul[1]
+        arr = _spplate_2d_as_fiber_by_pix(h1.data, h1.header)
+        if (h1.name or "").strip().upper() == "IVAR":
+            ivar_2d = arr
+        elif arr.shape == flux_2d.shape:
+            sigma_2d = arr
+
+    and_mask: np.ndarray | None = None
+    or_mask: np.ndarray | None = None
+    for name, slot in (("ANDMASK", "and"), ("ORMASK", "or")):
+        hdu = _spplate_hdu_by_name(hdul, name)
+        if hdu is None:
+            continue
+        arr = _spplate_2d_as_fiber_by_pix(hdu.data, hdu.header)
+        if arr.shape != flux_2d.shape:
+            log.warning(
+                "spPlate %s shape %s != flux shape %s; skipping",
+                name,
+                arr.shape,
+                flux_2d.shape,
+            )
+            continue
+        if slot == "and":
+            and_mask = arr.astype(np.int32, copy=False)
+        else:
+            or_mask = arr.astype(np.int32, copy=False)
+
+    if and_mask is None and or_mask is None:
+        for idx in (2, 3):
+            if len(hdul) <= idx or hdul[idx].data is None:
+                continue
+            arr = hdul[idx].data
+            if getattr(arr, "ndim", 0) != 2:
+                continue
+            arr2 = _spplate_2d_as_fiber_by_pix(arr, hdul[idx].header)
+            if arr2.shape != flux_2d.shape:
+                continue
+            hname = (hdul[idx].name or "").upper()
+            if "AND" in hname:
+                and_mask = arr2.astype(np.int32, copy=False)
+            elif "OR" in hname:
+                or_mask = arr2.astype(np.int32, copy=False)
+            elif and_mask is None:
+                and_mask = arr2.astype(np.int32, copy=False)
+            else:
+                or_mask = arr2.astype(np.int32, copy=False)
+
+    return flux_2d, ivar_2d, and_mask, or_mask
 
 
 def _read_sdss_spplate(
@@ -517,27 +606,8 @@ def _read_sdss_spplate(
     coeff0 = float(phdr["COEFF0"])
     coeff1 = float(phdr["COEFF1"])
 
-    flux_hdu = hdul[0]
-    if flux_hdu.data is None or flux_hdu.data.ndim != 2:
-        raise ValueError("spPlate HDU 0 must be a 2-D flux array (n_fiber, n_pix)")
-    n_fiber, n_pix = flux_hdu.data.shape
-    flux_2d = np.asarray(flux_hdu.data, dtype=np.float32)
-
-    sigma_2d: np.ndarray | None = None
-    if len(hdul) > 1 and hdul[1].data is not None and getattr(hdul[1].data, "ndim", 0) == 2:
-        if hdul[1].data.shape == flux_2d.shape:
-            sigma_2d = np.asarray(hdul[1].data, dtype=np.float32)
-
-    mask_or: np.ndarray | None = None
-    mask_and: np.ndarray | None = None
-    for idx in (2, 3):
-        if len(hdul) > idx and hdul[idx].data is not None:
-            arr = hdul[idx].data
-            if getattr(arr, "ndim", 0) == 2 and arr.shape == flux_2d.shape:
-                if mask_or is None:
-                    mask_or = np.asarray(arr, dtype=np.int32)
-                else:
-                    mask_and = np.asarray(arr, dtype=np.int32)
+    flux_2d, ivar_2d, mask_and, mask_or = _spplate_flux_and_calib_hdus(hdul)
+    n_fiber, n_pix = flux_2d.shape
 
     pix = np.arange(n_pix, dtype=np.float64)
     loglam = coeff0 + coeff1 * pix
@@ -578,19 +648,17 @@ def _read_sdss_spplate(
         if not np.any(np.isfinite(flux)) or np.all(flux == 0):
             continue
 
-        if sigma_2d is not None:
-            sigma = np.asarray(sigma_2d[row_i], dtype=np.float32)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                ivar = np.where(sigma > 0, 1.0 / (sigma * sigma), 0.0).astype(np.float32)
+        if ivar_2d is not None:
+            ivar = np.asarray(ivar_2d[row_i], dtype=np.float32)
         else:
             ivar = np.ones(n_pix, dtype=np.float32)
 
         mask = np.zeros(n_pix, dtype=np.uint8)
-        if mask_or is not None:
-            m = np.asarray(mask_or[row_i], dtype=np.int32)
-            mask = np.clip(m, 0, 255).astype(np.uint8)
         if mask_and is not None:
             m = np.asarray(mask_and[row_i], dtype=np.int32)
+            mask = np.clip(m, 0, 255).astype(np.uint8)
+        if mask_or is not None:
+            m = np.asarray(mask_or[row_i], dtype=np.int32)
             mask = np.clip(mask | np.clip(m, 0, 255), 0, 255).astype(np.uint8)
 
         meta = {
@@ -813,7 +881,9 @@ def _detect_format_from_path(path: Path) -> str:
             return "desi_coadd"
         phdr = hdul[0].header
         naxis2 = int(phdr.get("NAXIS2", 0) or 0)
-        if naxis2 == 640 and ("PLATEID" in phdr or "PLATE" in phdr) and "MJD" in phdr:
+        if naxis2 in (640, 1000) and ("PLATEID" in phdr or "PLATE" in phdr) and "MJD" in phdr:
+            return "sdss_spplate"
+        if "COEFF0" in phdr and "COEFF1" in phdr and ("PLATEID" in phdr or "PLATE" in phdr):
             return "sdss_spplate"
     return "generic"
 
@@ -863,10 +933,11 @@ def ingest_spectra_from_fits(
     n_pix_expected: int | None = None,
     on_length_mismatch: str = "error",
     with_resolution: bool = False,
-    on_duplicate_source_id: Literal["append", "error", "skip"] = "append",
+    on_duplicate_source_id: Literal["append", "error", "skip"] = "skip",
     specobj_lookup: Path | str | None = None,
     specobj_lookup_survey: str | None = None,
     specobj_lookup_from_catalog: bool = False,
+    specobj_lookup_from_plate: bool = False,
 ) -> dict[int, int]:
     """
     Ingest 1-D spectra from a FITS file into HEALPix-partitioned Zarr v3 stacks.
@@ -915,9 +986,9 @@ def ingest_spectra_from_fits(
         Requires ``wavelength_mode="shared"`` and DESI coadd input.
         Increases storage by ~3× (see README for cost estimates).
     on_duplicate_source_id:
-        ``append`` (default) may duplicate ``source_id`` rows if a file is
-        ingested twice.  ``error`` raises when an ID already exists in the tile.
-        ``skip`` drops only conflicting rows from the incoming batch.
+        ``skip`` (default) drops incoming rows whose ``source_id`` is already in
+        the tile.  ``error`` raises when an ID already exists.  ``append`` always
+        appends (may duplicate rows if a file is ingested twice).
 
     Returns
     -------
@@ -962,14 +1033,24 @@ def ingest_spectra_from_fits(
                     dec_col=dec_col,
                 )
             elif detected_fmt == "sdss_spplate":
-                if specobj_lookup and specobj_lookup_from_catalog:
-                    raise ValueError(
-                        "Pass only one of specobj_lookup= or specobj_lookup_from_catalog=True"
+                n_lookup_modes = sum(
+                    bool(x)
+                    for x in (
+                        specobj_lookup,
+                        specobj_lookup_from_catalog,
+                        specobj_lookup_from_plate,
                     )
-                if not specobj_lookup and not specobj_lookup_from_catalog:
+                )
+                if n_lookup_modes > 1:
                     raise ValueError(
-                        "sdss_spplate ingest requires specobj_lookup= (sidecar Parquet/CSV) "
-                        "or specobj_lookup_from_catalog=True (lake catalogs/<survey>/)."
+                        "Pass only one of specobj_lookup=, specobj_lookup_from_catalog=True, "
+                        "or specobj_lookup_from_plate=True"
+                    )
+                if n_lookup_modes == 0:
+                    raise ValueError(
+                        "sdss_spplate ingest requires specobj_lookup= (sidecar Parquet/CSV), "
+                        "specobj_lookup_from_catalog=True (lake catalogs/<survey>/), or "
+                        "specobj_lookup_from_plate=True (synthesize specObjID from header)."
                     )
                 from data_lake.ingest.sdss_specobj_lookup import (
                     build_fiber_to_specobjid_map,
@@ -984,6 +1065,8 @@ def ingest_spectra_from_fits(
                     lookup_path=specobj_lookup,
                     catalog_root=output_root if specobj_lookup_from_catalog else None,
                     lookup_survey=specobj_lookup_survey,
+                    spplate_hdul=hdul,
+                    lookup_from_plate=specobj_lookup_from_plate,
                 )
                 records, wcs_attrs = _read_sdss_spplate(
                     hdul,
@@ -1221,7 +1304,7 @@ def _write_spectrum_info(
     has_resolution: bool = False,
     resolution_n_diag: int | None = None,
     resolution_offsets: list[int] | None = None,
-    on_duplicate_source_id: str = "append",
+    on_duplicate_source_id: str = "skip",
 ) -> None:
     info = {
         "survey_name": survey_name,
@@ -1316,15 +1399,21 @@ try:
         default=None,
         help="Sidecar survey filter when the lookup file has no SURVEY column.",
     )
+    @click.option(
+        "--specobj-lookup-from-plate/--no-specobj-lookup-from-plate",
+        default=False,
+        show_default=True,
+        help="Synthesize SPECOBJID from spPlate PLATE/MJD/FIBERID/RUN2D (no sidecar).",
+    )
     @click.option("--on-length-mismatch",
                   type=click.Choice(["error", "pad", "truncate"]),
                   default="error", show_default=True)
     @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
-        default="append",
+        default="skip",
         show_default=True,
-        help="If a source_id already exists in a tile Zarr, append (default), raise, or skip.",
+        help="If a source_id already exists in a tile Zarr: skip (default), raise, or append.",
     )
     @click.option("--with-resolution/--no-with-resolution", default=None,
                   help=(
@@ -1354,6 +1443,7 @@ try:
         specobj_lookup: Path | None,
         specobj_lookup_from_catalog: bool,
         specobj_lookup_survey: str | None,
+        specobj_lookup_from_plate: bool,
         on_length_mismatch: str,
         on_duplicate: str,
         with_resolution: bool | None,
@@ -1396,6 +1486,7 @@ try:
             specobj_lookup=specobj_lookup,
             specobj_lookup_from_catalog=specobj_lookup_from_catalog,
             specobj_lookup_survey=specobj_lookup_survey,
+            specobj_lookup_from_plate=specobj_lookup_from_plate,
         )
 
         sid_col = source_id_col or "SPECOBJID"

@@ -29,11 +29,12 @@ def _write_minimal_spplate(
     phdu.header["MJD"] = mjd
     phdu.header["COEFF0"] = coeff0
     phdu.header["COEFF1"] = coeff1
+    ivar = np.where(sigma > 0, 1.0 / (sigma * sigma), 0.0).astype(np.float32)
     hdus = [
         phdu,
-        fits.ImageHDU(sigma),
-        fits.ImageHDU(mask0),
-        fits.ImageHDU(mask0),
+        fits.ImageHDU(ivar, name="IVAR"),
+        fits.ImageHDU(mask0, name="ANDMASK"),
+        fits.ImageHDU(mask0, name="ORMASK"),
     ]
     fiberid = np.arange(1, n_fiber + 1, dtype=np.int32)
     ra = np.linspace(120.0, 121.0, n_fiber)
@@ -44,7 +45,8 @@ def _write_minimal_spplate(
         fits.Column(name="DEC", format="D", array=dec),
         fits.Column(name="OBJID", format="5J", array=np.zeros((n_fiber, 5), dtype=np.int32)),
     ]
-    hdus.append(fits.BinTableHDU.from_columns(cols))
+    hdus.append(fits.BinTableHDU.from_columns(cols, name="PLUGMAP"))
+    phdu.header["RUN2D"] = "v5_13_2"
     fits.HDUList(hdus).writeto(path, overwrite=True)
 
 
@@ -127,6 +129,72 @@ class TestSpplateIngest:
         acc = SpectrumAccessor(lake, "sdss_test")
         assert acc.get_spectrum(111) is not None
         assert acc.get_spectrum(222) is not None
+
+    def test_ingest_from_plate_specobjid(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
+        from data_lake.ingest.sdss_specobj_lookup import sdss_specobjid_from_plate_fiber
+        from data_lake.io.spectra import SpectrumAccessor
+
+        plate, mjd = 1960, 53289
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=2)
+        lake = tmp_path / "lake"
+        index_map = ingest_spectra_from_fits(
+            sp,
+            lake,
+            "sdss_plate_id",
+            fmt="sdss_spplate",
+            specobj_lookup_from_plate=True,
+            norder=5,
+        )
+        assert len(index_map) == 2
+        sid1 = sdss_specobjid_from_plate_fiber(plate, 1, mjd, "v5_13_2")
+        sid2 = sdss_specobjid_from_plate_fiber(plate, 2, mjd, "v5_13_2")
+        assert sid1 in index_map and sid2 in index_map
+        acc = SpectrumAccessor(lake, "sdss_plate_id")
+        sp1 = acc.get_spectrum(sid1)
+        assert sp1.ivar.max() > 0
+
+    @pytest.fixture
+    def boss_spplate_path(self) -> Path:
+        path = Path(__file__).resolve().parents[1] / "data" / "spPlate-3523-55144.fits"
+        if not path.is_file():
+            pytest.skip(f"Example spPlate not found: {path}")
+        return path
+
+    def test_boss_spplate_read_and_ingest(
+        self, tmp_path: Path, boss_spplate_path: Path,
+    ) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import (
+            _read_sdss_spplate,
+            ingest_spectra_from_fits,
+        )
+        from data_lake.ingest.sdss_specobj_lookup import build_fiber_to_specobjid_from_spplate
+        from data_lake.io.spectra import SpectrumAccessor
+
+        with fits.open(boss_spplate_path) as hdul:
+            fiber_map = build_fiber_to_specobjid_from_spplate(hdul, boss_spplate_path)
+            records, wcs = _read_sdss_spplate(
+                hdul, path=boss_spplate_path, fiber_to_specobjid=fiber_map,
+            )
+        assert wcs["n_pix"] == 3854
+        assert len(records) >= 400
+        assert records[0].ivar.max() > 1.0
+
+        lake = tmp_path / "lake"
+        n = ingest_spectra_from_fits(
+            boss_spplate_path,
+            lake,
+            "boss_plate_test",
+            fmt="sdss_spplate",
+            specobj_lookup_from_plate=True,
+            norder=5,
+            on_duplicate_source_id="skip",
+        )
+        assert len(n) == len(records)
+        acc = SpectrumAccessor(lake, "boss_plate_test")
+        any_sid = next(iter(n))
+        assert acc.get_spectrum(any_sid).flux.shape[0] == 3854
 
     def test_requires_lookup(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
