@@ -938,6 +938,7 @@ def ingest_spectra_from_fits(
     specobj_lookup_survey: str | None = None,
     specobj_lookup_from_catalog: bool = False,
     specobj_lookup_from_plate: bool = False,
+    specobj_id_layout: str = "auto",
 ) -> dict[int, int]:
     """
     Ingest 1-D spectra from a FITS file into HEALPix-partitioned Zarr v3 stacks.
@@ -1067,6 +1068,7 @@ def ingest_spectra_from_fits(
                     lookup_survey=specobj_lookup_survey,
                     spplate_hdul=hdul,
                     lookup_from_plate=specobj_lookup_from_plate,
+                    specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
                 )
                 records, wcs_attrs = _read_sdss_spplate(
                     hdul,
@@ -1405,6 +1407,13 @@ try:
         show_default=True,
         help="Synthesize SPECOBJID from spPlate PLATE/MJD/FIBERID/RUN2D (no sidecar).",
     )
+    @click.option(
+        "--specobj-id-layout",
+        type=click.Choice(["auto", "dr7", "dr8plus"], case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="specObjID bit packing for --specobj-lookup-from-plate (DR7 vs DR8+).",
+    )
     @click.option("--on-length-mismatch",
                   type=click.Choice(["error", "pad", "truncate"]),
                   default="error", show_default=True)
@@ -1444,6 +1453,7 @@ try:
         specobj_lookup_from_catalog: bool,
         specobj_lookup_survey: str | None,
         specobj_lookup_from_plate: bool,
+        specobj_id_layout: str,
         on_length_mismatch: str,
         on_duplicate: str,
         with_resolution: bool | None,
@@ -1487,6 +1497,7 @@ try:
             specobj_lookup_from_catalog=specobj_lookup_from_catalog,
             specobj_lookup_survey=specobj_lookup_survey,
             specobj_lookup_from_plate=specobj_lookup_from_plate,
+            specobj_id_layout=specobj_id_layout.lower(),
         )
 
         sid_col = source_id_col or "SPECOBJID"

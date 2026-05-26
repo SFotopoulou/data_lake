@@ -10,7 +10,9 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
+
+SpecObjIdLayout = Literal["auto", "dr7", "dr8plus"]
 
 import numpy as np
 import pyarrow as pa
@@ -329,6 +331,7 @@ def build_fiber_to_specobjid_map(
     lookup_survey: str | None = None,
     spplate_hdul=None,
     lookup_from_plate: bool = False,
+    specobj_id_layout: SpecObjIdLayout = "auto",
 ) -> dict[int, int]:
     """
     Return ``{fiber_id: specobjid}`` for one plate–MJD within a survey.
@@ -339,7 +342,11 @@ def build_fiber_to_specobjid_map(
     if lookup_from_plate:
         if spplate_hdul is None:
             raise ValueError("lookup_from_plate=True requires spplate_hdul=")
-        return build_fiber_to_specobjid_from_spplate(spplate_hdul)
+        return build_fiber_to_specobjid_from_spplate(
+            spplate_hdul,
+            survey_name=survey_name,
+            specobj_id_layout=specobj_id_layout,
+        )
 
     if lookup_path is None and catalog_root is None:
         raise ValueError(
@@ -365,6 +372,80 @@ def build_fiber_to_specobjid_map(
     )
 
 
+def infer_specobjid_layout(
+    phdr,
+    survey_name: str | None = None,
+    *,
+    layout: SpecObjIdLayout = "auto",
+) -> Literal["dr7", "dr8plus"]:
+    """Choose DR7 vs DR8+ specObjID packing for spPlate synthesis.
+
+    DR7 (SkyServer DR7): plate/mjd/fiber in low bits — see
+    https://skyserver.sdss.org/dr7/en/help/docs/algorithm.asp?key=objID
+
+    DR8+ (SDSS-III/IV, BOSS, eBOSS, DR17): plate@50, fiber@38, (mjd-50000)@24,
+    run2d@10 — matches SciServer ``fSDSSfromSpecID``.
+    """
+    if layout in ("dr7", "dr8plus"):
+        return layout
+
+    survey_key = (survey_name or "").lower().replace("-", "").replace("_", "")
+    if "dr7" in survey_key or survey_key.endswith("sdss7"):
+        return "dr7"
+
+    run2d = None
+    for key in ("RUN2D", "VERS2D", "VERSCOMB"):
+        if key in phdr:
+            run2d = phdr[key]
+            break
+
+    if isinstance(run2d, str) and run2d.strip().lower().startswith("v"):
+        return "dr8plus"
+    if run2d is not None:
+        # Integer RUN2D (26, 103, 104, …) still uses the DR8+ 64-bit layout.
+        return "dr8plus"
+
+    mjd = int(phdr["MJD"]) if "MJD" in phdr else 0
+    plate = None
+    for key in ("PLATEID", "PLATE"):
+        if key in phdr:
+            plate = int(phdr[key])
+            break
+    if plate is not None and plate < 4000 and mjd < 53000:
+        log.info(
+            "spPlate specObjID: no RUN2D in header; using DR7 layout "
+            "(plate=%s mjd=%s)",
+            plate,
+            mjd,
+        )
+        return "dr7"
+
+    raise KeyError(
+        "spPlate header missing RUN2D; cannot infer DR8+ specObjID. "
+        "Use --specobj-id-layout dr7 for SDSS-II plates, or pass "
+        "--specobj-lookup / --specobj-lookup-from-catalog."
+    )
+
+
+def sdss_specobjid_dr7_from_plate_fiber(
+    plate: int,
+    fiber: int,
+    mjd: int,
+    *,
+    object_type: int = 0,
+    line: int = 0,
+) -> int:
+    """DR7 CAS specObjID (plate @0, mjd @16, fiber @32, type @42, line @48)."""
+    raw = (
+        (int(plate) & 0xFFFF)
+        | ((int(mjd) & 0xFFFF) << 16)
+        | ((int(fiber) & 0x3FF) << 32)
+        | ((int(object_type) & 0x3F) << 42)
+        | ((int(line) & 0xFFFF) << 48)
+    )
+    return normalize_object_id(raw)
+
+
 def encode_sdss_run2d(run2d: int | str) -> int:
     """Encode SDSS-III/IV ``RUN2D`` (e.g. ``v5_13_2``) into the 14-bit specObjID field."""
     if isinstance(run2d, str):
@@ -376,7 +457,7 @@ def encode_sdss_run2d(run2d: int | str) -> int:
     return int(run2d)
 
 
-def sdss_specobjid_from_plate_fiber(
+def sdss_specobjid_dr8plus_from_plate_fiber(
     plate: int,
     fiber: int,
     mjd: int,
@@ -384,7 +465,7 @@ def sdss_specobjid_from_plate_fiber(
     *,
     line: int = 0,
 ) -> int:
-    """CAS-style 64-bit specObjID from plate, fiber, MJD, and RUN2D (DR8+ layout)."""
+    """DR8+ CAS specObjID from plate, fiber, MJD, and RUN2D (BOSS/DR17 layout)."""
     run2d_val = encode_sdss_run2d(run2d)
     mjd_val = int(mjd) - 50000
     if mjd_val < 0:
@@ -399,29 +480,34 @@ def sdss_specobjid_from_plate_fiber(
     return normalize_object_id(raw)
 
 
+# Backward-compatible alias
+sdss_specobjid_from_plate_fiber = sdss_specobjid_dr8plus_from_plate_fiber
+
+
 def build_fiber_to_specobjid_from_spplate(
     hdul,
     path: Path | None = None,
     *,
     fiber_ids: Iterable[int] | None = None,
+    survey_name: str | None = None,
+    specobj_id_layout: SpecObjIdLayout = "auto",
 ) -> dict[int, int]:
-    """Build ``{FIBERID: specObjID}`` from spPlate header + PLUGMAP (no specObj sidecar).
-
-    Uses ``PLATEID``/``PLATE``, ``MJD``, ``RUN2D`` from the primary header and each
-    1-based ``FIBERID`` from the plugmap BINTABLE.  IDs match SDSS CAS ``specObjID``
-    for ``line=0`` (SpecObj rows).
-    """
+    """Build ``{FIBERID: specObjID}`` from spPlate header + PLUGMAP (no specObj sidecar)."""
     phdr = hdul[0].header
     plate, mjd = spplate_plate_mjd_from_hdul(hdul, path)
+    layout = infer_specobjid_layout(phdr, survey_name, layout=specobj_id_layout)
+    log.info("spPlate specObjID synthesis: layout=%s survey=%r", layout, survey_name)
+
     run2d = None
-    for key in ("RUN2D", "VERS2D", "VERSCOMB"):
-        if key in phdr:
-            run2d = phdr[key]
-            break
-    if run2d is None:
-        raise KeyError(
-            "spPlate header missing RUN2D (needed to synthesize specObjID without a lookup)"
-        )
+    if layout == "dr8plus":
+        for key in ("RUN2D", "VERS2D", "VERSCOMB"):
+            if key in phdr:
+                run2d = phdr[key]
+                break
+        if run2d is None:
+            raise KeyError(
+                "spPlate header missing RUN2D (required for DR8+ specObjID synthesis)"
+            )
 
     if fiber_ids is None:
         from data_lake.ingest.fits_to_spectra_zarr import _spplate_fiber_table_hdu
@@ -436,7 +522,10 @@ def build_fiber_to_specobjid_from_spplate(
         fid = int(fiber)
         if fid in out:
             continue
-        out[fid] = sdss_specobjid_from_plate_fiber(plate, fid, mjd, run2d)
+        if layout == "dr7":
+            out[fid] = sdss_specobjid_dr7_from_plate_fiber(plate, fid, mjd)
+        else:
+            out[fid] = sdss_specobjid_dr8plus_from_plate_fiber(plate, fid, mjd, run2d)
     return out
 
 

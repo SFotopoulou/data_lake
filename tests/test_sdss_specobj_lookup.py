@@ -11,6 +11,8 @@ import pytest
 from data_lake.ingest.fits_to_parquet import normalize_object_id
 from data_lake.ingest.sdss_specobj_lookup import (
     build_fiber_to_specobjid_map,
+    sdss_specobjid_dr7_from_plate_fiber,
+    sdss_specobjid_dr8plus_from_plate_fiber,
     sdss_specobjid_from_plate_fiber,
 )
 
@@ -23,6 +25,18 @@ class TestSpecobjIdEncoding:
     def test_dr8_reference_value(self) -> None:
         sid = sdss_specobjid_from_plate_fiber(4055, 408, 55359, "v5_7_0")
         assert sid == normalize_object_id(4565636362342690816)
+
+    def test_dr7_and_dr8plus_differ(self) -> None:
+        dr7 = sdss_specobjid_dr7_from_plate_fiber(287, 320, 52251)
+        dr8 = sdss_specobjid_dr8plus_from_plate_fiber(287, 320, 52251, 26)
+        assert dr7 != dr8
+
+    def test_dr7_roundtrip_bits(self) -> None:
+        plate, fiber, mjd = 287, 320, 52251
+        raw = int(sdss_specobjid_dr7_from_plate_fiber(plate, fiber, mjd))
+        assert (raw & 0xFFFF) == plate
+        assert ((raw >> 16) & 0xFFFF) == mjd
+        assert ((raw >> 32) & 0x3FF) == fiber
 
 
 class TestSpecobjLookupSurveyScope:

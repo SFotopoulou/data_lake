@@ -492,17 +492,22 @@ SPECOBJID** column in the FITS file.  Ingest maps each **FIBERID** to
 ``source_id`` via one of:
 
 1. **Sidecar / catalog** — join on ``(survey, PLATE, MJD, FIBERID)``
-2. **Plate header** — synthesize CAS ``specObjID`` from ``PLATE``, ``MJD``,
-   ``FIBERID``, and ``RUN2D`` (``--specobj-lookup-from-plate``)
+2. **Plate header** — synthesize CAS ``specObjID`` from plate/mjd/fiber
+   (``--specobj-lookup-from-plate``).  **DR7 and DR8+ use different 64-bit layouts**
+   (see below); use ``--specobj-id-layout auto|dr7|dr8plus``.
 
 HDU layout (BOSS example ``spPlate-3523-55144.fits``): primary flux
 ``(n_fiber, n_pix)``; ``IVAR`` (inverse variance, not sigma); ``ANDMASK`` /
 ``ORMASK``; ``PLUGMAP`` BINTABLE with ``FIBERID``, ``RA``, ``DEC``.
 
 ```bash
-# Quick ingest without a specObj sidecar (IDs from PLATE/MJD/FIBERID/RUN2D)
+# Quick ingest without a specObj sidecar (DR8+/BOSS: needs RUN2D v5_* in header)
 dl-ingest-spectra data/spPlate-3523-55144.fits --survey boss_dr12 \
-  --format sdss_spplate --specobj-lookup-from-plate
+  --format sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr8plus
+
+# SDSS-II / DR7 plates (low bits; no RUN2D) — force DR7 packing:
+dl-ingest-spectra spPlate-287-52251.fits --survey sdss_dr7 \
+  --format sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr7
 
 # Sidecar Parquet/CSV: columns survey, PLATE, MJD, FIBERID, SPECOBJID
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \

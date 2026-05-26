@@ -471,6 +471,13 @@ try:
         help="Synthesize SPECOBJID from spPlate header (no sidecar).",
     )
     @click.option(
+        "--specobj-id-layout",
+        type=click.Choice(["auto", "dr7", "dr8plus"], case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="specObjID packing for --specobj-lookup-from-plate (DR7 vs DR8+).",
+    )
+    @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
         default="skip",
@@ -515,6 +522,7 @@ try:
         specobj_lookup_from_catalog: bool,
         specobj_lookup_survey: str | None,
         specobj_lookup_from_plate: bool,
+        specobj_id_layout: str,
         on_duplicate: str,
         wavelength_mode: str | None,
         on_length_mismatch: str,
@@ -559,6 +567,7 @@ try:
                 specobj_lookup_from_catalog=specobj_lookup_from_catalog,
                 specobj_lookup_survey=specobj_lookup_survey,
                 specobj_lookup_from_plate=specobj_lookup_from_plate,
+                specobj_id_layout=specobj_id_layout.lower(),
             )
             total_index_map.update(m)
 
