@@ -491,7 +491,9 @@ BOSS: 1000 plugmap rows, typically ~500 with non-zero flux).  There is **no
 SPECOBJID** column in the FITS file.  Ingest maps each **FIBERID** to
 ``source_id`` via one of:
 
-1. **Sidecar / catalog** — join on ``(survey, PLATE, MJD, FIBERID)``
+1. **Sidecar / catalog** — join on ``(survey,) PLATE, MJD, FIBERID``; ID from
+   ``source_id``, ``specobjid``, ``TARGETID``, or ``--source-id-col`` (not
+   photometric ``objid`` unless you set that column explicitly)
 2. **Plate header** — synthesize CAS ``specObjID`` from plate/mjd/fiber
    (``--specobj-lookup-from-plate``).  **DR7 and DR8+ use different 64-bit layouts**
    (see below); use ``--specobj-id-layout auto|dr7|dr8plus``.
@@ -510,7 +512,7 @@ dl-ingest-spectra data/spPlate-3523-55144.fits --survey boss_dr12 \
 dl-ingest-spectra spPlate-287-52251.fits --survey sdss_dr7 \
   --format sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr7
 
-# Sidecar Parquet/CSV: columns survey, PLATE, MJD, FIBERID, SPECOBJID
+# Sidecar Parquet/CSV: survey, PLATE, MJD, FIBERID, plus an ID column
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
   --format sdss_spplate \
   --specobj-lookup /path/to/specobj_lookup.parquet
@@ -520,10 +522,13 @@ dl-ingest-spectra spPlate-5695-56191.fits --survey boss_dr12 \
   --format sdss_spplate \
   --specobj-lookup /path/to/boss_specobj_lookup.parquet
 
-# Or resolve IDs from an ingested **specObj** lake catalog (catalogs/<survey>/)
-# Required columns: plate (or PLATEID), mjd, fiber/FIBERID, SPECOBJID (not photo objid)
+# Lake catalog: join on plate/mjd/fiber; ID from catalog source_id or specobjid
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
   --format sdss_spplate --specobj-lookup-from-catalog
+
+# If the catalog used a non-default ID column at ingest time:
+dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
+  --format sdss_spplate --specobj-lookup-from-catalog --source-id-col TARGETID
 ```
 
 If catalog lookup finds **0 fibers**, run the debug helper before re-ingesting:
@@ -540,12 +545,13 @@ dl-debug-specobj-lookup spPlate-1960-53289.fits --survey sdss_dr17 /path/to/lake
   --specobj-lookup /path/to/lookup.parquet
 ```
 
-The tool reports plugmap fiber count, resolved catalog columns, row counts for
+The tool reports **PLUGMAP column names** (flags ``OBJID`` as imaging ID, not
+``specObjID``), plugmap fiber count, resolved catalog columns, row counts for
 plate/mjd, sample ``fiber → specobjid`` pairs, and overlap with the plate file.
 Exit code **1** when every mode maps zero fibers (same failure as ingest).
 
-Photo-only catalogs (without plate/mjd/fiber/specobjid) cannot drive spPlate
-ingest; use ``--specobj-lookup-from-plate`` or ingest the specObj table first.
+Catalogs without plate/mjd/fiber cannot drive spPlate ingest; photo-only tables
+need ``--specobj-lookup-from-plate`` or a specObj export with spectroscopic keys.
 
 ```bash
 dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \

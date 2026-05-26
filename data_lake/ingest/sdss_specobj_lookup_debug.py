@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -64,6 +65,7 @@ class SpecObjLookupDebugReport:
     inferred_layout: str | None = None
     layout_error: str | None = None
     plugmap_fibers: list[int] = field(default_factory=list)
+    plugmap_audit: dict[str, Any] = field(default_factory=dict)
     modes: list[LookupModeResult] = field(default_factory=list)
 
     def mode(self, name: str) -> LookupModeResult | None:
@@ -82,6 +84,7 @@ class SpecObjLookupDebugReport:
             "inferred_layout": self.inferred_layout,
             "layout_error": self.layout_error,
             "plugmap_fiber_count": len(self.plugmap_fibers),
+            "plugmap_audit": self.plugmap_audit,
             "modes": [
                 {
                     "name": m.name,
@@ -92,6 +95,96 @@ class SpecObjLookupDebugReport:
                 for m in self.modes
             ],
         }
+
+
+_SPECOBJID_COLUMN_RE = re.compile(r"spec.*obj.*id|specobjid", re.I)
+_OBJID_COLUMN_RE = re.compile(r"^obj.?id$|^objid$", re.I)
+_PHOTO_ID_PARTS = frozenset({"RUN", "RERUN", "CAMCOL", "FIELD", "ID"})
+
+
+def inspect_spplate_plugmap(hdul) -> dict[str, Any]:
+    """Summarize PLUGMAP (HDU 5) columns and flag ID-like names.
+
+    Official spPlate model:
+    https://data.sdss.org/datamodel/files/BOSS_SPECTRO_REDUX/RUN2D/PLATE4/spPlate.html
+  """
+    from data_lake.ingest.fits_to_spectra_zarr import _spplate_fiber_table_hdu
+
+    audit: dict[str, Any] = {
+        "hdu_name": None,
+        "n_rows": 0,
+        "columns": [],
+        "specobjid_like": [],
+        "objid_like": [],
+        "photo_id_parts_present": [],
+        "notes": [],
+    }
+    ftable = _spplate_fiber_table_hdu(hdul)
+    if ftable is None:
+        audit["notes"].append("No BINTABLE with FIBERID found (expected PLUGMAP).")
+        return audit
+
+    audit["hdu_name"] = (ftable.name or "").strip() or None
+    names = list(ftable.data.dtype.names or ())
+    audit["n_rows"] = len(ftable.data)
+    row_i = min(500, max(0, len(ftable.data) - 1))
+
+    for name in names:
+        col = ftable.data[name]
+        sample = col[row_i]
+        if hasattr(sample, "tolist"):
+            sample_repr = sample.tolist()
+        else:
+            sample_repr = sample
+        entry: dict[str, Any] = {
+            "name": name,
+            "dtype": str(col.dtype),
+            "sample": sample_repr,
+        }
+        upper = name.upper()
+        if _SPECOBJID_COLUMN_RE.search(name):
+            audit["specobjid_like"].append(name)
+            entry["role"] = "possible_specobjid"
+        elif _OBJID_COLUMN_RE.search(name) or upper == "OBJID":
+            audit["objid_like"].append(name)
+            entry["role"] = "photometric_objid_not_specobjid"
+        elif upper == "FIBERID":
+            entry["role"] = "fiber_join_key"
+        elif upper in _PHOTO_ID_PARTS:
+            audit["photo_id_parts_present"].append(name)
+            entry["role"] = "photo_objid_component"
+        audit["columns"].append(entry)
+
+    if audit["specobjid_like"]:
+        audit["notes"].append(
+            "Column(s) matching specObjID name pattern found — verify against CAS "
+            "before using as --source-id-col."
+        )
+    else:
+        audit["notes"].append(
+            "No SPECOBJID column in PLUGMAP (expected for spPlate). "
+            "Use header PLATE/MJD + FIBERID + RUN2D synthesis or a SpecObj catalog."
+        )
+
+    if audit["objid_like"]:
+        audit["notes"].append(
+            "OBJID is the 5-part imaging ID (run/rerun/camcol/field/id), not specObjID."
+        )
+
+    parts = {n.upper() for n in audit["photo_id_parts_present"]}
+    if parts >= {"RUN", "CAMCOL", "FIELD", "ID"} and "OBJID" in {c.upper() for c in audit["objid_like"]}:
+        try:
+            objid = ftable.data["OBJID"][row_i]
+            run = int(ftable.data["RUN"][row_i]) if "RUN" in names else None
+            field = int(ftable.data["FIELD"][row_i]) if "FIELD" in names else None
+            if run is not None and int(objid[0]) == run:
+                audit["notes"].append(
+                    "OBJID[0] matches RUN — confirms imaging objID, not spectroscopic specObjID."
+                )
+        except Exception:
+            pass
+
+    return audit
 
 
 def _plugmap_fiber_ids(hdul) -> list[int]:
@@ -136,6 +229,7 @@ def debug_specobj_lookup(
     try_from_catalog: bool = True,
     try_from_sidecar: bool = True,
     specobj_id_layout: SpecObjIdLayout = "auto",
+    catalog_id_col: str | None = None,
 ) -> SpecObjLookupDebugReport:
     """Build a diagnostic report for one spPlate file."""
     path = Path(spplate_path)
@@ -144,6 +238,7 @@ def debug_specobj_lookup(
         phdr = hdul[0].header
         header = {k: phdr[k] for k in _HEADER_KEYS if k in phdr}
         plugmap = _plugmap_fiber_ids(hdul)
+        plugmap_audit = inspect_spplate_plugmap(hdul)
 
         report = SpecObjLookupDebugReport(
             spplate_path=path,
@@ -152,6 +247,7 @@ def debug_specobj_lookup(
             mjd=mjd,
             header=header,
             plugmap_fibers=plugmap,
+            plugmap_audit=plugmap_audit,
         )
 
         try:
@@ -186,6 +282,7 @@ def debug_specobj_lookup(
                     mjd,
                     lookup_path=lookup_path,
                     lookup_survey=lookup_survey,
+                    catalog_id_col=catalog_id_col,
                 )
             except Exception as exc:
                 mode.error = str(exc)
@@ -196,7 +293,11 @@ def debug_specobj_lookup(
         if try_from_catalog and catalog_root is not None:
             mode = LookupModeResult(name="catalog")
             probe = probe_catalog_specobj_lookup(
-                survey_name, plate, mjd, catalog_root=catalog_root,
+                survey_name,
+                plate,
+                mjd,
+                catalog_root=catalog_root,
+                catalog_id_col=catalog_id_col,
             )
             mode.fiber_map = dict(probe.fiber_map)
             mode.extra = probe.to_dict()
@@ -221,8 +322,32 @@ def format_debug_report(
     lines.append(f"plugmap: {len(report.plugmap_fibers)} distinct FIBERID(s)")
     if report.plugmap_fibers:
         preview = report.plugmap_fibers[:8]
-        extra = f" … +{len(report.plugmap_fibers) - 8}" if len(report.plugmap_fibers) > 8 else ""
+        extra = (
+            f" … +{len(report.plugmap_fibers) - 8}"
+            if len(report.plugmap_fibers) > 8
+            else ""
+        )
         lines.append(f"  sample FIBERIDs: {preview}{extra}")
+
+    audit = report.plugmap_audit
+    if audit:
+        lines.append("")
+        lines.append("=== PLUGMAP columns (HDU 5) ===")
+        hdu_name = audit.get("hdu_name") or "PLUGMAP"
+        lines.append(f"  table: {hdu_name!r}  rows: {audit.get('n_rows', 0)}")
+        for note in audit.get("notes") or []:
+            lines.append(f"  • {note}")
+        flagged = (audit.get("specobjid_like") or []) + (audit.get("objid_like") or [])
+        if flagged:
+            lines.append(f"  flagged ID-like columns: {', '.join(flagged)}")
+        for col in audit.get("columns") or []:
+            role = col.get("role")
+            role_s = f" [{role}]" if role else ""
+            col_sample = col.get("sample")
+            sample_s = repr(col_sample)
+            if len(sample_s) > 72:
+                sample_s = sample_s[:69] + "…"
+            lines.append(f"  {col['name']:22} {col['dtype']:12}{role_s}  sample={sample_s}")
 
     if report.header:
         lines.append("header:")
@@ -267,10 +392,11 @@ def format_debug_report(
             lines.append(f"  catalog_dir: {mode.extra.get('catalog_dir')}")
             lines.append(f"  tiles: {mode.extra.get('tile_count', 0)}")
             lines.append(
-                "  columns: "
+                "  join: "
                 f"plate={cols.get('plate')!r} mjd={cols.get('mjd')!r} "
-                f"fiber={cols.get('fiber')!r} specobjid={cols.get('specobjid')!r}"
+                f"fiber={cols.get('fiber')!r}"
             )
+            lines.append(f"  id column: {cols.get('source_id')!r}")
             lines.append(f"  rows with plate: {mode.extra.get('n_plate_rows', 0)}")
             lines.append(f"  rows with plate+mjd: {mode.extra.get('n_plate_mjd_rows', 0)}")
             mjds = mode.extra.get("mjds_for_plate") or []
@@ -306,7 +432,7 @@ def format_debug_report(
     elif all(m.size == 0 for m in report.modes):
         lines.append(
             "RESULT: no fibers resolved — ingest would skip all spectra. "
-            "Use a specObj catalog with specobjid+plate+mjd+fiber, "
+            "Use a catalog with plate+mjd+fiber (+ source_id or specobjid), "
             "--specobj-lookup-from-plate, or a sidecar lookup file."
         )
     else:
@@ -349,6 +475,11 @@ def format_debug_report(
     show_default=True,
     help="specObjID packing for plate synthesis.",
 )
+@click.option(
+    "--source-id-col",
+    default=None,
+    help="Catalog/sidecar ID column after plate/mjd/fiber join (same as dl-ingest-spectra).",
+)
 @click.option("--sample", default=5, show_default=True, help="Sample mappings per mode.")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
 @click.option("-v", "--verbose", is_flag=True)
@@ -362,6 +493,7 @@ def cli(
     no_catalog: bool,
     no_plate: bool,
     specobj_id_layout: str,
+    source_id_col: str | None,
     sample: int,
     as_json: bool,
     verbose: bool,
@@ -390,6 +522,7 @@ def cli(
         try_from_catalog=catalog_root is not None,
         try_from_sidecar=specobj_lookup is not None,
         specobj_id_layout=specobj_id_layout.lower(),  # type: ignore[arg-type]
+        catalog_id_col=source_id_col,
     )
 
     if as_json:

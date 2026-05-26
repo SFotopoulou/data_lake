@@ -1,8 +1,9 @@
 """
-sdss_specobj_lookup – resolve (survey, plate, mjd, fiber) → SPECOBJID for spPlate ingest.
+sdss_specobj_lookup – resolve (survey, plate, mjd, fiber) → source_id for spPlate ingest.
 
-spPlate FITS files do not carry SPECOBJID; ingest joins against a sidecar Parquet/CSV
-or scans an ingested lake catalog under ``catalogs/<survey>/``.
+spPlate FITS files do not carry a spectroscopic ID; ingest joins on **PLATE, MJD,
+FIBERID** against a sidecar Parquet/CSV or lake catalog, then reads the catalog's
+ID column (``source_id``, ``specobjid``, ``TARGETID``, or ``--source-id-col``).
 """
 
 from __future__ import annotations
@@ -35,8 +36,19 @@ _FIBER_COL_ALIASES = (
     "fiber",
     "FIBER",
 )
-# Do not alias ``objid`` / ``OBJID`` here — that is the photometric ID, not specObjID.
 _SPECOBJID_COL_ALIASES = ("SPECOBJID", "specobjid", "SPEC_OBJID", "spec_objid")
+# Join keys for catalog/sidecar (``objid`` is never a join key).
+_PLATE_MJD_FIBER_REQUIRED = ("PLATE", "MJD", "FIBERID")
+# ID columns after join (no photometric ``objid`` unless passed via ``catalog_id_col``).
+_CATALOG_ID_COL_ALIASES = (
+    "source_id",
+    "SOURCE_ID",
+    "SPECOBJID",
+    "specobjid",
+    "SPEC_OBJID",
+    "TARGETID",
+    "targetid",
+)
 
 
 def _resolve_column(names: Iterable[str], aliases: tuple[str, ...]) -> str | None:
@@ -101,21 +113,20 @@ def _filter_sidecar_table(
     plate_col = _resolve_column(names, _PLATE_COL_ALIASES)
     mjd_col = _resolve_column(names, _MJD_COL_ALIASES)
     fiber_col = _resolve_column(names, _FIBER_COL_ALIASES)
-    sid_col = _resolve_column(names, _SPECOBJID_COL_ALIASES)
     missing = [
         name
         for name, col in (
             ("PLATE", plate_col),
             ("MJD", mjd_col),
             ("FIBERID", fiber_col),
-            ("SPECOBJID", sid_col),
         )
         if col is None
     ]
     if missing:
         raise ValueError(
-            f"specObj lookup missing required column(s) {missing}; "
-            f"available: {names[:30]}{'…' if len(names) > 30 else ''}"
+            f"spPlate lookup missing join column(s) {missing} "
+            f"(need plate/mjd/fiber); available: {names[:30]}"
+            f"{'…' if len(names) > 30 else ''}"
         )
 
     plate_mask = pc.equal(table.column(plate_col).cast(pa.int64()), pa.scalar(int(plate), pa.int64()))
@@ -131,6 +142,48 @@ def _column_as_int64_numpy(column: pa.ChunkedArray) -> np.ndarray:
     )
 
 
+def _resolve_spplate_catalog_id_column(
+    names: Iterable[str],
+    catalog_dir: Path | None,
+    override: str | None,
+) -> str:
+    """Pick the catalog/sidecar column that supplies ``source_id`` after plate/mjd/fiber join."""
+    if override:
+        col = _resolve_column(names, (override,))
+        if col is None:
+            raise ValueError(
+                f"Requested --source-id-col {override!r} not in table; "
+                f"columns: {list(names)[:30]}"
+            )
+        return col
+
+    col = _resolve_column(names, _CATALOG_ID_COL_ALIASES)
+    if col is not None:
+        return col
+
+    if catalog_dir is not None:
+        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+
+        names_no_photo = [
+            n
+            for n in names
+            if n.lower() not in ("objid", "obj_id", "bestobjid", "thing_id", "thingid")
+        ]
+        if names_no_photo:
+            try:
+                return resolve_source_id_column(
+                    catalog_dir, schema_names=names_no_photo,
+                )
+            except KeyError:
+                pass
+
+    raise ValueError(
+        "spPlate catalog join needs an ID column (e.g. source_id, specobjid, TARGETID) "
+        f"after matching on {_PLATE_MJD_FIBER_REQUIRED}; "
+        f"pass --source-id-col. Columns: {list(names)[:30]}"
+    )
+
+
 def _warn_catalog_lookup_miss(
     catalog_dir: Path,
     survey_name: str,
@@ -140,7 +193,7 @@ def _warn_catalog_lookup_miss(
     plate_col: str,
     mjd_col: str,
     fiber_col: str,
-    sid_col: str,
+    id_col: str,
     mjds_for_plate: list[int] | None,
     n_plate_rows: int,
 ) -> None:
@@ -183,26 +236,25 @@ def _warn_catalog_lookup_miss(
         plate_col,
         mjd_col,
         fiber_col,
-        sid_col,
+        id_col,
     )
 
 
-def _table_to_fiber_map(table: pa.Table) -> dict[int, int]:
+def _table_to_fiber_map(table: pa.Table, id_col: str) -> dict[int, int]:
     names = table.schema.names
     fiber_col = _resolve_column(names, _FIBER_COL_ALIASES)
-    sid_col = _resolve_column(names, _SPECOBJID_COL_ALIASES)
-    assert fiber_col is not None and sid_col is not None
+    assert fiber_col is not None
 
     fibers = table.column(fiber_col).to_pylist()
-    specobjids = table.column(sid_col).to_pylist()
+    ids = table.column(id_col).to_pylist()
     out: dict[int, int] = {}
-    for fiber, sid in zip(fibers, specobjids):
+    for fiber, sid in zip(fibers, ids):
         if fiber is None or sid is None:
             continue
         fid = int(fiber)
         if fid in out:
             log.warning(
-                "Duplicate FIBERID %d in lookup (keeping first SPECOBJID)", fid,
+                "Duplicate FIBERID %d in lookup (keeping first %s)", fid, id_col,
             )
             continue
         out[fid] = normalize_object_id(sid)
@@ -216,6 +268,7 @@ def _build_from_sidecar(
     *,
     lookup_path: Path | str,
     lookup_survey: str | None,
+    catalog_id_col: str | None = None,
 ) -> dict[int, int]:
     table = load_lookup_table(lookup_path)
     filtered = _filter_sidecar_table(
@@ -225,7 +278,10 @@ def _build_from_sidecar(
         mjd=mjd,
         lookup_survey=lookup_survey,
     )
-    return _table_to_fiber_map(filtered)
+    id_col = _resolve_spplate_catalog_id_column(
+        filtered.schema.names, catalog_dir=None, override=catalog_id_col,
+    )
+    return _table_to_fiber_map(filtered, id_col)
 
 
 @dataclass
@@ -238,7 +294,7 @@ class CatalogLookupProbe:
     plate_col: str | None = None
     mjd_col: str | None = None
     fiber_col: str | None = None
-    sid_col: str | None = None
+    id_col: str | None = None
     n_plate_rows: int = 0
     n_plate_mjd_rows: int = 0
     mjds_for_plate: list[int] = field(default_factory=list)
@@ -258,7 +314,7 @@ class CatalogLookupProbe:
                 "plate": self.plate_col,
                 "mjd": self.mjd_col,
                 "fiber": self.fiber_col,
-                "specobjid": self.sid_col,
+                "source_id": self.id_col,
             },
             "n_plate_rows": self.n_plate_rows,
             "n_plate_mjd_rows": self.n_plate_mjd_rows,
@@ -274,6 +330,7 @@ def probe_catalog_specobj_lookup(
     mjd: int,
     *,
     catalog_root: Path | str,
+    catalog_id_col: str | None = None,
 ) -> CatalogLookupProbe:
     """Scan lake catalog tiles and return join stats (same logic as ingest)."""
     root = Path(catalog_root) / "catalogs" / survey_name
@@ -291,7 +348,7 @@ def probe_catalog_specobj_lookup(
     plate_col: str | None = None
     mjd_col: str | None = None
     fiber_col: str | None = None
-    sid_col: str | None = None
+    id_col: str | None = None
     mjds_for_plate: set[int] = set()
 
     try:
@@ -304,20 +361,33 @@ def probe_catalog_specobj_lookup(
                 plate_col = _resolve_column(names, _PLATE_COL_ALIASES)
                 mjd_col = _resolve_column(names, _MJD_COL_ALIASES)
                 fiber_col = _resolve_column(names, _FIBER_COL_ALIASES)
-                sid_col = _resolve_column(names, _SPECOBJID_COL_ALIASES)
                 probe.plate_col = plate_col
                 probe.mjd_col = mjd_col
                 probe.fiber_col = fiber_col
-                probe.sid_col = sid_col
-                if not all((plate_col, mjd_col, fiber_col, sid_col)):
+                if not all((plate_col, mjd_col, fiber_col)):
                     probe.error = (
-                        "Missing plate/mjd/fiber/SPECOBJID columns "
-                        "(photometric objid is not valid); "
+                        "Missing plate/mjd/fiber join columns; "
                         f"sample schema: {names[:30]}"
                     )
                     return probe
+                try:
+                    id_col = _resolve_spplate_catalog_id_column(
+                        names, probe.catalog_dir, catalog_id_col,
+                    )
+                except ValueError as exc:
+                    probe.error = str(exc)
+                    return probe
+                probe.id_col = id_col
+                log.info(
+                    "spPlate catalog lookup: survey=%s join on %r,%r,%r id from %r",
+                    survey_name,
+                    plate_col,
+                    mjd_col,
+                    fiber_col,
+                    id_col,
+                )
 
-            cols = [plate_col, mjd_col, fiber_col, sid_col]  # type: ignore[list-item]
+            cols = [plate_col, mjd_col, fiber_col, id_col]  # type: ignore[list-item]
             chunk = pq.read_table(str(tile_path), columns=cols)
             plates = _column_as_int64_numpy(chunk.column(plate_col))
             mjds = _column_as_int64_numpy(chunk.column(mjd_col))
@@ -331,7 +401,7 @@ def probe_catalog_specobj_lookup(
                 continue
             probe.n_plate_mjd_rows += int(np.count_nonzero(sel))
             sub = chunk.filter(pa.array(sel))
-            partial = _table_to_fiber_map(sub)
+            partial = _table_to_fiber_map(sub, id_col)  # type: ignore[arg-type]
             for fid, sid in partial.items():
                 if fid in probe.fiber_map:
                     log.warning(
@@ -345,7 +415,7 @@ def probe_catalog_specobj_lookup(
 
     probe.mjds_for_plate = sorted(mjds_for_plate)
     if not probe.fiber_map and probe.error is None:
-        assert plate_col and mjd_col and fiber_col and sid_col
+        assert plate_col and mjd_col and fiber_col and id_col
         _warn_catalog_lookup_miss(
             root,
             survey_name,
@@ -354,7 +424,7 @@ def probe_catalog_specobj_lookup(
             plate_col=plate_col,
             mjd_col=mjd_col,
             fiber_col=fiber_col,
-            sid_col=sid_col,
+            id_col=id_col,
             mjds_for_plate=probe.mjds_for_plate,
             n_plate_rows=probe.n_plate_rows,
         )
@@ -367,9 +437,14 @@ def _build_from_catalog(
     mjd: int,
     *,
     catalog_root: Path | str,
+    catalog_id_col: str | None = None,
 ) -> dict[int, int]:
     probe = probe_catalog_specobj_lookup(
-        survey_name, int(plate), int(mjd), catalog_root=catalog_root,
+        survey_name,
+        int(plate),
+        int(mjd),
+        catalog_root=catalog_root,
+        catalog_id_col=catalog_id_col,
     )
     if probe.error and not probe.fiber_map:
         if probe.tile_count == 0 or not probe.catalog_dir.is_dir():
@@ -396,12 +471,14 @@ def build_fiber_to_specobjid_map(
     spplate_hdul=None,
     lookup_from_plate: bool = False,
     specobj_id_layout: SpecObjIdLayout = "auto",
+    catalog_id_col: str | None = None,
 ) -> dict[int, int]:
     """
-    Return ``{fiber_id: specobjid}`` for one plate–MJD within a survey.
+    Return ``{fiber_id: source_id}`` for one plate–MJD within a survey.
 
-    Provide exactly one of ``lookup_path`` (sidecar) or ``catalog_root`` (lake root).
-    ``survey_name`` is always required and scopes sidecar rows and catalog directory.
+    Catalog/sidecar rows are matched on **PLATE, MJD, FIBERID** only.  The ID value
+  comes from ``catalog_id_col`` (e.g. CLI ``--source-id-col``) or the first of
+    ``source_id``, ``specobjid``, ``TARGETID`` in the table.
     """
     if lookup_from_plate:
         if spplate_hdul is None:
@@ -427,12 +504,14 @@ def build_fiber_to_specobjid_map(
             int(mjd),
             lookup_path=lookup_path,
             lookup_survey=lookup_survey,
+            catalog_id_col=catalog_id_col,
         )
     return _build_from_catalog(
         survey_name,
         int(plate),
         int(mjd),
         catalog_root=catalog_root,  # type: ignore[arg-type]
+        catalog_id_col=catalog_id_col,
     )
 
 

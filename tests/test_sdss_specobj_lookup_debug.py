@@ -15,7 +15,9 @@ from data_lake.ingest.sdss_specobj_lookup_debug import (
     cli,
     debug_specobj_lookup,
     format_debug_report,
+    inspect_spplate_plugmap,
 )
+from astropy.io import fits
 
 _BOSS_SPPLATE = Path(__file__).resolve().parents[1] / "data" / "spPlate-3523-55144.fits"
 
@@ -114,3 +116,17 @@ class TestDebugCli:
         text = format_debug_report(report, sample=2)
         assert "plate:" in text
         assert "from_plate" in text
+        assert "PLUGMAP columns" in text
+        assert "OBJID" in text
+        assert "photometric_objid_not_specobjid" in text
+
+    def test_inspect_plugmap_flags_objid_not_specobjid(self, boss_spplate_path: Path) -> None:
+        if not boss_spplate_path.is_file():
+            pytest.skip("BOSS spPlate fixture not present")
+        with fits.open(boss_spplate_path, memmap=True) as hdul:
+            audit = inspect_spplate_plugmap(hdul)
+        assert audit["hdu_name"] == "PLUGMAP"
+        assert "FIBERID" in {c["name"] for c in audit["columns"]}
+        assert "OBJID" in audit["objid_like"]
+        assert not audit["specobjid_like"]
+        assert any("not specObjID" in n or "No SPECOBJID" in n for n in audit["notes"])

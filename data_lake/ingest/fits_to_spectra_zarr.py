@@ -975,8 +975,9 @@ def ingest_spectra_from_fits(
         When the sidecar has no survey column, use this string to scope rows
         (defaults to ``survey_name``).
     specobj_lookup_from_catalog:
-        If True, build fiber→SPECOBJID from ``catalogs/<survey_name>/`` under
-        ``output_root`` instead of a sidecar file.
+        If True, join ``catalogs/<survey_name>/`` on plate/mjd/fiber and take
+        IDs from ``source_id_col`` or the catalog's ID column (not required to
+        be named ``specobjid``).
     n_pix_expected:
         If set, enforce that all spectra have this pixel count.
     on_length_mismatch:
@@ -1069,6 +1070,7 @@ def ingest_spectra_from_fits(
                     spplate_hdul=hdul,
                     lookup_from_plate=specobj_lookup_from_plate,
                     specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
+                    catalog_id_col=source_id_col,
                 )
                 records, wcs_attrs = _read_sdss_spplate(
                     hdul,

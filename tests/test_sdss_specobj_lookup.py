@@ -170,11 +170,32 @@ class TestSpecobjLookupSurveyScope:
 
 
 class TestCatalogLookup:
-    def test_catalog_requires_specobjid_not_objid(self, tmp_path: Path) -> None:
-        """Photometric ``objid`` must not be used as the spPlate join key."""
+    def test_catalog_join_plate_mjd_fiber_without_specobjid(self, tmp_path: Path) -> None:
+        """Join on plate/mjd/fiber; ID from ``source_id`` (no specobjid column)."""
         lake = tmp_path / "lake"
-        cat_dir = lake / "catalogs" / "sdss_spec"
-        tile_dir = cat_dir / "Norder=5" / "Dir=0"
+        tile_dir = lake / "catalogs" / "sdss_spec" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "plate": pa.array([3523], type=pa.int32()),
+                "mjd": pa.array([55144], type=pa.int64()),
+                "fiber": pa.array([501], type=pa.int16()),
+                "source_id": pa.array([4242], type=pa.int64()),
+                "objid": pa.array([9001], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        m = build_fiber_to_specobjid_map(
+            "sdss_spec",
+            3523,
+            55144,
+            catalog_root=lake,
+        )
+        assert m == {501: normalize_object_id(4242)}
+
+    def test_catalog_photo_objid_only_requires_explicit_col(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "photo" / "Norder=5" / "Dir=0"
         tile_dir.mkdir(parents=True)
         pq.write_table(
             pa.table({
@@ -185,9 +206,9 @@ class TestCatalogLookup:
             }),
             tile_dir / "Npix=1.parquet",
         )
-        with pytest.raises(ValueError, match="SPECOBJID"):
+        with pytest.raises((ValueError, KeyError)):
             build_fiber_to_specobjid_map(
-                "sdss_spec",
+                "photo",
                 3523,
                 55144,
                 catalog_root=lake,
