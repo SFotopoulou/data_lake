@@ -511,11 +511,22 @@ def sdss_specobjid_dr7_from_plate_fiber(
 
 
 def encode_sdss_run2d(run2d: int | str) -> int:
-    """Encode SDSS-III/IV ``RUN2D`` (e.g. ``v5_13_2``) into the 14-bit specObjID field."""
+    """Encode ``RUN2D`` into the 14-bit specObjID field.
+
+    Accepts SDSS-II integer codes (e.g. ``26``), numeric strings (``"26"``), or
+    SDSS-III/IV version strings (``v5_13_2``).
+    """
     if isinstance(run2d, str):
-        parts = run2d.strip().lstrip("vV").split("_")
+        text = run2d.strip()
+        if not text:
+            raise ValueError("RUN2D is empty")
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text)
+        parts = text.lstrip("vV").split("_")
         if len(parts) != 3:
-            raise ValueError(f"RUN2D must look like vN_M_P, got {run2d!r}")
+            raise ValueError(
+                f"RUN2D must be an integer code or vN_M_P string, got {run2d!r}"
+            )
         major, minor, patch = (int(parts[0]), int(parts[1]), int(parts[2]))
         return (major - 5) * 10000 + minor * 100 + patch
     return int(run2d)

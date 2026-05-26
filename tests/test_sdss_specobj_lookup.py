@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pyarrow as pa
@@ -11,10 +12,36 @@ import pytest
 from data_lake.ingest.fits_to_parquet import normalize_object_id
 from data_lake.ingest.sdss_specobj_lookup import (
     build_fiber_to_specobjid_map,
+    encode_sdss_run2d,
     sdss_specobjid_dr7_from_plate_fiber,
     sdss_specobjid_dr8plus_from_plate_fiber,
     sdss_specobjid_from_plate_fiber,
 )
+
+_CAS_EXAMPLES = Path(__file__).resolve().parents[1] / "data" / "sdss-specobjid.txt"
+
+
+def _load_cas_specobjid_examples(path: Path = _CAS_EXAMPLES) -> list[dict]:
+    rows: list[dict] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(
+            r'(\w+)\s+"?\s*(\d+)\s*"\s+(\S+)\s+(""|"[^"]*"|\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)',
+            line,
+        )
+        assert m, f"unparseable CAS example line: {line!r}"
+        survey, sid, run2d, _, plate, _tile, mjd, fiber = m.groups()
+        rows.append({
+            "survey": survey,
+            "specobjid": int(sid),
+            "run2d": run2d.strip('"'),
+            "plate": int(plate),
+            "mjd": int(mjd),
+            "fiber": int(fiber),
+        })
+    return rows
 
 
 def _write_lookup(path: Path, rows: list[dict]) -> None:
@@ -37,6 +64,30 @@ class TestSpecobjIdEncoding:
         assert (raw & 0xFFFF) == plate
         assert ((raw >> 16) & 0xFFFF) == mjd
         assert ((raw >> 32) & 0x3FF) == fiber
+
+    def test_encode_run2d_integer_string(self) -> None:
+        assert encode_sdss_run2d("26") == 26
+        assert encode_sdss_run2d("v5_13_2") == 1302
+
+    @pytest.mark.skipif(not _CAS_EXAMPLES.is_file(), reason="CAS fixture missing")
+    def test_cas_examples_match_dr8plus_layout(self) -> None:
+        """Real SkyServer rows in data/sdss-specobjid.txt (SDSS + eBOSS)."""
+        for row in _load_cas_specobjid_examples():
+            got = int(
+                sdss_specobjid_dr8plus_from_plate_fiber(
+                    row["plate"], row["fiber"], row["mjd"], row["run2d"],
+                )
+            )
+            dr7 = int(
+                sdss_specobjid_dr7_from_plate_fiber(
+                    row["plate"], row["fiber"], row["mjd"],
+                )
+            )
+            assert got == row["specobjid"], (
+                f"{row['survey']} plate={row['plate']} mjd={row['mjd']} "
+                f"fiber={row['fiber']} run2d={row['run2d']!r}"
+            )
+            assert dr7 != row["specobjid"]
 
 
 class TestSpecobjLookupSurveyScope:
