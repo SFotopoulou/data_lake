@@ -1033,6 +1033,10 @@ dl-describe-lake                      # print survey × modality summary
 dl-describe-lake --refresh            # rebuild then print
 ```
 
+For **spectra**, ``total_rows`` in the registry is the sum of ``source_id`` lengths
+across all ``Npix=*.zarr`` tiles (same count as the ingestion report notebook’s
+``n_spectra_in_zarr``). Catalog rows use ``catalog_info.json`` ``total_rows``.
+
 **Master association** — map master ID columns to catalog join keys. Keep the
 master Parquet thin; store mapping in a sidecar ``<master>.meta.json``:
 

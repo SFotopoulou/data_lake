@@ -102,6 +102,49 @@ def iter_modality_surveys(layer_root: Path, info_name: str) -> Iterator[tuple[st
             yield p.name, p
 
 
+def _iter_zarr_tiles(survey_root: Path) -> Iterator[Path]:
+    yield from sorted(survey_root.rglob("Npix=*.zarr"))
+
+
+def _zarr_tile_n_sources(tile_path: Path) -> int | None:
+    """Row count for one spectrum/cutout tile (reads ``source_id`` array metadata only)."""
+    meta_path = tile_path / "source_id" / "zarr.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            shape = meta.get("shape")
+            if shape:
+                return int(shape[0])
+        except Exception:
+            pass
+    try:
+        import zarr
+
+        root = zarr.open_group(
+            store=zarr.storage.LocalStore(str(tile_path)),
+            mode="r",
+            zarr_format=3,
+        )
+        return int(root["source_id"].shape[0])
+    except Exception:
+        log.debug("Could not count sources in Zarr tile %s", tile_path, exc_info=True)
+        return None
+
+
+def _count_zarr_sources(survey_root: Path) -> int | None:
+    """Sum ``source_id`` lengths across all ``Npix=*.zarr`` tiles under a survey."""
+    total = 0
+    n_tiles = 0
+    for tile in _iter_zarr_tiles(survey_root):
+        n = _zarr_tile_n_sources(tile)
+        if n is None:
+            log.warning("Skipping unreadable Zarr tile for row count: %s", tile)
+            continue
+        total += n
+        n_tiles += 1
+    return total if n_tiles else None
+
+
 def _load_catalog_manifest_or_none(catalog_root: Path, survey: str) -> dict[str, Any] | None:
     path = catalog_root / MANIFEST_FILENAME
     if path.is_file():
@@ -315,6 +358,15 @@ def _info_registry_row(
         n_columns = manifest.get("n_columns")
         source_id = manifest.get("source_id_column") or source_id
 
+    total_rows: int | None = None
+    if modality == MODALITY_SPECTRA:
+        counted = _count_zarr_sources(survey_root)
+        if counted is not None:
+            total_rows = counted
+        else:
+            raw = info.get("total_spectra", info.get("total_rows"))
+            total_rows = int(raw) if raw is not None else None
+
     return {
         "survey": survey,
         "modality": modality,
@@ -324,7 +376,7 @@ def _info_registry_row(
         "ra_column": info.get("ra_column"),
         "dec_column": info.get("dec_column"),
         "n_columns": n_columns,
-        "total_rows": None,
+        "total_rows": total_rows,
         "manifest_path": manifest_rel or str(info_path.relative_to(lake_root)),
         "has_schema_manifest": manifest_path.is_file(),
     }

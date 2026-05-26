@@ -11,7 +11,11 @@ import pyarrow.parquet as pq
 import pytest
 from astropy.table import Table
 
+from concurrent.futures import ThreadPoolExecutor
+
+from data_lake.ingest.desi_parallel_ingest import TileBatch, WorkerResult, ingest_spectra_parallel
 from data_lake.ingest.fits_to_parquet import ingest_catalog
+from data_lake.ingest.fits_to_spectra_zarr import _meta_to_bytes
 from data_lake.lake_registry import (
     REGISTRY_FILENAME,
     build_lake_registry_table,
@@ -99,3 +103,66 @@ def test_build_registry_table_empty_lake(tmp_path: Path) -> None:
     (lake / "catalogs").mkdir(parents=True)
     table = build_lake_registry_table(lake)
     assert table.num_rows == 0
+
+
+def _mini_spectrum_decoder(path_str: str, norder: int) -> WorkerResult:
+    label = Path(path_str).stem
+    npix = 100 if label == "fileA" else 200
+    sid = 101 if label == "fileA" else 202
+    n_pix = 8
+    flux = np.full((1, n_pix), float(sid), dtype=np.float32)
+    ivar = np.ones_like(flux)
+    mask = np.zeros((1, n_pix), dtype=np.uint8)
+    sids = np.array([sid], dtype=np.int64)
+    mb = _meta_to_bytes({
+        "z": 0.1, "z_err": 0.01, "snr": 5.0,
+        "exptime": 100.0, "R": 3000.0, "instr": "TEST",
+    })
+    wave = np.linspace(3600.0, 3700.0, n_pix, dtype=np.float64)
+    wcs = {
+        "ctype": "WAVE", "crval": float(wave[0]),
+        "cdelt": float(wave[1] - wave[0]), "crpix": 1.0,
+        "unit": "Angstrom", "air_or_vacuum": "vacuum", "n_pix": n_pix,
+    }
+    return WorkerResult(
+        path=path_str,
+        ok=True,
+        batches=[TileBatch(npix=npix, flux=flux, ivar=ivar, mask=mask, source_ids=sids, meta_bytes=mb)],
+        wavelength=wave,
+        wcs_attrs=wcs,
+        n_pix=n_pix,
+        n_spectra=1,
+        elapsed_s=0.0,
+    )
+
+
+def test_registry_spectra_total_rows(tmp_path: Path) -> None:
+    lake = tmp_path / "lake"
+    paths = []
+    for label in ("fileA", "fileB"):
+        p = tmp_path / f"{label}.fits"
+        p.touch()
+        paths.append(p)
+
+    ingest_spectra_parallel(
+        file_paths=paths,
+        output_root=lake,
+        survey_name="SPEC_SURV",
+        n_workers=1,
+        norder=5,
+        checkpoint_path=tmp_path / "ckpt.json",
+        failures_log=tmp_path / "fail.jsonl",
+        show_progress=False,
+        decoder=_mini_spectrum_decoder,
+        executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+    )
+
+    refresh_lake_registry(lake)
+    table = load_lake_registry(lake)
+    spec_rows = [
+        r
+        for r in table.to_pylist()
+        if r["survey"] == "SPEC_SURV" and r["modality"] == "spectra"
+    ]
+    assert len(spec_rows) == 1
+    assert spec_rows[0]["total_rows"] == 2
