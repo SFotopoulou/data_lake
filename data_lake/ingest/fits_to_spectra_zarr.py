@@ -75,6 +75,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -292,6 +294,112 @@ def _open_or_create_spectrum_tile(
     root.attrs.update(attrs)
 
     return root
+
+
+def widen_spectrum_tile(
+    tile_path: Path,
+    new_n_pix: int,
+    *,
+    wavelength_mode: str,
+    mask_dtype: np.dtype,
+    wcs_attrs: dict[str, Any],
+    n_diag: int | None = None,
+    resolution_offsets: np.ndarray | None = None,
+) -> zarr.Group:
+    """Widen an existing spectrum tile to ``new_n_pix`` by padding existing rows.
+
+    Writes a new tile to a sibling temp path, copies all arrays with right-padding
+    on the pixel axis, then atomically replaces the original.  On any error the
+    original tile is left untouched.
+
+    Arrays widened:
+    - ``flux``       → pad with ``NaN``
+    - ``ivar``       → pad with ``0.0``
+    - ``mask``       → pad with ``0``
+    - ``wavelength`` (per_source) → pad rows with ``0.0``
+    - ``wavelength`` (shared)     → extend 1-D vector with ``0.0``
+    - ``resolution`` (if present) → pad pixel axis with ``0.0``
+    - ``source_id``, ``meta``     → copied unchanged
+    """
+    tmp_path = tile_path.parent / (tile_path.name + ".__widening__")
+    backup_path = tile_path.parent / (tile_path.name + ".__widening_backup__")
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+
+    old_store = zarr.storage.LocalStore(str(tile_path))
+    old_root = zarr.open_group(store=old_store, mode="r", zarr_format=3)
+    old_n_pix = int(old_root["flux"].shape[1])
+    n_rows = int(old_root["flux"].shape[0])
+
+    if new_n_pix <= old_n_pix:
+        return zarr.open_group(store=old_store, mode="a", zarr_format=3)
+
+    pad_width = new_n_pix - old_n_pix
+    log.info(
+        "Widening spectrum tile %s: n_pix %d → %d (%d existing rows)",
+        tile_path.name,
+        old_n_pix,
+        new_n_pix,
+        n_rows,
+    )
+
+    new_root = _open_or_create_spectrum_tile(
+        tmp_path,
+        new_n_pix,
+        wavelength_mode,
+        mask_dtype,
+        wcs_attrs,
+        n_diag=n_diag,
+        resolution_offsets=resolution_offsets,
+    )
+
+    _CHUNK = 256  # rows per migration batch
+
+    def _copy_padded_2d(name: str, pad_val: float, dtype) -> None:
+        src = old_root[name]
+        dst = new_root[name]
+        for start in range(0, n_rows, _CHUNK):
+            end = min(start + _CHUNK, n_rows)
+            chunk = np.asarray(src[start:end]).astype(dtype)
+            padded = np.pad(chunk, ((0, 0), (0, pad_width)), constant_values=pad_val)
+            dst.append(padded)
+
+    _copy_padded_2d("flux", np.nan, np.float32)
+    _copy_padded_2d("ivar", 0.0, np.float32)
+    _copy_padded_2d("mask", 0, np.dtype(mask_dtype))
+
+    if wavelength_mode == "per_source":
+        _copy_padded_2d("wavelength", 0.0, np.float32)
+    else:
+        old_wave = np.asarray(old_root["wavelength"][:])
+        new_wave = np.pad(old_wave, (0, pad_width), constant_values=0.0)
+        new_root["wavelength"][:] = new_wave
+
+    if n_rows > 0:
+        new_root["source_id"].append(np.asarray(old_root["source_id"][:]))
+        new_root["meta"].append(np.asarray(old_root["meta"][:]))
+
+    if "resolution" in old_root and n_rows > 0:
+        src_res = old_root["resolution"]
+        dst_res = new_root["resolution"]
+        for start in range(0, n_rows, _CHUNK):
+            end = min(start + _CHUNK, n_rows)
+            chunk = np.asarray(src_res[start:end]).astype(np.float32)
+            # shape: (batch, n_diag, old_n_pix) → (batch, n_diag, new_n_pix)
+            padded = np.pad(chunk, ((0, 0), (0, 0), (0, pad_width)), constant_values=0.0)
+            dst_res.append(padded)
+
+    # --- atomic swap ---
+    os.rename(tile_path, backup_path)
+    try:
+        os.rename(tmp_path, tile_path)
+    except Exception:
+        os.rename(backup_path, tile_path)
+        raise
+    shutil.rmtree(backup_path, ignore_errors=True)
+
+    new_store = zarr.storage.LocalStore(str(tile_path))
+    return zarr.open_group(store=new_store, mode="a", zarr_format=3)
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1261,20 @@ def ingest_spectra_from_fits(
         )
         tile_n_pix = int(root["flux"].shape[1])
 
+        # Dynamic tile widening: when incoming batch has longer spectra than the
+        # existing tile, widen (pad existing rows) rather than truncate new spectra.
+        if tile_exists and length_policy == "pad" and batch_max_pix > tile_n_pix:
+            root = widen_spectrum_tile(
+                tile_path,
+                batch_max_pix,
+                wavelength_mode=wavelength_mode_effective,
+                mask_dtype=mask_dtype,
+                wcs_attrs=wcs_attrs,
+                n_diag=n_diag,
+                resolution_offsets=res_offsets,
+            )
+            tile_n_pix = int(root["flux"].shape[1])
+
         n_existing = int(root["source_id"].shape[0])
         existing: set[int] = set()
         if n_existing > 0:
@@ -1174,7 +1296,8 @@ def ingest_spectra_from_fits(
                     f"Use --on-length-mismatch pad or truncate."
                 )
             log.info(
-                "Aligning %d spectrum(s) to n_pix=%d for tile Npix=%s (%s)",
+                "Aligning %d spectrum(s) to n_pix=%d for tile Npix=%s (%s; "
+                "pad=extend short/truncate long)",
                 len(mismatched),
                 tile_n_pix,
                 npix,
@@ -1256,30 +1379,80 @@ def _fix_length(
     target_n_pix: int,
     mode: str,
 ) -> list[SpectrumRecord]:
-    fixed = []
+    """Align spectrum length to ``target_n_pix`` for storage in an existing tile.
+
+    ``pad`` (default for SDSS spPlate): pad shorter spectra with NaN flux; truncate
+    longer spectra to the tile width (common when appending a longer spPlate to a
+    tile created from shorter spec files).
+    ``truncate``: truncate longer spectra only; error if shorter than target.
+    """
+    fixed: list[SpectrumRecord] = []
+    n_pad = n_trunc = 0
     for r in records:
         n = len(r.flux)
         if n == target_n_pix:
             fixed.append(r)
-        elif mode == "truncate":
-            fixed.append(SpectrumRecord(
-                source_id=r.source_id, ra=r.ra, dec=r.dec,
-                flux=r.flux[:target_n_pix],
-                ivar=r.ivar[:target_n_pix],
-                mask=r.mask[:target_n_pix],
-                wavelength=r.wavelength[:target_n_pix] if r.wavelength is not None else None,
-                meta=r.meta,
-            ))
-        else:  # pad
-            pad = target_n_pix - n
-            fixed.append(SpectrumRecord(
-                source_id=r.source_id, ra=r.ra, dec=r.dec,
+            continue
+        if n > target_n_pix:
+            if mode == "error":
+                raise ValueError(
+                    f"Spectrum length {n} > tile n_pix {target_n_pix} for "
+                    f"source_id={r.source_id}; use --on-length-mismatch pad or truncate."
+                )
+            n_trunc += 1
+            fixed.append(
+                SpectrumRecord(
+                    source_id=r.source_id,
+                    ra=r.ra,
+                    dec=r.dec,
+                    flux=r.flux[:target_n_pix].copy(),
+                    ivar=r.ivar[:target_n_pix].copy(),
+                    mask=r.mask[:target_n_pix].copy(),
+                    wavelength=(
+                        r.wavelength[:target_n_pix].copy()
+                        if r.wavelength is not None
+                        else None
+                    ),
+                    meta=r.meta,
+                )
+            )
+            continue
+        # n < target_n_pix
+        if mode == "truncate":
+            raise ValueError(
+                f"Spectrum length {n} < tile n_pix {target_n_pix} for "
+                f"source_id={r.source_id}; use --on-length-mismatch pad."
+            )
+        pad = target_n_pix - n
+        n_pad += 1
+        fixed.append(
+            SpectrumRecord(
+                source_id=r.source_id,
+                ra=r.ra,
+                dec=r.dec,
                 flux=np.pad(r.flux, (0, pad), constant_values=np.nan),
                 ivar=np.pad(r.ivar, (0, pad), constant_values=0.0),
                 mask=np.pad(r.mask, (0, pad), constant_values=0),
-                wavelength=np.pad(r.wavelength, (0, pad)) if r.wavelength is not None else None,
+                wavelength=(
+                    np.pad(r.wavelength, (0, pad))
+                    if r.wavelength is not None
+                    else None
+                ),
                 meta=r.meta,
-            ))
+            )
+        )
+    if n_trunc:
+        log.warning(
+            "Truncated %d spectrum(s) to n_pix=%d (longer than existing tile width)",
+            n_trunc,
+            target_n_pix,
+        )
+    if n_pad:
+        log.info(
+            "Padded %d spectrum(s) to n_pix=%d (shorter than tile width)",
+            n_pad,
+            target_n_pix,
+        )
     return fixed
 
 

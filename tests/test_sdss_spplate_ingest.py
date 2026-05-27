@@ -104,6 +104,27 @@ class TestSpplateDetectAndRead:
         assert len(records[0].flux) == 32
 
 
+class TestFixLength:
+    def test_pad_truncates_when_longer_than_tile(self) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import SpectrumRecord, _fix_length
+
+        n_long = 4664
+        target = 4638
+        rec = SpectrumRecord(
+            source_id=1,
+            ra=120.0,
+            dec=45.0,
+            flux=np.ones(n_long, dtype=np.float32),
+            ivar=np.ones(n_long, dtype=np.float32),
+            mask=np.zeros(n_long, dtype=np.uint8),
+            wavelength=np.linspace(4000.0, 9000.0, n_long),
+            meta={},
+        )
+        out = _fix_length([rec], target, "pad")
+        assert len(out[0].flux) == target
+        assert len(out[0].wavelength) == target
+
+
 class TestSpplateIngest:
     def test_ingest_to_zarr(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
@@ -205,3 +226,291 @@ class TestSpplateIngest:
             ingest_spectra_from_fits(
                 sp, tmp_path / "lake", "sdss_test", fmt="sdss_spplate",
             )
+
+
+# ---------------------------------------------------------------------------
+# Dynamic tile widening tests
+# ---------------------------------------------------------------------------
+
+
+def _make_records(source_ids, n_pix: int, *, wavelength_mode: str = "per_source"):
+    """Build minimal SpectrumRecord list for widening tests."""
+    from data_lake.ingest.fits_to_spectra_zarr import SpectrumRecord
+
+    records = []
+    for sid in source_ids:
+        flux = np.full(n_pix, float(sid), dtype=np.float32)
+        ivar = np.ones(n_pix, dtype=np.float32)
+        mask = np.zeros(n_pix, dtype=np.uint8)
+        wave = np.linspace(3500.0, 9000.0, n_pix).astype(np.float32)
+        records.append(
+            SpectrumRecord(
+                source_id=sid,
+                ra=120.0,
+                dec=45.0,
+                flux=flux,
+                ivar=ivar,
+                mask=mask,
+                wavelength=wave if wavelength_mode == "per_source" else None,
+                meta={},
+            )
+        )
+    return records
+
+
+def _make_tile(tile_path, records, n_pix, *, wavelength_mode, n_diag=None):
+    """Create a Zarr tile from records at the given path."""
+    import numpy as np
+    import zarr
+
+    from data_lake.ingest.fits_to_spectra_zarr import (
+        _open_or_create_spectrum_tile,
+        _META_DTYPE,
+        _meta_to_bytes,
+    )
+
+    wcs_attrs = {"n_pix": n_pix, "coeff0": 3.5, "coeff1": 0.0001}
+    mask_dtype = np.dtype(np.uint8)
+    root = _open_or_create_spectrum_tile(
+        tile_path,
+        n_pix,
+        wavelength_mode,
+        mask_dtype,
+        wcs_attrs,
+        n_diag=n_diag,
+    )
+
+    flux = np.stack([r.flux for r in records]).astype(np.float32)
+    ivar = np.stack([r.ivar for r in records]).astype(np.float32)
+    mask = np.stack([r.mask for r in records]).astype(mask_dtype)
+    ids = np.array([r.source_id for r in records], dtype=np.int64)
+    meta = np.frombuffer(
+        b"".join(_meta_to_bytes(r.meta) for r in records),
+        dtype="|V" + str(_META_DTYPE.itemsize),
+    )
+
+    root["flux"].append(flux)
+    root["ivar"].append(ivar)
+    root["mask"].append(mask)
+    root["source_id"].append(ids)
+    root["meta"].append(meta)
+
+    if wavelength_mode == "per_source":
+        waves = np.stack([r.wavelength.astype(np.float32) for r in records])
+        root["wavelength"].append(waves)
+    else:
+        root["wavelength"][:] = np.linspace(3500.0, 9000.0, n_pix)
+
+    if n_diag is not None:
+        res = np.zeros((len(records), n_diag, n_pix), dtype=np.float32)
+        root["resolution"].append(res)
+
+    return root
+
+
+class TestWidenSpectrumTile:
+    """Unit tests for the ``widen_spectrum_tile`` helper."""
+
+    def test_widen_per_source_wavelength(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import widen_spectrum_tile
+
+        n_old, n_new = 32, 64
+        records = _make_records([1, 2, 3], n_old, wavelength_mode="per_source")
+        tile_path = tmp_path / "Npix=1.zarr"
+        wcs = {"n_pix": n_old, "coeff0": 3.5, "coeff1": 0.0001}
+        mask_dtype = np.dtype(np.uint8)
+        _make_tile(tile_path, records, n_old, wavelength_mode="per_source")
+
+        root = widen_spectrum_tile(
+            tile_path,
+            n_new,
+            wavelength_mode="per_source",
+            mask_dtype=mask_dtype,
+            wcs_attrs=wcs,
+        )
+
+        assert root["flux"].shape == (3, n_new)
+        assert root["ivar"].shape == (3, n_new)
+        assert root["mask"].shape == (3, n_new)
+        assert root["wavelength"].shape == (3, n_new)
+        assert root["source_id"].shape == (3,)
+
+        flux_arr = np.asarray(root["flux"][:])
+        # Original values preserved in the first n_old columns
+        assert np.all(flux_arr[:, :n_old] == np.array([1.0, 2.0, 3.0])[:, None])
+        # Padding filled with NaN
+        assert np.all(np.isnan(flux_arr[:, n_old:]))
+
+        ivar_arr = np.asarray(root["ivar"][:])
+        assert np.all(ivar_arr[:, :n_old] == 1.0)
+        assert np.all(ivar_arr[:, n_old:] == 0.0)
+
+        wave_arr = np.asarray(root["wavelength"][:])
+        assert np.all(wave_arr[:, n_old:] == 0.0)
+
+    def test_widen_shared_wavelength(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import widen_spectrum_tile
+
+        n_old, n_new = 32, 60
+        records = _make_records([10, 20], n_old, wavelength_mode="per_source")
+        tile_path = tmp_path / "Npix=2.zarr"
+        wcs = {"n_pix": n_old, "coeff0": 3.5, "coeff1": 0.0001}
+        mask_dtype = np.dtype(np.uint8)
+        _make_tile(tile_path, records, n_old, wavelength_mode="shared")
+
+        root = widen_spectrum_tile(
+            tile_path,
+            n_new,
+            wavelength_mode="shared",
+            mask_dtype=mask_dtype,
+            wcs_attrs=wcs,
+        )
+
+        assert root["flux"].shape == (2, n_new)
+        assert root["wavelength"].shape == (n_new,)
+
+        wave = np.asarray(root["wavelength"][:])
+        assert len(wave) == n_new
+        assert np.all(wave[n_old:] == 0.0)
+        assert wave[0] > 0.0  # original values preserved
+
+    def test_widen_with_resolution_array(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import widen_spectrum_tile
+
+        n_old, n_new, n_diag = 32, 48, 5
+        records = _make_records([100, 200], n_old)
+        tile_path = tmp_path / "Npix=3.zarr"
+        wcs = {"n_pix": n_old, "coeff0": 3.5, "coeff1": 0.0001}
+        mask_dtype = np.dtype(np.uint8)
+        res_offsets = np.arange(-2, 3, dtype=np.int32)
+        _make_tile(
+            tile_path,
+            records,
+            n_old,
+            wavelength_mode="per_source",
+            n_diag=n_diag,
+        )
+
+        root = widen_spectrum_tile(
+            tile_path,
+            n_new,
+            wavelength_mode="per_source",
+            mask_dtype=mask_dtype,
+            wcs_attrs=wcs,
+            n_diag=n_diag,
+            resolution_offsets=res_offsets,
+        )
+
+        assert root["resolution"].shape == (2, n_diag, n_new)
+        res_arr = np.asarray(root["resolution"][:])
+        assert np.all(res_arr[:, :, n_old:] == 0.0)
+
+    def test_noop_when_not_wider(self, tmp_path: Path) -> None:
+        """widen_spectrum_tile should return unchanged tile when new_n_pix <= old."""
+        from data_lake.ingest.fits_to_spectra_zarr import widen_spectrum_tile
+
+        n_pix = 32
+        records = _make_records([1], n_pix)
+        tile_path = tmp_path / "Npix=4.zarr"
+        wcs = {"n_pix": n_pix, "coeff0": 3.5, "coeff1": 0.0001}
+        mask_dtype = np.dtype(np.uint8)
+        _make_tile(tile_path, records, n_pix, wavelength_mode="per_source")
+
+        root = widen_spectrum_tile(
+            tile_path,
+            n_pix,  # same width → no-op
+            wavelength_mode="per_source",
+            mask_dtype=mask_dtype,
+            wcs_attrs=wcs,
+        )
+        assert root["flux"].shape == (1, n_pix)
+
+
+class TestDynamicTileWideningOnIngest:
+    """Integration tests: ingest triggers dynamic tile widening."""
+
+    def test_wider_batch_widens_per_source_tile(self, tmp_path: Path) -> None:
+        """Ingest short spectra then longer spectra into same tile; old rows padded."""
+        from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
+
+        plate, mjd = 1960, 53289
+        short_sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        long_sp = tmp_path / f"spPlate-{plate}-{mjd+1}.fits"
+        lookup_short = tmp_path / "lookup_short.parquet"
+        lookup_long = tmp_path / "lookup_long.parquet"
+
+        # First file: 2 spectra, n_pix=32
+        _write_minimal_spplate(short_sp, plate=plate, mjd=mjd, n_fiber=2, n_pix=32)
+        _write_lookup(lookup_short, plate, mjd, "widen_test", {1: 1001, 2: 1002})
+
+        # Second file: 2 new spectra, n_pix=64 (wider)
+        _write_minimal_spplate(long_sp, plate=plate, mjd=mjd + 1, n_fiber=2, n_pix=64)
+        _write_lookup(lookup_long, plate, mjd + 1, "widen_test", {1: 2001, 2: 2002})
+
+        lake = tmp_path / "lake"
+        ingest_spectra_from_fits(
+            short_sp, lake, "widen_test",
+            fmt="sdss_spplate", specobj_lookup=lookup_short,
+            norder=5, on_length_mismatch="pad",
+        )
+        ingest_spectra_from_fits(
+            long_sp, lake, "widen_test",
+            fmt="sdss_spplate", specobj_lookup=lookup_long,
+            norder=5, on_length_mismatch="pad",
+        )
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(lake, "widen_test")
+        sp_short = acc.get_spectrum(1001)
+        sp_long = acc.get_spectrum(2001)
+
+        # Both spectra are accessible
+        assert sp_short is not None
+        assert sp_long is not None
+
+        # Tile n_pix expanded to accommodate longer spectra
+        assert sp_long.flux.shape[0] == 64
+        assert sp_short.flux.shape[0] == 64  # old row padded to new width
+
+        # Padded tail of original short spectrum should be NaN
+        assert np.all(np.isnan(sp_short.flux[32:]))
+
+    def test_wider_batch_widens_shared_wavelength_tile(self, tmp_path: Path) -> None:
+        """Same scenario using shared wavelength mode."""
+        from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
+
+        plate, mjd = 2000, 54000
+        short_sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        long_sp = tmp_path / f"spPlate-{plate}-{mjd+1}.fits"
+        lookup_short = tmp_path / "lookup_s.parquet"
+        lookup_long = tmp_path / "lookup_l.parquet"
+
+        _write_minimal_spplate(short_sp, plate=plate, mjd=mjd, n_fiber=2, n_pix=32)
+        _write_lookup(lookup_short, plate, mjd, "shared_widen_test", {1: 3001, 2: 3002})
+
+        _write_minimal_spplate(long_sp, plate=plate, mjd=mjd + 1, n_fiber=2, n_pix=64)
+        _write_lookup(lookup_long, plate, mjd + 1, "shared_widen_test", {1: 4001, 2: 4002})
+
+        lake = tmp_path / "lake"
+        ingest_spectra_from_fits(
+            short_sp, lake, "shared_widen_test",
+            fmt="sdss_spplate", specobj_lookup=lookup_short,
+            norder=5, wavelength_mode="shared", on_length_mismatch="pad",
+        )
+        ingest_spectra_from_fits(
+            long_sp, lake, "shared_widen_test",
+            fmt="sdss_spplate", specobj_lookup=lookup_long,
+            norder=5, wavelength_mode="shared", on_length_mismatch="pad",
+        )
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(lake, "shared_widen_test")
+        sp_short = acc.get_spectrum(3001)
+        sp_long = acc.get_spectrum(4001)
+        assert sp_short is not None
+        assert sp_long is not None
+        assert sp_long.flux.shape[0] == 64
+        assert sp_short.flux.shape[0] == 64
+        assert np.all(np.isnan(sp_short.flux[32:]))

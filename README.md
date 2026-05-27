@@ -502,6 +502,30 @@ HDU layout (BOSS example ``spPlate-3523-55144.fits``): primary flux
 ``(n_fiber, n_pix)``; ``IVAR`` (inverse variance, not sigma); ``ANDMASK`` /
 ``ORMASK``; ``PLUGMAP`` BINTABLE with ``FIBERID``, ``RA``, ``DEC``.
 
+##### Dynamic tile widening
+
+Different ``spPlate`` files for the same sky tile may have different pixel
+counts (``n_pix``).  When ``--on-length-mismatch pad`` is set (the default for
+``sdss_spplate`` format), **incoming spectra that are longer than the existing
+tile are handled by widening the tile** rather than being truncated:
+
+1. A temporary replacement tile is written alongside the original
+   (``Npix=<N>.zarr.__widening__``).
+2. All existing arrays are copied row-by-row with right-padding:
+   ``flux`` → ``NaN``, ``ivar`` → ``0.0``, ``mask`` → ``0``,
+   ``wavelength`` → ``0.0`` (per-source rows or shared 1-D vector),
+   ``resolution`` (if present) → ``0.0`` on the pixel axis.
+3. The temp tile is atomically swapped into place (backup rename strategy).
+4. Ingest continues normally: new rows are appended at the wider ``n_pix``.
+
+If widening fails mid-write the original tile is left untouched.  Widening
+is logged at INFO level: ``Widening spectrum tile Npix=N.zarr: n_pix OLD → NEW
+(K existing rows)``.
+
+Incoming spectra **shorter** than the current tile are still right-padded by
+``_fix_length`` as before.  Using ``--on-length-mismatch truncate`` disables
+widening and truncates longer spectra instead.
+
 ```bash
 # Quick ingest without a specObj sidecar (DR8+/BOSS: primary header RUN2D only;
 # VERS2D/VERSCOMB are pipeline versions, not used for specObjID)
@@ -552,6 +576,28 @@ Exit code **1** when every mode maps zero fibers (same failure as ingest).
 
 Catalogs without plate/mjd/fiber cannot drive spPlate ingest; photo-only tables
 need ``--specobj-lookup-from-plate`` or a specObj export with spectroscopic keys.
+
+**Plates missing from your SDSS catalog** — export plugmap positions from the
+FITS files, optionally keeping only fibers not already in the lake catalog:
+
+```bash
+# All active fibers (non-zero flux) from one or more plates
+dl-extract-spplate-catalog /data/SDSS/spPlate/spPlate-3523-55144.fits \
+  -o spplate_3523_plugmap.parquet
+
+# Many files
+dl-extract-spplate-catalog --file-list spplate_paths.txt -o all_plugmaps.parquet
+
+# Only fibers absent from catalogs/SDSS_DR17/ (plate+mjd+fiber anti-join)
+dl-extract-spplate-catalog --file-list spplate_paths.txt \
+  --subtract-catalog /path/to/lake --survey SDSS_DR17 \
+  -o missing_from_specobj.parquet
+```
+
+Output columns: ``plate``, ``mjd``, ``fiberid``, ``ra``, ``dec`` (plus
+``spplate_file``, ``holetype``, ``objtype`` when present).  Ingest the Parquet
+as a supplemental catalog (with ``ra``/``dec`` for HEALPix) or use it as a
+``--specobj-lookup`` sidecar after adding a ``source_id`` / ``specobjid`` column.
 
 ```bash
 dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
@@ -710,9 +756,10 @@ dl-ingest-spectra-from-list spec_files.txt --survey sdss_dr17 \
 dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
   --format sdss_spplate --specobj-lookup /path/to/lookup.parquet --on-duplicate skip
 
-SDSS spec lists: pixel lengths differ slightly; ingest auto-pads when format is
-``sdss_boss`` or ``sdss_spplate``. Override with ``--on-length-mismatch pad`` or
-``truncate`` (same as ``dl-ingest-spectra``).
+SDSS spec lists: pixel lengths differ slightly; ingest auto-pads (or widens the
+existing tile) when format is ``sdss_boss`` or ``sdss_spplate``.  Override with
+``--on-length-mismatch pad`` (default; widens tiles for longer incoming spectra)
+or ``truncate`` (same as ``dl-ingest-spectra``).
 
 # Patch _cutout_index / _spectrum_index when --update-catalog (default).
 ```
