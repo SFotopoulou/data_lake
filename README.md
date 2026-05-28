@@ -705,6 +705,50 @@ for t in tiles[:3]:
 PY
 ```
 
+#### 6dFGS spectra ingest (VR extension only)
+
+6dFGS target FITS files are multi-extension products. Ingest here reads only
+the combined ``VR`` spectral extension (not ``V`` or ``R``), with rows:
+``[flux, variance, sky, wavelength?]``. If the 4th row (explicit wavelength)
+exists it is preferred; otherwise wavelength is reconstructed from WCS header
+keywords.
+
+Source IDs are derived from the file stem (for example
+``g0001234-123456.fits`` → ``g0001234-123456``) and normalized with the same
+stable hashing path used by catalog ingest for string IDs.
+
+```bash
+# Single-file smoke test
+dl-ingest-spectra g0001234-123456.fits --survey SIXDF_DR3 \
+  --fmt 6df --source-id-col targetname
+
+# File-list ingest
+dl-ingest-spectra-from-list 6df_files.txt \
+  --survey SIXDF_DR3 \
+  --fmt 6df \
+  --source-id-col targetname \
+  --wavelength-mode shared \
+  --on-duplicate skip \
+  --checkpoint /path/to/lake/ingest_state/6df/checkpoint.json \
+  --failures-log /path/to/lake/ingest_state/6df/failures.jsonl
+```
+
+#### 6dFGS Slurm batch ingest
+
+Use `scripts/slurm_ingest_6df_spectra.sh`:
+
+```bash
+find /data/6dFGS/spectra -name "*.fits" | sort > 6df_files.txt
+export DATA_LAKE_CONFIG=/path/to/lake_config.toml
+export LAKE_INGEST_TOKEN='your-secret'
+export FILE_LIST="$(pwd)/6df_files.txt"
+export SURVEY=SIXDF_DR3
+export SOURCE_ID_COL=targetname
+sbatch scripts/slurm_ingest_6df_spectra.sh
+```
+
+Re-submit the same command to resume from checkpoint after timeout/preemption.
+
 Export specObj rows with a constant ``survey`` column when merging multiple releases
 into one lookup file.  spPlate wavelength grids (~3859 px, ``COEFF0``/``COEFF1``) differ
 from per-object ``spec-*.fits`` coadds (~4628 px); do not expect pixel-identical spectra.

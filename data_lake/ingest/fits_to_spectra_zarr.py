@@ -12,6 +12,7 @@ Supported input formats
   ``desispec.coaddition.coadd_cameras`` for IVAR-weighted camera combination of
   the B/R/Z arms onto a single monotonic BRZ wavelength grid.
   Requires ``pip install 'data-lake[desi]'`` (``desispec>=0.62``).
+* **6dFGS**     multi-extension target FITS – ingests only the combined VR spectrum extension.
 * **Generic**   spectral WCS FITS – 1-D or multi-spectra image HDU with CTYPE1=WAVE*.
 
 DESI note
@@ -1073,6 +1074,93 @@ def _is_2df_hdul(hdul: fits.HDUList) -> bool:
     return "SEQNUM" in phdr or "BJSEL" in phdr
 
 
+def _is_6df_hdul(hdul: fits.HDUList) -> bool:
+    """Return True if the FITS HDU list looks like a 6dFGS target file."""
+    names = [(h.name or "").strip().upper() for h in hdul]
+    return "VR" in names and ("V" in names or "R" in names)
+
+
+def _select_6df_vr_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
+    """Pick the combined 6dFGS VR spectral extension."""
+    for i, hdu in enumerate(hdul):
+        name = (hdu.name or "").strip().upper()
+        if name in ("VR", "VRSPEC", "VR_SPECTRUM") and hdu.data is not None:
+            return i, hdu  # type: ignore[return-value]
+    # 6dF docs: 8th extension (index 7) is typically combined/spliced VR.
+    if len(hdul) > 7 and hdul[7].data is not None:
+        return 7, hdul[7]  # type: ignore[return-value]
+    raise ValueError("6dFGS file has no VR spectral extension")
+
+
+def _read_6df_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+) -> tuple[list[SpectrumRecord], dict]:
+    """Read a 6dFGS FITS file, ingesting only the combined VR extension."""
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    phdr = hdul[0].header
+    ra = float(phdr.get("RA", 0.0))
+    dec = float(phdr.get("DEC", 0.0))
+
+    # Match catalog key by target filename stem (e.g. "g0001234-123456")
+    source_id = normalize_object_id(source_path.stem)
+
+    _, vr_hdu = _select_6df_vr_hdu(hdul)
+    vhdr = vr_hdu.header
+    data = np.asarray(vr_hdu.data, dtype=np.float64)
+    if data.ndim != 2:
+        raise ValueError(
+            f"6dFGS VR extension in {source_path.name} has shape {data.shape}; expected 2-D"
+        )
+
+    if data.shape[0] in (3, 4):
+        arr = data
+    elif data.shape[1] in (3, 4):
+        arr = data.T
+    else:
+        raise ValueError(
+            f"6dFGS VR extension in {source_path.name} has shape {data.shape}; expected (3|4, n_pix)"
+        )
+
+    n_pix = int(arr.shape[1])
+    flux = arr[0].astype(np.float32)
+    variance = arr[1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ivar = np.where(variance > 0.0, 1.0 / variance, 0.0).astype(np.float32)
+    mask = np.zeros(n_pix, dtype=np.uint8)
+
+    # Some 6dF VR HDUs include an explicit wavelength row in addition to WCS.
+    if arr.shape[0] >= 4:
+        explicit_wave = np.asarray(arr[3], dtype=np.float64)
+        if np.all(np.isfinite(explicit_wave)) and np.all(np.diff(explicit_wave) > 0):
+            wavelength = explicit_wave
+        else:
+            wavelength = _wavelength_from_wcs(vhdr, n_pix)
+    else:
+        wavelength = _wavelength_from_wcs(vhdr, n_pix)
+
+    wcs_attrs = _wcs_attrs_from_header(vhdr, n_pix)
+    meta: dict[str, Any] = {
+        "z": float(vhdr.get("Z", phdr.get("Z", 0.0))),
+        "z_err": 0.0,
+        "snr": 0.0,
+        "exptime": float(vhdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+        "R": float(vhdr.get("SPEC_RES", 1000.0)),
+        "instr": "6dFGS",
+    }
+    return [SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=ivar,
+        mask=mask,
+        wavelength=wavelength,
+        meta=meta,
+    )], wcs_attrs
+
+
 def _detect_format_from_path(path: Path) -> str:
     """
     Heuristically detect the FITS spectral format from HDU names only.
@@ -1089,6 +1177,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "sdss_boss"
         if any(arm + "_FLUX" in names for arm in ("B", "R", "Z")):
             return "desi_coadd"
+        if _is_6df_hdul(hdul):
+            return "6df"
         phdr = hdul[0].header
         naxis2 = int(phdr.get("NAXIS2", 0) or 0)
         if naxis2 in (640, 1000) and ("PLATEID" in phdr or "PLATE" in phdr) and "MJD" in phdr:
@@ -1178,7 +1268,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"generic"``.  Auto-detected from HDU names if ``None``.
+        ``"2df"``, ``"6df"``, ``"generic"``.  Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
         ``SPECOBJID`` for spPlate ingest.  Mutually exclusive with
@@ -1293,6 +1383,8 @@ def ingest_spectra_from_fits(
                 )
             elif detected_fmt == "2df":
                 records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
+            elif detected_fmt == "6df":
+                records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -1663,7 +1755,7 @@ try:
                   default=None,
                   help="Mask dtype (overrides config; default 'uint8').")
     @click.option("--fmt", default=None,
-                  type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df"]),
+                  type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df", "6df"]),
                   help="Force input format (auto-detected by default).")
     @click.option(
         "--specobj-lookup",
