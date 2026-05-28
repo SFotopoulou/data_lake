@@ -605,6 +605,106 @@ dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
   --on-duplicate skip
 ```
 
+#### 2dFGRS 1-D spectra ingest
+
+2dFGRS FITS files have a fixed layout: HDU 0 carries sky coordinates
+(``RA``, ``DEC``, ``SEQNUM``) and HDU 1 (named ``SPECTRUM``) holds a
+``(3, 1024)`` image with rows ``[flux, variance, sky]``.  Wavelength is
+reconstructed from ``CRVAL1 / CRPIX1 / CDELT1`` in the spectral extension.
+
+**Source ID:** the numeric stem of the filename (e.g. ``154714`` from
+``154714.fits``) is used directly as the integer source ID, which must match
+the ``serial`` column that was used when ingesting the 2dF catalog:
+
+```bash
+# Catalog must already be ingested with serial as source_id:
+dl-ingest-catalog 2dfgrs_catalog.fits --survey 2DFGRS_DR3 \
+  --source-id-col serial --ra-col RA --dec-col DEC
+
+# Single file (smoke test)
+dl-ingest-spectra 154714.fits --survey 2DFGRS_DR3 \
+  --fmt 2df --source-id-col serial
+
+# Auto-detection also works (SPECTRUM HDU + SEQNUM/BJSEL triggers 2df format)
+dl-ingest-spectra 154714.fits --survey 2DFGRS_DR3
+
+# File list (sequential, with checkpoint for restarts)
+dl-ingest-spectra-from-list 2df_files.txt \
+  --survey 2DFGRS_DR3 \
+  --fmt 2df \
+  --source-id-col serial \
+  --wavelength-mode shared \
+  --on-duplicate skip \
+  --on-length-mismatch pad \
+  --checkpoint /path/to/lake/ingest_state/2df/checkpoint.json \
+  --failures-log /path/to/lake/ingest_state/2df/failures.jsonl
+```
+
+#### 2dFGRS Slurm batch ingest (300 k files)
+
+Use `scripts/slurm_ingest_2df_spectra.sh` for large-scale runs:
+
+```bash
+# 1. Build the file list (all 1-D FITS under your data tree)
+find /data/2dFGRS/spectra -name "*.fits" | sort > 2df_files.txt
+
+# 2. Submit
+mkdir -p logs
+export DATA_LAKE_CONFIG=/path/to/lake_config.toml
+export LAKE_INGEST_TOKEN='your-secret'
+export FILE_LIST="$(pwd)/2df_files.txt"
+export SURVEY=2DFGRS_DR3
+sbatch scripts/slurm_ingest_2df_spectra.sh
+```
+
+The script:
+- runs `dl-ingest-spectra-from-list` with checkpoint + failure log,
+- calls `dl-finalize-catalog` and `dl-validate-spectra-ingest` on completion.
+
+**Restarting after preemption or timeout** — re-submit the same `sbatch`
+command; the checkpoint file records completed paths and they are skipped.
+
+**Reviewing / retrying failures:**
+
+```bash
+# List failed paths
+python -c "
+import json, sys
+for line in open('ingest_state/2df/failures.jsonl'):
+    print(json.loads(line).get('path', ''))
+" > retry_list.txt
+
+# Re-run on failures only
+export FILE_LIST=retry_list.txt
+sbatch scripts/slurm_ingest_2df_spectra.sh
+```
+
+**QA after ingest:**
+
+```bash
+# Count spectra in Zarr vs files processed
+dl-describe-lake --config "$DATA_LAKE_CONFIG" --survey 2DFGRS_DR3
+
+# Spot-check one spectrum
+python - <<'PY'
+from data_lake.io.spectra import SpectrumAccessor
+from data_lake.ingest.fits_to_parquet import normalize_object_id
+acc = SpectrumAccessor('/path/to/lake', '2DFGRS_DR3')
+sp = acc.get_spectrum(normalize_object_id('154714'))
+print('flux shape:', sp.flux.shape, 'max_ivar:', sp.ivar.max())
+PY
+
+# Verify catalog linkage (serial → _spectrum_index)
+python - <<'PY'
+import pyarrow.parquet as pq, pathlib
+tiles = list(pathlib.Path('/path/to/lake/catalogs/2DFGRS_DR3').rglob('*.parquet'))
+for t in tiles[:3]:
+    tbl = pq.read_table(t, columns=['serial', '_spectrum_index'])
+    linked = (tbl['_spectrum_index'].to_pylist().count(-1))
+    print(t.name, 'rows:', len(tbl), 'unlinked:', linked)
+PY
+```
+
 Export specObj rows with a constant ``survey`` column when merging multiple releases
 into one lookup file.  spPlate wavelength grids (~3859 px, ``COEFF0``/``COEFF1``) differ
 from per-object ``spec-*.fits`` coadds (~4628 px); do not expect pixel-identical spectra.

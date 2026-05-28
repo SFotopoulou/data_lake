@@ -449,7 +449,7 @@ try:
     @click.option(
         "--fmt",
         default=None,
-        type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic"]),
+        type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df"]),
         help="Force FITS format (default: auto-detect).",
     )
     @click.option(

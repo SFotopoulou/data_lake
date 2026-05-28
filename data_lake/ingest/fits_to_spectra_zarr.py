@@ -971,6 +971,108 @@ def _read_generic_1d(
     return records, wcs_attrs
 
 
+def _read_2df_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+) -> tuple[list[SpectrumRecord], dict]:
+    """Read a 2dFGRS 1-D spectrum FITS file.
+
+    Expected layout:
+    - HDU 0 (PRIMARY): sky position in header (``RA``, ``DEC``), ``SEQNUM``,
+      ``NAME``, ``BJSEL``.
+    - HDU 1 (SPECTRUM): 2-D image of shape ``(3, n_pix)`` where rows are
+      ``[flux, variance, sky]``; spectral WCS in extension header
+      (``CRVAL1``, ``CRPIX1``, ``CDELT1``).
+
+    Source ID is derived from the file basename (numeric stem = ``serial``
+    value in the catalog), normalised via :func:`normalize_object_id`.
+    The ``serial`` numeric value is used directly when the stem is a pure
+    integer, or hashed otherwise.
+    """
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    phdr = hdul[0].header
+    ra = float(phdr.get("RA", 0.0))
+    dec = float(phdr.get("DEC", 0.0))
+
+    # Source ID from filename stem (matches catalog ``serial`` column)
+    stem = source_path.stem
+    # Remove any secondary extension (e.g. "154714.fits.gz" → "154714")
+    for sfx in (".fits", ".fit"):
+        if stem.lower().endswith(sfx):
+            stem = stem[: -len(sfx)]
+    source_id = normalize_object_id(stem)
+
+    # Locate the SPECTRUM extension
+    spec_hdu_idx = None
+    for i, hdu in enumerate(hdul):
+        if hdu.name.upper() == "SPECTRUM":
+            spec_hdu_idx = i
+            break
+    if spec_hdu_idx is None:
+        # Fall back to HDU 1
+        spec_hdu_idx = 1
+        log.warning(
+            "2dF: no SPECTRUM HDU in %s; using HDU 1", source_path.name
+        )
+
+    shdu = hdul[spec_hdu_idx]
+    shdr = shdu.header
+    data = np.array(shdu.data, dtype=np.float64)
+
+    # Normalise to (3, n_pix)
+    if data.ndim == 2 and data.shape[0] == 3:
+        pass  # (3, n_pix) — expected
+    elif data.ndim == 2 and data.shape[1] == 3:
+        data = data.T  # (n_pix, 3) → (3, n_pix)
+    else:
+        raise ValueError(
+            f"2dF SPECTRUM HDU in {source_path.name} has unexpected shape "
+            f"{data.shape}; expected (3, n_pix)"
+        )
+
+    n_pix = data.shape[1]
+    flux = data[0].astype(np.float32)
+    variance = data[1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ivar = np.where(variance > 0.0, 1.0 / variance, 0.0).astype(np.float32)
+    mask = np.zeros(n_pix, dtype=np.uint8)
+
+    wavelength = _wavelength_from_wcs(shdr, n_pix)
+    wcs_attrs = _wcs_attrs_from_header(shdr, n_pix)
+
+    meta: dict[str, Any] = {
+        "z":       float(shdr.get("Z", phdr.get("Z", 0.0))),
+        "z_err":   0.0,
+        "snr":     0.0,
+        "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+        "R":       float(shdr.get("SPEC_RES", 500.0)),
+        "instr":   "2dFGRS",
+    }
+
+    record = SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=ivar,
+        mask=mask,
+        wavelength=wavelength,
+        meta=meta,
+    )
+    return [record], wcs_attrs
+
+
+def _is_2df_hdul(hdul: fits.HDUList) -> bool:
+    """Return True if the FITS HDU list looks like a 2dFGRS spectrum file."""
+    names = [h.name.upper() for h in hdul]
+    if "SPECTRUM" not in names:
+        return False
+    phdr = hdul[0].header
+    # 2dF primary HDUs carry SEQNUM and BJSEL keywords
+    return "SEQNUM" in phdr or "BJSEL" in phdr
+
+
 def _detect_format_from_path(path: Path) -> str:
     """
     Heuristically detect the FITS spectral format from HDU names only.
@@ -993,6 +1095,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "sdss_spplate"
         if "COEFF0" in phdr and "COEFF1" in phdr and ("PLATEID" in phdr or "PLATE" in phdr):
             return "sdss_spplate"
+        if _is_2df_hdul(hdul):
+            return "2df"
     return "generic"
 
 
@@ -1187,6 +1291,8 @@ def ingest_spectra_from_fits(
                     ra_col=ra_col,
                     dec_col=dec_col,
                 )
+            elif detected_fmt == "2df":
+                records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -1557,7 +1663,7 @@ try:
                   default=None,
                   help="Mask dtype (overrides config; default 'uint8').")
     @click.option("--fmt", default=None,
-                  type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic"]),
+                  type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df"]),
                   help="Force input format (auto-detected by default).")
     @click.option(
         "--specobj-lookup",
