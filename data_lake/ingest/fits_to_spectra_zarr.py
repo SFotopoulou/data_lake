@@ -1180,12 +1180,8 @@ def _read_ozdes_spectrum(
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
-    z = float(header.get("Z", 0.0))
-    if z < -1.0:
-        z = 0.0
-
     meta: dict[str, Any] = {
-        "z": z,
+        "z": float(header.get("Z", 0.0)),
         "z_err": float(header.get("Z_ERR", 0.0)),
         "snr": 0.0,
         "exptime": float(header.get("EXPTIME", 0.0)),
@@ -1283,11 +1279,8 @@ def _read_zcosmos_spectrum(
     shdr = shdu.header
     ra = float(shdr.get("RA", phdr.get("RA", 0.0)))
     dec = float(shdr.get("DEC", phdr.get("DEC", 0.0)))
-    z = float(shdr.get("Z", phdr.get("Z", 0.0)))
-    if z < -1.0:
-        z = 0.0
     meta: dict[str, Any] = {
-        "z": z,
+        "z": float(shdr.get("Z", phdr.get("Z", 0.0))),
         "z_err": float(shdr.get("Z_ERR", phdr.get("Z_ERR", 0.0))),
         "snr": 0.0,
         "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
@@ -1297,6 +1290,99 @@ def _read_zcosmos_spectrum(
     wcs_attrs = {
         "wcs_source": "explicit",
         "n_pix": n_pix,
+    }
+    return [SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=ivar,
+        mask=mask,
+        wavelength=wavelength,
+        meta=meta,
+    )], wcs_attrs
+
+
+def _find_vandels_noise_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
+    """Return the VANDELS 1-D noise estimate extension."""
+    for i, hdu in enumerate(hdul):
+        if (hdu.name or "").strip().upper() == "NOISE" and hdu.data is not None:
+            return i, hdu  # type: ignore[return-value]
+    summary = _summarize_fits_hdus(hdul)
+    raise ValueError(
+        "VANDELS NOISE extension not found (expected 1-D image HDU named NOISE). "
+        f"Found: {summary}"
+    )
+
+
+def _is_vandels_stacked_layout(hdul: fits.HDUList) -> bool:
+    """True when PRIMARY holds 1-D flux and a matching NOISE extension exists."""
+    if not hdul or hdul[0].data is None:
+        return False
+    flux_shape = np.asarray(hdul[0].data).shape
+    if len(flux_shape) != 1 or flux_shape[0] <= 0:
+        return False
+    n_pix = int(flux_shape[0])
+    try:
+        _, noise_hdu = _find_vandels_noise_hdu(hdul)
+    except ValueError:
+        return False
+    return np.asarray(noise_hdu.data).shape == (n_pix,)
+
+
+def _is_vandels_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if the file looks like a VANDELS 1-D spectrum FITS."""
+    if not _is_vandels_stacked_layout(hdul):
+        return False
+    if path.name.lower().startswith("sc_"):
+        return True
+    return "PND OBJID" in hdul[0].header
+
+
+def _read_vandels_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read a VANDELS stacked 1-D spectrum (PRIMARY flux + NOISE extension).
+
+    ``source_id`` is ``normalize_object_id(path.name)`` for catalog filename linkage.
+    Sky position uses ``PND OBJRA`` / ``PND OBJDEC``; redshift from ``PND Z``.
+    """
+    if not _is_vandels_stacked_layout(hdul):
+        summary = _summarize_fits_hdus(hdul)
+        raise ValueError(
+            "VANDELS stacked layout not found (expected PRIMARY 1-D flux + NOISE). "
+            f"Found: {summary}"
+        )
+
+    source_id = _wig_source_id_from_path(source_path)
+    flux_hdu = hdul[0]
+    header = flux_hdu.header
+    flux = np.asarray(flux_hdu.data, dtype=np.float32)
+    n_pix = int(flux.shape[0])
+
+    _, noise_hdu = _find_vandels_noise_hdu(hdul)
+    noise = np.asarray(noise_hdu.data, dtype=np.float64)
+    valid_noise = np.isfinite(noise) & (noise > 0.0)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ivar64 = np.where(valid_noise, 1.0 / (noise * noise), 0.0)
+    ivar = np.clip(ivar64, 0.0, np.finfo(np.float32).max).astype(np.float32)
+
+    finite = np.isfinite(flux) & np.isfinite(_wavelength_from_wcs(header, n_pix))
+    mask = np.where(finite & valid_noise, 0, 1).astype(np.uint8)
+
+    ra = float(header.get("PND OBJRA", header.get("RA", 0.0)))
+    dec = float(header.get("PND OBJDEC", header.get("DEC", 0.0)))
+    wavelength = _wavelength_from_wcs(header, n_pix)
+    wcs_attrs = _wcs_attrs_from_header(header, n_pix)
+    meta: dict[str, Any] = {
+        "z": float(header.get("PND Z", header.get("Z", 0.0))),
+        "z_err": float(header.get("PND ZERR", header.get("Z_ERR", 0.0))),
+        "snr": 0.0,
+        "exptime": float(header.get("EXPTIME", 0.0)),
+        "R": float(header.get("SPEC_RES", 1000.0)),
+        "instr": str(header.get("INSTRUME", "VIMOS"))[:16],
     }
     return [SpectrumRecord(
         source_id=source_id,
@@ -1619,6 +1705,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "2df"
         if _is_zcosmos_hdul(hdul, path):
             return "zcosmos"
+        if _is_vandels_hdul(hdul, path):
+            return "vandels"
         if _is_ozdes_hdul(hdul, path):
             return "ozdes"
         if stem.startswith("wig") and _is_wig_spectrum_layout(hdul):
@@ -1704,7 +1792,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"generic"``.
+        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"generic"``.
         Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
@@ -1834,6 +1922,8 @@ def ingest_spectra_from_fits(
                 )
             elif detected_fmt == "zcosmos":
                 records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
+            elif detected_fmt == "vandels":
+                records, wcs_attrs = _read_vandels_spectrum(hdul, source_path)
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -2238,6 +2328,7 @@ try:
                           "wig",
                           "ozdes",
                           "zcosmos",
+                          "vandels",
                       ],
                   ),
                   help="Force input format (auto-detected by default).")

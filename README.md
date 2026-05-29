@@ -780,6 +780,26 @@ dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 \
 dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --source-id-col SOURCE
 ```
 
+#### VANDELS spectra ingest (stacked only)
+
+VANDELS multi-extension FITS files store the stacked 1-D spectrum in PRIMARY with a
+matching ``NOISE`` extension (1-σ noise estimate → IVAR). Per-epoch ``EXR2D`` / ``SKY`` /
+``THUMB`` extensions are ignored.
+
+**Catalog linkage:** ingest the catalog with ``--source-id-col`` set to the column that
+stores the spectrum **filename** (e.g. ``sc_UDS313141_P3M1Q4_008_1.fits``). Spectrum
+ingest derives the same ``source_id`` from ``normalize_object_id(path.name)``.
+
+```bash
+dl-ingest-catalog vandels_catalog.fits --survey VANDELS \
+  --source-id-col <filename_column> --ra-col RA --dec-col DEC
+
+dl-ingest-spectra sc_UDS313141_P3M1Q4_008_1.fits --survey VANDELS --fmt vandels
+
+# Auto-detect works for sc_*.fits with PRIMARY + NOISE layout
+dl-ingest-spectra sc_UDS313141_P3M1Q4_008_1.fits --survey VANDELS
+```
+
 #### WiggleZ spectra ingest
 
 WiggleZ 1-D FITS files use a 1-D flux array (PRIMARY / ``EXTNAME='spectrum'``) plus a

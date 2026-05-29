@@ -54,7 +54,7 @@ class TestOzdesIngest:
         assert r.flux.shape == (128,)
         assert r.ivar[0] == pytest.approx(0.25)
         assert r.mask.sum() == pytest.approx(12, abs=1)
-        assert r.meta["z"] == 0.0  # sentinel cleared
+        assert r.meta["z"] == pytest.approx(-9.999)
 
     def test_auto_detects_ozdes(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_spectra_zarr import _detect_format_from_path

@@ -460,6 +460,7 @@ try:
                 "wig",
                 "ozdes",
                 "zcosmos",
+                "vandels",
             ],
         ),
         help="Force FITS format (default: auto-detect).",
