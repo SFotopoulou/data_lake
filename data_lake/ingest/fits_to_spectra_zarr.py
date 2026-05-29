@@ -1011,6 +1011,29 @@ def _is_2df_spectrum_hdu(hdu: fits.ImageHDU | fits.PrimaryHDU | fits.HDU) -> boo
     return True
 
 
+def _summarize_fits_hdus(hdul: fits.HDUList) -> str:
+    """One-line summary of HDUs for error messages."""
+    parts: list[str] = []
+    for i, hdu in enumerate(hdul):
+        shape = getattr(hdu.data, "shape", None)
+        parts.append(f"HDU{i} {hdu.name!r} shape={shape}")
+    return "; ".join(parts) if parts else "(empty HDU list)"
+
+
+def _is_2df_stamp_only_hdul(hdul: fits.HDUList) -> bool:
+    """True when the file looks like a 2dF stamp image without a 1-D spectrum."""
+    if len(hdul) != 1:
+        return False
+    phdr = hdul[0].header
+    if "SEQNUM" not in phdr and "BJSEL" not in phdr:
+        return False
+    data = hdul[0].data
+    if data is None:
+        return False
+    shape = tuple(np.asarray(data).shape)
+    return shape == (49, 49)
+
+
 def _find_2df_spectrum_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU | fits.PrimaryHDU]:
     """Locate the 2dF spectral image extension (named SPECTRUM or heuristic)."""
     for i, hdu in enumerate(hdul):
@@ -1019,8 +1042,16 @@ def _find_2df_spectrum_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU | fit
     for i, hdu in enumerate(hdul):
         if _is_2df_spectrum_hdu(hdu):
             return i, hdu  # type: ignore[return-value]
+    summary = _summarize_fits_hdus(hdul)
+    if _is_2df_stamp_only_hdul(hdul):
+        raise ValueError(
+            "2dF stamp-only FITS (49×49 PRIMARY image, no SPECTRUM extension). "
+            "This is not a 1-D spectrum file; use the matching spectrum FITS for this "
+            f"serial or remove it from the ingest list. Found: {summary}"
+        )
     raise ValueError(
-        "no 2dF spectral extension found (expected 2-D HDU with 3 rows: flux, variance, sky)"
+        "no 2dF spectral extension found (expected 2-D HDU with 3 rows: flux, variance, sky). "
+        f"Found: {summary}"
     )
 
 

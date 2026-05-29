@@ -664,6 +664,17 @@ The script:
 **Restarting after preemption or timeout** — re-submit the same `sbatch`
 command; the checkpoint file records completed paths and they are skipped.
 
+**Stamp-only FITS (not spectra):** some paths under the FDR tree are
+49×49 postage-stamp images with only a PRIMARY HDU (`SEQNUM`, `RA`, `DEC`)
+and **no** `SPECTRUM` extension (e.g. `161216.fits`). Ingest correctly rejects
+these with `2dF stamp-only FITS`. They are not 1-D spectra; remove them from
+the file list or point ingest at the directory that holds the matching
+`(3, n_pix)` spectrum files. To filter a list before Slurm:
+
+```bash
+python scripts/filter_2df_spectrum_list.py 2df_files.txt -o 2df_spectra_only.txt
+```
+
 **Reviewing / retrying failures:**
 
 ```bash

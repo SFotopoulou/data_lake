@@ -134,7 +134,23 @@ class TestDetect2df:
         fits.HDUList([primary]).writeto(p, overwrite=True)
 
         with fits.open(p, memmap=True) as hdul:
-            with pytest.raises(ValueError, match="no 2dF spectral extension"):
+            with pytest.raises(ValueError, match="no 2dF spectral extension|Found:"):
+                _read_2df_spectrum(hdul, p)
+
+    def test_stamp_only_fits_raises_clear_message(self, tmp_path: Path) -> None:
+        """FDR tree can include 49×49 stamp images without a SPECTRUM extension."""
+        from data_lake.ingest.fits_to_spectra_zarr import _read_2df_spectrum
+
+        primary = fits.PrimaryHDU(np.zeros((49, 49), dtype=np.float32))
+        primary.header["SEQNUM"] = 161216
+        primary.header["BJSEL"] = 17.5
+        primary.header["RA"] = 1.0
+        primary.header["DEC"] = -1.0
+        p = tmp_path / "161216.fits"
+        fits.HDUList([primary]).writeto(p, overwrite=True)
+
+        with fits.open(p, memmap=True) as hdul:
+            with pytest.raises(ValueError, match="stamp-only FITS"):
                 _read_2df_spectrum(hdul, p)
 
     def test_auto_detects_2df_format(self, tmp_path: Path) -> None:
