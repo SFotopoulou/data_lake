@@ -972,6 +972,58 @@ def _read_generic_1d(
     return records, wcs_attrs
 
 
+def _parse_2df_spectrum_data(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    """Parse 2dF-style ``(flux, variance, sky[, ...])`` image data."""
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError(f"expected 2-D spectrum HDU, got shape {arr.shape}")
+    if arr.shape[0] == 3:
+        flux = arr[0]
+        variance = arr[1]
+        n_pix = int(arr.shape[1])
+    elif arr.shape[1] == 3:
+        flux = arr[:, 0]
+        variance = arr[:, 1]
+        n_pix = int(arr.shape[0])
+    else:
+        raise ValueError(
+            f"expected (3, n_pix) or (n_pix, 3) spectrum layout, got {arr.shape}"
+        )
+    if n_pix <= 0:
+        raise ValueError("spectrum HDU has zero pixels")
+    return flux, variance, n_pix
+
+
+def _is_2df_spectrum_hdu(hdu: fits.ImageHDU | fits.PrimaryHDU | fits.HDU) -> bool:
+    """True when an HDU holds a 2dF-style 3-row spectrum image."""
+    if hdu.data is None:
+        return False
+    try:
+        arr = np.asarray(hdu.data)
+    except Exception:
+        return False
+    if arr.ndim != 2 or 3 not in arr.shape:
+        return False
+    try:
+        _parse_2df_spectrum_data(arr)
+    except ValueError:
+        return False
+    return True
+
+
+def _find_2df_spectrum_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU | fits.PrimaryHDU]:
+    """Locate the 2dF spectral image extension (named SPECTRUM or heuristic)."""
+    for i, hdu in enumerate(hdul):
+        if (hdu.name or "").strip().upper() == "SPECTRUM" and _is_2df_spectrum_hdu(hdu):
+            return i, hdu  # type: ignore[return-value]
+    for i, hdu in enumerate(hdul):
+        if _is_2df_spectrum_hdu(hdu):
+            return i, hdu  # type: ignore[return-value]
+    raise ValueError(
+        "no 2dF spectral extension found (expected 2-D HDU with 3 rows: flux, variance, sky)"
+    )
+
+
 def _read_2df_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
@@ -1004,37 +1056,18 @@ def _read_2df_spectrum(
             stem = stem[: -len(sfx)]
     source_id = normalize_object_id(stem)
 
-    # Locate the SPECTRUM extension
-    spec_hdu_idx = None
-    for i, hdu in enumerate(hdul):
-        if hdu.name.upper() == "SPECTRUM":
-            spec_hdu_idx = i
-            break
-    if spec_hdu_idx is None:
-        # Fall back to HDU 1
-        spec_hdu_idx = 1
+    spec_hdu_idx, shdu = _find_2df_spectrum_hdu(hdul)
+    if (shdu.name or "").strip().upper() != "SPECTRUM":
         log.warning(
-            "2dF: no SPECTRUM HDU in %s; using HDU 1", source_path.name
+            "2dF: no SPECTRUM HDU in %s; using HDU %d (%r)",
+            source_path.name,
+            spec_hdu_idx,
+            shdu.name,
         )
 
-    shdu = hdul[spec_hdu_idx]
     shdr = shdu.header
-    data = np.array(shdu.data, dtype=np.float64)
-
-    # Normalise to (3, n_pix)
-    if data.ndim == 2 and data.shape[0] == 3:
-        pass  # (3, n_pix) — expected
-    elif data.ndim == 2 and data.shape[1] == 3:
-        data = data.T  # (n_pix, 3) → (3, n_pix)
-    else:
-        raise ValueError(
-            f"2dF SPECTRUM HDU in {source_path.name} has unexpected shape "
-            f"{data.shape}; expected (3, n_pix)"
-        )
-
-    n_pix = data.shape[1]
-    flux = data[0].astype(np.float32)
-    variance = data[1]
+    flux, variance, n_pix = _parse_2df_spectrum_data(np.asarray(shdu.data))
+    flux = flux.astype(np.float32)
     with np.errstate(divide="ignore", invalid="ignore"):
         ivar = np.where(variance > 0.0, 1.0 / variance, 0.0).astype(np.float32)
     mask = np.zeros(n_pix, dtype=np.uint8)
@@ -1066,12 +1099,40 @@ def _read_2df_spectrum(
 
 def _is_2df_hdul(hdul: fits.HDUList) -> bool:
     """Return True if the FITS HDU list looks like a 2dFGRS spectrum file."""
-    names = [h.name.upper() for h in hdul]
-    if "SPECTRUM" not in names:
-        return False
     phdr = hdul[0].header
-    # 2dF primary HDUs carry SEQNUM and BJSEL keywords
-    return "SEQNUM" in phdr or "BJSEL" in phdr
+    if "SEQNUM" not in phdr and "BJSEL" not in phdr:
+        return False
+    try:
+        _find_2df_spectrum_hdu(hdul)
+    except ValueError:
+        return False
+    return True
+
+
+def _ensure_batch_rows_2d(batch: np.ndarray) -> np.ndarray:
+    """Ensure flux/ivar/mask batch arrays are ``(n_rows, n_pix)`` for Zarr append."""
+    arr = np.asarray(batch)
+    if arr.ndim == 1:
+        return arr[np.newaxis, :]
+    if arr.ndim != 2:
+        raise ValueError(f"expected 1-D or 2-D batch, got shape {arr.shape}")
+    return arr
+
+
+def _ensure_batch_ids(batch_ids: np.ndarray) -> np.ndarray:
+    """Ensure source_id batch is 1-D (Zarr append rejects 0-D scalars)."""
+    ids = np.atleast_1d(np.asarray(batch_ids, dtype=np.int64))
+    return ids
+
+
+def _ensure_batch_meta(batch_meta: np.ndarray, n_rows: int) -> np.ndarray:
+    """Ensure structured meta batch has shape ``(n_rows,)``."""
+    meta = np.asarray(batch_meta)
+    if meta.ndim == 0:
+        return meta.reshape(1)
+    if n_rows and meta.shape[0] != n_rows:
+        return meta.reshape(n_rows)
+    return meta
 
 
 def _is_6df_hdul(hdul: fits.HDUList) -> bool:
@@ -1458,6 +1519,14 @@ def ingest_spectra_from_fits(
             resolution_offsets=res_offsets,
         )
         tile_n_pix = int(root["flux"].shape[1])
+        if root["flux"].ndim != 2:
+            raise ValueError(
+                f"Corrupt spectrum tile {tile_path}: flux array must be 2-D, "
+                f"got shape {root['flux'].shape}"
+            )
+        tile_wavelength_mode = str(
+            root.attrs.get("wavelength_mode", wavelength_mode_effective)
+        )
 
         # Dynamic tile widening: when incoming batch has longer spectra than the
         # existing tile, widen (pad existing rows) rather than truncate new spectra.
@@ -1465,13 +1534,16 @@ def ingest_spectra_from_fits(
             root = widen_spectrum_tile(
                 tile_path,
                 batch_max_pix,
-                wavelength_mode=wavelength_mode_effective,
+                wavelength_mode=tile_wavelength_mode,
                 mask_dtype=mask_dtype,
                 wcs_attrs=wcs_attrs,
                 n_diag=n_diag,
                 resolution_offsets=res_offsets,
             )
             tile_n_pix = int(root["flux"].shape[1])
+            tile_wavelength_mode = str(
+                root.attrs.get("wavelength_mode", wavelength_mode_effective)
+            )
 
         n_existing = int(root["source_id"].shape[0])
         existing: set[int] = set()
@@ -1505,13 +1577,25 @@ def ingest_spectra_from_fits(
 
         start_idx = root["flux"].shape[0]
 
-        batch_flux  = np.stack([r.flux  for r in tile_records]).astype(np.float32)
-        batch_ivar  = np.stack([r.ivar  for r in tile_records]).astype(np.float32)
-        batch_mask  = np.stack([r.mask  for r in tile_records]).astype(mask_dtype)
-        batch_ids   = np.array([r.source_id for r in tile_records], dtype=np.int64)
-        batch_meta  = np.frombuffer(
-            b"".join(_meta_to_bytes(r.meta) for r in tile_records),
-            dtype="|V" + str(_META_DTYPE.itemsize),
+        n_rows = len(tile_records)
+        batch_flux = _ensure_batch_rows_2d(
+            np.stack([r.flux for r in tile_records])
+        ).astype(np.float32)
+        batch_ivar = _ensure_batch_rows_2d(
+            np.stack([r.ivar for r in tile_records])
+        ).astype(np.float32)
+        batch_mask = _ensure_batch_rows_2d(
+            np.stack([r.mask for r in tile_records])
+        ).astype(mask_dtype)
+        batch_ids = _ensure_batch_ids(
+            np.array([r.source_id for r in tile_records], dtype=np.int64)
+        )
+        batch_meta = _ensure_batch_meta(
+            np.frombuffer(
+                b"".join(_meta_to_bytes(r.meta) for r in tile_records),
+                dtype="|V" + str(_META_DTYPE.itemsize),
+            ),
+            n_rows,
         )
 
         root["flux"].append(batch_flux)
@@ -1520,13 +1604,13 @@ def ingest_spectra_from_fits(
         root["source_id"].append(batch_ids)
         root["meta"].append(batch_meta)
 
-        if wavelength_mode_effective == "per_source":
-            batch_wave = np.stack([
+        if tile_wavelength_mode == "per_source":
+            batch_wave = _ensure_batch_rows_2d(np.stack([
                 r.wavelength.astype(np.float32)
                 if r.wavelength is not None
                 else np.zeros(tile_n_pix, dtype=np.float32)
                 for r in tile_records
-            ])
+            ]))
             root["wavelength"].append(batch_wave)
         elif start_idx == 0 and tile_records[0].wavelength is not None:
             # Write shared wavelength once (first time the tile is created)

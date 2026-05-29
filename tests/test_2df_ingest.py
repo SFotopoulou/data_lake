@@ -99,6 +99,44 @@ def _write_catalog_with_serial(
 
 
 class TestDetect2df:
+    def test_finds_unnamed_spectrum_hdu(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import _read_2df_spectrum
+
+        n_pix = 64
+        flux = np.ones(n_pix, dtype=np.float32)
+        var = np.ones(n_pix, dtype=np.float32)
+        sky = np.zeros(n_pix, dtype=np.float32)
+        data = np.stack([flux, var, sky])
+        primary = fits.PrimaryHDU(np.zeros((8, 8), dtype=np.float32))
+        primary.header["SEQNUM"] = 5168
+        primary.header["BJSEL"] = 17.0
+        primary.header["RA"] = 1.0
+        primary.header["DEC"] = -1.0
+        spec = fits.ImageHDU(data)  # no HDU name
+        spec.header["CRVAL1"] = 5000.0
+        spec.header["CRPIX1"] = 1.0
+        spec.header["CDELT1"] = 2.0
+        p = tmp_path / "005168.fits"
+        fits.HDUList([primary, spec]).writeto(p, overwrite=True)
+
+        with fits.open(p, memmap=True) as hdul:
+            records, _ = _read_2df_spectrum(hdul, p)
+        assert len(records) == 1
+        assert records[0].flux.shape == (n_pix,)
+
+    def test_missing_spectrum_hdu_raises(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import _read_2df_spectrum
+
+        primary = fits.PrimaryHDU(np.zeros((8, 8), dtype=np.float32))
+        primary.header["SEQNUM"] = 5168
+        primary.header["BJSEL"] = 17.0
+        p = tmp_path / "005168.fits"
+        fits.HDUList([primary]).writeto(p, overwrite=True)
+
+        with fits.open(p, memmap=True) as hdul:
+            with pytest.raises(ValueError, match="no 2dF spectral extension"):
+                _read_2df_spectrum(hdul, p)
+
     def test_auto_detects_2df_format(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_spectra_zarr import _detect_format_from_path
 
