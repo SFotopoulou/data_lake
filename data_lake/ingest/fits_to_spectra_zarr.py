@@ -1492,6 +1492,94 @@ def _read_vipers_spectrum(
     )], wcs_attrs
 
 
+_VUDS_ID_KEY = "LAM CESAM VO IDENT"
+_VUDS_RA_KEY = "LAM CESAM VO ALPHA"
+_VUDS_DEC_KEY = "LAM CESAM VO DELTA"
+_VUDS_Z_KEY = "LAM CESAM VO Z"
+
+
+def _is_vuds_stacked_layout(hdul: fits.HDUList) -> bool:
+    """True when PRIMARY holds a 1-D VUDS flux array with catalog ID metadata."""
+    if not hdul or hdul[0].data is None:
+        return False
+    shape = np.asarray(hdul[0].data).shape
+    if len(shape) != 1 or shape[0] <= 0:
+        return False
+    return _VUDS_ID_KEY in hdul[0].header
+
+
+def _is_vuds_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if the file looks like a VUDS 1-D spectrum FITS."""
+    if not _is_vuds_stacked_layout(hdul):
+        return False
+    if path.name.lower().startswith("sc_"):
+        return True
+    return _VUDS_Z_KEY in hdul[0].header
+
+
+def _read_vuds_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+    *,
+    source_id_col: str | None = None,
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read a VUDS 1-D spectrum from PRIMARY (flux + spectral WCS).
+
+    ``source_id`` comes from ``LAM CESAM VO IDENT`` by default.  Sky position
+    and redshift use ``LAM CESAM VO ALPHA`` / ``DELTA`` / ``Z``.  No uncertainty
+    or mask extensions are expected (IVAR defaults to 1, mask to 0).
+    """
+    if not _is_vuds_stacked_layout(hdul):
+        summary = _summarize_fits_hdus(hdul)
+        raise ValueError(
+            "VUDS stacked layout not found (expected PRIMARY 1-D flux with "
+            f"{_VUDS_ID_KEY!r}). Found: {summary}"
+        )
+
+    flux_hdu = hdul[0]
+    header = flux_hdu.header
+    flux = np.asarray(flux_hdu.data, dtype=np.float32)
+    n_pix = int(flux.shape[0])
+
+    sid_key = source_id_col or _VUDS_ID_KEY
+    if sid_key.strip().upper() == "ID":
+        sid_key = _VUDS_ID_KEY
+    if sid_key not in header:
+        source_id = object_id_from_fits_header(header, sid_key, hdu_index=0)
+    else:
+        from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+        raw_id = header[sid_key]
+        if isinstance(raw_id, (float, np.floating)) and np.isfinite(raw_id) and raw_id == int(raw_id):
+            source_id = normalize_object_id(int(raw_id))
+        else:
+            source_id = normalize_object_id(raw_id)
+    ra = float(header.get(_VUDS_RA_KEY, header.get("RA", 0.0)))
+    dec = float(header.get(_VUDS_DEC_KEY, header.get("DEC", 0.0)))
+    wavelength = _wavelength_from_wcs(header, n_pix)
+    wcs_attrs = _wcs_attrs_from_header(header, n_pix)
+
+    meta: dict[str, Any] = {
+        "z": float(header.get(_VUDS_Z_KEY, header.get("Z", 0.0))),
+        "z_err": float(header.get("LAM CESAM VO ZERR", header.get("Z_ERR", 0.0))),
+        "snr": 0.0,
+        "exptime": float(header.get("EXPTIME", 0.0)),
+        "R": float(header.get("SPEC_RES", 1000.0)),
+        "instr": str(header.get("INSTRUME", header.get("ESO INS ID", "VIMOS")))[:16],
+    }
+    return [SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=np.ones(n_pix, dtype=np.float32),
+        mask=np.zeros(n_pix, dtype=np.uint8),
+        wavelength=wavelength,
+        meta=meta,
+    )], wcs_attrs
+
+
 def _parse_2df_spectrum_data(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse 2dF-style ``(flux, variance, sky[, ...])`` image data."""
     arr = np.asarray(data, dtype=np.float64)
@@ -1801,6 +1889,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "2df"
         if _is_vipers_hdul(hdul, path):
             return "vipers"
+        if _is_vuds_hdul(hdul, path):
+            return "vuds"
         if _is_zcosmos_hdul(hdul, path):
             return "zcosmos"
         if _is_vandels_hdul(hdul, path):
@@ -1890,7 +1980,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"vipers"``, ``"generic"``.
+        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"vipers"``, ``"vuds"``, ``"generic"``.
         Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
@@ -2029,6 +2119,12 @@ def ingest_spectra_from_fits(
                     source_id_col=source_id_col,
                     ra_col=ra_col,
                     dec_col=dec_col,
+                )
+            elif detected_fmt == "vuds":
+                records, wcs_attrs = _read_vuds_spectrum(
+                    hdul,
+                    source_path,
+                    source_id_col=source_id_col,
                 )
             else:
                 records, wcs_attrs = _read_generic_1d(
@@ -2436,6 +2532,7 @@ try:
                           "zcosmos",
                           "vandels",
                           "vipers",
+                          "vuds",
                       ],
                   ),
                   help="Force input format (auto-detected by default).")

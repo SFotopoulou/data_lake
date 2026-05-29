@@ -820,6 +820,29 @@ dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS \
 dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS --source-id-col ID
 ```
 
+#### VUDS spectra ingest
+
+VUDS 1-D spectra are stored as a single PRIMARY image array with spectral WCS.
+Object metadata uses ``LAM CESAM VO IDENT``, ``LAM CESAM VO ALPHA`` / ``DELTA``,
+and ``LAM CESAM VO Z``.  No uncertainty or mask extensions are expected (IVAR=1,
+mask=0).
+
+**Catalog linkage:** ingest the catalog with ``--source-id-col ID``; spectrum
+ingest reads ``LAM CESAM VO IDENT`` (``--source-id-col ID`` is accepted as an
+alias).
+
+```bash
+dl-ingest-catalog vuds_catalog.fits --survey VUDS \
+  --source-id-col ID --ra-col RA --dec-col DEC
+
+dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS \
+  --fmt vuds --source-id-col ID
+
+# Auto-detect works for sc_*.fits with LAM CESAM VO metadata
+dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS \
+  --source-id-col ID
+```
+
 #### WiggleZ spectra ingest
 
 WiggleZ 1-D FITS files use a 1-D flux array (PRIMARY / ``EXTNAME='spectrum'``) plus a

@@ -462,6 +462,7 @@ try:
                 "zcosmos",
                 "vandels",
                 "vipers",
+                "vuds",
             ],
         ),
         help="Force FITS format (default: auto-detect).",
