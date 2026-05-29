@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from astropy.io import fits
+from tqdm import tqdm
 
 from data_lake.ingest.fits_to_spectra_zarr import _is_2df_spectrum_hdu
 
@@ -36,14 +37,22 @@ def main() -> int:
         default=None,
         help="Optional path listing rejected inputs",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bar",
+    )
     args = parser.parse_args()
+
+    entries: list[str] = []
+    for line in args.file_list.read_text().splitlines():
+        path_str = line.strip()
+        if path_str and not path_str.startswith("#"):
+            entries.append(path_str)
 
     kept: list[str] = []
     rejected: list[str] = []
-    for line in args.file_list.read_text().splitlines():
-        path_str = line.strip()
-        if not path_str or path_str.startswith("#"):
-            continue
+    for path_str in tqdm(entries, desc="filter 2df", unit="file", disable=args.no_progress):
         p = Path(path_str)
         if not p.is_file():
             rejected.append(path_str)
