@@ -77,6 +77,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -1580,6 +1581,102 @@ def _read_vuds_spectrum(
     )], wcs_attrs
 
 
+def _vvds_source_id_from_path(path: Path) -> int:
+    """``source_id`` from ``sc_<ID>_...`` filename stem (matches catalog ``ID`` column)."""
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    match = re.match(r"sc_(\d+)", path.stem, re.IGNORECASE)
+    if not match:
+        raise ValueError(
+            f"VVDS filename missing sc_<ID>_ prefix (expected catalog ID in name): {path.name}"
+        )
+    return normalize_object_id(match.group(1))
+
+
+def _flatten_vvds_primary_flux(data: np.ndarray) -> np.ndarray:
+    """Coerce VVDS PRIMARY data to a 1-D flux vector."""
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim == 1:
+        return arr.astype(np.float32)
+    if arr.ndim == 2 and arr.shape[0] == 1:
+        return arr[0].astype(np.float32)
+    if arr.ndim == 2 and arr.shape[1] == 1:
+        return arr[:, 0].astype(np.float32)
+    raise ValueError(
+        f"VVDS PRIMARY flux must be 1-D or single-row/column 2-D, got shape {arr.shape}"
+    )
+
+
+def _is_vvds_stacked_layout(hdul: fits.HDUList) -> bool:
+    """True when PRIMARY holds a VVDS 1-D (or 1×N) flux array without VUDS metadata."""
+    if not hdul or hdul[0].data is None:
+        return False
+    if _VUDS_ID_KEY in hdul[0].header:
+        return False
+    try:
+        flux = _flatten_vvds_primary_flux(np.asarray(hdul[0].data))
+    except ValueError:
+        return False
+    return flux.size > 0
+
+
+def _is_vvds_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if the file looks like a VVDS 1-D spectrum FITS."""
+    if not path.name.lower().startswith("sc_"):
+        return False
+    return _is_vvds_stacked_layout(hdul)
+
+
+def _read_vvds_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+    *,
+    ra_col: str = "RA",
+    dec_col: str = "DEC",
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read a VVDS 1-D spectrum from PRIMARY (flux + spectral WCS).
+
+    ``source_id`` is parsed from the filename ``sc_<ID>_...`` prefix.  Sky position
+    uses ``RA`` / ``DEC``.  No uncertainty or mask extensions are expected.
+    """
+    if not _is_vvds_stacked_layout(hdul):
+        summary = _summarize_fits_hdus(hdul)
+        raise ValueError(
+            "VVDS stacked layout not found (expected PRIMARY 1-D flux, not VUDS). "
+            f"Found: {summary}"
+        )
+
+    flux_hdu = hdul[0]
+    header = flux_hdu.header
+    flux = _flatten_vvds_primary_flux(flux_hdu.data)
+    n_pix = int(flux.shape[0])
+    source_id = _vvds_source_id_from_path(source_path)
+    ra = float(header.get(ra_col, 0.0))
+    dec = float(header.get(dec_col, 0.0))
+    wavelength = _wavelength_from_wcs(header, n_pix)
+    wcs_attrs = _wcs_attrs_from_header(header, n_pix)
+
+    meta: dict[str, Any] = {
+        "z": float(header.get("REDSHIFT", header.get("Z", 0.0))),
+        "z_err": float(header.get("REDSHIFT_ERR", header.get("Z_ERR", 0.0))),
+        "snr": 0.0,
+        "exptime": float(header.get("EXPTIME", 0.0)),
+        "R": float(header.get("SPEC_RES", 1000.0)),
+        "instr": str(header.get("INSTRUME", header.get("ESO INS ID", "VIMOS")))[:16],
+    }
+    return [SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=np.ones(n_pix, dtype=np.float32),
+        mask=np.zeros(n_pix, dtype=np.uint8),
+        wavelength=wavelength,
+        meta=meta,
+    )], wcs_attrs
+
+
 def _parse_2df_spectrum_data(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse 2dF-style ``(flux, variance, sky[, ...])`` image data."""
     arr = np.asarray(data, dtype=np.float64)
@@ -1891,6 +1988,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "vipers"
         if _is_vuds_hdul(hdul, path):
             return "vuds"
+        if _is_vvds_hdul(hdul, path):
+            return "vvds"
         if _is_zcosmos_hdul(hdul, path):
             return "zcosmos"
         if _is_vandels_hdul(hdul, path):
@@ -1980,7 +2079,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"vipers"``, ``"vuds"``, ``"generic"``.
+        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"vipers"``, ``"vuds"``, ``"vvds"``, ``"generic"``.
         Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
@@ -2125,6 +2224,13 @@ def ingest_spectra_from_fits(
                     hdul,
                     source_path,
                     source_id_col=source_id_col,
+                )
+            elif detected_fmt == "vvds":
+                records, wcs_attrs = _read_vvds_spectrum(
+                    hdul,
+                    source_path,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
                 )
             else:
                 records, wcs_attrs = _read_generic_1d(
@@ -2533,6 +2639,7 @@ try:
                           "vandels",
                           "vipers",
                           "vuds",
+                          "vvds",
                       ],
                   ),
                   help="Force input format (auto-detected by default).")

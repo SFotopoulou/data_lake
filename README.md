@@ -843,6 +843,28 @@ dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS
   --source-id-col ID
 ```
 
+#### VVDS spectra ingest
+
+VVDS 1-D spectra use a PRIMARY flux array (1-D or ``(1, n_pix)``) with spectral WCS.
+Sky coordinates are in ``RA`` / ``DEC``.  No uncertainty or mask extensions are
+expected (IVAR=1, mask=0).
+
+**Catalog linkage:** ingest the catalog with ``--source-id-col ID``; spectrum ingest
+derives ``source_id`` from the numeric segment in the filename prefix
+``sc_<ID>_...`` (e.g. ``sc_000030078_...`` → ``30078``).  Files with VUDS
+``LAM CESAM VO IDENT`` metadata are routed to the ``vuds`` reader instead.
+
+```bash
+dl-ingest-catalog vvds_catalog.fits --survey VVDS \
+  --source-id-col ID --ra-col RA --dec-col DEC
+
+dl-ingest-spectra sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits --survey VVDS \
+  --fmt vvds
+
+# Auto-detect works for sc_*.fits without VUDS metadata
+dl-ingest-spectra sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits --survey VVDS
+```
+
 #### WiggleZ spectra ingest
 
 WiggleZ 1-D FITS files use a 1-D flux array (PRIMARY / ``EXTNAME='spectrum'``) plus a

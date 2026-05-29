@@ -463,6 +463,7 @@ try:
                 "vandels",
                 "vipers",
                 "vuds",
+                "vvds",
             ],
         ),
         help="Force FITS format (default: auto-detect).",
