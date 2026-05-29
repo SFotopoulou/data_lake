@@ -1043,6 +1043,69 @@ def _read_generic_1d(
     return records, wcs_attrs
 
 
+def _wig_catalog_filename_key(path: Path) -> str:
+    """Catalog match key for WiggleZ (e.g. ``wig225415.fits`` from ``wig225415.fits.gz``)."""
+    name = path.name
+    if name.lower().endswith(".fits.gz"):
+        return name[: -len(".gz")]
+    return name
+
+
+def _wig_source_id_from_path(path: Path) -> int:
+    """``source_id`` matching catalog rows keyed by spectrum filename."""
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    return normalize_object_id(_wig_catalog_filename_key(path))
+
+
+def _is_wig_spectrum_layout(hdul: fits.HDUList) -> bool:
+    """True for 1-D flux + separate VARIANCE extension (WiggleZ-style)."""
+    if len(hdul) < 2 or hdul[0].data is None:
+        return False
+    shape = np.asarray(hdul[0].data).shape
+    if len(shape) != 1:
+        return False
+    hdu_names = [(h.name or "").strip().upper() for h in hdul]
+    if not any(n in ("VARIANCE", "VAR") for n in hdu_names):
+        return False
+    ext = (hdul[0].header.get("EXTNAME") or hdul[0].name or "").strip().upper()
+    return ext in ("SPECTRUM", "")
+
+
+def _is_wig_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if the file looks like a WiggleZ 1-D spectrum FITS."""
+    if not path.stem.lower().startswith("wig"):
+        return False
+    return _is_wig_spectrum_layout(hdul)
+
+
+def _read_wig_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read a WiggleZ 1-D spectrum (generic flux/variance layout).
+
+    ``source_id`` is ``normalize_object_id(<basename>)`` so it matches the
+    catalog column that stores the spectrum filename (e.g. ``wig225415.fits``).
+    Sky position uses ``RA_OBJ`` / ``DEC_OBJ``.
+    """
+    from dataclasses import replace
+
+    source_id = _wig_source_id_from_path(source_path)
+    records, wcs_attrs = _read_generic_1d(
+        hdul,
+        ra_col="RA_OBJ",
+        dec_col="DEC_OBJ",
+    )
+    out: list[SpectrumRecord] = []
+    for rec in records:
+        meta = dict(rec.meta)
+        meta["instr"] = str(meta.get("instr", "WiggleZ"))[:16]
+        out.append(replace(rec, source_id=source_id, meta=meta))
+    return out, wcs_attrs
+
+
 def _parse_2df_spectrum_data(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse 2dF-style ``(flux, variance, sky[, ...])`` image data."""
     arr = np.asarray(data, dtype=np.float64)
@@ -1350,6 +1413,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "sdss_spplate"
         if _is_2df_hdul(hdul):
             return "2df"
+        if stem.startswith("wig") and _is_wig_spectrum_layout(hdul):
+            return "wig"
     return "generic"
 
 
@@ -1431,7 +1496,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"generic"``.  Auto-detected from HDU names if ``None``.
+        ``"2df"``, ``"6df"``, ``"wig"``, ``"generic"``.  Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
         ``SPECOBJID`` for spPlate ingest.  Mutually exclusive with
@@ -1548,6 +1613,8 @@ def ingest_spectra_from_fits(
                 records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
             elif detected_fmt == "6df":
                 records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
+            elif detected_fmt == "wig":
+                records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -1941,7 +2008,9 @@ try:
                   default=None,
                   help="Mask dtype (overrides config; default 'uint8').")
     @click.option("--fmt", default=None,
-                  type=click.Choice(["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df", "6df"]),
+                  type=click.Choice(
+                      ["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df", "6df", "wig"],
+                  ),
                   help="Force input format (auto-detected by default).")
     @click.option(
         "--specobj-lookup",

@@ -760,11 +760,41 @@ sbatch scripts/slurm_ingest_6df_spectra.sh
 
 Re-submit the same command to resume from checkpoint after timeout/preemption.
 
+#### WiggleZ spectra ingest
+
+WiggleZ 1-D FITS files use a 1-D flux array (PRIMARY / ``EXTNAME='spectrum'``) plus a
+sibling ``VARIANCE`` extension.  Sky coordinates are in ``RA_OBJ`` / ``DEC_OBJ``.
+
+**Catalog linkage:** ingest the catalog with ``--source-id-col`` set to the column
+that stores the spectrum **filename** (e.g. ``wig225415.fits``).  Spectrum ingest
+derives the same ``source_id`` from the file basename (``normalize_object_id`` of
+``wig225415.fits``), so the stem alone (``wig225415``) will **not** match.
+
+```bash
+# Catalog (already ingested example)
+dl-ingest-catalog wigglez_catalog.fits --survey WIGGLEZ \
+  --source-id-col <filename_column> --ra-col RA --dec-col DEC
+
+# Single spectrum
+dl-ingest-spectra wig225415.fits --survey WIGGLEZ --fmt wig
+
+# Auto-detect works when the basename starts with ``wig`` and layout matches
+dl-ingest-spectra wig225415.fits --survey WIGGLEZ
+
+dl-ingest-spectra-from-list wig_files.txt \
+  --survey WIGGLEZ \
+  --fmt wig \
+  --wavelength-mode shared \
+  --on-duplicate skip \
+  --checkpoint /path/to/lake/ingest_state/wig/checkpoint.json \
+  --failures-log /path/to/lake/ingest_state/wig/failures.jsonl
+```
+
+#### Parallel batch ingest (many coadd files)
+
 Export specObj rows with a constant ``survey`` column when merging multiple releases
 into one lookup file.  spPlate wavelength grids (~3859 px, ``COEFF0``/``COEFF1``) differ
 from per-object ``spec-*.fits`` coadds (~4628 px); do not expect pixel-identical spectra.
-
-#### Parallel batch ingest (many coadd files)
 
 For survey-scale jobs (e.g. ~10 000 DESI coadd files) use the parallel
 batch CLI.  It runs decode + ``coadd_cameras`` in N worker processes while
