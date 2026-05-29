@@ -1205,6 +1205,111 @@ def _read_ozdes_spectrum(
     return [record], wcs_attrs
 
 
+def _is_zcosmos_container_hdu(hdu: fits.hdu.base.ExtensionHDU | fits.PrimaryHDU) -> bool:
+    """True when an HDU is a zCOSMOS spectral container binary table."""
+    if not isinstance(hdu, fits.BinTableHDU):
+        return False
+    cols = {c.upper() for c in hdu.columns.names}
+    required = {"WAVE", "FLUX_REDUCED", "ERR"}
+    return required.issubset(cols)
+
+
+def _find_zcosmos_container_hdu(hdul: fits.HDUList) -> tuple[int, fits.BinTableHDU]:
+    """Return the zCOSMOS spectral container table HDU."""
+    for i, hdu in enumerate(hdul):
+        if _is_zcosmos_container_hdu(hdu):
+            return i, hdu
+    summary = _summarize_fits_hdus(hdul)
+    raise ValueError(
+        "zCOSMOS spectral container not found (expected BinTable with columns "
+        f"WAVE/FLUX_REDUCED/ERR). Found: {summary}"
+    )
+
+
+def _is_zcosmos_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if this file looks like a zCOSMOS 1-D spectrum file."""
+    if not path.name.lower().startswith("zcosmos"):
+        return False
+    try:
+        _find_zcosmos_container_hdu(hdul)
+    except ValueError:
+        return False
+    return True
+
+
+def _read_zcosmos_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read a zCOSMOS 1-D spectrum from the spectral-container table.
+
+    Uses filename-based source linking: ``source_id = normalize_object_id(path.name)``.
+    """
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    source_id = normalize_object_id(source_path.name)
+    _, shdu = _find_zcosmos_container_hdu(hdul)
+    row = shdu.data[0]
+
+    wavelength = np.asarray(row["WAVE"], dtype=np.float64)
+    flux = np.asarray(row["FLUX_REDUCED"], dtype=np.float32)
+    err = np.asarray(row["ERR"], dtype=np.float64)
+
+    if wavelength.ndim != 1 or flux.ndim != 1 or err.ndim != 1:
+        raise ValueError(
+            "zCOSMOS arrays must be 1-D "
+            f"(got wave={wavelength.shape}, flux={flux.shape}, err={err.shape})"
+        )
+    if not (len(wavelength) == len(flux) == len(err)):
+        raise ValueError(
+            "zCOSMOS array lengths mismatch: "
+            f"wave={len(wavelength)} flux={len(flux)} err={len(err)}"
+        )
+    n_pix = int(len(flux))
+    finite_wave_flux = np.isfinite(wavelength) & np.isfinite(flux)
+    valid_err = np.isfinite(err) & (err > 0.0)
+    if np.any(valid_err):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ivar = np.where(valid_err, 1.0 / (err * err), 0.0).astype(np.float32)
+        mask = np.where(finite_wave_flux & valid_err, 0, 1).astype(np.uint8)
+    else:
+        # Some zCOSMOS products carry placeholder ERR arrays (all zeros/non-finite).
+        # Treat uncertainty as unavailable instead of masking the full spectrum.
+        ivar = np.ones(n_pix, dtype=np.float32)
+        mask = np.where(finite_wave_flux, 0, 1).astype(np.uint8)
+
+    phdr = hdul[0].header
+    shdr = shdu.header
+    ra = float(shdr.get("RA", phdr.get("RA", 0.0)))
+    dec = float(shdr.get("DEC", phdr.get("DEC", 0.0)))
+    z = float(shdr.get("Z", phdr.get("Z", 0.0)))
+    if z < -1.0:
+        z = 0.0
+    meta: dict[str, Any] = {
+        "z": z,
+        "z_err": float(shdr.get("Z_ERR", phdr.get("Z_ERR", 0.0))),
+        "snr": 0.0,
+        "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+        "R": float(shdr.get("SPEC_RES", phdr.get("SPEC_RES", 1000.0))),
+        "instr": str(shdr.get("INSTRUME", phdr.get("INSTRUME", "zCOSMOS")))[:16],
+    }
+    wcs_attrs = {
+        "wcs_source": "explicit",
+        "n_pix": n_pix,
+    }
+    return [SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=ivar,
+        mask=mask,
+        wavelength=wavelength,
+        meta=meta,
+    )], wcs_attrs
+
+
 def _parse_2df_spectrum_data(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse 2dF-style ``(flux, variance, sky[, ...])`` image data."""
     arr = np.asarray(data, dtype=np.float64)
@@ -1512,6 +1617,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "sdss_spplate"
         if _is_2df_hdul(hdul):
             return "2df"
+        if _is_zcosmos_hdul(hdul, path):
+            return "zcosmos"
         if _is_ozdes_hdul(hdul, path):
             return "ozdes"
         if stem.startswith("wig") and _is_wig_spectrum_layout(hdul):
@@ -1597,7 +1704,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"generic"``.
+        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"generic"``.
         Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
@@ -1725,6 +1832,8 @@ def ingest_spectra_from_fits(
                     ra_col=ra_col,
                     dec_col=dec_col,
                 )
+            elif detected_fmt == "zcosmos":
+                records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -2128,6 +2237,7 @@ try:
                           "6df",
                           "wig",
                           "ozdes",
+                          "zcosmos",
                       ],
                   ),
                   help="Force input format (auto-detected by default).")

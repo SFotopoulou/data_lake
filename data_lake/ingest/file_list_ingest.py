@@ -459,6 +459,7 @@ try:
                 "6df",
                 "wig",
                 "ozdes",
+                "zcosmos",
             ],
         ),
         help="Force FITS format (default: auto-detect).",
