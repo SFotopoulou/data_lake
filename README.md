@@ -1359,6 +1359,35 @@ There is no requirement to materialise a single wide table of the whole lake;
 often a **small association Parquet** plus **on-demand joins** to native
 catalog tiles is enough.
 
+### Catalog–catalog association (positional)
+
+Catalog↔catalog matching is **sky-based** (STILTS, ``build_crossmatch``, etc.).
+Catalog↔spectrum linkage is a **separate workflow**: the catalog row must carry
+the native spectrum key (or ``_spectrum_index`` after ingest), not a positional
+match to Zarr tiles.
+
+**Export columns for matching** — ``dl-extract-catalog`` projects any columns
+from raw catalog files (FITS, VOTable, Parquet, CSV, …) or from an ingested
+lake catalog:
+
+```bash
+# Raw survey catalog → Parquet for STILTS
+dl-extract-catalog survey_a.fits -o a_sky.parquet \
+  -c TARGETID -c RA -c DEC --valid-sky-only
+
+# Rename columns for STILTS (NAME:alias)
+dl-extract-catalog survey_b.fits -o b_sky.csv --format csv \
+  -c ID:id -c ra:RA -c dec:DEC
+
+# Already-ingested lake catalog
+dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \
+  -o desi_sky.parquet -c source_id -c ra -c dec
+
+# Many files
+dl-extract-catalog --file-list catalog_paths.txt -o all_a.parquet \
+  -c serial -c RA -c DEC --add-input-path
+```
+
 ### Associations with STILTS
 
 [STILTS](https://www.starlink.ac.uk/stilts/) is a strong choice when you need
@@ -1369,10 +1398,10 @@ partitioning — see `data_lake/io/crossmatch.py`).
 
 **Suggested workflow:**
 
-1. **Materialise inputs** — Export the lake catalogs you need to FITS or
-   VOTable (e.g. DuckDB `COPY (SELECT source_id, ra, dec, …) TO 'a.parquet'`
-   then convert with Astropy / Polars, or write FITS directly). Keep
-   **`source_id`** and sky columns consistent with the Parquet catalog.
+1. **Materialise inputs** — Use ``dl-extract-catalog`` (above) or DuckDB
+   ``COPY (SELECT …)`` to write FITS/VOTable/Parquet with the ID and sky columns
+   you need for matching. Keep **native IDs** consistent with how each catalog
+   was (or will be) ingested.
 2. **Run STILTS** — e.g. `tskymatch2` / `tmatch2` with your chosen `find=`
    policy, error circles, and output columns for both tables.
 3. **Write the master** — Convert STILTS output to **Parquet** (columnar,

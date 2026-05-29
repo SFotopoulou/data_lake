@@ -1,0 +1,117 @@
+"""Tests for dl-extract-catalog / catalog_extract."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from astropy.io import fits
+from astropy.table import Table
+
+from data_lake.export.catalog_extract import (
+    extract_catalog,
+    extract_from_catalog_path,
+    filter_valid_sky_rows,
+    parse_column_spec,
+    resolve_column_specs,
+    select_catalog_columns,
+)
+
+
+def _write_fits_catalog(path: Path, n: int = 3) -> None:
+    tbl = Table({
+        "TARGETID": [100, 200, 300],
+        "RA": [120.0, 120.1, -9999.0],
+        "DEC": [45.0, 45.1, -9999.0],
+        "Z": [0.1, 0.2, 0.3],
+    })
+    tbl.write(path, format="fits", overwrite=True)
+
+
+class TestColumnSpecs:
+    def test_parse_alias(self) -> None:
+        assert parse_column_spec("ra:RA") == ("ra", "RA")
+        assert parse_column_spec("TARGETID") == ("TARGETID", None)
+
+    def test_resolve_case_insensitive(self) -> None:
+        mapping = resolve_column_specs(["RA", "Dec", "id"], ["ra", "dec:DEC", "ID"])
+        assert mapping == [("RA", "RA"), ("Dec", "DEC"), ("id", "id")]
+
+
+class TestExtractFromFile:
+    def test_select_columns(self, tmp_path: Path) -> None:
+        cat = tmp_path / "cat.fits"
+        _write_fits_catalog(cat)
+        out = select_catalog_columns(
+            extract_from_catalog_path(cat, ["TARGETID", "RA", "DEC"]),
+            ["TARGETID", "RA", "DEC"],
+        )
+        assert out.num_rows == 3
+        assert out.column_names == ["TARGETID", "RA", "DEC"]
+
+    def test_column_rename(self, tmp_path: Path) -> None:
+        cat = tmp_path / "cat.fits"
+        _write_fits_catalog(cat)
+        tbl = extract_from_catalog_path(cat, ["RA:ra", "DEC:dec", "TARGETID:id"])
+        assert tbl.column_names == ["ra", "dec", "id"]
+
+    def test_valid_sky_filter(self, tmp_path: Path) -> None:
+        cat = tmp_path / "cat.fits"
+        _write_fits_catalog(cat)
+        tbl = extract_from_catalog_path(
+            cat,
+            ["TARGETID", "RA", "DEC"],
+            valid_sky_only=True,
+        )
+        assert tbl.num_rows == 2
+
+    def test_write_parquet(self, tmp_path: Path) -> None:
+        cat = tmp_path / "cat.fits"
+        out = tmp_path / "sky.parquet"
+        _write_fits_catalog(cat)
+        table = extract_catalog(
+            out,
+            ["TARGETID", "RA", "DEC"],
+            paths=[cat],
+            valid_sky_only=True,
+        )
+        assert table.num_rows == 2
+        assert pq.read_table(out).num_rows == 2
+
+
+class TestExtractFromLake:
+    def test_lake_catalog(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "TEST_SURVEY" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "source_id": pa.array([1, 2], type=pa.int64()),
+                "ra": pa.array([10.0, 11.0], type=pa.float64()),
+                "dec": pa.array([0.5, 0.6], type=pa.float64()),
+                "_healpix_norder5": pa.array([1, 1], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "TEST_SURVEY" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"source_id_mode": "sequential", "total_rows": 2}',
+        )
+        out = tmp_path / "export.parquet"
+        tbl = extract_catalog(
+            out,
+            ["source_id", "ra", "dec"],
+            lake_root=lake,
+            survey="TEST_SURVEY",
+        )
+        assert tbl.num_rows == 2
+        assert set(tbl.column_names) == {"source_id", "ra", "dec"}
+
+
+class TestFilterValidSky:
+    def test_requires_sky_columns(self) -> None:
+        tbl = pa.table({"x": [1]})
+        with pytest.raises(ValueError, match="RA/Dec"):
+            filter_valid_sky_rows(tbl)
