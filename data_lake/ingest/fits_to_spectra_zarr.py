@@ -918,6 +918,68 @@ def _read_desi_with_desispec(
     return records, wcs_attrs, res_diags, res_offsets
 
 
+def _generic_extension_to_2d(
+    data: np.ndarray,
+    *,
+    n_spec: int,
+    n_pix: int,
+    label: str,
+) -> np.ndarray:
+    """Coerce a flux/variance/ivar extension to ``(n_spec, n_pix)``."""
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim == 1:
+        if arr.shape[0] != n_pix:
+            raise ValueError(
+                f"{label} length {arr.shape[0]} does not match flux length {n_pix}"
+            )
+        if n_spec != 1:
+            raise ValueError(
+                f"{label} is 1-D but flux HDU has {n_spec} spectra"
+            )
+        return arr[np.newaxis, :]
+    if arr.ndim == 2:
+        if arr.shape == (n_spec, n_pix):
+            return arr
+        if arr.shape == (n_pix, n_spec):
+            return arr.T
+        raise ValueError(
+            f"{label} shape {arr.shape} does not match flux shape ({n_spec}, {n_pix})"
+        )
+    raise ValueError(f"{label} must be 1-D or 2-D, got shape {arr.shape}")
+
+
+def _variance_to_ivar(variance: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(variance > 0.0, 1.0 / variance, 0.0).astype(np.float32)
+
+
+def _load_generic_ivar_2d(
+    hdul: fits.HDUList,
+    *,
+    flux_hdu_idx: int,
+    n_spec: int,
+    n_pix: int,
+) -> np.ndarray | None:
+    """
+    Load per-pixel IVAR from a sibling extension, if present.
+
+    Supports ``IVAR`` (used directly) and ``VARIANCE`` / ``VAR`` (converted to IVAR).
+    """
+    for i, hdu in enumerate(hdul):
+        if i == flux_hdu_idx or hdu.data is None:
+            continue
+        name = (hdu.name or "").strip().upper()
+        if name not in ("IVAR", "VARIANCE", "VAR"):
+            continue
+        arr_2d = _generic_extension_to_2d(
+            hdu.data, n_spec=n_spec, n_pix=n_pix, label=name,
+        )
+        if name == "IVAR":
+            return arr_2d.astype(np.float32)
+        return _variance_to_ivar(arr_2d)
+    return None
+
+
 def _read_generic_1d(
     hdul: fits.HDUList,
     image_hdu: int = 0,
@@ -930,6 +992,8 @@ def _read_generic_1d(
     Read a generic 1-D FITS spectrum (spectral WCS in primary header).
 
     Handles both single-spectrum (1-D) and multi-spectrum (2-D) image HDUs.
+    When a sibling ``VARIANCE`` (or ``VAR``) / ``IVAR`` extension is present, it
+    is aligned to the flux HDU and converted to IVAR (variance → ``1/var``).
     """
     hdu = hdul[image_hdu]
     data = np.array(hdu.data, dtype=np.float64)
@@ -948,11 +1012,18 @@ def _read_generic_1d(
 
     base_id = object_id_from_fits_header(header, source_id_col, hdu_index=image_hdu)
     base_ra, base_dec = sky_from_fits_header(header, ra_col, dec_col)
+    ivar_2d = _load_generic_ivar_2d(
+        hdul, flux_hdu_idx=image_hdu, n_spec=n_spec, n_pix=n_pix,
+    )
 
     records: list[SpectrumRecord] = []
     for i in range(n_spec):
         ra, dec = base_ra, base_dec
         source_id = base_id if n_spec == 1 else base_id + i
+        if ivar_2d is not None:
+            ivar = ivar_2d[i]
+        else:
+            ivar = np.ones(n_pix, dtype=np.float32)
         meta = {
             "z":       float(header.get("Z", 0.0)),
             "z_err":   float(header.get("Z_ERR", 0.0)),
@@ -964,7 +1035,7 @@ def _read_generic_1d(
         records.append(SpectrumRecord(
             source_id=source_id + i, ra=ra, dec=dec,
             flux=spectra_2d[i].astype(np.float32),
-            ivar=np.ones(n_pix, dtype=np.float32),
+            ivar=ivar,
             mask=np.zeros(n_pix, dtype=np.uint8),
             wavelength=wavelength,
             meta=meta,
