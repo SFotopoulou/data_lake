@@ -1,0 +1,183 @@
+"""Tests for in-lake catalog cross-match."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+from data_lake.io.crossmatch import (
+    CrossmatchAccessor,
+    CrossmatchTileConfig,
+    build_crossmatch,
+    crossmatch_root,
+    iter_populated_tile_npixels,
+    resolve_crossmatch_sky_columns,
+    survey_b_pixels_for_tile,
+    _crossmatch_tile_worker,
+)
+
+
+def _write_catalog_tile(
+    lake: Path,
+    survey: str,
+    *,
+    norder: int,
+    npix: int,
+    source_ids: list[int],
+    ra: list[float],
+    dec: list[float],
+) -> None:
+    tile_dir = lake / "catalogs" / survey / healpix_dir(norder, npix)
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    hp_col = f"_healpix_norder{norder}"
+    pq.write_table(
+        pa.table({
+            "source_id": pa.array(source_ids, type=pa.int64()),
+            "ra": pa.array(ra, type=pa.float64()),
+            "dec": pa.array(dec, type=pa.float64()),
+            hp_col: pa.array([npix] * len(source_ids), type=pa.int64()),
+            "_cutout_index": pa.array([-1] * len(source_ids), type=pa.int64()),
+            "_spectrum_index": pa.array([-1] * len(source_ids), type=pa.int64()),
+        }),
+        tile_dir / f"Npix={npix}.parquet",
+    )
+    info = {
+        "hats_order": norder,
+        "ra_column": "ra",
+        "dec_column": "dec",
+        "source_id_mode": "sequential",
+        "total_rows": len(source_ids),
+        "total_columns": 6,
+    }
+    (lake / "catalogs" / survey / "catalog_info.json").write_text(json.dumps(info))
+
+
+class TestCrossmatchHelpers:
+    def test_iter_populated_tiles(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        _write_catalog_tile(
+            lake, "A", norder=5, npix=100,
+            source_ids=[1], ra=[10.0], dec=[0.0],
+        )
+        _write_catalog_tile(
+            lake, "A", norder=5, npix=200,
+            source_ids=[2], ra=[11.0], dec=[0.1],
+        )
+        root = lake / "catalogs" / "A"
+        assert iter_populated_tile_npixels(root, norder=5) == [100, 200]
+
+    def test_resolve_sky_columns(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        _write_catalog_tile(lake, "A", norder=5, npix=1, source_ids=[1], ra=[0.0], dec=[0.0])
+        _write_catalog_tile(lake, "B", norder=5, npix=1, source_ids=[2], ra=[0.0], dec=[0.0])
+        ra, dec, order = resolve_crossmatch_sky_columns(lake, "A", "B")
+        assert (ra, dec, order) == ("ra", "dec", 5)
+
+    def test_survey_b_pixels_use_edges(self) -> None:
+        import healpy as hp
+
+        norder = 5
+        nside = hp.order2nside(norder)
+        npix = int(assign_healpix(np.array([120.0]), np.array([45.0]), norder)[0])
+        radius_rad = np.radians(1.0 / 3600.0)  # 1 arcsec
+
+        pixels = survey_b_pixels_for_tile(nside, npix, radius_rad)
+        assert npix in pixels
+
+        neighbours = [int(n) for n in hp.get_all_neighbours(nside, npix, nest=True) if n >= 0]
+        for n in neighbours:
+            assert n in pixels
+
+        # edge+radius search should not rely on source centroid: more than neighbours alone
+        # when radius > 0 (vertex discs may add pixels beyond immediate ring at some geometries)
+        assert len(pixels) >= len(neighbours) + 1
+
+
+class TestBuildCrossmatch:
+    def test_nearest_match_within_radius(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder, npix=npix,
+            source_ids=[1001], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "SURVEY_B", norder=norder, npix=npix,
+            source_ids=[2001], ra=[ra + 0.0001], dec=[dec + 0.0001],
+        )
+
+        result = build_crossmatch(
+            lake,
+            "SURVEY_A",
+            "SURVEY_B",
+            radius_arcsec=2.0,
+            show_progress=False,
+        )
+        assert result.n_match_rows == 1
+        assert crossmatch_root(lake, "SURVEY_A", "SURVEY_B").is_dir()
+
+        with CrossmatchAccessor(lake, "SURVEY_A", "SURVEY_B") as xm:
+            matches = xm.get_matches(source_id_a=1001, fmt="polars")
+        assert matches.height == 1
+        row = matches.row(0, named=True)
+        assert row["source_id_b"] == 2001
+        assert row["sep_arcsec"] < 2.0
+
+    def test_no_match_beyond_radius(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        npix_a = int(assign_healpix(np.array([10.0]), np.array([0.0]), norder)[0])
+        npix_b = int(assign_healpix(np.array([50.0]), np.array([0.0]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "A", norder=norder, npix=npix_a,
+            source_ids=[1], ra=[10.0], dec=[0.0],
+        )
+        _write_catalog_tile(
+            lake, "B", norder=norder, npix=npix_b,
+            source_ids=[2], ra=[50.0], dec=[0.0],
+        )
+
+        result = build_crossmatch(lake, "A", "B", radius_arcsec=1.0)
+        assert result.n_match_rows == 0
+
+    def test_tile_worker(self, tmp_path: Path) -> None:
+        """Exercise the parallel worker entry point without ProcessPoolExecutor."""
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder, npix=npix,
+            source_ids=[1001], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "SURVEY_B", norder=norder, npix=npix,
+            source_ids=[2001], ra=[ra + 0.0001], dec=[dec + 0.0001],
+        )
+
+        out_root = crossmatch_root(lake, "SURVEY_A", "SURVEY_B")
+        cfg = CrossmatchTileConfig(
+            lake_root=str(lake),
+            survey_a="SURVEY_A",
+            survey_b="SURVEY_B",
+            npix_a=npix,
+            norder=norder,
+            ra_col="ra",
+            dec_col="dec",
+            radius_arcsec=2.0,
+            out_root=str(out_root),
+        )
+        res = _crossmatch_tile_worker(cfg)
+        assert res.error is None
+        assert res.n_match_rows == 1
+        assert res.n_tiles_written == 1

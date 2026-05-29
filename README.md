@@ -1379,22 +1379,49 @@ dl-extract-catalog survey_a.fits -o a_sky.parquet \
 dl-extract-catalog survey_b.fits -o b_sky.csv --format csv \
   -c ID:id -c ra:RA -c dec:DEC
 
-# Already-ingested lake catalog
+# Already-ingested lake catalog (streams; does not load full survey into RAM)
 dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \
-  -o desi_sky.parquet -c source_id -c ra -c dec
+  -o desi_sky.parquet -c source_id -c ra -c dec --engine tiles
+
+# 100M+ rows: tiled export (parallel STILTS / bounded memory)
+dl-extract-catalog --lake-root /data/lake --survey GAIA_DR3 \
+  --output-dir /scratch/gaia_sky/ -c source_id -c ra -c dec --progress
+
+# Large FITS before ingest
+dl-extract-catalog huge_cat.fits -o sky.parquet --streaming \
+  -c TARGETID -c RA -c DEC --valid-sky-only
 
 # Many files
 dl-extract-catalog --file-list catalog_paths.txt -o all_a.parquet \
   -c serial -c RA -c DEC --add-input-path
 ```
 
+**Very large surveys** — avoid materialising hundreds of millions of rows in
+one process. Prefer **in-lake cross-match** (``dl-crossmatch``) which streams
+tile-by-tile like ingest. Use ``dl-extract-catalog`` only when an external tool
+(STILTS) needs a portable extract.
+
+```bash
+# Positional catalog↔catalog match at lake scale (survey A defines partition)
+dl-crossmatch SURVEY_A SURVEY_B /data/lake \
+  --radius-arcsec 1.0 --n-workers 8 --progress
+
+# Output: catalogs/crossmatch/SURVEY_A_x_SURVEY_B/
+# Query: CrossmatchAccessor or DuckDB over that tree
+```
+
+Lake exports read **one HEALPix tile at a time** (or use DuckDB
+``COPY`` via ``--engine duckdb`` for a single Parquet file). Prefer
+``--output-dir`` when you need a portable extract for external tools.
+
 ### Associations with STILTS
 
-[STILTS](https://www.starlink.ac.uk/stilts/) is a strong choice when you need
+[STILTS](https://www.starlink.ac.uk/stilts/) is useful when you need
 **explicit match semantics** (all neighbours in a radius, symmetric / mutual
-best matches, extra columns, proper motions, etc.) beyond the built-in
-`build_crossmatch` helper (nearest neighbour within a radius, survey-A-centric
-partitioning — see `data_lake/io/crossmatch.py`).
+best matches, proper motions, etc.) beyond ``dl-crossmatch`` (nearest neighbour
+within a radius, survey-A-centric partitioning). At hundreds of millions of
+rows, prefer ``dl-crossmatch``; use STILTS on smaller extracts or per-tile
+exports from ``dl-extract-catalog --output-dir``.
 
 **Suggested workflow:**
 

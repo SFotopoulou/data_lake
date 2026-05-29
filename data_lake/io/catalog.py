@@ -187,7 +187,17 @@ class CatalogAccessor:
         fmt:
             Return type: ``"polars"`` (default), ``"astropy"``, or ``"arrow"``.
         """
-        arrow_result: pa.Table = self._con.execute(sql).arrow()
+        raw = self._con.execute(sql).arrow()
+        if isinstance(raw, pa.RecordBatchReader):
+            try:
+                arrow_result = raw.read_all()
+            except (ValueError, pa.ArrowInvalid):
+                batches = list(raw)
+                arrow_result = (
+                    pa.Table.from_batches(batches) if batches else pa.table({})
+                )
+        else:
+            arrow_result = raw
         return self._convert(arrow_result, fmt)
 
     # ------------------------------------------------------------------
@@ -363,6 +373,8 @@ class CatalogAccessor:
         if fmt == "polars":
             try:
                 import polars as pl
+                if table.num_columns == 0:
+                    return pl.DataFrame()
                 return pl.from_arrow(table)
             except ImportError as e:
                 raise ImportError("polars is not installed.") from e

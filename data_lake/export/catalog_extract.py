@@ -6,6 +6,12 @@ ID and sky columns (plus any extras) from survey catalog files or from an
 already-ingested lake catalog.  This is separate from catalog↔spectrum linkage,
 which uses ``_spectrum_index`` / native spectrum keys on catalog rows.
 
+Large surveys (tens–hundreds of millions of rows, or more) must **not** be
+materialised in RAM.  Lake exports stream one HEALPix tile at a time; optional
+``--output-dir`` writes a HATS tree for parallel downstream tools.  For
+catalog↔catalog matching without a monolithic export, prefer in-lake
+``build_crossmatch`` (``data_lake.io.crossmatch``).
+
 Example
 -------
 ::
@@ -13,34 +19,52 @@ Example
     dl-extract-catalog survey_a.fits -o a_positions.parquet \\
         -c TARGETID -c RA -c DEC
 
-    dl-extract-catalog --file-list catalogs.txt -o b.csv --format csv \\
-        -c ID -c ra:RA -c dec:DEC --valid-sky-only
-
     dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \\
-        -c source_id -c ra -c dec -o desi_dr1_sky.parquet
+        -c source_id -c ra -c dec -o desi_sky.parquet
+
+    # 290M+ rows: tiled export (bounded RAM, parallel-friendly)
+    dl-extract-catalog --lake-root /data/lake --survey GAIA_DR3 \\
+        --output-dir /scratch/gaia_sky/ -c source_id -c ra -c dec
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Iterator, Literal, Sequence
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import (
     _read_source_table,
-    is_valid_sky_position,
+    _ZSTD_LEVEL,
     resolve_catalog_column_name,
 )
 
 log = logging.getLogger(__name__)
 
 OutputFormat = Literal["parquet", "csv", "fits", "votable"]
+LakeEngine = Literal["auto", "tiles", "duckdb"]
 _SKY_RA_ALIASES = ("ra", "ra_deg", "radeg", "raj2000", "ra_obj")
 _SKY_DEC_ALIASES = ("dec", "dec_deg", "decdeg", "dej2000", "dec_obj")
+_LARGE_OUTPUT_ROW_WARN = 5_000_000
+_FITS_STREAM_BATCH_ROWS = 1_000_000
+
+
+@dataclass(frozen=True)
+class ExtractResult:
+    """Summary of a streaming extract (no in-memory table retained)."""
+
+    n_rows: int
+    column_names: tuple[str, ...]
+    output: Path | None = None
+    output_dir: Path | None = None
+    n_tiles: int = 0
 
 
 def parse_column_spec(spec: str) -> tuple[str, str | None]:
@@ -87,13 +111,12 @@ def select_catalog_columns(
     return pa.table(dict(zip(names, arrays)))
 
 
-def filter_valid_sky_rows(
+def _resolve_sky_output_names(
     table: pa.Table,
     *,
-    ra_col: str | None = None,
-    dec_col: str | None = None,
-) -> pa.Table:
-    """Drop rows whose RA/Dec are not usable for HEALPix / cone matching."""
+    ra_col: str | None,
+    dec_col: str | None,
+) -> tuple[str, str]:
     ra_name = ra_col
     dec_name = dec_col
     if ra_name is None:
@@ -113,20 +136,39 @@ def filter_valid_sky_rows(
             "valid-sky filter needs RA/Dec columns; pass --ra-col and --dec-col "
             f"or include them in the export (columns: {table.schema.names})"
         )
+    return ra_name, dec_name
 
-    ra = pc.cast(table.column(ra_name).combine_chunks(), pa.float64())
-    dec = pc.cast(table.column(dec_name).combine_chunks(), pa.float64())
-    ra_np = ra.to_numpy(zero_copy_only=False)
-    dec_np = dec.to_numpy(zero_copy_only=False)
-    mask = pa.array(
-        [is_valid_sky_position(float(r), float(d)) for r, d in zip(ra_np, dec_np)],
-        type=pa.bool_(),
+
+def filter_valid_sky_rows(
+    table: pa.Table,
+    *,
+    ra_col: str | None = None,
+    dec_col: str | None = None,
+) -> pa.Table:
+    """Drop rows whose RA/Dec are not usable for HEALPix / cone matching."""
+    ra_name, dec_name = _resolve_sky_output_names(table, ra_col=ra_col, dec_col=dec_col)
+
+    ra_np = np.asarray(
+        pc.cast(table.column(ra_name).combine_chunks(), pa.float64()),
+        dtype=np.float64,
+    )
+    dec_np = np.asarray(
+        pc.cast(table.column(dec_name).combine_chunks(), pa.float64()),
+        dtype=np.float64,
+    )
+    mask = (
+        np.isfinite(ra_np)
+        & np.isfinite(dec_np)
+        & (dec_np >= -90.0)
+        & (dec_np <= 90.0)
+        & (ra_np > -9000.0)
+        & (dec_np > -9000.0)
     )
     n_before = table.num_rows
-    out = table.filter(mask)
+    out = table.filter(pa.array(mask, type=pa.bool_()))
     n_after = out.num_rows
     if n_after < n_before:
-        log.info(
+        log.debug(
             "Dropped %d row(s) with invalid sky position (kept %d)",
             n_before - n_after,
             n_after,
@@ -136,6 +178,272 @@ def filter_valid_sky_rows(
 
 def _sql_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def _lake_catalog_root(lake_root: Path | str, survey: str) -> Path:
+    root = Path(lake_root) / "catalogs" / survey
+    if not root.is_dir():
+        raise FileNotFoundError(f"Catalog not found: {root}")
+    return root
+
+
+def _lake_norder(catalog_root: Path, norder: int | None) -> int:
+    if norder is not None:
+        return norder
+    info_path = catalog_root / "catalog_info.json"
+    if info_path.is_file():
+        with open(info_path) as fh:
+            return int(json.load(fh).get("hats_order", 5))
+    return 5
+
+
+def iter_lake_catalog_tiles(
+    catalog_root: Path,
+    *,
+    norder: int | None = None,
+) -> Iterator[Path]:
+    """Yield ``Npix=*.parquet`` tile paths under a lake catalog."""
+    order = _lake_norder(catalog_root, norder)
+    order_root = catalog_root / f"Norder={order}"
+    if order_root.is_dir():
+        yield from sorted(order_root.rglob("Npix=*.parquet"))
+        return
+    yield from sorted(catalog_root.rglob("Npix=*.parquet"))
+
+
+def _project_tile_table(
+    table: pa.Table,
+    mapping: Sequence[tuple[str, str]],
+) -> pa.Table:
+    return pa.table(
+        {out_name: table.column(src).combine_chunks() for src, out_name in mapping}
+    )
+
+
+def _process_tile_chunk(
+    table: pa.Table,
+    mapping: Sequence[tuple[str, str]],
+    *,
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+) -> pa.Table:
+    chunk = _project_tile_table(table, mapping)
+    if valid_sky_only:
+        chunk = filter_valid_sky_rows(chunk, ra_col=ra_col, dec_col=dec_col)
+    return chunk
+
+
+def stream_extract_from_lake_catalog(
+    lake_root: Path | str,
+    survey: str,
+    specs: Sequence[str],
+    *,
+    output: Path | None = None,
+    output_dir: Path | None = None,
+    norder: int | None = None,
+    valid_sky_only: bool = False,
+    ra_col: str | None = None,
+    dec_col: str | None = None,
+    engine: LakeEngine = "auto",
+    show_progress: bool = False,
+) -> ExtractResult:
+    """Stream column projection from lake Parquet tiles without loading the full survey."""
+    if output is None and output_dir is None:
+        raise ValueError("pass output or output_dir")
+    if output is not None and output_dir is not None:
+        raise ValueError("pass output or output_dir, not both")
+
+    catalog_root = _lake_catalog_root(lake_root, survey)
+    order = _lake_norder(catalog_root, norder)
+    tiles = list(iter_lake_catalog_tiles(catalog_root, norder=order))
+    if not tiles:
+        raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
+
+    schema_names = pq.read_schema(str(tiles[0])).names
+    mapping = resolve_column_specs(schema_names, specs)
+    src_cols = [src for src, _ in mapping]
+    out_names = tuple(out for _, out in mapping)
+
+    use_duckdb = engine == "duckdb" or (
+        engine == "auto" and output is not None and output_dir is None
+    )
+    if use_duckdb and output is not None:
+        try:
+            return _stream_lake_via_duckdb(
+                catalog_root,
+                order,
+                mapping,
+                output=output,
+                valid_sky_only=valid_sky_only,
+                ra_col=ra_col,
+                dec_col=dec_col,
+            )
+        except Exception as exc:
+            log.warning(
+                "DuckDB export failed (%s); falling back to tile streaming.", exc
+            )
+
+    return _stream_lake_tile_by_tile(
+        catalog_root,
+        tiles,
+        mapping,
+        src_cols=src_cols,
+        out_names=out_names,
+        output=output,
+        output_dir=output_dir,
+        valid_sky_only=valid_sky_only,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        show_progress=show_progress,
+    )
+
+
+def _duckdb_sky_predicate(
+    mapping: Sequence[tuple[str, str]],
+    *,
+    ra_col: str | None,
+    dec_col: str | None,
+) -> str:
+    dummy = pa.table({out: pa.array([0.0], type=pa.float64()) for _, out in mapping[:1]})
+    ra_name, dec_name = _resolve_sky_output_names(dummy, ra_col=ra_col, dec_col=dec_col)
+    ra_sql = _sql_ident(ra_name)
+    dec_sql = _sql_ident(dec_name)
+    return (
+        f"isfinite({ra_sql}) AND isfinite({dec_sql}) "
+        f"AND {dec_sql} BETWEEN -90 AND 90 "
+        f"AND {ra_sql} > -9000 AND {dec_sql} > -9000"
+    )
+
+
+def _stream_lake_via_duckdb(
+    catalog_root: Path,
+    norder: int,
+    mapping: Sequence[tuple[str, str]],
+    *,
+    output: Path,
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+) -> ExtractResult:
+    import duckdb
+
+    glob = str(catalog_root / f"Norder={norder}" / "**" / "*.parquet")
+    col_sql = ", ".join(
+        f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping
+    )
+    where = ""
+    if valid_sky_only:
+        where = f" WHERE {_duckdb_sky_predicate(mapping, ra_col=ra_col, dec_col=dec_col)}"
+
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        output.unlink()
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        sql = (
+            f"COPY (SELECT {col_sql} FROM read_parquet(?, hive_partitioning=false)"
+            f"{where}) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
+        con.execute(sql, [glob, str(output)])
+        n_rows = int(
+            con.execute("SELECT count(*) FROM read_parquet(?)", [str(output)]).fetchone()[0]
+        )
+    finally:
+        con.close()
+
+    out_names = tuple(out for _, out in mapping)
+    log.info("DuckDB wrote %d row(s) → %s", n_rows, output)
+    return ExtractResult(
+        n_rows=n_rows,
+        column_names=out_names,
+        output=output,
+    )
+
+
+def _stream_lake_tile_by_tile(
+    catalog_root: Path,
+    tiles: Sequence[Path],
+    mapping: Sequence[tuple[str, str]],
+    *,
+    src_cols: Sequence[str],
+    out_names: Sequence[str],
+    output: Path | None,
+    output_dir: Path | None,
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+    show_progress: bool,
+) -> ExtractResult:
+    writer: pq.ParquetWriter | None = None
+    n_rows = 0
+    n_written_tiles = 0
+
+    iterator: Iterable[Path] = tiles
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm
+
+            iterator = tqdm(tiles, unit="tile", desc="extract")
+        except ImportError:
+            pass
+
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for tile_path in iterator:
+            raw = pq.read_table(str(tile_path), columns=list(src_cols))
+            chunk = _process_tile_chunk(
+                raw,
+                mapping,
+                valid_sky_only=valid_sky_only,
+                ra_col=ra_col,
+                dec_col=dec_col,
+            )
+            if chunk.num_rows == 0:
+                continue
+
+            if output_dir is not None:
+                rel = tile_path.relative_to(catalog_root)
+                out_path = output_dir / rel
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                pq.write_table(chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL)
+            else:
+                assert output is not None
+                if writer is None:
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    writer = pq.ParquetWriter(
+                        str(output),
+                        chunk.schema,
+                        compression="zstd",
+                        compression_level=_ZSTD_LEVEL,
+                    )
+                writer.write_table(chunk)
+
+            n_rows += chunk.num_rows
+            n_written_tiles += 1
+    finally:
+        if writer is not None:
+            writer.close()
+
+    out_path = output_dir if output_dir is not None else output
+    log.info(
+        "Streamed %d row(s) from %d tile(s) → %s",
+        n_rows,
+        n_written_tiles,
+        out_path,
+    )
+    return ExtractResult(
+        n_rows=n_rows,
+        column_names=tuple(out_names),
+        output=output,
+        output_dir=output_dir,
+        n_tiles=n_written_tiles,
+    )
 
 
 def extract_from_lake_catalog(
@@ -148,20 +456,29 @@ def extract_from_lake_catalog(
     ra_col: str | None = None,
     dec_col: str | None = None,
 ) -> pa.Table:
-    """Read selected columns from ``catalogs/<survey>/`` Parquet tiles."""
-    from data_lake.io.catalog import CatalogAccessor
+    """In-memory lake extract (small catalogs / tests only)."""
+    import tempfile
 
-    acc = CatalogAccessor(lake_root, survey, norder=norder)
-    mapping = resolve_column_specs(acc.columns, specs)
-    col_sql = ", ".join(f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping)
-    raw = acc.query(f"SELECT {col_sql} FROM catalog", fmt="arrow")
-    if isinstance(raw, pa.RecordBatchReader):
-        table = raw.read_all()
-    else:
-        table = raw
-    if valid_sky_only:
-        table = filter_valid_sky_rows(table, ra_col=ra_col, dec_col=dec_col)
-    return table
+    catalog_root = _lake_catalog_root(lake_root, survey)
+    tiles = list(iter_lake_catalog_tiles(catalog_root, norder=_lake_norder(catalog_root, norder)))
+    mapping = resolve_column_specs(pq.read_schema(str(tiles[0])).names, specs)
+
+    with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
+        out = Path(tmp) / "extract.parquet"
+        result = stream_extract_from_lake_catalog(
+            lake_root,
+            survey,
+            specs,
+            output=out,
+            norder=norder,
+            valid_sky_only=valid_sky_only,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            engine="tiles",
+        )
+        if result.n_rows == 0:
+            return pa.table({out_name: pa.array([], type=pa.float64()) for _, out_name in mapping})
+        return pq.read_table(out)
 
 
 def extract_from_catalog_path(
@@ -172,12 +489,82 @@ def extract_from_catalog_path(
     ra_col: str | None = None,
     dec_col: str | None = None,
 ) -> pa.Table:
-    """Read one catalog file and return the selected columns."""
+    """Read one catalog file and return the selected columns (in memory)."""
     table = _read_source_table(Path(path))
     out = select_catalog_columns(table, specs)
     if valid_sky_only:
         out = filter_valid_sky_rows(out, ra_col=ra_col, dec_col=dec_col)
     return out
+
+
+def stream_extract_from_fits_catalog(
+    path: Path | str,
+    specs: Sequence[str],
+    output: Path,
+    *,
+    valid_sky_only: bool = False,
+    ra_col: str | None = None,
+    dec_col: str | None = None,
+    batch_rows: int = _FITS_STREAM_BATCH_ROWS,
+) -> ExtractResult:
+    """Stream a large FITS BINTABLE to Parquet in row batches."""
+    from astropy.io import fits
+    from astropy.table import Table
+
+    from data_lake.ingest.fits_to_parquet import _bintable_hdu_index
+
+    path = Path(path)
+    if path.suffix.lower() not in {".fit", ".fits", ".fz"} and not path.name.lower().endswith(".fits.gz"):
+        raise ValueError(f"--streaming requires FITS input, got {path.name}")
+
+    writer: pq.ParquetWriter | None = None
+    n_rows = 0
+    out_names: tuple[str, ...] = ()
+
+    with fits.open(str(path), memmap=True, ignore_missing_simple=True) as hdul:
+        idx = _bintable_hdu_index(hdul)
+        hdu = hdul[idx]
+        data = hdu.data
+        if data is None:
+            raise ValueError(f"{path}: BINTABLE HDU {idx} has no data")
+        n_total = len(data)
+        names = data.dtype.names or ()
+        mapping = resolve_column_specs(list(names), specs)
+        src_cols = [src for src, _ in mapping]
+        out_names = tuple(out for _, out in mapping)
+
+        for start in range(0, n_total, batch_rows):
+            stop = min(start + batch_rows, n_total)
+            batch_tbl = Table({col: data[col][start:stop] for col in src_cols})
+            from data_lake.ingest.fits_to_parquet import _astropy_table_to_arrow
+
+            chunk = _process_tile_chunk(
+                _astropy_table_to_arrow(batch_tbl),
+                mapping,
+                valid_sky_only=valid_sky_only,
+                ra_col=ra_col,
+                dec_col=dec_col,
+            )
+            if chunk.num_rows == 0:
+                continue
+            if writer is None:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                writer = pq.ParquetWriter(
+                    str(output),
+                    chunk.schema,
+                    compression="zstd",
+                    compression_level=_ZSTD_LEVEL,
+                )
+            writer.write_table(chunk)
+            n_rows += chunk.num_rows
+            log.info("Streamed rows %d–%d of %d from %s", start, stop, n_total, path.name)
+
+    if writer is not None:
+        writer.close()
+    elif output.exists():
+        output.unlink()
+
+    return ExtractResult(n_rows=n_rows, column_names=out_names, output=output)
 
 
 def extract_from_catalog_paths(
@@ -188,11 +575,32 @@ def extract_from_catalog_paths(
     ra_col: str | None = None,
     dec_col: str | None = None,
     add_input_path: bool = False,
-) -> pa.Table:
+    streaming: bool = False,
+    output: Path | None = None,
+    batch_rows: int = _FITS_STREAM_BATCH_ROWS,
+) -> pa.Table | ExtractResult:
     """Concatenate extracts from multiple catalog files."""
+    path_list = [Path(p) for p in paths]
+    if not path_list:
+        raise ValueError("no catalog paths to read")
+
+    if streaming:
+        if output is None:
+            raise ValueError("streaming file extract requires output path")
+        if len(path_list) != 1:
+            raise ValueError("streaming FITS extract supports one input file at a time")
+        return stream_extract_from_fits_catalog(
+            path_list[0],
+            specs,
+            output,
+            valid_sky_only=valid_sky_only,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            batch_rows=batch_rows,
+        )
+
     tables: list[pa.Table] = []
-    for path in paths:
-        p = Path(path)
+    for p in path_list:
         chunk = extract_from_catalog_path(
             p,
             specs,
@@ -208,8 +616,6 @@ def extract_from_catalog_paths(
         tables.append(chunk)
         log.info("Read %d row(s) from %s", chunk.num_rows, p.name)
 
-    if not tables:
-        raise ValueError("no catalog paths to read")
     if len(tables) == 1:
         return tables[0]
     return pa.concat_tables(tables, promote_options="default")
@@ -231,6 +637,15 @@ def infer_output_format(path: Path, explicit: OutputFormat | None) -> OutputForm
     return "parquet"
 
 
+def _warn_large_non_parquet(n_rows: int, fmt: OutputFormat) -> None:
+    if fmt != "parquet" and n_rows >= _LARGE_OUTPUT_ROW_WARN:
+        log.warning(
+            "%d rows to %s may be slow or fail; prefer Parquet or --output-dir tiles.",
+            n_rows,
+            fmt,
+        )
+
+
 def write_catalog_extract(
     table: pa.Table,
     output: Path | str,
@@ -241,9 +656,10 @@ def write_catalog_extract(
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     fmt = infer_output_format(output, output_format)
+    _warn_large_non_parquet(table.num_rows, fmt)
 
     if fmt == "parquet":
-        pq.write_table(table, str(output), compression="zstd")
+        pq.write_table(table, str(output), compression="zstd", compression_level=_ZSTD_LEVEL)
         return
 
     if fmt == "csv":
@@ -281,48 +697,77 @@ def write_catalog_extract(
 
 
 def extract_catalog(
-    output: Path | str,
-    specs: Sequence[str],
+    output: Path | str | None = None,
+    specs: Sequence[str] | None = None,
     *,
     paths: Sequence[Path | str] | None = None,
     lake_root: Path | str | None = None,
     survey: str | None = None,
+    output_dir: Path | str | None = None,
     norder: int | None = None,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
     add_input_path: bool = False,
     output_format: OutputFormat | None = None,
-) -> pa.Table:
-    """Extract columns and write *output*; returns the table."""
+    engine: LakeEngine = "auto",
+    streaming: bool = False,
+    batch_rows: int = _FITS_STREAM_BATCH_ROWS,
+    show_progress: bool = False,
+) -> ExtractResult | pa.Table:
+    """Extract columns and write output; returns summary or small in-memory table."""
+    if specs is None:
+        raise ValueError("specs required")
+
     if lake_root is not None:
         if not survey:
             raise ValueError("--survey is required with --lake-root")
         if paths:
             raise ValueError("pass catalog paths or --lake-root/--survey, not both")
-        table = extract_from_lake_catalog(
+        result = stream_extract_from_lake_catalog(
             lake_root,
             survey,
             specs,
+            output=Path(output) if output is not None else None,
+            output_dir=Path(output_dir) if output_dir is not None else None,
             norder=norder,
             valid_sky_only=valid_sky_only,
             ra_col=ra_col,
             dec_col=dec_col,
+            engine=engine,
+            show_progress=show_progress,
         )
-    else:
-        if not paths:
-            raise ValueError("catalog path(s) or --file-list required without --lake-root")
-        table = extract_from_catalog_paths(
-            paths,
-            specs,
-            valid_sky_only=valid_sky_only,
-            ra_col=ra_col,
-            dec_col=dec_col,
-            add_input_path=add_input_path,
-        )
+        if output is not None and output_format not in (None, "parquet"):
+            fmt = infer_output_format(Path(output), output_format)
+            if fmt != "parquet":
+                raise ValueError(
+                    "Lake streaming export writes Parquet; convert offline or use raw file input."
+                )
+        return result
 
-    write_catalog_extract(table, output, output_format=output_format)
-    return table
+    if not paths:
+        raise ValueError("catalog path(s) or --lake-root required")
+    if output_dir is not None:
+        raise ValueError("--output-dir is only valid with --lake-root")
+
+    raw_result = extract_from_catalog_paths(
+        paths,
+        specs,
+        valid_sky_only=valid_sky_only,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        add_input_path=add_input_path,
+        streaming=streaming,
+        output=Path(output) if output is not None else None,
+        batch_rows=batch_rows,
+    )
+    if isinstance(raw_result, ExtractResult):
+        return raw_result
+
+    if output is None:
+        return raw_result
+    write_catalog_extract(raw_result, output, output_format=output_format)
+    return raw_result
 
 
 # ---------------------------------------------------------------------------
@@ -343,9 +788,15 @@ import click
 @click.option(
     "-o",
     "--output",
-    required=True,
+    default=None,
     type=click.Path(path_type=Path),
-    help="Output Parquet, CSV, FITS, or VOTable (format from suffix or --format).",
+    help="Single output file (Parquet recommended). Not used with --output-dir.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write HATS tile tree (bounded RAM; best for 100M+ row lake catalogs).",
 )
 @click.option(
     "-c",
@@ -360,16 +811,23 @@ import click
     "output_format",
     type=click.Choice(["parquet", "csv", "fits", "votable"], case_sensitive=False),
     default=None,
-    help="Output format (default: infer from --output suffix).",
+    help="Output format for raw file input (default: infer from --output suffix).",
 )
 @click.option(
     "--lake-root",
     type=click.Path(exists=True, path_type=Path),
     default=None,
-    help="Data lake root; read from catalogs/<survey>/ instead of input files.",
+    help="Data lake root; stream from catalogs/<survey>/ tiles.",
 )
 @click.option("--survey", default=None, help="Survey name under catalogs/ (with --lake-root).")
 @click.option("--norder", type=int, default=None, help="HEALPix order (default: catalog_info.json).")
+@click.option(
+    "--engine",
+    type=click.Choice(["auto", "tiles", "duckdb"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Lake export engine: DuckDB COPY (auto) or Arrow tile streaming.",
+)
 @click.option(
     "--valid-sky-only",
     is_flag=True,
@@ -382,20 +840,38 @@ import click
     is_flag=True,
     help="Add input_path column when merging multiple catalog files.",
 )
+@click.option(
+    "--streaming",
+    is_flag=True,
+    help="Stream a large FITS BINTABLE to Parquet in row batches (one input file).",
+)
+@click.option(
+    "--batch-rows",
+    default=_FITS_STREAM_BATCH_ROWS,
+    show_default=True,
+    type=int,
+    help="Row batch size for --streaming FITS export.",
+)
+@click.option("--progress", "show_progress", is_flag=True, help="Show tile progress bar (lake export).")
 @click.option("-v", "--verbose", is_flag=True)
 def cli(
     paths: tuple[Path, ...],
     file_list: Path | None,
-    output: Path,
+    output: Path | None,
+    output_dir: Path | None,
     columns: tuple[str, ...],
     output_format: str | None,
     lake_root: Path | None,
     survey: str | None,
     norder: int | None,
+    engine: str,
     valid_sky_only: bool,
     ra_col: str | None,
     dec_col: str | None,
     add_input_path: bool,
+    streaming: bool,
+    batch_rows: int,
+    show_progress: bool,
     verbose: bool,
 ) -> None:
     """Export selected catalog columns for catalog–catalog association (sky matching)."""
@@ -408,6 +884,8 @@ def cli(
             if line and not line.startswith("#"):
                 all_paths.append(Path(line))
 
+    if output is None and output_dir is None:
+        raise click.ClickException("Pass -o/--output or --output-dir.")
     if lake_root is None and not all_paths:
         raise click.ClickException(
             "Pass catalog path(s), --file-list, or --lake-root with --survey."
@@ -416,6 +894,12 @@ def cli(
         raise click.ClickException("--survey is required with --lake-root.")
     if lake_root is not None and all_paths:
         raise click.ClickException("Use either input paths or --lake-root/--survey, not both.")
+    if output is not None and output_dir is not None:
+        raise click.ClickException("Pass -o/--output or --output-dir, not both.")
+    if streaming and lake_root is not None:
+        raise click.ClickException("--streaming is for raw FITS input, not --lake-root.")
+    if streaming and len(all_paths) != 1:
+        raise click.ClickException("--streaming requires exactly one input FITS file.")
 
     fmt: OutputFormat | None = (
         output_format.lower()  # type: ignore[assignment]
@@ -423,19 +907,33 @@ def cli(
         else None
     )
 
-    table = extract_catalog(
-        output,
-        list(columns),
+    result = extract_catalog(
+        output=output,
+        specs=list(columns),
         paths=all_paths or None,
         lake_root=lake_root,
         survey=survey,
+        output_dir=output_dir,
         norder=norder,
         valid_sky_only=valid_sky_only,
         ra_col=ra_col,
         dec_col=dec_col,
         add_input_path=add_input_path,
         output_format=fmt,
+        engine=engine.lower(),  # type: ignore[arg-type]
+        streaming=streaming,
+        batch_rows=batch_rows,
+        show_progress=show_progress,
     )
-    click.echo(
-        f"Wrote {table.num_rows} row(s), {len(table.schema.names)} column(s) → {output}"
-    )
+
+    if isinstance(result, ExtractResult):
+        dest = result.output_dir or result.output
+        extra = f", {result.n_tiles} tile(s)" if result.n_tiles else ""
+        click.echo(
+            f"Wrote {result.n_rows} row(s), {len(result.column_names)} column(s)"
+            f"{extra} → {dest}"
+        )
+    else:
+        click.echo(
+            f"Wrote {result.num_rows} row(s), {len(result.schema.names)} column(s) → {output}"
+        )

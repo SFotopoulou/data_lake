@@ -11,12 +11,14 @@ from astropy.io import fits
 from astropy.table import Table
 
 from data_lake.export.catalog_extract import (
+    ExtractResult,
     extract_catalog,
     extract_from_catalog_path,
     filter_valid_sky_rows,
     parse_column_spec,
     resolve_column_specs,
     select_catalog_columns,
+    stream_extract_from_lake_catalog,
 )
 
 
@@ -72,8 +74,8 @@ class TestExtractFromFile:
         out = tmp_path / "sky.parquet"
         _write_fits_catalog(cat)
         table = extract_catalog(
-            out,
-            ["TARGETID", "RA", "DEC"],
+            output=out,
+            specs=["TARGETID", "RA", "DEC"],
             paths=[cat],
             valid_sky_only=True,
         )
@@ -100,14 +102,46 @@ class TestExtractFromLake:
             '"source_id_mode": "sequential", "total_rows": 2}',
         )
         out = tmp_path / "export.parquet"
-        tbl = extract_catalog(
-            out,
-            ["source_id", "ra", "dec"],
+        result = extract_catalog(
+            output=out,
+            specs=["source_id", "ra", "dec"],
             lake_root=lake,
             survey="TEST_SURVEY",
+            engine="tiles",
         )
-        assert tbl.num_rows == 2
-        assert set(tbl.column_names) == {"source_id", "ra", "dec"}
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        assert set(pq.read_table(out).column_names) == {"source_id", "ra", "dec"}
+
+    def test_lake_catalog_tiled_output(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        for npix in (1, 2):
+            tile_dir = lake / "catalogs" / "BIG" / "Norder=5" / "Dir=0"
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            pq.write_table(
+                pa.table({
+                    "source_id": pa.array([npix], type=pa.int64()),
+                    "ra": pa.array([float(npix)], type=pa.float64()),
+                    "dec": pa.array([0.0], type=pa.float64()),
+                }),
+                tile_dir / f"Npix={npix}.parquet",
+            )
+        (lake / "catalogs" / "BIG" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"source_id_mode": "sequential", "total_rows": 2}',
+        )
+        out_dir = tmp_path / "tiles"
+        result = stream_extract_from_lake_catalog(
+            lake,
+            "BIG",
+            ["source_id", "ra", "dec"],
+            output_dir=out_dir,
+            engine="tiles",
+        )
+        assert result.n_rows == 2
+        assert result.n_tiles == 2
+        assert (out_dir / "Norder=5" / "Dir=0" / "Npix=1.parquet").is_file()
+        assert (out_dir / "Norder=5" / "Dir=0" / "Npix=2.parquet").is_file()
 
 
 class TestFilterValidSky:
