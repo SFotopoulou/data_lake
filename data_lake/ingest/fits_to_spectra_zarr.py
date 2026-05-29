@@ -1106,6 +1106,105 @@ def _read_wig_spectrum(
     return out, wcs_attrs
 
 
+def _is_ozdes_stacked_layout(hdul: fits.HDUList) -> bool:
+    """True when HDU 0/1/2 are stacked flux, variance, and bad-pixel mask."""
+    if len(hdul) < 3:
+        return False
+    if hdul[0].data is None or hdul[1].data is None or hdul[2].data is None:
+        return False
+    flux_shape = np.asarray(hdul[0].data).shape
+    if len(flux_shape) != 1:
+        return False
+    n_pix = int(flux_shape[0])
+    if n_pix <= 0:
+        return False
+    names = [(h.name or "").strip().upper() for h in hdul[:3]]
+    if names[1] not in ("VARIANCE", "VAR"):
+        return False
+    if names[2] not in ("BADPIX", "BAD_PIX", "MASK"):
+        return False
+    for idx in (1, 2):
+        sh = np.asarray(hdul[idx].data).shape
+        if sh != (n_pix,):
+            return False
+    return True
+
+
+def _is_ozdes_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if the file looks like an OzDES stacked 1-D spectrum FITS."""
+    if not _is_ozdes_stacked_layout(hdul):
+        return False
+    if path.stem.lower().startswith("ozdes"):
+        return True
+    return "SOURCE" in hdul[0].header
+
+
+def _read_ozdes_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+    *,
+    source_id_col: str | None = None,
+    ra_col: str = "RA",
+    dec_col: str = "DEC",
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read an OzDES stacked 1-D spectrum (PRIMARY + VARIANCE + BADPIX).
+
+    Only the stacked HDUs 0–2 are ingested; per-epoch ``SPECTRUM_*`` extensions
+    are ignored.  ``source_id`` comes from the ``SOURCE`` header keyword by default.
+    """
+    if not _is_ozdes_stacked_layout(hdul):
+        summary = _summarize_fits_hdus(hdul)
+        raise ValueError(
+            "OzDES stacked layout not found (expected HDU0 flux, HDU1 VARIANCE, "
+            f"HDU2 BADPIX). Found: {summary}"
+        )
+
+    flux_hdu = hdul[0]
+    header = flux_hdu.header
+    flux = np.asarray(flux_hdu.data, dtype=np.float32)
+    n_pix = int(flux.shape[0])
+
+    variance = _generic_extension_to_2d(
+        hdul[1].data, n_spec=1, n_pix=n_pix, label="VARIANCE",
+    )[0]
+    ivar = _variance_to_ivar(variance)
+
+    bad = np.asarray(hdul[2].data, dtype=np.float64)
+    bad = np.where(np.isfinite(bad), bad, 0.0)
+    mask = (bad != 0).astype(np.uint8)
+
+    sid_key = source_id_col or "SOURCE"
+    source_id = object_id_from_fits_header(header, sid_key, hdu_index=0)
+    ra, dec = sky_from_fits_header(header, ra_col, dec_col)
+    wavelength = _wavelength_from_wcs(header, n_pix)
+    wcs_attrs = _wcs_attrs_from_header(header, n_pix)
+
+    z = float(header.get("Z", 0.0))
+    if z < -1.0:
+        z = 0.0
+
+    meta: dict[str, Any] = {
+        "z": z,
+        "z_err": float(header.get("Z_ERR", 0.0)),
+        "snr": 0.0,
+        "exptime": float(header.get("EXPTIME", 0.0)),
+        "R": float(header.get("SPEC_RES", 1000.0)),
+        "instr": str(header.get("INSTRUME", "OzDES"))[:16],
+    }
+    record = SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=ivar,
+        mask=mask,
+        wavelength=wavelength,
+        meta=meta,
+    )
+    return [record], wcs_attrs
+
+
 def _parse_2df_spectrum_data(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse 2dF-style ``(flux, variance, sky[, ...])`` image data."""
     arr = np.asarray(data, dtype=np.float64)
@@ -1413,6 +1512,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "sdss_spplate"
         if _is_2df_hdul(hdul):
             return "2df"
+        if _is_ozdes_hdul(hdul, path):
+            return "ozdes"
         if stem.startswith("wig") and _is_wig_spectrum_layout(hdul):
             return "wig"
     return "generic"
@@ -1496,7 +1597,8 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"wig"``, ``"generic"``.  Auto-detected from HDU names if ``None``.
+        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"generic"``.
+        Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
         ``SPECOBJID`` for spPlate ingest.  Mutually exclusive with
@@ -1615,6 +1717,14 @@ def ingest_spectra_from_fits(
                 records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
             elif detected_fmt == "wig":
                 records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
+            elif detected_fmt == "ozdes":
+                records, wcs_attrs = _read_ozdes_spectrum(
+                    hdul,
+                    source_path,
+                    source_id_col=source_id_col,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -2009,7 +2119,16 @@ try:
                   help="Mask dtype (overrides config; default 'uint8').")
     @click.option("--fmt", default=None,
                   type=click.Choice(
-                      ["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df", "6df", "wig"],
+                      [
+                          "sdss_boss",
+                          "sdss_spplate",
+                          "desi_coadd",
+                          "generic",
+                          "2df",
+                          "6df",
+                          "wig",
+                          "ozdes",
+                      ],
                   ),
                   help="Force input format (auto-detected by default).")
     @click.option(

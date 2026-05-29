@@ -450,7 +450,16 @@ try:
         "--fmt",
         default=None,
         type=click.Choice(
-            ["sdss_boss", "sdss_spplate", "desi_coadd", "generic", "2df", "6df", "wig"],
+            [
+                "sdss_boss",
+                "sdss_spplate",
+                "desi_coadd",
+                "generic",
+                "2df",
+                "6df",
+                "wig",
+                "ozdes",
+            ],
         ),
         help="Force FITS format (default: auto-detect).",
     )

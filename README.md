@@ -760,6 +760,26 @@ sbatch scripts/slurm_ingest_6df_spectra.sh
 
 Re-submit the same command to resume from checkpoint after timeout/preemption.
 
+#### OzDES spectra ingest (stacked only)
+
+OzDES target FITS files store the **stacked** spectrum in the first three HDUs:
+PRIMARY (flux), ``VARIANCE``, ``BADPIX`` (``0`` = good, ``1`` = bad).  Per-epoch
+``SPECTRUM_*`` extensions are not ingested.
+
+**Catalog linkage:** use ``--source-id-col SOURCE`` when ingesting the catalog
+(the spectrum header keyword ``SOURCE``, e.g. ``04D1qt``).
+
+```bash
+dl-ingest-catalog ozdes_catalog.fits --survey OZDES_DR2 \
+  --source-id-col SOURCE --ra-col RA --dec-col DEC
+
+dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 \
+  --fmt ozdes --source-id-col SOURCE
+
+# Auto-detect when the basename starts with OzDES and HDU layout matches
+dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --source-id-col SOURCE
+```
+
 #### WiggleZ spectra ingest
 
 WiggleZ 1-D FITS files use a 1-D flux array (PRIMARY / ``EXTNAME='spectrum'``) plus a
