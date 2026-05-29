@@ -286,6 +286,29 @@ def survey_b_pixels_for_tile(
     return sorted(pixels)
 
 
+def tile_search_cone(
+    nside_a: int,
+    npix_a: int,
+    radius_rad: float,
+) -> tuple[float, float, float]:
+    """Return ``(ra_deg, dec_deg, search_radius_deg)`` covering survey-A tile *npix_a*.
+
+    The search disc spans the pixel extent (centre to farthest vertex) plus the
+    match radius, so every source in tile A and every survey-B candidate within
+    ``radius_rad`` of any A source is included.
+    """
+    theta, phi = hp.pix2ang(nside_a, int(npix_a), nest=True)
+    ra_deg = float(np.degrees(phi))
+    dec_deg = float(90.0 - np.degrees(theta))
+
+    vec_center = hp.ang2vec(theta, phi)
+    verts = hp.boundaries(nside_a, int(npix_a), nest=True)
+    cosines = np.clip(verts.T @ vec_center, -1.0, 1.0)
+    pixel_ext_rad = float(np.arccos(cosines.min()))
+    search_deg = float(np.degrees(pixel_ext_rad + radius_rad))
+    return ra_deg, dec_deg, search_deg
+
+
 def _catalog_ids_to_int64(values) -> np.ndarray:
     """Coerce catalog ID column values to int64 for cross-match output."""
     from data_lake.ingest.fits_to_parquet import normalize_object_id
@@ -310,7 +333,6 @@ def _crossmatch_one_tile(
 ) -> int:
     """Match one survey-A tile; write Parquet. Returns number of match rows."""
     nside_a = hp.order2nside(norder_a)
-    nside_b = hp.order2nside(norder_b)
     hp_col = f"_healpix_norder{norder_a}"
     id_col_a = acc_a.source_id_column
     id_col_b = acc_b.source_id_column
@@ -328,20 +350,18 @@ def _crossmatch_one_tile(
     dec_a = df_a[dec_col_a].to_numpy().astype(np.float64)
     ids_a = _catalog_ids_to_int64(df_a[id_col_a].to_list())
 
-    neighbour_pixels = survey_b_pixels_for_tile(
-        nside_a, npix_a, radius_rad, nside_b=nside_b,
+    ra_center, dec_center, search_deg = tile_search_cone(nside_a, npix_a, radius_rad)
+    df_b = acc_b.sources_in_cone(
+        ra_center,
+        dec_center,
+        search_deg,
+        columns=cols_b,
+        fmt="polars",
+        ra_col=ra_col_b,
+        dec_col=dec_col_b,
     )
-
-    frames_b = []
-    for npix_b in neighbour_pixels:
-        df_b_tile = acc_b.sources_in_tile(npix_b, columns=cols_b, fmt="polars")
-        if not df_b_tile.is_empty():
-            frames_b.append(df_b_tile)
-
-    if not frames_b:
+    if df_b.is_empty():
         return 0
-
-    df_b = pl.concat(frames_b).unique(subset=[id_col_b], keep="first")
     ra_b = df_b[ra_col_b].to_numpy().astype(np.float64)
     dec_b = df_b[dec_col_b].to_numpy().astype(np.float64)
     ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
@@ -917,7 +937,13 @@ try:
         click.echo(
             f"Cross-match {result.crossmatch_name}: "
             f"{result.n_match_rows:,} match row(s) in {result.n_tiles_written:,} tile(s) "
-            f"→ {result.output_root} ({result.elapsed_s:.1f} s, {result.n_workers} worker(s))"
+            f"→ {result.output_root} ({result.elapsed_s:.1f} s, {result.n_workers} process worker(s)"
+            + (
+                "; DuckDB may use additional CPU threads for parquet I/O"
+                if result.n_workers == 1
+                else ""
+            )
+            + ")"
         )
 
 except ImportError:

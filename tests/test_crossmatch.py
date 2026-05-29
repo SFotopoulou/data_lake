@@ -19,6 +19,7 @@ from data_lake.io.crossmatch import (
     resolve_crossmatch_settings,
     resolve_crossmatch_sky_columns,
     survey_b_pixels_for_tile,
+    tile_search_cone,
     _crossmatch_tile_worker,
 )
 
@@ -133,6 +134,24 @@ class TestCrossmatchHelpers:
         )
         assert npix_b in pixels
 
+    def test_tile_search_cone_covers_pixel(self) -> None:
+        import healpy as hp
+
+        nside = hp.order2nside(6)
+        npix = 42
+        radius_rad = np.radians(0.5 / 3600.0)
+        ra_c, dec_c, search_deg = tile_search_cone(nside, npix, radius_rad)
+
+        theta, phi = hp.pix2ang(nside, npix, nest=True)
+        vec_center = hp.ang2vec(theta, phi)
+        verts = hp.boundaries(nside, npix, nest=True)
+        cosines = np.clip(verts.T @ vec_center, -1.0, 1.0)
+        pixel_ext_deg = np.degrees(np.arccos(cosines.min()))
+
+        assert search_deg >= pixel_ext_deg
+        assert abs(ra_c - np.degrees(phi)) < 1e-9
+        assert abs(dec_c - (90.0 - np.degrees(theta))) < 1e-9
+
 
 class TestBuildCrossmatch:
     def test_nearest_match_within_radius(self, tmp_path: Path) -> None:
@@ -215,6 +234,31 @@ class TestBuildCrossmatch:
 
         result = build_crossmatch(
             lake, "EUCLID", "SDSS", radius_arcsec=2.0, show_progress=False,
+        )
+        assert result.n_match_rows == 1
+
+    def test_coarse_b_tile_decoys_outside_cone(self, tmp_path: Path) -> None:
+        """B at coarse Norder: distant sources in the same tile must not affect matching."""
+        lake = tmp_path / "lake"
+        ra, dec = 120.0, 45.0
+        norder_a, norder_b = 6, 4
+        npix_a = int(assign_healpix(np.array([ra]), np.array([dec]), norder_a)[0])
+        npix_b = int(assign_healpix(np.array([ra]), np.array([dec]), norder_b)[0])
+
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder_a, npix=npix_a,
+            source_ids=[1001], ra=[ra], dec=[dec],
+        )
+        # Same coarse B tile holds a match and a far decoy (would dominate a full-tile load).
+        _write_catalog_tile(
+            lake, "SURVEY_B", norder=norder_b, npix=npix_b,
+            source_ids=[2001, 9999],
+            ra=[ra + 0.0001, 50.0],
+            dec=[dec + 0.0001, 0.0],
+        )
+
+        result = build_crossmatch(
+            lake, "SURVEY_A", "SURVEY_B", radius_arcsec=2.0, show_progress=False,
         )
         assert result.n_match_rows == 1
 

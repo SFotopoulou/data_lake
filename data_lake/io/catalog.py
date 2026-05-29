@@ -42,6 +42,11 @@ _REDSHIFT_COLUMN_CANDIDATES: tuple[str, ...] = (
 )
 
 
+def _quote_sql_ident(name: str) -> str:
+    """Double-quote a SQL identifier (DuckDB)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def resolve_redshift_column(column_names: list[str]) -> str | None:
     """Return the catalog column name to use for spectroscopic redshift."""
     by_upper = {n.upper(): n for n in column_names}
@@ -223,6 +228,9 @@ class CatalogAccessor:
         radius_deg: float,
         columns: list[str] | None = None,
         fmt: ReturnFormat = "polars",
+        *,
+        ra_col: str | None = None,
+        dec_col: str | None = None,
     ):
         """
         Return sources within a cone.
@@ -230,6 +238,11 @@ class CatalogAccessor:
         Uses a fast HEALPix tile pre-filter plus a per-row angular separation
         check via DuckDB's haversine-equivalent SQL.
         """
+        ra_name = ra_col or self._info.get("ra_column", "ra")
+        dec_name = dec_col or self._info.get("dec_column", "dec")
+        ra_sql = _quote_sql_ident(ra_name)
+        dec_sql = _quote_sql_ident(dec_name)
+
         try:
             import healpy as hp
             nside = hp.order2nside(self.norder)
@@ -239,7 +252,7 @@ class CatalogAccessor:
         except ImportError:
             tiles = None
 
-        col_expr = ", ".join(columns) if columns else "*"
+        col_expr = ", ".join(_quote_sql_ident(c) for c in columns) if columns else "*"
         hp_col = f"_healpix_norder{self.norder}"
 
         if tiles is not None:
@@ -256,9 +269,9 @@ class CatalogAccessor:
                 degrees(
                   acos(
                     LEAST(1.0,
-                      sin(radians(dec)) * sin(radians({dec}))
-                      + cos(radians(dec)) * cos(radians({dec}))
-                        * cos(radians(ra - {ra}))
+                      sin(radians({dec_sql})) * sin(radians({dec}))
+                      + cos(radians({dec_sql})) * cos(radians({dec}))
+                        * cos(radians({ra_sql} - {ra}))
                     )
                   )
                 )
