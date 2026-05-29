@@ -526,6 +526,18 @@ def resolve_source_id_column(
     return candidates[0]
 
 
+def is_valid_sky_position(ra: float, dec: float) -> bool:
+    """True when RA/Dec in degrees can be mapped to a HEALPix pixel."""
+    if not np.isfinite(ra) or not np.isfinite(dec):
+        return False
+    if dec < -90.0 or dec > 90.0:
+        return False
+    # SDSS / pipeline sentinels for unused plug-map fibers
+    if ra <= -9000.0 or dec <= -9000.0:
+        return False
+    return True
+
+
 def assign_healpix(
     ra_deg: np.ndarray,
     dec_deg: np.ndarray,

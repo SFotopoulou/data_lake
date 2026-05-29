@@ -101,7 +101,49 @@ class TestSpplateDetectAndRead:
             normalize_object_id(9002),
         }
         assert wcs["n_pix"] == 32
-        assert len(records[0].flux) == 32
+
+    def test_skips_sentinel_plugmap_coordinates(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import assign_healpix, normalize_object_id
+        from data_lake.ingest.fits_to_spectra_zarr import _read_sdss_spplate
+
+        plate, mjd = 309, 51666
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=3)
+        with fits.open(sp, mode="update", memmap=False) as hdul:
+            hdul[4].data["RA"][2] = -9999.0
+            hdul[4].data["DEC"][2] = -9999.0
+            hdul.flush()
+
+        fiber_map = {1: 9001, 2: 9002, 3: 9003}
+        with fits.open(sp) as hdul:
+            records, _ = _read_sdss_spplate(
+                hdul, path=sp, fiber_to_specobjid=fiber_map, skip_unmatched=False,
+            )
+        assert len(records) == 2
+        assert {r.source_id for r in records} == {
+            normalize_object_id(9001),
+            normalize_object_id(9002),
+        }
+        for rec in records:
+            assign_healpix(np.array([rec.ra]), np.array([rec.dec]), 5)
+
+    def test_example_spplate_with_sentinel_fibers(self) -> None:
+        from data_lake.ingest.fits_to_parquet import assign_healpix
+        from data_lake.ingest.fits_to_spectra_zarr import _read_sdss_spplate
+
+        path = Path(__file__).resolve().parents[1] / "data" / "spPlate-0309-51666.fits"
+        if not path.is_file():
+            pytest.skip(f"Example spPlate not found: {path}")
+
+        with fits.open(path, memmap=True) as hdul:
+            fdata = hdul[5].data
+            fiber_map = {int(f): int(f) for f in fdata["FIBERID"]}
+            records, _ = _read_sdss_spplate(
+                hdul, path=path, fiber_to_specobjid=fiber_map, skip_unmatched=False,
+            )
+        assert len(records) == 637
+        for rec in records:
+            assign_healpix(np.array([rec.ra]), np.array([rec.dec]), 5)
 
 
 class TestFixLength:

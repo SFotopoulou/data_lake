@@ -92,6 +92,7 @@ from astropy.io import fits
 from data_lake.ingest.fits_to_parquet import (
     assign_healpix,
     healpix_dir,
+    is_valid_sky_position,
     object_id_from_fits_header,
     sky_from_fits_header,
 )
@@ -763,6 +764,11 @@ def _read_sdss_spplate(
         else:
             ivar = np.ones(n_pix, dtype=np.float32)
 
+        ra = float(ra_arr[row_i])
+        dec = float(dec_arr[row_i])
+        if not is_valid_sky_position(ra, dec):
+            continue
+
         mask = np.zeros(n_pix, dtype=np.uint8)
         if mask_and is not None:
             m = np.asarray(mask_and[row_i], dtype=np.int32)
@@ -784,8 +790,8 @@ def _read_sdss_spplate(
         }
         records.append(SpectrumRecord(
             source_id=source_id,
-            ra=float(ra_arr[row_i]),
-            dec=float(dec_arr[row_i]),
+            ra=ra,
+            dec=dec,
             flux=flux,
             ivar=ivar,
             mask=mask,
