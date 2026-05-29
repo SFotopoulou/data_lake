@@ -286,6 +286,13 @@ def survey_b_pixels_for_tile(
     return sorted(pixels)
 
 
+def _catalog_ids_to_int64(values) -> np.ndarray:
+    """Coerce catalog ID column values to int64 for cross-match output."""
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
+    return np.asarray([normalize_object_id(v) for v in values], dtype=np.int64)
+
+
 def _crossmatch_one_tile(
     *,
     npix_a: int,
@@ -305,8 +312,10 @@ def _crossmatch_one_tile(
     nside_a = hp.order2nside(norder_a)
     nside_b = hp.order2nside(norder_b)
     hp_col = f"_healpix_norder{norder_a}"
-    cols_a = ["source_id", ra_col_a, dec_col_a]
-    cols_b = ["source_id", ra_col_b, dec_col_b]
+    id_col_a = acc_a.source_id_column
+    id_col_b = acc_b.source_id_column
+    cols_a = [id_col_a, ra_col_a, dec_col_a]
+    cols_b = [id_col_b, ra_col_b, dec_col_b]
 
     out_dir = out_root / healpix_dir(norder_a, npix_a)
     out_file = out_dir / f"Npix={npix_a}.parquet"
@@ -317,7 +326,7 @@ def _crossmatch_one_tile(
 
     ra_a = df_a[ra_col_a].to_numpy().astype(np.float64)
     dec_a = df_a[dec_col_a].to_numpy().astype(np.float64)
-    ids_a = df_a["source_id"].to_numpy().astype(np.int64)
+    ids_a = _catalog_ids_to_int64(df_a[id_col_a].to_list())
 
     neighbour_pixels = survey_b_pixels_for_tile(
         nside_a, npix_a, radius_rad, nside_b=nside_b,
@@ -332,10 +341,10 @@ def _crossmatch_one_tile(
     if not frames_b:
         return 0
 
-    df_b = pl.concat(frames_b).unique(subset=["source_id"], keep="first")
+    df_b = pl.concat(frames_b).unique(subset=[id_col_b], keep="first")
     ra_b = df_b[ra_col_b].to_numpy().astype(np.float64)
     dec_b = df_b[dec_col_b].to_numpy().astype(np.float64)
-    ids_b = df_b["source_id"].to_numpy().astype(np.int64)
+    ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
 
     matched_a, matched_b, sep = _match_sky(
         ra_a, dec_a, ids_a, ra_b, dec_b, ids_b, radius_deg
@@ -554,6 +563,13 @@ def build_crossmatch(
 
         with CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a, \
              CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b:
+            log.info(
+                "ID columns: %s (%r) × %s (%r)",
+                survey_a,
+                acc_a.source_id_column,
+                survey_b,
+                acc_b.source_id_column,
+            )
             for npix_a in iterator:
                 n_rows = _crossmatch_one_tile(
                     npix_a=npix_a,

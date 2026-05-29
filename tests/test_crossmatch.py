@@ -34,13 +34,15 @@ def _write_catalog_tile(
     dec: list[float],
     ra_col: str = "ra",
     dec_col: str = "dec",
+    id_col: str = "source_id",
+    source_id_mode: str | None = None,
 ) -> None:
     tile_dir = lake / "catalogs" / survey / healpix_dir(norder, npix)
     tile_dir.mkdir(parents=True, exist_ok=True)
     hp_col = f"_healpix_norder{norder}"
     pq.write_table(
         pa.table({
-            "source_id": pa.array(source_ids, type=pa.int64()),
+            id_col: pa.array(source_ids, type=pa.int64()),
             ra_col: pa.array(ra, type=pa.float64()),
             dec_col: pa.array(dec, type=pa.float64()),
             hp_col: pa.array([npix] * len(source_ids), type=pa.int64()),
@@ -49,11 +51,12 @@ def _write_catalog_tile(
         }),
         tile_dir / f"Npix={npix}.parquet",
     )
+    mode = source_id_mode or (f"column:{id_col}" if id_col != "source_id" else "sequential")
     info = {
         "hats_order": norder,
         "ra_column": ra_col,
         "dec_column": dec_col,
-        "source_id_mode": "sequential",
+        "source_id_mode": mode,
         "total_rows": len(source_ids),
         "total_columns": 6,
     }
@@ -188,6 +191,30 @@ class TestBuildCrossmatch:
             "SURVEY_B",
             radius_arcsec=2.0,
             show_progress=False,
+        )
+        assert result.n_match_rows == 1
+
+    def test_native_id_column_names(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "EUCLID", norder=norder, npix=npix,
+            source_ids=[1001], ra=[ra], dec=[dec],
+            ra_col="right_ascension", dec_col="declination",
+            id_col="object_id",
+        )
+        _write_catalog_tile(
+            lake, "SDSS", norder=norder, npix=npix,
+            source_ids=[2001], ra=[ra + 0.0001], dec=[dec + 0.0001],
+            ra_col="PLUG_RA", dec_col="PLUG_DEC",
+            id_col="TARGETID",
+        )
+
+        result = build_crossmatch(
+            lake, "EUCLID", "SDSS", radius_arcsec=2.0, show_progress=False,
         )
         assert result.n_match_rows == 1
 
