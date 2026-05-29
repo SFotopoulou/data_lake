@@ -71,6 +71,23 @@ class CrossmatchResult:
 
 
 @dataclass(frozen=True)
+class CrossmatchSurveySettings:
+    """Per-survey sky columns and HEALPix order."""
+
+    ra_col: str
+    dec_col: str
+    norder: int
+
+
+@dataclass(frozen=True)
+class CrossmatchSettings:
+    """Resolved cross-match configuration for both surveys."""
+
+    survey_a: CrossmatchSurveySettings
+    survey_b: CrossmatchSurveySettings
+
+
+@dataclass(frozen=True)
 class CrossmatchTileConfig:
     """Pickle-friendly config for one survey-A tile (parallel workers)."""
 
@@ -78,9 +95,12 @@ class CrossmatchTileConfig:
     survey_a: str
     survey_b: str
     npix_a: int
-    norder: int
-    ra_col: str
-    dec_col: str
+    norder_a: int
+    norder_b: int
+    ra_col_a: str
+    dec_col_a: str
+    ra_col_b: str
+    dec_col_b: str
     radius_arcsec: float
     out_root: str
 
@@ -119,6 +139,62 @@ def _sky_columns_from_catalog_info(catalog_root: Path) -> tuple[str, str, int]:
     )
 
 
+def resolve_crossmatch_settings(
+    lake_root: Path | str,
+    survey_a: str,
+    survey_b: str,
+    *,
+    ra_col_a: str | None = None,
+    dec_col_a: str | None = None,
+    norder_a: int | None = None,
+    ra_col_b: str | None = None,
+    dec_col_b: str | None = None,
+    norder_b: int | None = None,
+    ra_col: str | None = None,
+    dec_col: str | None = None,
+    norder: int | None = None,
+) -> CrossmatchSettings:
+    """Resolve per-survey RA/Dec columns and HEALPix order from catalog_info.json.
+
+    Legacy ``ra_col`` / ``dec_col`` / ``norder`` apply to survey A only.
+    """
+    root = Path(lake_root)
+    ra_a, dec_a, order_a = _sky_columns_from_catalog_info(root / "catalogs" / survey_a)
+    ra_b, dec_b, order_b = _sky_columns_from_catalog_info(root / "catalogs" / survey_b)
+
+    settings = CrossmatchSettings(
+        survey_a=CrossmatchSurveySettings(
+            ra_col=ra_col_a or ra_col or ra_a,
+            dec_col=dec_col_a or dec_col or dec_a,
+            norder=norder_a if norder_a is not None else (norder if norder is not None else order_a),
+        ),
+        survey_b=CrossmatchSurveySettings(
+            ra_col=ra_col_b or ra_b,
+            dec_col=dec_col_b or dec_b,
+            norder=norder_b if norder_b is not None else order_b,
+        ),
+    )
+    if settings.survey_a.norder != settings.survey_b.norder:
+        log.info(
+            "Cross-match %s (Norder=%d) × %s (Norder=%d); output partitioned at survey-A order.",
+            survey_a,
+            settings.survey_a.norder,
+            survey_b,
+            settings.survey_b.norder,
+        )
+    if settings.survey_a.ra_col != settings.survey_b.ra_col or settings.survey_a.dec_col != settings.survey_b.dec_col:
+        log.info(
+            "Sky columns: %s (%r, %r) × %s (%r, %r)",
+            survey_a,
+            settings.survey_a.ra_col,
+            settings.survey_a.dec_col,
+            survey_b,
+            settings.survey_b.ra_col,
+            settings.survey_b.dec_col,
+        )
+    return settings
+
+
 def resolve_crossmatch_sky_columns(
     lake_root: Path | str,
     survey_a: str,
@@ -128,42 +204,16 @@ def resolve_crossmatch_sky_columns(
     dec_col: str | None = None,
     norder: int | None = None,
 ) -> tuple[str, str, int]:
-    """Resolve shared RA/Dec column names and HEALPix order for a cross-match."""
-    root = Path(lake_root)
-    ra_a, dec_a, order_a = _sky_columns_from_catalog_info(root / "catalogs" / survey_a)
-    ra_b, dec_b, order_b = _sky_columns_from_catalog_info(root / "catalogs" / survey_b)
-
-    ra = ra_col or ra_a
-    dec = dec_col or dec_a
-    order = norder if norder is not None else order_a
-
-    if ra_col is None and ra_a != ra_b:
-        log.warning(
-            "Survey %s uses ra_column=%r but %s uses %r; using %r for both.",
-            survey_a,
-            ra_a,
-            survey_b,
-            ra_b,
-            ra,
-        )
-    if dec_col is None and dec_a != dec_b:
-        log.warning(
-            "Survey %s uses dec_column=%r but %s uses %r; using %r for both.",
-            survey_a,
-            dec_a,
-            survey_b,
-            dec_b,
-            dec,
-        )
-    if norder is None and order_a != order_b:
-        log.warning(
-            "Surveys use different hats_order (%d vs %d); using %d (survey A). "
-            "Re-ingest at a common order if matches look wrong.",
-            order_a,
-            order_b,
-            order,
-        )
-    return ra, dec, order
+    """Legacy helper returning survey-A settings only."""
+    s = resolve_crossmatch_settings(
+        lake_root,
+        survey_a,
+        survey_b,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        norder=norder,
+    )
+    return s.survey_a.ra_col, s.survey_a.dec_col, s.survey_a.norder
 
 
 def iter_populated_tile_npixels(catalog_root: Path, *, norder: int | None = None) -> list[int]:
@@ -187,55 +237,64 @@ def iter_populated_tile_npixels(catalog_root: Path, *, norder: int | None = None
 
 
 def survey_b_pixels_for_tile(
-    nside: int,
+    nside_a: int,
     npix_a: int,
     radius_rad: float,
+    *,
+    nside_b: int | None = None,
 ) -> list[int]:
     """Return survey-B HEALPix pixels to load when matching survey-A tile *npix_a*.
 
-    Uses the **geometry of pixel A** (boundary vertices and edge neighbours),
-    not the centroid of sources in the tile:
+    Pixel indices are at **survey-B** resolution (``nside_b``).  The search region
+    is derived from the geometry of pixel A at ``nside_a`` (boundary vertices,
+    edge neighbours, match radius) — not from source centroids.
 
-    * *npix_a* itself
-    * immediate edge neighbours via :func:`healpy.get_all_neighbours`
-    * pixels within ``radius_rad`` of each boundary vertex (edge + radius)
-    * pixels within ``pixel_angular_extent + radius_rad`` of the pixel centre
-      (covers interior points near edges for large match radii)
+    When ``nside_b != nside_a``, sky coverage is mapped to the finer/coarser B grid
+    via :func:`healpy.query_disc` at ``nside_b``.
     """
+    nside_b = nside_b or nside_a
     npix_a = int(npix_a)
-    pixels: set[int] = {npix_a}
+    pixels: set[int] = set()
 
-    for n in hp.get_all_neighbours(nside, npix_a, nest=True):
-        if n >= 0:
-            pixels.add(int(n))
-
-    theta, phi = hp.pix2ang(nside, npix_a, nest=True)
+    theta, phi = hp.pix2ang(nside_a, npix_a, nest=True)
     vec_center = hp.ang2vec(theta, phi)
-    verts = hp.boundaries(nside, npix_a, nest=True)
+    verts = hp.boundaries(nside_a, npix_a, nest=True)
 
     if radius_rad > 0.0:
         for k in range(verts.shape[1]):
-            for p in hp.query_disc(nside, verts[:, k], radius_rad, nest=True, inclusive=True):
+            for p in hp.query_disc(nside_b, verts[:, k], radius_rad, nest=True, inclusive=True):
                 pixels.add(int(p))
 
     cosines = np.clip(verts.T @ vec_center, -1.0, 1.0)
     pixel_ext_rad = float(np.arccos(cosines.min()))
     search_rad = pixel_ext_rad + radius_rad
-    for p in hp.query_disc(nside, vec_center, search_rad, nest=True, inclusive=True):
+    for p in hp.query_disc(nside_b, vec_center, search_rad, nest=True, inclusive=True):
         pixels.add(int(p))
+
+    if nside_a == nside_b:
+        pixels.add(npix_a)
+        for n in hp.get_all_neighbours(nside_a, npix_a, nest=True):
+            if n >= 0:
+                pixels.add(int(n))
+    else:
+        npix_b_centre = int(hp.ang2pix(nside_b, theta, phi, nest=True))
+        pixels.add(npix_b_centre)
+        for n in hp.get_all_neighbours(nside_b, npix_b_centre, nest=True):
+            if n >= 0:
+                pixels.add(int(n))
 
     return sorted(pixels)
 
 
 def _crossmatch_one_tile(
     *,
-    lake_root: Path | str,
-    survey_a: str,
-    survey_b: str,
     npix_a: int,
-    norder: int,
-    ra_col: str,
-    dec_col: str,
+    norder_a: int,
+    norder_b: int,
+    ra_col_a: str,
+    dec_col_a: str,
+    ra_col_b: str,
+    dec_col_b: str,
     radius_deg: float,
     radius_rad: float,
     out_root: Path,
@@ -243,23 +302,26 @@ def _crossmatch_one_tile(
     acc_b: CatalogAccessor,
 ) -> int:
     """Match one survey-A tile; write Parquet. Returns number of match rows."""
-    nside = hp.order2nside(norder)
-    hp_col = f"_healpix_norder{norder}"
-    cols_a = ["source_id", ra_col, dec_col]
-    cols_b = ["source_id", ra_col, dec_col]
+    nside_a = hp.order2nside(norder_a)
+    nside_b = hp.order2nside(norder_b)
+    hp_col = f"_healpix_norder{norder_a}"
+    cols_a = ["source_id", ra_col_a, dec_col_a]
+    cols_b = ["source_id", ra_col_b, dec_col_b]
 
-    out_dir = out_root / healpix_dir(norder, npix_a)
+    out_dir = out_root / healpix_dir(norder_a, npix_a)
     out_file = out_dir / f"Npix={npix_a}.parquet"
 
     df_a = acc_a.sources_in_tile(npix_a, columns=cols_a, fmt="polars")
     if df_a.is_empty():
         return 0
 
-    ra_a = df_a[ra_col].to_numpy().astype(np.float64)
-    dec_a = df_a[dec_col].to_numpy().astype(np.float64)
+    ra_a = df_a[ra_col_a].to_numpy().astype(np.float64)
+    dec_a = df_a[dec_col_a].to_numpy().astype(np.float64)
     ids_a = df_a["source_id"].to_numpy().astype(np.int64)
 
-    neighbour_pixels = survey_b_pixels_for_tile(nside, npix_a, radius_rad)
+    neighbour_pixels = survey_b_pixels_for_tile(
+        nside_a, npix_a, radius_rad, nside_b=nside_b,
+    )
 
     frames_b = []
     for npix_b in neighbour_pixels:
@@ -271,8 +333,8 @@ def _crossmatch_one_tile(
         return 0
 
     df_b = pl.concat(frames_b).unique(subset=["source_id"], keep="first")
-    ra_b = df_b[ra_col].to_numpy().astype(np.float64)
-    dec_b = df_b[dec_col].to_numpy().astype(np.float64)
+    ra_b = df_b[ra_col_b].to_numpy().astype(np.float64)
+    dec_b = df_b[dec_col_b].to_numpy().astype(np.float64)
     ids_b = df_b["source_id"].to_numpy().astype(np.int64)
 
     matched_a, matched_b, sep = _match_sky(
@@ -309,16 +371,16 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
         radius_deg = config.radius_arcsec / 3600.0
         radius_rad = np.radians(radius_deg)
 
-        with CatalogAccessor(lake_root, config.survey_a, norder=config.norder) as acc_a, \
-             CatalogAccessor(lake_root, config.survey_b, norder=config.norder) as acc_b:
+        with CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a, \
+             CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b:
             n_rows = _crossmatch_one_tile(
-                lake_root=lake_root,
-                survey_a=config.survey_a,
-                survey_b=config.survey_b,
                 npix_a=config.npix_a,
-                norder=config.norder,
-                ra_col=config.ra_col,
-                dec_col=config.dec_col,
+                norder_a=config.norder_a,
+                norder_b=config.norder_b,
+                ra_col_a=config.ra_col_a,
+                dec_col_a=config.dec_col_a,
+                ra_col_b=config.ra_col_b,
+                dec_col_b=config.dec_col_b,
                 radius_deg=radius_deg,
                 radius_rad=radius_rad,
                 out_root=out_root,
@@ -368,6 +430,12 @@ def build_crossmatch(
     dec_col: str | None = None,
     overwrite: bool = False,
     *,
+    norder_a: int | None = None,
+    norder_b: int | None = None,
+    ra_col_a: str | None = None,
+    dec_col_a: str | None = None,
+    ra_col_b: str | None = None,
+    dec_col_b: str | None = None,
     populated_tiles_only: bool = True,
     show_progress: bool = False,
     n_workers: int = 1,
@@ -389,9 +457,13 @@ def build_crossmatch(
     radius_arcsec:
         Maximum matching radius in arcseconds.
     norder:
-        HEALPix partitioning order.
+        HEALPix order for survey A (legacy alias for ``norder_a``).
     ra_col / dec_col:
-        Column names for sky coordinates in both surveys.
+        Sky columns for survey A (legacy aliases for ``ra_col_a`` / ``dec_col_a``).
+    norder_a / norder_b:
+        Per-survey HEALPix order (default: each catalog's ``catalog_info.json``).
+    ra_col_a / dec_col_a / ra_col_b / dec_col_b:
+        Per-survey sky column overrides.
     overwrite:
         If False (default), skip existing output tiles.
     populated_tiles_only:
@@ -411,41 +483,49 @@ def build_crossmatch(
         raise ValueError("n_workers must be >= 1")
 
     lake_root = Path(lake_root)
-    ra_col, dec_col, norder = resolve_crossmatch_sky_columns(
+    settings = resolve_crossmatch_settings(
         lake_root,
         survey_a,
         survey_b,
+        ra_col_a=ra_col_a,
+        dec_col_a=dec_col_a,
+        norder_a=norder_a if norder_a is not None else norder,
+        ra_col_b=ra_col_b,
+        dec_col_b=dec_col_b,
+        norder_b=norder_b,
         ra_col=ra_col,
         dec_col=dec_col,
         norder=norder,
     )
+    norder_a = settings.survey_a.norder
+    norder_b = settings.survey_b.norder
 
     xm_name = crossmatch_name(survey_a, survey_b)
     out_root = crossmatch_root(lake_root, survey_a, survey_b)
 
     catalog_root_a = lake_root / "catalogs" / survey_a
     if populated_tiles_only:
-        tile_npixels = iter_populated_tile_npixels(catalog_root_a, norder=norder)
+        tile_npixels = iter_populated_tile_npixels(catalog_root_a, norder=norder_a)
         log.info(
             "Cross-match %s × %s: %d populated tile(s) in survey A at Norder=%d",
             survey_a,
             survey_b,
             len(tile_npixels),
-            norder,
+            norder_a,
         )
     else:
-        nside = hp.order2nside(norder)
-        tile_npixels = list(range(hp.nside2npix(nside)))
+        nside_a = hp.order2nside(norder_a)
+        tile_npixels = list(range(hp.nside2npix(nside_a)))
         log.info(
             "Cross-match %s × %s: scanning all %d HEALPix pixels at Norder=%d",
             survey_a,
             survey_b,
             len(tile_npixels),
-            norder,
+            norder_a,
         )
 
     pending, n_match_rows, n_tiles_written = _pending_crossmatch_tiles(
-        tile_npixels, out_root, norder, overwrite,
+        tile_npixels, out_root, norder_a, overwrite,
     )
     if n_workers > 1:
         log.info(
@@ -472,17 +552,17 @@ def build_crossmatch(
             except ImportError:
                 pass
 
-        with CatalogAccessor(lake_root, survey_a, norder=norder) as acc_a, \
-             CatalogAccessor(lake_root, survey_b, norder=norder) as acc_b:
+        with CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a, \
+             CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b:
             for npix_a in iterator:
                 n_rows = _crossmatch_one_tile(
-                    lake_root=lake_root,
-                    survey_a=survey_a,
-                    survey_b=survey_b,
                     npix_a=npix_a,
-                    norder=norder,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
+                    norder_a=norder_a,
+                    norder_b=norder_b,
+                    ra_col_a=settings.survey_a.ra_col,
+                    dec_col_a=settings.survey_a.dec_col,
+                    ra_col_b=settings.survey_b.ra_col,
+                    dec_col_b=settings.survey_b.dec_col,
                     radius_deg=radius_deg,
                     radius_rad=radius_rad,
                     out_root=out_root,
@@ -501,9 +581,12 @@ def build_crossmatch(
                 survey_a=survey_a,
                 survey_b=survey_b,
                 npix_a=npix_a,
-                norder=norder,
-                ra_col=ra_col,
-                dec_col=dec_col,
+                norder_a=norder_a,
+                norder_b=norder_b,
+                ra_col_a=settings.survey_a.ra_col,
+                dec_col_a=settings.survey_a.dec_col,
+                ra_col_b=settings.survey_b.ra_col,
+                dec_col_b=settings.survey_b.dec_col,
                 radius_arcsec=radius_arcsec,
                 out_root=str(out_root),
             )
@@ -550,7 +633,14 @@ def build_crossmatch(
         elapsed,
     )
 
-    _write_xm_info(out_root, xm_name, survey_a, survey_b, norder, radius_arcsec)
+    _write_xm_info(
+        out_root,
+        xm_name,
+        survey_a,
+        survey_b,
+        settings,
+        radius_arcsec,
+    )
     return CrossmatchResult(
         survey_a=survey_a,
         survey_b=survey_b,
@@ -559,7 +649,7 @@ def build_crossmatch(
         n_tiles_written=n_tiles_written,
         n_match_rows=n_match_rows,
         radius_arcsec=radius_arcsec,
-        norder=norder,
+        norder=norder_a,
         elapsed_s=elapsed,
         n_workers=n_workers,
     )
@@ -598,7 +688,7 @@ def _write_xm_info(
     xm_name: str,
     survey_a: str,
     survey_b: str,
-    norder: int,
+    settings: CrossmatchSettings,
     radius_arcsec: float,
 ) -> None:
     info = {
@@ -607,7 +697,13 @@ def _write_xm_info(
         "survey_a": survey_a,
         "survey_b": survey_b,
         "match_radius_arcsec": radius_arcsec,
-        "hats_order": norder,
+        "hats_order": settings.survey_a.norder,
+        "survey_a_norder": settings.survey_a.norder,
+        "survey_b_norder": settings.survey_b.norder,
+        "survey_a_ra_column": settings.survey_a.ra_col,
+        "survey_a_dec_column": settings.survey_a.dec_col,
+        "survey_b_ra_column": settings.survey_b.ra_col,
+        "survey_b_dec_column": settings.survey_b.dec_col,
         "schema_version": "1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -725,12 +821,16 @@ try:
     )
     @click.option(
         "--norder",
+        "norder_a",
         type=int,
         default=None,
-        help="HEALPix order (default: survey A catalog_info.json hats_order).",
+        help="Survey-A HEALPix order (default: catalog_info.json).",
     )
-    @click.option("--ra-col", default=None, help="RA column override (default: catalog_info).")
-    @click.option("--dec-col", default=None, help="Dec column override (default: catalog_info).")
+    @click.option("--norder-b", type=int, default=None, help="Survey-B HEALPix order.")
+    @click.option("--ra-col", "ra_col_a", default=None, help="Survey-A RA column override.")
+    @click.option("--dec-col", "dec_col_a", default=None, help="Survey-A Dec column override.")
+    @click.option("--ra-col-b", default=None, help="Survey-B RA column override.")
+    @click.option("--dec-col-b", default=None, help="Survey-B Dec column override.")
     @click.option("--overwrite", is_flag=True, help="Rebuild cross-match tiles that already exist.")
     @click.option(
         "--all-tiles",
@@ -752,9 +852,12 @@ try:
         output_root: Path | None,
         config_path: Path | None,
         radius_arcsec: float,
-        norder: int | None,
-        ra_col: str | None,
-        dec_col: str | None,
+        norder_a: int | None,
+        norder_b: int | None,
+        ra_col_a: str | None,
+        dec_col_a: str | None,
+        ra_col_b: str | None,
+        dec_col_b: str | None,
         overwrite: bool,
         all_tiles: bool,
         show_progress: bool,
@@ -764,9 +867,8 @@ try:
         """Build an in-lake positional cross-match between two ingested catalogs.
 
         Output: ``catalogs/crossmatch/<survey_a>_x_<survey_b>/`` (HATS Parquet).
-        Survey A defines the partition key. Matches are nearest-neighbour within
-        ``--radius-arcsec``. Re-run without ``--overwrite`` to resume (skips
-        existing tiles).
+        Each survey uses its own RA/Dec columns and Norder from ``catalog_info.json``
+        unless overridden.  Survey A defines the output partition key.
         """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         cfg = load_optional_config(config_path)
@@ -785,9 +887,12 @@ try:
             survey_a,
             survey_b,
             radius_arcsec=radius_arcsec,
-            norder=norder,
-            ra_col=ra_col,
-            dec_col=dec_col,
+            norder_a=norder_a,
+            norder_b=norder_b,
+            ra_col_a=ra_col_a,
+            dec_col_a=dec_col_a,
+            ra_col_b=ra_col_b,
+            dec_col_b=dec_col_b,
             overwrite=overwrite,
             populated_tiles_only=not all_tiles,
             show_progress=show_progress,

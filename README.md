@@ -1406,6 +1406,11 @@ tile-by-tile like ingest. Use ``dl-extract-catalog`` only when an external tool
 dl-crossmatch SURVEY_A SURVEY_B /data/lake \
   --radius-arcsec 1.0 --n-workers 8 --progress
 
+# Per-survey sky columns / Norder (defaults: each catalog_info.json)
+dl-crossmatch SURVEY_A SURVEY_B /data/lake \
+  --ra-col RA --dec-col DEC --norder 5 \
+  --ra-col-b RAJ2000 --dec-col-b DEJ2000 --norder-b 6
+
 # Output: catalogs/crossmatch/SURVEY_A_x_SURVEY_B/
 # Query: CrossmatchAccessor or DuckDB over that tree
 ```
