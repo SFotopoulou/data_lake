@@ -18,6 +18,7 @@ from data_lake.io.crossmatch import (
     iter_populated_tile_npixels,
     resolve_crossmatch_settings,
     resolve_crossmatch_sky_columns,
+    filter_survey_a_tiles_overlapping_survey_b,
     survey_b_pixels_for_tile,
     tile_search_cone,
     _crossmatch_tile_worker,
@@ -152,6 +153,38 @@ class TestCrossmatchHelpers:
         assert abs(ra_c - np.degrees(phi)) < 1e-9
         assert abs(dec_c - (90.0 - np.degrees(theta))) < 1e-9
 
+    def test_filter_a_tiles_by_b_footprint(self, tmp_path: Path) -> None:
+        import healpy as hp
+
+        lake = tmp_path / "lake"
+        norder = 5
+        nside = hp.order2nside(norder)
+        npix_overlap = int(assign_healpix(np.array([120.0]), np.array([45.0]), norder)[0])
+        npix_far = int(assign_healpix(np.array([10.0]), np.array([0.0]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "A", norder=norder, npix=npix_overlap,
+            source_ids=[1], ra=[120.0], dec=[45.0],
+        )
+        _write_catalog_tile(
+            lake, "A", norder=norder, npix=npix_far,
+            source_ids=[2], ra=[10.0], dec=[0.0],
+        )
+        _write_catalog_tile(
+            lake, "B", norder=norder, npix=npix_overlap,
+            source_ids=[100], ra=[120.0], dec=[45.0],
+        )
+
+        b_pop = set(iter_populated_tile_npixels(lake / "catalogs" / "B", norder=norder))
+        kept = filter_survey_a_tiles_overlapping_survey_b(
+            [npix_overlap, npix_far],
+            nside_a=nside,
+            nside_b=nside,
+            b_populated=b_pop,
+            radius_rad=np.radians(1.0 / 3600.0),
+        )
+        assert kept == [npix_overlap]
+
 
 class TestBuildCrossmatch:
     def test_nearest_match_within_radius(self, tmp_path: Path) -> None:
@@ -261,6 +294,26 @@ class TestBuildCrossmatch:
             lake, "SURVEY_A", "SURVEY_B", radius_arcsec=2.0, show_progress=False,
         )
         assert result.n_match_rows == 1
+
+    def test_disjoint_footprints_skip_a_tiles(self, tmp_path: Path) -> None:
+        """Survey-A tiles outside survey-B footprint are not processed."""
+        lake = tmp_path / "lake"
+        norder = 5
+        npix_a = int(assign_healpix(np.array([10.0]), np.array([0.0]), norder)[0])
+        npix_b = int(assign_healpix(np.array([120.0]), np.array([45.0]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "A", norder=norder, npix=npix_a,
+            source_ids=[1], ra=[10.0], dec=[0.0],
+        )
+        _write_catalog_tile(
+            lake, "B", norder=norder, npix=npix_b,
+            source_ids=[2], ra=[120.0], dec=[45.0],
+        )
+
+        result = build_crossmatch(lake, "A", "B", radius_arcsec=2.0, show_progress=False)
+        assert result.n_match_rows == 0
+        assert result.n_tiles_written == 0
 
     def test_no_match_beyond_radius(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"

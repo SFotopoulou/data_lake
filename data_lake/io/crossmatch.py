@@ -38,7 +38,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import healpy as hp
 import numpy as np
@@ -301,12 +301,63 @@ def tile_search_cone(
     ra_deg = float(np.degrees(phi))
     dec_deg = float(90.0 - np.degrees(theta))
 
-    vec_center = hp.ang2vec(theta, phi)
-    verts = hp.boundaries(nside_a, int(npix_a), nest=True)
-    cosines = np.clip(verts.T @ vec_center, -1.0, 1.0)
-    pixel_ext_rad = float(np.arccos(cosines.min()))
-    search_deg = float(np.degrees(pixel_ext_rad + radius_rad))
+    search_deg = float(np.degrees(_tile_search_radius_rad(nside_a, npix_a, radius_rad)))
     return ra_deg, dec_deg, search_deg
+
+
+def _tile_search_radius_rad(nside_a: int, npix_a: int, radius_rad: float) -> float:
+    """Angular radius (rad) covering survey-A pixel extent plus match radius."""
+    theta, phi = hp.pix2ang(nside_a, int(npix_a), nest=True)
+    vec = hp.ang2vec(theta, phi)
+    verts = hp.boundaries(nside_a, int(npix_a), nest=True)
+    cosines = np.clip(verts.T @ vec, -1.0, 1.0)
+    return float(np.arccos(cosines.min()) + radius_rad)
+
+
+def filter_survey_a_tiles_overlapping_survey_b(
+    npix_a_list: Sequence[int],
+    *,
+    nside_a: int,
+    nside_b: int,
+    b_populated: set[int],
+    radius_rad: float,
+) -> list[int]:
+    """Return survey-A tile indices that may contain matches in survey B.
+
+    A tile is kept when the same search disc used for survey-B cone queries
+    (pixel extent + match radius) intersects at least one populated survey-B
+    HEALPix pixel.  Works across different ``nside_a`` / ``nside_b``.
+    """
+    if not npix_a_list or not b_populated:
+        return []
+
+    npix_a_set = {int(p) for p in npix_a_list}
+    b_pop = {int(p) for p in b_populated}
+
+    if len(b_pop) <= len(npix_a_set):
+        keep: set[int] = set()
+        for npix_b in b_pop:
+            theta, phi = hp.pix2ang(nside_b, npix_b, nest=True)
+            vec = hp.ang2vec(theta, phi)
+            verts = hp.boundaries(nside_b, npix_b, nest=True)
+            cosines = np.clip(verts.T @ vec, -1.0, 1.0)
+            search_rad = float(np.arccos(cosines.min()) + radius_rad)
+            for npix_a in hp.query_disc(
+                nside_a, vec, search_rad, nest=True, inclusive=True,
+            ):
+                if int(npix_a) in npix_a_set:
+                    keep.add(int(npix_a))
+        return sorted(keep)
+
+    keep_list: list[int] = []
+    for npix_a in sorted(npix_a_set):
+        theta, phi = hp.pix2ang(nside_a, npix_a, nest=True)
+        vec = hp.ang2vec(theta, phi)
+        search_rad = _tile_search_radius_rad(nside_a, npix_a, radius_rad)
+        tiles_b = hp.query_disc(nside_b, vec, search_rad, nest=True, inclusive=True)
+        if b_pop.intersection(tiles_b):
+            keep_list.append(npix_a)
+    return keep_list
 
 
 def _catalog_ids_to_int64(values) -> np.ndarray:
@@ -472,9 +523,10 @@ def build_crossmatch(
     """
     Build a precomputed cross-match between two surveys.
 
-    Uses tile-by-tile nearest-neighbour matching.  Survey-B tiles are chosen from
-    the HEALPix **geometry** of each survey-A pixel (edge neighbours + boundary
-    vertices + match radius) via :func:`survey_b_pixels_for_tile`.
+    Uses tile-by-tile nearest-neighbour matching.  Survey-A tiles are limited to
+    those overlapping the survey-B populated footprint (see
+    :func:`filter_survey_a_tiles_overlapping_survey_b`).  Survey-B candidates
+    per tile are fetched with a cone query (pixel extent + match radius).
 
     Parameters
     ----------
@@ -497,7 +549,8 @@ def build_crossmatch(
         If False (default), skip existing output tiles.
     populated_tiles_only:
         When True (default), iterate only HEALPix tiles present in survey A
-        instead of the full ``12 * 4**norder`` pixel range.
+        instead of the full ``12 * 4**norder`` pixel range.  Tiles with no
+        overlap with survey-B populated footprint are always skipped.
     show_progress:
         Show a tqdm progress bar over survey-A tiles when available.
     n_workers:
@@ -533,6 +586,11 @@ def build_crossmatch(
     out_root = crossmatch_root(lake_root, survey_a, survey_b)
 
     catalog_root_a = lake_root / "catalogs" / survey_a
+    catalog_root_b = lake_root / "catalogs" / survey_b
+    radius_rad = np.radians(radius_arcsec / 3600.0)
+    nside_a = hp.order2nside(norder_a)
+    nside_b = hp.order2nside(norder_b)
+
     if populated_tiles_only:
         tile_npixels = iter_populated_tile_npixels(catalog_root_a, norder=norder_a)
         log.info(
@@ -543,7 +601,6 @@ def build_crossmatch(
             norder_a,
         )
     else:
-        nside_a = hp.order2nside(norder_a)
         tile_npixels = list(range(hp.nside2npix(nside_a)))
         log.info(
             "Cross-match %s × %s: scanning all %d HEALPix pixels at Norder=%d",
@@ -551,6 +608,31 @@ def build_crossmatch(
             survey_b,
             len(tile_npixels),
             norder_a,
+        )
+
+    b_populated = set(iter_populated_tile_npixels(catalog_root_b, norder=norder_b))
+    n_a_before = len(tile_npixels)
+    tile_npixels = filter_survey_a_tiles_overlapping_survey_b(
+        tile_npixels,
+        nside_a=nside_a,
+        nside_b=nside_b,
+        b_populated=b_populated,
+        radius_rad=radius_rad,
+    )
+    if n_a_before != len(tile_npixels):
+        log.info(
+            "Sky overlap: %d / %d survey-A tile(s) overlap survey-B footprint "
+            "(%d populated B tile(s) at Norder=%d)",
+            len(tile_npixels),
+            n_a_before,
+            len(b_populated),
+            norder_b,
+        )
+    if not tile_npixels:
+        log.warning(
+            "Cross-match %s × %s: no survey-A tiles overlap survey-B populated footprint",
+            survey_a,
+            survey_b,
         )
 
     pending, n_match_rows, n_tiles_written = _pending_crossmatch_tiles(
@@ -571,7 +653,6 @@ def build_crossmatch(
 
     if n_workers == 1:
         radius_deg = radius_arcsec / 3600.0
-        radius_rad = np.radians(radius_deg)
         iterator: Iterable[int] = pending
         if show_progress:
             try:
