@@ -800,6 +800,26 @@ dl-ingest-spectra sc_UDS313141_P3M1Q4_008_1.fits --survey VANDELS --fmt vandels
 dl-ingest-spectra sc_UDS313141_P3M1Q4_008_1.fits --survey VANDELS
 ```
 
+#### VIPERS spectra ingest
+
+VIPERS 1-D spectra are stored as a row-per-pixel binary table with columns
+``WAVES``, ``FLUXES``, ``NOISE``, and ``MASK``.  ``MASK`` values are stored as
+ingested (no remapping).  Redshift is read from ``REDSHIFT``.
+
+**Catalog linkage:** ingest the catalog with ``--source-id-col ID``; spectrum ingest
+reads the same ``ID`` keyword from the table header (e.g. ``406064719``).
+
+```bash
+dl-ingest-catalog vipers_catalog.fits --survey VIPERS \
+  --source-id-col ID --ra-col RA --dec-col DEC
+
+dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS \
+  --fmt vipers --source-id-col ID
+
+# Auto-detect works for VIPERS_*.fits with the spectral table layout
+dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS --source-id-col ID
+```
+
 #### WiggleZ spectra ingest
 
 WiggleZ 1-D FITS files use a 1-D flux array (PRIMARY / ``EXTNAME='spectrum'``) plus a

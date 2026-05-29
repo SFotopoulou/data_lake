@@ -1396,6 +1396,102 @@ def _read_vandels_spectrum(
     )], wcs_attrs
 
 
+def _is_vipers_table_hdu(hdu: fits.hdu.base.ExtensionHDU | fits.PrimaryHDU) -> bool:
+    """True when an HDU is a VIPERS row-per-pixel spectral binary table."""
+    if not isinstance(hdu, fits.BinTableHDU) or hdu.data is None or len(hdu.data) == 0:
+        return False
+    cols = {c.upper() for c in hdu.columns.names}
+    return {"WAVES", "FLUXES", "NOISE", "MASK"}.issubset(cols)
+
+
+def _find_vipers_table_hdu(hdul: fits.HDUList) -> tuple[int, fits.BinTableHDU]:
+    """Return the VIPERS spectral binary table HDU."""
+    for i, hdu in enumerate(hdul):
+        if _is_vipers_table_hdu(hdu):
+            return i, hdu
+    summary = _summarize_fits_hdus(hdul)
+    raise ValueError(
+        "VIPERS spectral table not found (expected BinTable with columns "
+        f"WAVES/FLUXES/NOISE/MASK). Found: {summary}"
+    )
+
+
+def _is_vipers_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if the file looks like a VIPERS 1-D spectrum FITS."""
+    try:
+        _, thdu = _find_vipers_table_hdu(hdul)
+    except ValueError:
+        return False
+    if path.name.lower().startswith("vipers"):
+        return True
+    return "ID" in thdu.header
+
+
+def _read_vipers_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+    *,
+    source_id_col: str | None = None,
+    ra_col: str = "RA",
+    dec_col: str = "DEC",
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read a VIPERS 1-D spectrum from a row-per-pixel binary table.
+
+    Columns ``WAVES``, ``FLUXES``, ``NOISE``, and ``MASK`` are stacked into 1-D
+    arrays.  ``MASK`` values are stored as ingested (no remapping).  ``source_id``
+    comes from the ``ID`` header keyword by default.
+    """
+    _, thdu = _find_vipers_table_hdu(hdul)
+    rows = thdu.data
+    wavelength = np.array([row["WAVES"] for row in rows], dtype=np.float64)
+    flux = np.array([row["FLUXES"] for row in rows], dtype=np.float32)
+    noise = np.array([row["NOISE"] for row in rows], dtype=np.float64)
+    mask = np.array([row["MASK"] for row in rows], dtype=np.uint8)
+
+    n_pix = int(len(flux))
+    if not (len(wavelength) == len(noise) == len(mask) == n_pix):
+        raise ValueError(
+            "VIPERS column lengths mismatch: "
+            f"wave={len(wavelength)} flux={n_pix} noise={len(noise)} mask={len(mask)}"
+        )
+
+    valid_noise = np.isfinite(noise) & (noise > 0.0)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ivar64 = np.where(valid_noise, 1.0 / (noise * noise), 0.0)
+    ivar = np.clip(ivar64, 0.0, np.finfo(np.float32).max).astype(np.float32)
+
+    header = thdu.header
+    phdr = hdul[0].header
+    sid_key = source_id_col or "ID"
+    source_id = object_id_from_fits_header(header, sid_key, hdu_index=0)
+    ra = float(header.get(ra_col, phdr.get(ra_col, 0.0)))
+    dec = float(header.get(dec_col, phdr.get(dec_col, 0.0)))
+
+    meta: dict[str, Any] = {
+        "z": float(header.get("REDSHIFT", header.get("Z", 0.0))),
+        "z_err": float(header.get("REDSHIFT_ERR", header.get("Z_ERR", 0.0))),
+        "snr": 0.0,
+        "exptime": float(header.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+        "R": float(header.get("SPEC_RES", phdr.get("SPEC_RES", 1000.0))),
+        "instr": str(header.get("INSTRUME", phdr.get("INSTRUME", "VIMOS")))[:16],
+    }
+    wcs_attrs = {
+        "wcs_source": "explicit",
+        "n_pix": n_pix,
+    }
+    return [SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=ivar,
+        mask=mask,
+        wavelength=wavelength,
+        meta=meta,
+    )], wcs_attrs
+
+
 def _parse_2df_spectrum_data(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse 2dF-style ``(flux, variance, sky[, ...])`` image data."""
     arr = np.asarray(data, dtype=np.float64)
@@ -1703,6 +1799,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "sdss_spplate"
         if _is_2df_hdul(hdul):
             return "2df"
+        if _is_vipers_hdul(hdul, path):
+            return "vipers"
         if _is_zcosmos_hdul(hdul, path):
             return "zcosmos"
         if _is_vandels_hdul(hdul, path):
@@ -1792,7 +1890,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"generic"``.
+        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"vipers"``, ``"generic"``.
         Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
@@ -1924,6 +2022,14 @@ def ingest_spectra_from_fits(
                 records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
             elif detected_fmt == "vandels":
                 records, wcs_attrs = _read_vandels_spectrum(hdul, source_path)
+            elif detected_fmt == "vipers":
+                records, wcs_attrs = _read_vipers_spectrum(
+                    hdul,
+                    source_path,
+                    source_id_col=source_id_col,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -2329,6 +2435,7 @@ try:
                           "ozdes",
                           "zcosmos",
                           "vandels",
+                          "vipers",
                       ],
                   ),
                   help="Force input format (auto-detected by default).")

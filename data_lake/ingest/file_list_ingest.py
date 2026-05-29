@@ -461,6 +461,7 @@ try:
                 "ozdes",
                 "zcosmos",
                 "vandels",
+                "vipers",
             ],
         ),
         help="Force FITS format (default: auto-detect).",
