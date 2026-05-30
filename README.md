@@ -1083,6 +1083,33 @@ dl-validate-spectra-ingest --survey desi_edr
 
 These accept ``--file-list``, ``--checkpoint``, ``--inflight``, ``--max-tiles``, and ``--strict`` (same semantics as the spectrum validator).
 
+#### Verify catalog ↔ spectra linkage
+
+After spectrum ingest (with ``--update-catalog``, the default), each catalog row
+should carry ``_source_id``, ``_healpix_norder{N}``, and ``_spectrum_index`` pointing
+at the matching row in the paired ``Npix=*.zarr`` tile.  Cross-check with:
+
+```bash
+# 1. Zarr internal layout (flux/ivar/mask/_source_id shapes)
+dl-validate-spectra-ingest --survey zCOSMOS_DR3
+
+# 2. Catalog row index ↔ Zarr _source_id agreement (per HEALPix tile)
+dl-validate-catalog-spectra-link --survey zCOSMOS_DR3
+
+# Quick smoke: first tile only, sample 100 linked rows per tile
+dl-validate-catalog-spectra-link --survey zCOSMOS_DR3 --max-tiles 1 --sample 100
+```
+
+If step 2 reports **unpatched catalog** (``_spectrum_index=-1`` but Zarr row exists)
+or stale indices, rebuild from on-disk Zarr without re-ingesting FITS:
+
+```bash
+dl-rebuild-catalog-indices --survey zCOSMOS_DR3 --kind spectrum
+dl-validate-catalog-spectra-link --survey zCOSMOS_DR3
+```
+
+Use ``--strict`` to treat orphan Zarr rows and unpatched catalog warnings as errors.
+
 #### Using the resolution matrix
 
 When a tile was ingested with `--with-resolution`, each `Spectrum` object
