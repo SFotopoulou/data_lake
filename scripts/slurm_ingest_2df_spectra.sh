@@ -94,7 +94,7 @@ dl-ingest-spectra-from-list \
     --config "${DATA_LAKE_CONFIG}" \
     --survey "${SURVEY}" \
     --fmt 2df \
-    --source-id-col serial \
+    --source-id-col SPFILE \
     --norder "${NORDER}" \
     --wavelength-mode "${WAVELENGTH_MODE}" \
     --on-duplicate skip \

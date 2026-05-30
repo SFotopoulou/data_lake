@@ -631,37 +631,50 @@ dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
 
 #### 2dFGRS 1-D spectra ingest
 
-2dFGRS FITS files have a fixed layout: HDU 0 carries sky coordinates
-(``RA``, ``DEC``, ``SEQNUM``) and HDU 1 (named ``SPECTRUM``) holds a
-``(3, 1024)`` image with rows ``[flux, variance, sky]``.  Wavelength is
-reconstructed from ``CRVAL1 / CRPIX1 / CDELT1`` in the spectral extension.
+2dFGRS 1-D FITS files contain one **SPECTRUM** HDU per observation.  HDU 0
+carries object metadata (``SEQNUM`` = catalog ``serial``, ``NAME``, ``RA``,
+``DEC``).  Each SPECTRUM extension holds a ``(3, 1024)`` image with rows
+``[flux, variance, sky]`` plus per-observation headers (``SPFILE``, ``Z``,
+``SNR``, ``OBSRA``, ``OBSDEC``).  Wavelength is reconstructed from
+``CRVAL1 / CRPIX1 / CDELT1`` in each extension.
 
-**Source ID:** the numeric stem of the filename (e.g. ``154714`` from
-``154714.fits``) is used directly as the integer source ID, which must match
-the ``serial`` column that was used when ingesting the 2dF catalog:
+**Link key:** use ``SPFILE`` (unique per observation) for ``_source_id``, not
+``serial``.  Many catalog rows share the same ``serial`` (multiple observations
+of one target).  Keep ``serial`` as the science ID; ingest the catalog with
+``--source-id-col SPFILE`` so ``_source_id = hash(SPFILE)`` on both sides.
 
 ```bash
-# Catalog must already be ingested with serial as source_id:
+# Catalog: serial kept; _source_id built from SPFILE
 dl-ingest-catalog 2dfgrs_catalog.fits --survey 2DFGRS_DR3 \
-  --source-id-col serial --ra-col RA --dec-col DEC
+  --source-id-col SPFILE --ra-col RA --dec-col DEC
 
-# Single file (smoke test)
-dl-ingest-spectra 154714.fits --survey 2DFGRS_DR3 \
-  --fmt 2df --source-id-col serial
+# Single file (smoke test) — one Zarr row per SPECTRUM HDU
+dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 \
+  --fmt 2df --source-id-col SPFILE
 
 # Auto-detection also works (SPECTRUM HDU + SEQNUM/BJSEL triggers 2df format)
-dl-ingest-spectra 154714.fits --survey 2DFGRS_DR3
+dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 --source-id-col SPFILE
 
 # File list (sequential, with checkpoint for restarts)
 dl-ingest-spectra-from-list 2df_files.txt \
   --survey 2DFGRS_DR3 \
   --fmt 2df \
-  --source-id-col serial \
-  --wavelength-mode shared \
+  --source-id-col SPFILE \
   --on-duplicate skip \
   --on-length-mismatch pad \
   --checkpoint /path/to/lake/ingest_state/2df/checkpoint.json \
   --failures-log /path/to/lake/ingest_state/2df/failures.jsonl
+```
+
+Multi-observation files (e.g. ``389442.fits`` with two SPECTRUM HDUs) auto-use
+``wavelength_mode='per_source'`` when extensions have different WCS grids.
+
+If the catalog was previously linked on ``serial``:
+
+```bash
+dl-repair-catalog-metadata /path/to/lake --survey 2DFGRS_DR3 --rebuild-link-id SPFILE
+dl-rebuild-catalog-indices --survey 2DFGRS_DR3 --kind spectrum
+dl-validate-catalog-spectra-link --survey 2DFGRS_DR3 --strict
 ```
 
 #### 2dFGRS Slurm batch ingest (300 k files)
@@ -720,23 +733,23 @@ sbatch scripts/slurm_ingest_2df_spectra.sh
 # Count spectra in Zarr vs files processed
 dl-describe-lake --config "$DATA_LAKE_CONFIG" --survey 2DFGRS_DR3
 
-# Spot-check one spectrum
+# Spot-check one spectrum (use SPFILE label from catalog)
 python - <<'PY'
 from data_lake.io.spectra import SpectrumAccessor
 from data_lake.ingest.fits_to_parquet import normalize_object_id
 acc = SpectrumAccessor('/path/to/lake', '2DFGRS_DR3')
-sp = acc.get_spectrum(normalize_object_id('154714'))
+sp = acc.get_spectrum(normalize_object_id('sgp805_001203_2z.fits'))
 print('flux shape:', sp.flux.shape, 'max_ivar:', sp.ivar.max())
 PY
 
-# Verify catalog linkage (serial → _spectrum_index)
+# Verify catalog linkage (SPFILE → _spectrum_index)
 python - <<'PY'
 import pyarrow.parquet as pq, pathlib
 tiles = list(pathlib.Path('/path/to/lake/catalogs/2DFGRS_DR3').rglob('*.parquet'))
 for t in tiles[:3]:
-    tbl = pq.read_table(t, columns=['serial', '_spectrum_index'])
-    linked = (tbl['_spectrum_index'].to_pylist().count(-1))
-    print(t.name, 'rows:', len(tbl), 'unlinked:', linked)
+    tbl = pq.read_table(t, columns=['serial', 'SPFILE', '_spectrum_index'])
+    unlinked = sum(1 for i in tbl['_spectrum_index'].to_pylist() if i < 0)
+    print(t.name, 'rows:', len(tbl), 'unlinked:', unlinked)
 PY
 ```
 

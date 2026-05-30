@@ -1749,14 +1749,34 @@ def _is_2df_stamp_only_hdul(hdul: fits.HDUList) -> bool:
     return shape == (49, 49)
 
 
-def _find_2df_spectrum_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU | fits.PrimaryHDU]:
-    """Locate the 2dF spectral image extension (named SPECTRUM or heuristic)."""
+_2DF_DEFAULT_SOURCE_ID_COL = "SPFILE"
+
+
+def _2df_filename_stem(source_path: Path) -> str:
+    """Numeric/object stem from a 2dF FITS path (legacy link key)."""
+    stem = source_path.stem
+    for sfx in (".fits", ".fit"):
+        if stem.lower().endswith(sfx):
+            stem = stem[: -len(sfx)]
+    return stem
+
+
+def _iter_2df_spectrum_hdus(
+    hdul: fits.HDUList,
+) -> list[tuple[int, fits.ImageHDU | fits.PrimaryHDU]]:
+    """Return all 2dF-style spectral image extensions, SPECTRUM-named first."""
+    named: list[tuple[int, fits.ImageHDU | fits.PrimaryHDU]] = []
+    other: list[tuple[int, fits.ImageHDU | fits.PrimaryHDU]] = []
     for i, hdu in enumerate(hdul):
-        if (hdu.name or "").strip().upper() == "SPECTRUM" and _is_2df_spectrum_hdu(hdu):
-            return i, hdu  # type: ignore[return-value]
-    for i, hdu in enumerate(hdul):
-        if _is_2df_spectrum_hdu(hdu):
-            return i, hdu  # type: ignore[return-value]
+        if not _is_2df_spectrum_hdu(hdu):
+            continue
+        if (hdu.name or "").strip().upper() == "SPECTRUM":
+            named.append((i, hdu))  # type: ignore[arg-type]
+        else:
+            other.append((i, hdu))  # type: ignore[arg-type]
+    hdus = named + other
+    if hdus:
+        return hdus
     summary = _summarize_fits_hdus(hdul)
     if _is_2df_stamp_only_hdul(hdul):
         raise ValueError(
@@ -1770,77 +1790,147 @@ def _find_2df_spectrum_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU | fit
     )
 
 
+def _find_2df_spectrum_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU | fits.PrimaryHDU]:
+    """Locate the first 2dF spectral image extension (named SPECTRUM or heuristic)."""
+    return _iter_2df_spectrum_hdus(hdul)[0]
+
+
+def _2df_link_label_from_header(
+    shdr: fits.Header,
+    phdr: fits.Header,
+    source_path: Path,
+    source_id_col: str,
+) -> tuple[str, bool]:
+    """Resolve the catalog link label from a 2dF spectrum HDU header.
+
+    Returns ``(label, used_fallback)`` where *used_fallback* is True when the
+    filename stem was used because *source_id_col* was absent from headers.
+    """
+    key = source_id_col.strip().upper()
+    for hdr in (shdr, phdr):
+        if key in hdr:
+            label = str(hdr[key]).strip()
+            if label:
+                return label, False
+    return _2df_filename_stem(source_path), True
+
+
+def _2df_sky_from_headers(shdr: fits.Header, phdr: fits.Header) -> tuple[float, float]:
+    """Per-observation sky position, falling back to PRIMARY ``RA``/``DEC``."""
+    ra = shdr.get("OBSRA", phdr.get("RA", 0.0))
+    dec = shdr.get("OBSDEC", phdr.get("DEC", 0.0))
+    return float(ra), float(dec)
+
+
+def _2df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
+    """True when 2dF records in one file have incompatible wavelength grids."""
+    if len(records) <= 1:
+        return False
+    ref = records[0].wavelength
+    for rec in records[1:]:
+        wave = rec.wavelength
+        if wave is None or ref is None:
+            return True
+        if wave.shape != ref.shape or not np.allclose(wave, ref):
+            return True
+    return False
+
+
 def _read_2df_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
+    *,
+    source_id_col: str = _2DF_DEFAULT_SOURCE_ID_COL,
 ) -> tuple[list[SpectrumRecord], dict]:
-    """Read a 2dFGRS 1-D spectrum FITS file.
+    """Read a 2dFGRS 1-D spectrum FITS file (one row per SPECTRUM HDU).
 
     Expected layout:
-    - HDU 0 (PRIMARY): sky position in header (``RA``, ``DEC``), ``SEQNUM``,
-      ``NAME``, ``BJSEL``.
-    - HDU 1 (SPECTRUM): 2-D image of shape ``(3, n_pix)`` where rows are
-      ``[flux, variance, sky]``; spectral WCS in extension header
+    - HDU 0 (PRIMARY): object metadata (``SEQNUM``, ``NAME``, ``BJSEL``, ``RA``,
+      ``DEC``).
+    - HDU 1+ (SPECTRUM): 2-D image of shape ``(3, n_pix)`` where rows are
+      ``[flux, variance, sky]``; per-observation metadata including ``SPFILE``,
+      ``Z``, ``SNR``, ``OBSRA``/``OBSDEC``; spectral WCS in extension header
       (``CRVAL1``, ``CRPIX1``, ``CDELT1``).
 
-    Source ID is derived from the file basename (numeric stem = ``serial``
-    value in the catalog), normalised via :func:`normalize_object_id`.
-    The ``serial`` numeric value is used directly when the stem is a pure
-    integer, or hashed otherwise.
+    Source ID defaults to ``normalize_object_id(SPFILE)`` from each extension
+    header (catalog link column).  When ``SPFILE`` is absent, falls back to the
+    file basename stem with a warning.
     """
     from data_lake.ingest.fits_to_parquet import normalize_object_id
 
     phdr = hdul[0].header
-    ra = float(phdr.get("RA", 0.0))
-    dec = float(phdr.get("DEC", 0.0))
+    spec_hdus = _iter_2df_spectrum_hdus(hdul)
+    records: list[SpectrumRecord] = []
+    wcs_attrs: dict = {}
+    seen_ids: dict[int, str] = {}
+    used_stem_fallback = False
 
-    # Source ID from filename stem (matches catalog ``serial`` column)
-    stem = source_path.stem
-    # Remove any secondary extension (e.g. "154714.fits.gz" → "154714")
-    for sfx in (".fits", ".fit"):
-        if stem.lower().endswith(sfx):
-            stem = stem[: -len(sfx)]
-    source_id = normalize_object_id(stem)
+    for spec_hdu_idx, shdu in spec_hdus:
+        if (shdu.name or "").strip().upper() != "SPECTRUM":
+            log.warning(
+                "2dF: unnamed spectral HDU in %s; using HDU %d (%r)",
+                source_path.name,
+                spec_hdu_idx,
+                shdu.name,
+            )
 
-    spec_hdu_idx, shdu = _find_2df_spectrum_hdu(hdul)
-    if (shdu.name or "").strip().upper() != "SPECTRUM":
+        shdr = shdu.header
+        link_label, fallback = _2df_link_label_from_header(
+            shdr, phdr, source_path, source_id_col,
+        )
+        if fallback:
+            used_stem_fallback = True
+        source_id = normalize_object_id(link_label)
+        if source_id in seen_ids:
+            raise ValueError(
+                f"duplicate 2dF source_id in {source_path.name}: "
+                f"{source_id_col}={link_label!r} and {seen_ids[source_id]!r} "
+                f"both map to the same _source_id"
+            )
+        seen_ids[source_id] = link_label
+
+        ra, dec = _2df_sky_from_headers(shdr, phdr)
+        flux, variance, n_pix = _parse_2df_spectrum_data(np.asarray(shdu.data))
+        flux = flux.astype(np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ivar = np.where(variance > 0.0, 1.0 / variance, 0.0).astype(np.float32)
+        mask = np.zeros(n_pix, dtype=np.uint8)
+
+        wavelength = _wavelength_from_wcs(shdr, n_pix)
+        if not wcs_attrs:
+            wcs_attrs = _wcs_attrs_from_header(shdr, n_pix)
+
+        snr_val = shdr.get("SNR", phdr.get("SNR", 0.0))
+        meta: dict[str, Any] = {
+            "z":       float(shdr.get("Z", phdr.get("Z", 0.0))),
+            "z_err":   0.0,
+            "snr":     float(snr_val) if snr_val not in ("", None) else 0.0,
+            "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+            "R":       float(shdr.get("SPEC_RES", 500.0)),
+            "instr":   "2dFGRS",
+        }
+
+        records.append(SpectrumRecord(
+            source_id=source_id,
+            ra=ra,
+            dec=dec,
+            flux=flux,
+            ivar=ivar,
+            mask=mask,
+            wavelength=wavelength,
+            meta=meta,
+        ))
+
+    if used_stem_fallback:
         log.warning(
-            "2dF: no SPECTRUM HDU in %s; using HDU %d (%r)",
+            "2dF: %s missing %r in spectrum header(s); using filename stem %r "
+            "as link key (prefer catalog --source-id-col SPFILE)",
             source_path.name,
-            spec_hdu_idx,
-            shdu.name,
+            source_id_col.strip().upper(),
+            _2df_filename_stem(source_path),
         )
 
-    shdr = shdu.header
-    flux, variance, n_pix = _parse_2df_spectrum_data(np.asarray(shdu.data))
-    flux = flux.astype(np.float32)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ivar = np.where(variance > 0.0, 1.0 / variance, 0.0).astype(np.float32)
-    mask = np.zeros(n_pix, dtype=np.uint8)
-
-    wavelength = _wavelength_from_wcs(shdr, n_pix)
-    wcs_attrs = _wcs_attrs_from_header(shdr, n_pix)
-
-    meta: dict[str, Any] = {
-        "z":       float(shdr.get("Z", phdr.get("Z", 0.0))),
-        "z_err":   0.0,
-        "snr":     0.0,
-        "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
-        "R":       float(shdr.get("SPEC_RES", 500.0)),
-        "instr":   "2dFGRS",
-    }
-
-    record = SpectrumRecord(
-        source_id=source_id,
-        ra=ra,
-        dec=dec,
-        flux=flux,
-        ivar=ivar,
-        mask=mask,
-        wavelength=wavelength,
-        meta=meta,
-    )
-    return [record], wcs_attrs
+    return records, wcs_attrs
 
 
 def _is_2df_hdul(hdul: fits.HDUList) -> bool:
@@ -2204,7 +2294,11 @@ def ingest_spectra_from_fits(
                     dec_col=dec_col,
                 )
             elif detected_fmt == "2df":
-                records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
+                records, wcs_attrs = _read_2df_spectrum(
+                    hdul,
+                    source_path,
+                    source_id_col=source_id_col or _2DF_DEFAULT_SOURCE_ID_COL,
+                )
             elif detected_fmt == "6df":
                 records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
             elif detected_fmt == "wig":
@@ -2267,6 +2361,16 @@ def ingest_spectra_from_fits(
         wavelength_mode_effective = "per_source"
         if length_policy == "error":
             length_policy = "pad"
+    elif detected_fmt == "2df" and (
+        len(records) > 1 or _2df_spectra_wcs_differs(records)
+    ):
+        if wavelength_mode == "shared":
+            log.info(
+                "2dF: using wavelength_mode='per_source' "
+                "(multiple SPECTRUM HDUs or differing WCS in %s).",
+                source_path.name,
+            )
+        wavelength_mode_effective = "per_source"
 
     n_pix = max(len(r.flux) for r in records)
     if n_pix_expected is not None and n_pix != n_pix_expected:
