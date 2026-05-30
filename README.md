@@ -982,6 +982,7 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
 | `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
 | `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
+| `dl-repair-catalog-metadata` | — | — | Same as finalize; fixes ``source_id_column`` / ``source_id_mode`` from tiles (``--survey`` or ``--all``) |
 | `dl-ingest-cutouts` | `--on-duplicate` | `skip`, `error`, `append` | Default **`skip`**; per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
