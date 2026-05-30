@@ -15,7 +15,9 @@ from data_lake.io.crossmatch import (
     CrossmatchTileConfig,
     build_crossmatch,
     crossmatch_root,
+    export_crossmatch_flat,
     iter_populated_tile_npixels,
+    load_crossmatch_table,
     resolve_crossmatch_settings,
     resolve_crossmatch_sky_columns,
     filter_survey_a_tiles_overlapping_survey_b,
@@ -383,3 +385,45 @@ class TestBuildCrossmatch:
         assert res.error is None
         assert res.n_match_rows == 1
         assert res.n_tiles_written == 1
+
+
+class TestCrossmatchExport:
+    def test_export_parquet_and_fits(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder, npix=npix,
+            source_ids=[1001], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "SURVEY_B", norder=norder, npix=npix,
+            source_ids=[2001], ra=[ra + 0.0001], dec=[dec + 0.0001],
+        )
+
+        parquet_out = tmp_path / "matches.parquet"
+        fits_out = tmp_path / "matches.fits"
+        result = build_crossmatch(
+            lake,
+            "SURVEY_A",
+            "SURVEY_B",
+            radius_arcsec=2.0,
+            show_progress=False,
+            export_parquet=parquet_out,
+            export_fits=fits_out,
+        )
+        assert result.n_match_rows == 1
+        assert result.export_parquet == parquet_out
+        assert result.export_fits == fits_out
+        assert parquet_out.is_file()
+        assert fits_out.is_file()
+
+        table = load_crossmatch_table(crossmatch_root(lake, "SURVEY_A", "SURVEY_B"))
+        assert table.num_rows == 1
+
+        assert export_crossmatch_flat(
+            crossmatch_root(lake, "SURVEY_A", "SURVEY_B"),
+            tmp_path / "reexport.parquet",
+        ) == 1

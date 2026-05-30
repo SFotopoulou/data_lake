@@ -24,6 +24,8 @@ Usage
 ...     survey_a="des_dr2",
 ...     survey_b="kids_dr4",
 ...     radius_arcsec=1.0,
+...     export_parquet="/data/lake/matches.parquet",
+...     export_fits="/data/lake/matches.fits",
 ... )
 >>> xm = CrossmatchAccessor("/data/lake", "des_dr2", "kids_dr4")
 >>> matches = xm.get_matches(source_id_a=12345678)
@@ -38,7 +40,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 import healpy as hp
 import numpy as np
@@ -68,6 +70,8 @@ class CrossmatchResult:
     norder: int
     elapsed_s: float
     n_workers: int = 1
+    export_parquet: Path | None = None
+    export_fits: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -538,6 +542,110 @@ def _pending_crossmatch_tiles(
     return pending, n_match_rows, n_tiles_written
 
 
+def _resolve_crossmatch_norder(out_root: Path, norder: int | None) -> int:
+    if norder is not None:
+        return norder
+    info_path = out_root / "catalog_info.json"
+    if info_path.is_file():
+        with open(info_path) as fh:
+            return int(json.load(fh).get("hats_order", 5))
+    for path in sorted(out_root.glob("Norder=*")):
+        if path.is_dir() and path.name.startswith("Norder="):
+            return int(path.name.split("=", 1)[1])
+    return 5
+
+
+def _crossmatch_parquet_glob(out_root: Path, norder: int) -> str:
+    return str(out_root / f"Norder={norder}" / "**" / "*.parquet")
+
+
+def _empty_crossmatch_table(norder: int) -> pa.Table:
+    hp_col = f"_healpix_norder{norder}"
+    return pa.table({
+        "source_id_a": pa.array([], type=pa.int64()),
+        "source_id_b": pa.array([], type=pa.int64()),
+        "sep_arcsec": pa.array([], type=pa.float32()),
+        hp_col: pa.array([], type=pa.int64()),
+    })
+
+
+def load_crossmatch_table(
+    out_root: Path | str,
+    *,
+    norder: int | None = None,
+) -> pa.Table:
+    """
+    Load all HATS cross-match tile Parquet files into one Arrow table.
+
+    Parameters
+    ----------
+    out_root:
+        Cross-match catalog root (``catalogs/crossmatch/<survey_a>_x_<survey_b>/``).
+    norder:
+        HEALPix partition order (default: ``catalog_info.json`` or ``Norder=*`` dir).
+    """
+    import glob as glob_mod
+
+    out_root = Path(out_root)
+    norder = _resolve_crossmatch_norder(out_root, norder)
+    files = glob_mod.glob(_crossmatch_parquet_glob(out_root, norder), recursive=True)
+    if not files:
+        return _empty_crossmatch_table(norder)
+
+    import duckdb
+
+    glob = _crossmatch_parquet_glob(out_root, norder)
+    con = duckdb.connect(":memory:")
+    try:
+        result = con.execute(f"SELECT * FROM parquet_scan('{glob}')").arrow()
+    finally:
+        con.close()
+    if isinstance(result, pa.RecordBatchReader):
+        return result.read_all()
+    return result
+
+
+def export_crossmatch_flat(
+    out_root: Path | str,
+    output: Path | str,
+    *,
+    norder: int | None = None,
+    output_format: Literal["parquet", "fits"] | None = None,
+) -> int:
+    """
+    Write consolidated cross-match rows to a single Parquet or FITS file.
+
+    Returns the number of rows written.
+    """
+    from data_lake.export.catalog_extract import infer_output_format, write_catalog_extract
+
+    output = Path(output)
+    table = load_crossmatch_table(out_root, norder=norder)
+    fmt = infer_output_format(output, output_format)
+    if fmt not in ("parquet", "fits"):
+        raise ValueError(f"cross-match flat export supports parquet or fits, got {fmt!r}")
+    write_catalog_extract(table, output, output_format=fmt)
+    return table.num_rows
+
+
+def _export_crossmatch_outputs(
+    out_root: Path,
+    norder: int,
+    *,
+    export_parquet: Path | str | None,
+    export_fits: Path | str | None,
+) -> tuple[Path | None, Path | None]:
+    parquet_path = Path(export_parquet) if export_parquet is not None else None
+    fits_path = Path(export_fits) if export_fits is not None else None
+    if parquet_path is not None:
+        n = export_crossmatch_flat(out_root, parquet_path, norder=norder, output_format="parquet")
+        log.info("Exported %d cross-match row(s) to %s", n, parquet_path)
+    if fits_path is not None:
+        n = export_crossmatch_flat(out_root, fits_path, norder=norder, output_format="fits")
+        log.info("Exported %d cross-match row(s) to %s", n, fits_path)
+    return parquet_path, fits_path
+
+
 def build_crossmatch(
     lake_root: Path | str,
     survey_a: str,
@@ -557,6 +665,8 @@ def build_crossmatch(
     populated_tiles_only: bool = True,
     show_progress: bool = False,
     n_workers: int = 1,
+    export_parquet: Path | str | None = None,
+    export_fits: Path | str | None = None,
 ) -> CrossmatchResult:
     """
     Build a precomputed cross-match between two surveys.
@@ -594,6 +704,9 @@ def build_crossmatch(
         Show a tqdm progress bar over survey-A tiles when available.
     n_workers:
         Parallel worker processes for disjoint survey-A tiles (default 1).
+    export_parquet / export_fits:
+        If set, after the HATS tiles are written, consolidate all match rows into
+        a single Parquet or FITS file at these paths (in addition to the tile layout).
 
     Returns
     -------
@@ -797,6 +910,12 @@ def build_crossmatch(
         settings,
         radius_arcsec,
     )
+    parquet_path, fits_path = _export_crossmatch_outputs(
+        out_root,
+        norder_a,
+        export_parquet=export_parquet,
+        export_fits=export_fits,
+    )
     return CrossmatchResult(
         survey_a=survey_a,
         survey_b=survey_b,
@@ -808,6 +927,8 @@ def build_crossmatch(
         norder=norder_a,
         elapsed_s=elapsed,
         n_workers=n_workers,
+        export_parquet=parquet_path,
+        export_fits=fits_path,
     )
 
 
@@ -1001,6 +1122,18 @@ try:
         type=int,
         help="Parallel worker processes (one survey-A tile per task).",
     )
+    @click.option(
+        "--export-parquet",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="Also write all match rows to a single Parquet file.",
+    )
+    @click.option(
+        "--export-fits",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="Also write all match rows to a single FITS BINTABLE.",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         survey_a: str,
@@ -1018,6 +1151,8 @@ try:
         all_tiles: bool,
         show_progress: bool,
         n_workers: int,
+        export_parquet: Path | None,
+        export_fits: Path | None,
         verbose: bool,
     ) -> None:
         """Build an in-lake positional cross-match between two ingested catalogs.
@@ -1053,18 +1188,22 @@ try:
             populated_tiles_only=not all_tiles,
             show_progress=show_progress,
             n_workers=n_workers,
+            export_parquet=export_parquet,
+            export_fits=export_fits,
         )
-        click.echo(
+        msg = (
             f"Cross-match {result.crossmatch_name}: "
             f"{result.n_match_rows:,} match row(s) in {result.n_tiles_written:,} tile(s) "
             f"→ {result.output_root} ({result.elapsed_s:.1f} s, {result.n_workers} process worker(s)"
-            + (
-                "; DuckDB may use additional CPU threads for parquet I/O"
-                if result.n_workers == 1
-                else ""
-            )
-            + ")"
         )
+        if result.export_parquet is not None:
+            msg += f"; parquet → {result.export_parquet}"
+        if result.export_fits is not None:
+            msg += f"; fits → {result.export_fits}"
+        if result.n_workers == 1:
+            msg += "; DuckDB may use additional CPU threads for parquet I/O"
+        msg += ")"
+        click.echo(msg)
 
 except ImportError:
     cli = None  # type: ignore[misc, assignment]
