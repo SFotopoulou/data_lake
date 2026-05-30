@@ -12,7 +12,7 @@ Supported input formats
   ``desispec.coaddition.coadd_cameras`` for IVAR-weighted camera combination of
   the B/R/Z arms onto a single monotonic BRZ wavelength grid.
   Requires ``pip install 'data-lake[desi]'`` (``desispec>=0.62``).
-* **6dFGS**     multi-extension target FITS – ingests only the combined VR spectrum extension.
+* **6dFGS**     multi-extension target FITS – ingests every combined VR spectrum extension.
 * **Generic**   spectral WCS FITS – 1-D or multi-spectra image HDU with CTYPE1=WAVE*.
 
 DESI note
@@ -1967,23 +1967,37 @@ def _6df_hdu_spectrum_role(name: str) -> str | None:
     return None
 
 
+def _6df_header_text(vhdr: fits.Header, phdr: fits.Header, *keys: str) -> str | None:
+    """Return the first non-empty FITS header string among *keys* on VR/PRIMARY."""
+    for hdr in (vhdr, phdr):
+        for key in keys:
+            if key in hdr:
+                text = str(hdr[key]).strip()
+                if text:
+                    return text
+    return None
+
+
 def _6df_link_label_from_header(
     vhdr: fits.Header,
     phdr: fits.Header,
     source_path: Path,
 ) -> tuple[str, bool]:
-    """Resolve the catalog link label for a 6dFGS spectrum.
+    """Resolve the catalog link label for a 6dFGS VR spectrum.
 
-    Uses VR/PRIMARY ``TARGET`` (same string as catalog ``targetname``).  Returns
-    ``(label, used_fallback)`` where *used_fallback* is True when the filename
-    stem was used because ``TARGET``/``TARGETNAME`` were absent.
+    Uses ``TARGET`` (catalog ``targetname``) and ``NAME_V`` when both are
+    present: ``target|name_v``.  When ``NAME_V`` is absent, falls back to
+    ``TARGET`` alone.  Returns ``(label, used_fallback)`` where *used_fallback*
+    is True when the filename stem was used because ``TARGET`` was absent.
     """
-    for hdr in (vhdr, phdr):
-        for hdr_key in ("TARGET", "TARGETNAME"):
-            if hdr_key in hdr:
-                label = str(hdr[hdr_key]).strip()
-                if label:
-                    return label, False
+    from data_lake.ingest.fits_to_parquet import composite_link_label
+
+    target = _6df_header_text(vhdr, phdr, "TARGET", "TARGETNAME")
+    name_v = _6df_header_text(vhdr, phdr, "NAME_V")
+    if target and name_v:
+        return composite_link_label(target, name_v), False
+    if target:
+        return target, False
     return source_path.stem, True
 
 
@@ -2058,51 +2072,64 @@ def _is_6df_hdul(hdul: fits.HDUList) -> bool:
     return "vr" in roles and ("v" in roles or "r" in roles)
 
 
-def _select_6df_vr_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
-    """Pick the combined 6dFGS VR spectral extension."""
+def _iter_6df_vr_hdus(hdul: fits.HDUList) -> list[tuple[int, fits.ImageHDU]]:
+    """Return all combined 6dFGS VR spectral extensions with data."""
+    hdus: list[tuple[int, fits.ImageHDU]] = []
     for i, hdu in enumerate(hdul):
         if _6df_hdu_spectrum_role(hdu.name or "") == "vr" and hdu.data is not None:
-            return i, hdu  # type: ignore[return-value]
+            hdus.append((i, hdu))  # type: ignore[arg-type]
+    if hdus:
+        return hdus
     # Legacy layout: 8th extension (index 7) is typically combined/spliced VR.
     if len(hdul) > 7 and hdul[7].data is not None:
-        return 7, hdul[7]  # type: ignore[return-value]
-    raise ValueError("6dFGS file has no VR spectral extension")
+        return [(7, hdul[7])]  # type: ignore[list-item]
+    summary = _summarize_fits_hdus(hdul)
+    raise ValueError(
+        "6dFGS file has no VR spectral extension. "
+        f"Found: {summary}"
+    )
 
 
-def _read_6df_spectrum(
-    hdul: fits.HDUList,
+def _6df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
+    """True when 6dF VR records in one file have incompatible wavelength grids."""
+    if len(records) <= 1:
+        return False
+    ref = records[0].wavelength
+    for rec in records[1:]:
+        wave = rec.wavelength
+        if wave is None or ref is None:
+            return True
+        if wave.shape != ref.shape or not np.allclose(wave, ref):
+            return True
+    return False
+
+
+def _read_6df_vr_record(
+    vr_hdu: fits.ImageHDU,
+    phdr: fits.Header,
     source_path: Path,
-) -> tuple[list[SpectrumRecord], dict]:
-    """Read a 6dFGS FITS file, ingesting only the combined VR extension.
-
-    ``source_id`` is the ``TARGET`` keyword on the VR extension header (same
-    string as catalog ``targetname``, e.g. ``g2259418-254505``).  When
-    ``TARGET`` is absent, falls back to the filename stem with a warning.
-
-    Sky coordinates are taken from VR ``OBSRA``/``OBSDEC`` (degrees), with
-    fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or sexagesimal
-    ``OBJCTRA``/``OBJCTDEC``.
-    """
+) -> SpectrumRecord:
+    """Parse one 6dFGS VR extension into a :class:`SpectrumRecord`."""
     from data_lake.ingest.fits_to_parquet import normalize_object_id
 
-    phdr = hdul[0].header
-
-    _, vr_hdu = _select_6df_vr_hdu(hdul)
     vhdr = vr_hdu.header
     ra, dec = _6df_sky_from_headers(vhdr, phdr)
     link_label, used_fallback = _6df_link_label_from_header(vhdr, phdr, source_path)
     if used_fallback:
         log.warning(
-            "6dF: %s missing TARGET on VR/PRIMARY header; using filename stem %r "
-            "as link key (catalog --source-id-col targetname should match TARGET)",
+            "6dF: %s HDU %r missing TARGET on VR/PRIMARY header; using filename stem %r "
+            "as link key (catalog --source-id-col targetname,NAME_V should match "
+            "TARGET and NAME_V)",
             source_path.name,
+            vr_hdu.name,
             source_path.stem,
         )
     source_id = normalize_object_id(link_label)
     data = np.asarray(vr_hdu.data, dtype=np.float64)
     if data.ndim != 2:
         raise ValueError(
-            f"6dFGS VR extension in {source_path.name} has shape {data.shape}; expected 2-D"
+            f"6dFGS VR extension {vr_hdu.name!r} in {source_path.name} has shape "
+            f"{data.shape}; expected 2-D"
         )
 
     if data.shape[0] in (3, 4):
@@ -2111,7 +2138,8 @@ def _read_6df_spectrum(
         arr = data.T
     else:
         raise ValueError(
-            f"6dFGS VR extension in {source_path.name} has shape {data.shape}; expected (3|4, n_pix)"
+            f"6dFGS VR extension {vr_hdu.name!r} in {source_path.name} has shape "
+            f"{data.shape}; expected (3|4, n_pix)"
         )
 
     n_pix = int(arr.shape[1])
@@ -2121,7 +2149,6 @@ def _read_6df_spectrum(
         ivar = np.where(variance > 0.0, 1.0 / variance, 0.0).astype(np.float32)
     mask = np.zeros(n_pix, dtype=np.uint8)
 
-    # Some 6dF VR HDUs include an explicit wavelength row in addition to WCS.
     if arr.shape[0] >= 4:
         explicit_wave = np.asarray(arr[3], dtype=np.float64)
         if np.all(np.isfinite(explicit_wave)) and np.all(np.diff(explicit_wave) > 0):
@@ -2131,7 +2158,6 @@ def _read_6df_spectrum(
     else:
         wavelength = _wavelength_from_wcs(vhdr, n_pix)
 
-    wcs_attrs = _wcs_attrs_from_header(vhdr, n_pix)
     meta: dict[str, Any] = {
         "z": float(vhdr.get("Z", phdr.get("Z", 0.0))),
         "z_err": 0.0,
@@ -2140,7 +2166,7 @@ def _read_6df_spectrum(
         "R": float(vhdr.get("SPEC_RES", 1000.0)),
         "instr": "6dFGS",
     }
-    return [SpectrumRecord(
+    return SpectrumRecord(
         source_id=source_id,
         ra=ra,
         dec=dec,
@@ -2149,7 +2175,50 @@ def _read_6df_spectrum(
         mask=mask,
         wavelength=wavelength,
         meta=meta,
-    )], wcs_attrs
+    )
+
+
+def _select_6df_vr_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
+    """Pick the first combined 6dFGS VR spectral extension."""
+    return _iter_6df_vr_hdus(hdul)[0]
+
+
+def _read_6df_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+) -> tuple[list[SpectrumRecord], dict]:
+    """Read a 6dFGS FITS file, ingesting every combined VR extension.
+
+    Each VR HDU becomes one spectrum row.  ``source_id`` is built from VR
+    ``TARGET`` and ``NAME_V`` (``target|name_v``), matching catalog ingest with
+    ``--source-id-col targetname,NAME_V``.  When ``NAME_V`` is absent, only
+    ``TARGET`` is used.  When ``TARGET`` is absent, falls back to the filename
+    stem with a warning.
+
+    Sky coordinates are taken from each VR extension's ``OBSRA``/``OBSDEC``
+    (degrees), with fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or
+    sexagesimal ``OBJCTRA``/``OBJCTDEC``.
+    """
+    phdr = hdul[0].header
+    vr_hdus = _iter_6df_vr_hdus(hdul)
+    records: list[SpectrumRecord] = []
+    wcs_attrs: dict = {}
+    seen_ids: dict[int, str] = {}
+
+    for _, vr_hdu in vr_hdus:
+        rec = _read_6df_vr_record(vr_hdu, phdr, source_path)
+        if rec.source_id in seen_ids:
+            raise ValueError(
+                f"duplicate 6dF source_id in {source_path.name}: "
+                f"VR HDU {vr_hdu.name!r} link label maps to the same _source_id "
+                f"as {seen_ids[rec.source_id]!r}"
+            )
+        seen_ids[rec.source_id] = vr_hdu.name or ""
+        if not wcs_attrs:
+            wcs_attrs = _wcs_attrs_from_header(vr_hdu.header, len(rec.flux))
+        records.append(rec)
+
+    return records, wcs_attrs
 
 
 def _detect_format_from_path(path: Path) -> str:
@@ -2437,6 +2506,16 @@ def ingest_spectra_from_fits(
             log.info(
                 "2dF: using wavelength_mode='per_source' "
                 "(multiple SPECTRUM HDUs or differing WCS in %s).",
+                source_path.name,
+            )
+        wavelength_mode_effective = "per_source"
+    elif detected_fmt == "6df" and (
+        len(records) > 1 or _6df_spectra_wcs_differs(records)
+    ):
+        if wavelength_mode == "shared":
+            log.info(
+                "6dF: using wavelength_mode='per_source' "
+                "(multiple VR HDUs or differing WCS in %s).",
                 source_path.name,
             )
         wavelength_mode_effective = "per_source"

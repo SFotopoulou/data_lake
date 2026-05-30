@@ -123,6 +123,43 @@ def stable_object_id_from_string(text: str) -> int:
     return int.from_bytes(digest, byteorder="big", signed=True)
 
 
+def composite_link_label(*parts: object, sep: str = "|") -> str:
+    """Join non-empty label parts into one stable link string (e.g. ``a|b``)."""
+    values = [_object_id_text(p) for p in parts if _object_id_text(p)]
+    if not values:
+        raise ValueError("composite link label requires at least one non-empty part")
+    return sep.join(values)
+
+
+def parse_source_id_column_spec(source_id_col: str) -> list[str]:
+    """Split a catalog ``--source-id-col`` spec into one or more column names."""
+    return [part.strip() for part in source_id_col.split(",") if part.strip()]
+
+
+def resolve_source_id_column_names(
+    source_id_col: str,
+    schema_names: list[str],
+) -> list[str]:
+    """Resolve a single or comma-separated source-ID column spec against *schema_names*."""
+    matched: list[str] = []
+    missing: list[str] = []
+    for part in parse_source_id_column_spec(source_id_col):
+        name = match_schema_column(part, schema_names)
+        if name is None:
+            missing.append(part)
+        else:
+            matched.append(name)
+    if missing:
+        raise ValueError(
+            f"Source-ID column(s) not in catalog schema: {missing!r}. "
+            f"Available: {sorted(schema_names)[:30]}"
+            f"{'…' if len(schema_names) > 30 else ''}"
+        )
+    if not matched:
+        raise ValueError("source-id column spec is empty")
+    return matched
+
+
 def _object_id_text(value: object) -> str:
     if value is None:
         raise ValueError("object ID is None")
@@ -395,6 +432,25 @@ def ensure_catalog_source_ids(
         matched = match_schema_column(source_id_col, table.schema.names)
         if matched is not None:
             source_id_col = matched
+
+    if source_id_col and "," in source_id_col:
+        col_names = resolve_source_id_column_names(source_id_col, table.schema.names)
+        labels = [
+            composite_link_label(*row)
+            for row in zip(*(table.column(name).to_pylist() for name in col_names))
+        ]
+        hashes = pa.array(
+            [stable_object_id_from_string(text) for text in labels],
+            type=pa.int64(),
+        )
+        table = _set_lake_join_id_column(table, hashes)
+        spec = ",".join(col_names)
+        log.info(
+            "Composite link IDs from columns %r → _source_id (mode composite:%s).",
+            col_names,
+            spec,
+        )
+        return table, f"composite:{spec}"
 
     if not source_id_col or source_id_col not in table.schema.names:
         inferred = infer_native_id_column(table.schema.names)
@@ -682,13 +738,16 @@ def rebuild_parquet_tile_link_id(
     """
     tile_path = Path(tile_path)
     table = read_parquet_tile(tile_path)
-    matched = match_schema_column(link_col, table.schema.names)
-    if matched is None:
-        raise KeyError(
-            f"Link column {link_col!r} not in tile {tile_path.name}; "
-            f"columns: {sorted(table.schema.names)[:25]}"
-        )
-    table, mode = ensure_catalog_source_ids(table, matched)
+    if "," in link_col:
+        table, mode = ensure_catalog_source_ids(table, link_col)
+    else:
+        matched = match_schema_column(link_col, table.schema.names)
+        if matched is None:
+            raise KeyError(
+                f"Link column {link_col!r} not in tile {tile_path.name}; "
+                f"columns: {sorted(table.schema.names)[:25]}"
+            )
+        table, mode = ensure_catalog_source_ids(table, matched)
     if reset_indices:
         n = len(table)
         minus_one = pa.array(np.full(n, -1, dtype=np.int64), type=pa.int64())

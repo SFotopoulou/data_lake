@@ -338,6 +338,7 @@ column is always ``source_id_column: "_source_id"``. When you pass
 | Decimal string column | ``"39627658462934656"`` in FITS ASCII | Parsed native + ``_source_id`` | ``column:TARGETID`` |
 | Vector ID column | SDSS ``OBJID`` shape ``(5,)`` | **Error** — use scalar ``objid`` | — |
 | Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | ``NAME`` kept; ``_source_id`` = stable hash | ``label:NAME`` |
+| Composite labels | ``targetname`` + ``NAME_V`` (6dF) | Both columns kept; ``_source_id`` = hash of ``target\|name_v`` | ``composite:targetname,NAME_V`` |
 | (none) | — | ``_source_id`` 0…N−1 only | ``sequential`` |
 
 **Whitespace:** leading and trailing spaces are stripped before parsing or
@@ -360,6 +361,11 @@ Use the **same** spelling (after strip) in cutout/spectrum FITS headers via
 
 If no ``--source-id-col`` is given, ingest tries common column names
 (``TARGETID``, ``SOURCE_ID``, …) or generates sequential ``_source_id`` values.
+
+For surveys where the join key spans two catalog columns (6dF ``targetname`` +
+``NAME_V``), pass a comma-separated spec: ``--source-id-col targetname,NAME_V``.
+Both columns are preserved; ``_source_id`` is the stable hash of
+``targetname|NAME_V`` (same string built from FITS ``TARGET`` and ``NAME_V``).
 
 **Upgrading existing lakes** (tiles still have legacy ``source_id``):
 
@@ -772,27 +778,36 @@ for t in tiles[:3]:
 PY
 ```
 
-#### 6dFGS spectra ingest (VR extension only)
+#### 6dFGS spectra ingest (all VR extensions)
 
-6dFGS target FITS files are multi-extension products. Ingest here reads only
-the combined ``VR`` spectral extension (not ``V`` or ``R``), with rows:
+6dFGS target FITS files are multi-extension products. Ingest reads **every**
+combined ``SPECTRUM VR`` extension (not ``V`` or ``R`` alone), with rows:
 ``[flux, variance, sky, wavelength?]``. If the 4th row (explicit wavelength)
 exists it is preferred; otherwise wavelength is reconstructed from WCS header
-keywords.
+keywords.  Some targets have multiple VR versions in one file (same
+``targetname``, different ``NAME_V``).
 
-Source IDs are read from the VR extension header ``TARGET`` keyword (same
-value as catalog ``targetname``, e.g. ``g2259418-254505``).  Ingest the catalog
-with ``--source-id-col targetname`` so ``_source_id`` matches ``TARGET``.
-When ``TARGET`` is missing, the filename stem is used as a fallback.
-
-Sky coordinates for HEALPix assignment come from the VR extension ``OBSRA`` /
-``OBSDEC`` keywords (degrees).  These match the catalog ``ra``/``dec`` columns
-when the catalog is ingested in degrees.  Sexagesimal ``OBJCTRA``/``OBJCTDEC``
-on the PRIMARY stamp are parsed as a fallback when ``OBSRA`` is absent.
+**Link key:** ``TARGET`` + ``NAME_V`` on each VR header → ``target|name_v``
+(e.g. ``g2302140-251235|N-00023``).  Ingest the catalog with a **composite**
+source column so ``_source_id`` matches on both sides:
 
 ```bash
-# Single-file smoke test
-dl-ingest-spectra g0001234-123456.fits --survey SIXDF_DR3 --fmt 6df
+dl-ingest-catalog 6df_catalog.fits --survey SIXDF_DR3 \
+  --source-id-col targetname,NAME_V --ra-col ra --dec-col dec
+```
+
+Spectrum ingest resolves the same composite label from FITS headers internally
+(no sidecar lookup like SDSS spPlate).  When ``NAME_V`` is absent, only
+``TARGET`` is used.  When ``TARGET`` is missing, the filename stem is used as
+a fallback.
+
+Sky coordinates for HEALPix assignment come from each VR extension's ``OBSRA`` /
+``OBSDEC`` keywords (degrees).  Sexagesimal ``OBJCTRA``/``OBJCTDEC`` on the
+PRIMARY stamp are parsed as a fallback when ``OBSRA`` is absent.
+
+```bash
+# Single-file smoke test (two VR rows in data/g2302140-251235.fits)
+dl-ingest-spectra g2302140-251235.fits --survey SIXDF_DR3 --fmt 6df
 
 # File-list ingest
 dl-ingest-spectra-from-list 6df_files.txt \
