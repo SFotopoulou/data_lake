@@ -401,6 +401,97 @@ class TestUpdateIndexFromZarrTiles:
         spec_idx = merged.column("_spectrum_index").to_pylist()
         assert all(v >= 0 for v in spec_idx)
 
+    def test_rebuild_uses_catalog_info_norder(self, tmp_path: Path) -> None:
+        """Rebuild reads hats_order from catalog_info.json when --norder omitted."""
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+        from data_lake.ingest.update_catalog_indices import (
+            update_index_column_from_zarr_tiles,
+        )
+
+        ids = [5_000_001, 5_000_002]
+        ra = [50.0, 60.0]
+        dec = [20.0, -20.0]
+        _write_mini_catalog(
+            tmp_path, "zcosmos_like", LAKE_JOIN_ID_COLUMN, ids, ra, dec, norder=1,
+        )
+        _write_mini_spectra_zarr(tmp_path, "zcosmos_like", ids, ra, dec, norder=1)
+
+        n_modified = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name="zcosmos_like",
+            kind="spectrum",
+            norder=None,
+        )
+        assert n_modified > 0
+
+        tiles = list((tmp_path / "catalogs" / "zcosmos_like").rglob("Npix=*.parquet"))
+        merged = pa.concat_tables([pq.ParquetFile(str(t)).read() for t in tiles])
+        assert all(v >= 0 for v in merged.column("_spectrum_index").to_pylist())
+
+    def test_rebuild_rglob_fallback(self, tmp_path: Path) -> None:
+        """Catalog tile found via rglob when not under expected Norder/Dir path."""
+        from data_lake.ingest.fits_to_parquet import (
+            LAKE_JOIN_ID_COLUMN,
+            assign_healpix,
+            healpix_dir,
+        )
+        from data_lake.ingest.update_catalog_indices import (
+            update_index_column_from_zarr_tiles,
+        )
+
+        ids = [7_000_001]
+        ra = [120.0]
+        dec = [45.0]
+        norder = 1
+        npix = int(assign_healpix(np.array(ra), np.array(dec), norder)[0])
+        _write_mini_catalog(
+            tmp_path, "rglob_survey", LAKE_JOIN_ID_COLUMN, ids, ra, dec, norder=norder,
+        )
+        _write_mini_spectra_zarr(tmp_path, "rglob_survey", ids, ra, dec, norder=norder)
+
+        # Move catalog tile off canonical HATS path (rglob must still find it).
+        cat_root = tmp_path / "catalogs" / "rglob_survey"
+        canonical = cat_root / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
+        alt = cat_root / "legacy_layout" / f"Npix={npix}.parquet"
+        alt.parent.mkdir(parents=True)
+        alt.write_bytes(canonical.read_bytes())
+        canonical.unlink()
+        canonical.parent.rmdir()
+        canonical.parent.parent.rmdir()
+
+        n_modified = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name="rglob_survey",
+            kind="spectrum",
+            norder=None,
+        )
+        assert n_modified == 1
+        tbl = pq.ParquetFile(alt).read()
+        assert tbl.column("_spectrum_index").to_pylist() == [0]
+
+    def test_rebuild_warns_missing_catalog_tile(self, tmp_path: Path, caplog) -> None:
+        import logging
+
+        from data_lake.ingest.update_catalog_indices import (
+            update_index_column_from_zarr_tiles,
+        )
+
+        caplog.set_level(logging.WARNING)
+        ids = [8_000_001]
+        _write_mini_spectra_zarr(tmp_path, "no_cat", ids, [10.0], [0.0], norder=5)
+        cat_root = tmp_path / "catalogs" / "no_cat"
+        cat_root.mkdir(parents=True)
+        (cat_root / "catalog_info.json").write_text(json.dumps({"hats_order": 5}))
+
+        n_modified = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name="no_cat",
+            kind="spectrum",
+            norder=None,
+        )
+        assert n_modified == 0
+        assert any("no catalog tile" in r.message for r in caplog.records)
+
 
 class TestBuildIndexMapFromZarr:
     def test_roundtrip_via_zarr_scan(self, tmp_path: Path) -> None:

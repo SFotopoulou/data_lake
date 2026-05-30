@@ -400,8 +400,20 @@ try:
             f"missing catalog tile: {st.n_missing_catalog_tile}"
         )
 
+        if st.n_unpatched_catalog > 0:
+            click.echo(
+                f"Hint: run dl-rebuild-catalog-indices --survey {survey_name!r} "
+                f"--kind spectrum (uses hats_order from catalog_info.json unless --norder is set)"
+            )
+
         if rep.ok(strict=strict):
-            click.echo(f"OK: catalog ↔ spectra link for {survey_name!r}.")
+            if rep.warnings and not strict:
+                click.echo(
+                    f"OK (with {len(rep.warnings)} warning(s)): "
+                    f"catalog ↔ spectra link for {survey_name!r}."
+                )
+            else:
+                click.echo(f"OK: catalog ↔ spectra link for {survey_name!r}.")
             sys.exit(0)
         click.echo("Link validation failed.", err=True)
         sys.exit(1)

@@ -155,3 +155,32 @@ class TestValidateCatalogSpectraLink:
         rep = run_validation(lake, SURVEY, sample=1)
         assert rep.ok(strict=True)
         assert rep.stats.n_linked == 1
+
+    def test_cli_unpatched_emits_rebuild_hint(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.ingest.validate_catalog_spectra_link import cli
+
+        if cli is None:
+            pytest.skip("click not available")
+
+        lake = _make_lake(tmp_path)
+        npix = 42
+        cat_path = (
+            lake / "catalogs" / SURVEY / healpix_dir(NORDER, npix) / f"Npix={npix}.parquet"
+        )
+        _write_catalog_tile(
+            cat_path,
+            source_ids=[101, 102],
+            spectrum_indices=[-1, -1],
+            npix=npix,
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--survey", SURVEY, str(lake)],
+        )
+        assert result.exit_code == 0
+        assert "unpatched catalog:" in result.output
+        assert "dl-rebuild-catalog-indices" in result.output
+        assert "OK (with" in result.output

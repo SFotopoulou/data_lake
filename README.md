@@ -1115,11 +1115,13 @@ If step 2 reports **unpatched catalog** (``_spectrum_index=-1`` but Zarr row exi
 or stale indices, rebuild from on-disk Zarr without re-ingesting FITS:
 
 ```bash
+# --norder defaults to catalog_info.json hats_order (not always 5)
 dl-rebuild-catalog-indices --survey zCOSMOS_DR3 --kind spectrum
 dl-validate-catalog-spectra-link --survey zCOSMOS_DR3
 ```
 
 Use ``--strict`` to treat orphan Zarr rows and unpatched catalog warnings as errors.
+Override partitioning only when needed: ``--norder 1`` (must match catalog ``hats_order``).
 
 #### Using the resolution matrix
 
@@ -1271,6 +1273,9 @@ uv sync --extra desi --extra dev
 
 dl-rebuild-catalog-indices --survey desi_dr1 --kind spectrum
 dl-rebuild-catalog-indices --survey desi_dr1 --kind cutout   # if cutouts exist
+
+``--norder`` defaults to ``hats_order`` in ``catalogs/<survey>/catalog_info.json``.
+Pass ``--norder`` only to override that metadata value.
 
 # Without reinstalling, use the module directly:
 uv run python -m data_lake.ingest.update_catalog_indices --survey desi_dr1 --kind spectrum

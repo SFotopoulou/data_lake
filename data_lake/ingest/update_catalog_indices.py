@@ -16,6 +16,7 @@ are handled correctly without any manual configuration.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Literal
@@ -44,6 +45,63 @@ _INDEX_COL: dict[str, str] = {
     "spectrum": "_spectrum_index",
 }
 _KIND_DIR: dict[str, str] = {"spectrum": "spectra", "cutout": "cutouts"}
+_MODALITY_INFO: dict[str, str] = {"spectrum": "spectrum_info.json", "cutout": "cutout_info.json"}
+
+
+def _resolve_catalog_norder(
+    catalog_root: Path,
+    modality_root: Path | None = None,
+    *,
+    kind: IndexKind = "spectrum",
+    override: int | None = None,
+) -> int:
+    """Return HEALPix order for catalog tile paths (metadata, then default 5)."""
+    if override is not None:
+        return override
+
+    cat_order: int | None = None
+    info_path = catalog_root / "catalog_info.json"
+    if info_path.is_file():
+        with open(info_path) as fh:
+            info = json.load(fh)
+        if "hats_order" in info:
+            cat_order = int(info["hats_order"])
+
+    if cat_order is None:
+        log.warning(
+            "catalog_info.json missing hats_order under %s; defaulting to norder=5",
+            catalog_root,
+        )
+        return 5
+
+    if modality_root is not None:
+        mod_info_path = modality_root / _MODALITY_INFO.get(kind, "spectrum_info.json")
+        if mod_info_path.is_file():
+            with open(mod_info_path) as fh:
+                mod_info = json.load(fh)
+            mod_order = mod_info.get("hats_order")
+            if mod_order is not None and int(mod_order) != cat_order:
+                log.warning(
+                    "hats_order mismatch: catalog %d vs %s %d (using catalog order)",
+                    cat_order,
+                    mod_info_path.name,
+                    int(mod_order),
+                )
+
+    return cat_order
+
+
+def _catalog_tile_for_npix(
+    catalog_root: Path,
+    norder: int,
+    npix: int,
+) -> Path | None:
+    """Resolve catalog Parquet path for one HEALPix pixel (with rglob fallback)."""
+    primary = catalog_root / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
+    if primary.is_file():
+        return primary
+    fallback = next(catalog_root.rglob(f"Npix={npix}.parquet"), None)
+    return fallback
 
 
 def _patch_catalog_parquet_file(
@@ -113,7 +171,7 @@ def update_index_column_from_zarr_tiles(
     lake_root: Path | str,
     survey_name: str,
     kind: IndexKind = "spectrum",
-    norder: int = 5,
+    norder: int | None = None,
     source_id_col: str | None = None,
 ) -> int:
     """Patch catalog indices one Zarr tile at a time (bounded memory).
@@ -142,6 +200,13 @@ def update_index_column_from_zarr_tiles(
     sid_col = resolve_source_id_column(
         catalog_root, schema_names=schema_names, override=source_id_col,
     )
+    resolved_norder = _resolve_catalog_norder(
+        catalog_root, zarr_root, kind=kind, override=norder,
+    )
+    log.info(
+        "Rebuilding %s using catalog hats_order=%d (id_col=%r)",
+        index_col, resolved_norder, sid_col,
+    )
 
     n_modified = 0
     tile_paths = sorted(zarr_root.rglob("Npix=*.zarr"))
@@ -155,6 +220,8 @@ def update_index_column_from_zarr_tiles(
             if LAKE_JOIN_ID_COLUMN not in root and LEGACY_JOIN_ID_COLUMN not in root:
                 continue
             sids = np.asarray(zarr_join_array(root)[:], dtype=np.int64)
+            if sids.size == 0:
+                continue
             partial_map = {
                 normalize_object_id(int(sid)): int(i)
                 for i, sid in enumerate(sids.tolist())
@@ -164,10 +231,15 @@ def update_index_column_from_zarr_tiles(
             continue
 
         npix = _npix_from_tile_name(tile_path.name)
-        catalog_tile = (
-            catalog_root / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
-        )
-        if not catalog_tile.exists():
+        catalog_tile = _catalog_tile_for_npix(catalog_root, resolved_norder, npix)
+        if catalog_tile is None:
+            log.warning(
+                "Zarr %s: no catalog tile for Npix=%d at hats_order=%d under %s",
+                tile_path.name,
+                npix,
+                resolved_norder,
+                catalog_root,
+            )
             continue
         if _patch_catalog_parquet_file(
             catalog_tile,
@@ -176,6 +248,16 @@ def update_index_column_from_zarr_tiles(
             index_col=index_col,
         ):
             n_modified += 1
+        else:
+            log.warning(
+                "Zarr %s: catalog tile %s has no matching %s values "
+                "(%d Zarr row(s); id_col=%r)",
+                tile_path.name,
+                catalog_tile.name,
+                sid_col,
+                len(partial_map),
+                sid_col,
+            )
 
     log.info(
         "Patched %s from %d Zarr tile(s) for survey=%r (id_col=%r)",
@@ -362,8 +444,12 @@ try:
         show_default=True,
         help="Which index column to rebuild.",
     )
-    @click.option("--norder", default=5, show_default=True, type=int,
-                  help="HEALPix order used for catalog partitioning.")
+    @click.option(
+        "--norder",
+        default=None,
+        type=int,
+        help="HEALPix order for catalog tile paths (default: hats_order from catalog_info.json).",
+    )
     @click.option(
         "--source-id-col",
         default=None,
@@ -376,7 +462,7 @@ try:
     def cli_rebuild(
         survey_name: str,
         kind: str,
-        norder: int,
+        norder: int | None,
         source_id_col: str | None,
         lake_root: Path | None,
         config_path: Path | None,
