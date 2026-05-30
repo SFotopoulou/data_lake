@@ -175,25 +175,63 @@ class TestExtractFromLake:
         tbl = pq.read_table(out)
         assert tbl.column_names == ["_spectrum_index"]
 
-    def test_lake_csv_output_rejected(self, tmp_path: Path) -> None:
+    def test_lake_csv_export(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         tile_dir = lake / "catalogs" / "S" / "Norder=5" / "Dir=0"
         tile_dir.mkdir(parents=True)
         pq.write_table(
-            pa.table({"x": [1]}),
+            pa.table({
+                "ra": pa.array([10.0], type=pa.float64()),
+                "dec": pa.array([0.5], type=pa.float64()),
+            }),
             tile_dir / "Npix=1.parquet",
         )
         (lake / "catalogs" / "S" / "catalog_info.json").write_text(
             '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
             '"source_id_mode": "sequential", "total_rows": 1}',
         )
-        with pytest.raises(ValueError, match="Parquet only"):
-            extract_catalog(
-                output=tmp_path / "out.csv",
-                specs=["x"],
-                lake_root=lake,
-                survey="S",
-            )
+        out = tmp_path / "out.csv"
+        result = extract_catalog(
+            output=out,
+            specs=["ra", "dec"],
+            lake_root=lake,
+            survey="S",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 1
+        text = out.read_text()
+        assert "ra,dec" in text.splitlines()[0]
+        assert "10.0,0.5" in text.splitlines()[1]
+
+    def test_lake_fits_export(self, tmp_path: Path) -> None:
+        from astropy.io import fits
+        from astropy.table import Table
+
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "S" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"TARGETID": pa.array([42], type=pa.int64())}),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "S" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"source_id_mode": "sequential", "total_rows": 1}',
+        )
+        out = tmp_path / "out.fits"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID"],
+            lake_root=lake,
+            survey="S",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 1
+        with fits.open(out) as hdul:
+            tbl = Table(hdul[1].data)
+        assert int(tbl["TARGETID"][0]) == 42
 
 
 class TestFilterValidSky:

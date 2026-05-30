@@ -1397,7 +1397,13 @@ dl-extract-catalog survey_b.fits -o b_sky.csv --format csv \
 
 # Already-ingested lake catalog (streams; does not load full survey into RAM)
 dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \
-  -o desi_sky.parquet -c source_id -c ra -c dec --engine tiles
+  -o desi_sky.parquet -c _source_id -c ra -c dec --engine tiles
+
+# Same lake export to CSV or FITS (CSV streams tile-by-tile; FITS uses a temp Parquet pass)
+dl-extract-catalog --lake-root /data/lake --survey zCOSMOS_DR3 \
+  -o zCOSMOS_sky.csv -c _source_id -c ra -c dec_
+dl-extract-catalog --lake-root /data/lake --survey zCOSMOS_DR3 \
+  -o zCOSMOS_sky.fits -c _source_id -c ra -c dec_
 
 # 100M+ rows: tiled export (parallel STILTS / bounded memory)
 dl-extract-catalog --lake-root /data/lake --survey GAIA_DR3 \

@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Literal, Sequence
@@ -288,6 +290,7 @@ def stream_extract_from_lake_catalog(
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
+    output_format: OutputFormat | None = None,
     engine: LakeEngine = "auto",
     show_progress: bool = False,
 ) -> ExtractResult:
@@ -308,21 +311,29 @@ def stream_extract_from_lake_catalog(
     src_cols = [src for src, _ in mapping]
     out_names = tuple(out for _, out in mapping)
 
-    out_is_parquet = (
-        output is not None
-        and (output.suffix.lower() == ".parquet" or output.suffix == "")
-    )
+    fmt: OutputFormat = "parquet"
+    if output is not None:
+        fmt = infer_output_format(Path(output), output_format)
+    if output_dir is not None and fmt != "parquet":
+        raise ValueError(
+            "--output-dir writes a HATS Parquet tree only; use -o file.csv or file.fits "
+            "for a single-file export."
+        )
+
     use_duckdb = (
         tiles
-        and out_is_parquet
-        and (engine == "duckdb" or (engine == "auto" and output_dir is None))
+        and output is not None
+        and output_dir is None
+        and fmt in ("parquet", "csv")
+        and (engine == "duckdb" or engine == "auto")
     )
-    if use_duckdb and output is not None:
+    if use_duckdb:
         try:
             return _stream_lake_via_duckdb(
                 tiles,
                 mapping,
                 output=output,
+                output_format=fmt,
                 valid_sky_only=valid_sky_only,
                 ra_col=ra_col,
                 dec_col=dec_col,
@@ -340,6 +351,7 @@ def stream_extract_from_lake_catalog(
         out_names=out_names,
         output=output,
         output_dir=output_dir,
+        output_format=fmt,
         valid_sky_only=valid_sky_only,
         ra_col=ra_col,
         dec_col=dec_col,
@@ -369,6 +381,7 @@ def _stream_lake_via_duckdb(
     mapping: Sequence[tuple[str, str]],
     *,
     output: Path,
+    output_format: OutputFormat,
     valid_sky_only: bool,
     ra_col: str | None,
     dec_col: str | None,
@@ -388,17 +401,26 @@ def _stream_lake_via_duckdb(
         output.unlink()
 
     files = [str(Path(p).resolve()) for p in tile_paths]
+    if output_format == "parquet":
+        copy_to = "TO $out (FORMAT PARQUET, COMPRESSION ZSTD)"
+        count_from = "read_parquet($out)"
+    elif output_format == "csv":
+        copy_to = "TO $out (HEADER, DELIMITER ',')"
+        count_from = "read_csv($out, header=true)"
+    else:
+        raise ValueError(f"DuckDB lake export does not support {output_format!r}")
+
     con = duckdb.connect(database=":memory:")
     try:
         # Explicit file list avoids hive_partitioning on Norder=/Dir= paths and
         # dodges COPY placeholder ordering quirks with read vs write targets.
         con.execute(
             f"COPY (SELECT {col_sql} FROM read_parquet($files, hive_partitioning=false)"
-            f"{where}) TO $out (FORMAT PARQUET, COMPRESSION ZSTD)",
+            f"{where}) {copy_to}",
             {"files": files, "out": str(output)},
         )
         n_rows = int(
-            con.execute("SELECT count(*) FROM read_parquet($out)", {"out": str(output)}).fetchone()[0]
+            con.execute(f"SELECT count(*) FROM {count_from}", {"out": str(output)}).fetchone()[0]
         )
     finally:
         con.close()
@@ -412,25 +434,18 @@ def _stream_lake_via_duckdb(
     )
 
 
-def _stream_lake_tile_by_tile(
+def _iter_lake_extract_chunks(
     catalog_root: Path,
     tiles: Sequence[Path],
     mapping: Sequence[tuple[str, str]],
     *,
     src_cols: Sequence[str],
-    out_names: Sequence[str],
-    output: Path | None,
-    output_dir: Path | None,
     valid_sky_only: bool,
     ra_col: str | None,
     dec_col: str | None,
     show_progress: bool,
-) -> ExtractResult:
-    writer: pq.ParquetWriter | None = None
-    writer_schema: pa.Schema | None = None
-    n_rows = 0
-    n_written_tiles = 0
-
+) -> Iterator[pa.Table]:
+    """Yield projected catalog chunks one HEALPix tile at a time."""
     iterator: Iterable[Path] = tiles
     if show_progress:
         try:
@@ -440,15 +455,193 @@ def _stream_lake_tile_by_tile(
         except ImportError:
             pass
 
+    for tile_path in iterator:
+        raw = _canonicalize_column_types(_read_catalog_tile(tile_path, src_cols))
+        chunk = _process_tile_chunk(
+            raw,
+            mapping,
+            valid_sky_only=valid_sky_only,
+            ra_col=ra_col,
+            dec_col=dec_col,
+        )
+        if chunk.num_rows > 0:
+            yield chunk
+
+
+def _csv_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _write_chunks_to_csv(chunks: Iterable[pa.Table], output: Path) -> int:
+    import csv
+
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        output.unlink()
+
+    n_rows = 0
+    wrote_header = False
+    with open(output, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        for chunk in chunks:
+            if not wrote_header:
+                writer.writerow(list(chunk.schema.names))
+                wrote_header = True
+            cols = [chunk.column(name).to_pylist() for name in chunk.schema.names]
+            for row in zip(*cols):
+                writer.writerow([_csv_cell(v) for v in row])
+            n_rows += chunk.num_rows
+    return n_rows
+
+
+def _write_chunks_to_parquet(
+    chunks: Iterable[pa.Table],
+    output: Path,
+) -> int:
+    writer: pq.ParquetWriter | None = None
+    writer_schema: pa.Schema | None = None
+    n_rows = 0
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        output.unlink()
+
+    try:
+        for chunk in chunks:
+            if writer is None:
+                writer_schema = chunk.schema
+                writer = pq.ParquetWriter(
+                    str(output),
+                    writer_schema,
+                    compression="zstd",
+                    compression_level=_ZSTD_LEVEL,
+                )
+            elif writer_schema is not None and not chunk.schema.equals(writer_schema):
+                chunk = _align_table_to_schema(chunk, writer_schema)
+            writer.write_table(chunk)
+            n_rows += chunk.num_rows
+    finally:
+        if writer is not None:
+            writer.close()
+    return n_rows
+
+
+def _arrow_table_to_astropy(table: pa.Table):
+    from astropy.table import Table
+
+    astropy_tbl = Table()
+    for name in table.schema.names:
+        col = table.column(name).combine_chunks()
+        if pa.types.is_nested(col.type):
+            astropy_tbl[name] = col.to_pylist()
+        else:
+            try:
+                astropy_tbl[name] = col.to_numpy(zero_copy_only=False)
+            except (pa.ArrowInvalid, TypeError, ValueError):
+                astropy_tbl[name] = col.to_pylist()
+    return astropy_tbl
+
+
+def write_catalog_extract_from_parquet(
+    parquet_path: Path | str,
+    output: Path | str,
+    *,
+    output_format: OutputFormat | None = None,
+) -> int:
+    """Convert a Parquet extract to CSV/FITS/VOTable without loading huge tables at once."""
+    parquet_path = Path(parquet_path)
+    output = Path(output)
+    fmt = infer_output_format(output, output_format)
+    pf = pq.ParquetFile(parquet_path)
+    n_rows = pf.metadata.num_rows or 0
+    _warn_large_non_parquet(n_rows, fmt)
+
+    if fmt == "parquet":
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(parquet_path, output)
+        return n_rows
+
+    if fmt == "csv":
+        import csv
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.exists():
+            output.unlink()
+        wrote_header = False
+        with open(output, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            for batch in pf.iter_batches(batch_size=_FITS_STREAM_BATCH_ROWS):
+                chunk = pa.Table.from_batches([batch])
+                if not wrote_header:
+                    writer.writerow(list(chunk.schema.names))
+                    wrote_header = True
+                cols = [chunk.column(name).to_pylist() for name in chunk.schema.names]
+                for row in zip(*cols):
+                    writer.writerow([_csv_cell(v) for v in row])
+        return n_rows
+
+    from astropy.table import vstack as vstack_tables
+
+    parts = []
+    for batch in pf.iter_batches(batch_size=_FITS_STREAM_BATCH_ROWS):
+        parts.append(_arrow_table_to_astropy(pa.Table.from_batches([batch])))
+    astropy_tbl = parts[0] if len(parts) == 1 else vstack_tables(parts)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "fits":
+        astropy_tbl.write(str(output), format="fits", overwrite=True)
+        return n_rows
+    if fmt == "votable":
+        astropy_tbl.write(str(output), format="votable", overwrite=True)
+        return n_rows
+    raise ValueError(f"unsupported output format {fmt!r}")
+
+
+def _stream_lake_tile_by_tile(
+    catalog_root: Path,
+    tiles: Sequence[Path],
+    mapping: Sequence[tuple[str, str]],
+    *,
+    src_cols: Sequence[str],
+    out_names: Sequence[str],
+    output: Path | None,
+    output_dir: Path | None,
+    output_format: OutputFormat,
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+    show_progress: bool,
+) -> ExtractResult:
+    chunk_iter = _iter_lake_extract_chunks(
+        catalog_root,
+        tiles,
+        mapping,
+        src_cols=src_cols,
+        valid_sky_only=valid_sky_only,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        show_progress=show_progress,
+    )
+
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        n_rows = 0
+        n_written_tiles = 0
+        iterator: Iterable[Path] = tiles
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
 
-    try:
+                iterator = tqdm(tiles, unit="tile", desc="extract")
+            except ImportError:
+                pass
         for tile_path in iterator:
-            raw = _canonicalize_column_types(
-                _read_catalog_tile(tile_path, src_cols)
-            )
+            raw = _canonicalize_column_types(_read_catalog_tile(tile_path, src_cols))
             chunk = _process_tile_chunk(
                 raw,
                 mapping,
@@ -458,46 +651,56 @@ def _stream_lake_tile_by_tile(
             )
             if chunk.num_rows == 0:
                 continue
-
-            if output_dir is not None:
-                rel = tile_path.relative_to(catalog_root)
-                out_path = output_dir / rel
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                pq.write_table(chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL)
-            else:
-                assert output is not None
-                if writer is None:
-                    output.parent.mkdir(parents=True, exist_ok=True)
-                    writer_schema = chunk.schema
-                    writer = pq.ParquetWriter(
-                        str(output),
-                        writer_schema,
-                        compression="zstd",
-                        compression_level=_ZSTD_LEVEL,
-                    )
-                elif writer_schema is not None and not chunk.schema.equals(writer_schema):
-                    chunk = _align_table_to_schema(chunk, writer_schema)
-                writer.write_table(chunk)
-
+            rel = tile_path.relative_to(catalog_root)
+            out_path = output_dir / rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL)
             n_rows += chunk.num_rows
             n_written_tiles += 1
-    finally:
-        if writer is not None:
-            writer.close()
+        log.info(
+            "Streamed %d row(s) from %d tile(s) → %s",
+            n_rows,
+            n_written_tiles,
+            output_dir,
+        )
+        return ExtractResult(
+            n_rows=n_rows,
+            column_names=tuple(out_names),
+            output_dir=output_dir,
+            n_tiles=n_written_tiles,
+        )
 
-    out_path = output_dir if output_dir is not None else output
-    log.info(
-        "Streamed %d row(s) from %d tile(s) → %s",
-        n_rows,
-        n_written_tiles,
-        out_path,
-    )
+    assert output is not None
+    output = Path(output)
+
+    if output_format in ("fits", "votable"):
+        with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
+            tmp_pq = Path(tmp) / "lake_extract.parquet"
+            n_rows = _write_chunks_to_parquet(
+                _iter_lake_extract_chunks(
+                    catalog_root,
+                    tiles,
+                    mapping,
+                    src_cols=src_cols,
+                    valid_sky_only=valid_sky_only,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    show_progress=show_progress,
+                ),
+                tmp_pq,
+            )
+            write_catalog_extract_from_parquet(tmp_pq, output, output_format=output_format)
+    elif output_format == "csv":
+        n_rows = _write_chunks_to_csv(chunk_iter, output)
+    else:
+        n_rows = _write_chunks_to_parquet(chunk_iter, output)
+
+    log.info("Streamed %d row(s) from %d tile(s) → %s", n_rows, len(tiles), output)
     return ExtractResult(
         n_rows=n_rows,
         column_names=tuple(out_names),
         output=output,
-        output_dir=output_dir,
-        n_tiles=n_written_tiles,
+        n_tiles=len(tiles),
     )
 
 
@@ -725,21 +928,10 @@ def write_catalog_extract(
             writer.writerow(table.schema.names)
             cols = [table.column(n).to_pylist() for n in table.schema.names]
             for row in zip(*cols):
-                writer.writerow(row)
+                writer.writerow([_csv_cell(v) for v in row])
         return
 
-    from astropy.table import Table
-
-    astropy_tbl = Table()
-    for name in table.schema.names:
-        col = table.column(name).combine_chunks()
-        if pa.types.is_nested(col.type):
-            astropy_tbl[name] = col.to_pylist()
-        else:
-            try:
-                astropy_tbl[name] = col.to_numpy(zero_copy_only=False)
-            except (pa.ArrowInvalid, TypeError, ValueError):
-                astropy_tbl[name] = col.to_pylist()
+    astropy_tbl = _arrow_table_to_astropy(table)
 
     if fmt == "fits":
         astropy_tbl.write(str(output), format="fits", overwrite=True)
@@ -779,13 +971,6 @@ def extract_catalog(
             raise ValueError("--survey is required with --lake-root")
         if paths:
             raise ValueError("pass catalog paths or --lake-root/--survey, not both")
-        if output is not None:
-            fmt = infer_output_format(Path(output), output_format)
-            if fmt != "parquet":
-                raise ValueError(
-                    "Lake export writes Parquet only. Use a .parquet path (or convert "
-                    "offline), or export from the original FITS/CSV catalog file."
-                )
         result = stream_extract_from_lake_catalog(
             lake_root,
             survey,
@@ -796,6 +981,7 @@ def extract_catalog(
             valid_sky_only=valid_sky_only,
             ra_col=ra_col,
             dec_col=dec_col,
+            output_format=output_format,
             engine=engine,
             show_progress=show_progress,
         )
@@ -867,7 +1053,7 @@ import click
     "output_format",
     type=click.Choice(["parquet", "csv", "fits", "votable"], case_sensitive=False),
     default=None,
-    help="Output format for raw file input (default: infer from --output suffix).",
+    help="Output format (default: infer from --output suffix). Lake export supports all formats.",
 )
 @click.option(
     "--lake-root",
