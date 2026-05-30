@@ -666,6 +666,49 @@ def migrate_parquet_tile_join_column(
     return "missing"
 
 
+def rebuild_parquet_tile_link_id(
+    tile_path: Path | str,
+    link_col: str,
+    *,
+    catalog_parquet_options: CatalogParquetOptions | None = None,
+    reset_indices: bool = True,
+) -> tuple[str, str]:
+    """Recompute ``_source_id`` from *link_col* on one catalog tile.
+
+    Unlike :func:`migrate_parquet_tile_join_column`, this always replaces an
+    existing ``_source_id`` column (e.g. switch zCOSMOS from ``id`` to
+    ``filename`` hash).  Returns ``(status, source_id_mode)`` where *status*
+    is ``"rebuilt"``.
+    """
+    tile_path = Path(tile_path)
+    table = read_parquet_tile(tile_path)
+    matched = match_schema_column(link_col, table.schema.names)
+    if matched is None:
+        raise KeyError(
+            f"Link column {link_col!r} not in tile {tile_path.name}; "
+            f"columns: {sorted(table.schema.names)[:25]}"
+        )
+    table, mode = ensure_catalog_source_ids(table, matched)
+    if reset_indices:
+        n = len(table)
+        minus_one = pa.array(np.full(n, -1, dtype=np.int64), type=pa.int64())
+        if "_spectrum_index" in table.schema.names:
+            idx = table.schema.get_field_index("_spectrum_index")
+            table = table.set_column(idx, "_spectrum_index", minus_one)
+        if "_cutout_index" in table.schema.names:
+            idx = table.schema.get_field_index("_cutout_index")
+            table = table.set_column(idx, "_cutout_index", minus_one)
+    opts = catalog_parquet_options or CatalogParquetOptions()
+    pq.write_table(
+        table,
+        str(tile_path),
+        compression="zstd",
+        compression_level=opts.compression_level,
+        write_statistics=opts.write_statistics,
+    )
+    return "rebuilt", mode
+
+
 def is_valid_sky_position(ra: float, dec: float) -> bool:
     """True when RA/Dec in degrees can be mapped to a HEALPix pixel."""
     if not np.isfinite(ra) or not np.isfinite(dec):
@@ -1562,7 +1605,7 @@ def finalize_catalog_survey(
     catalog_root = Path(catalog_root)
     ra = ra_col
     dec = dec_col
-    sid = source_id_mode or "sequential"
+    sid = source_id_mode if source_id_mode is not None else "sequential"
     hats_order = norder
     stream = streaming
     info_path = catalog_root / "catalog_info.json"
@@ -1571,7 +1614,8 @@ def finalize_catalog_survey(
             info = json.load(fh)
         ra = info.get("ra_column", ra)
         dec = info.get("dec_column", dec)
-        sid = info.get("source_id_mode", sid)
+        if source_id_mode is None:
+            sid = info.get("source_id_mode", sid)
         hats_order = int(info.get("hats_order", hats_order))
         stream = bool(info.get("ingest_streaming", stream))
 

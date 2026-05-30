@@ -111,3 +111,88 @@ class TestRepairCatalogMetadata:
         tbl = pq.ParquetFile(tile_dir / "Npix=42.parquet").read()
         assert LAKE_JOIN_ID_COLUMN in tbl.schema.names
         assert tbl.column(LAKE_JOIN_ID_COLUMN).to_pylist() == [1, 2]
+
+
+class TestRebuildLinkId:
+    def test_rebuild_link_id_filename(self, tmp_path: Path) -> None:
+        """Recompute _source_id from filename; science id and indices updated."""
+        from data_lake.ingest.fits_to_parquet import (
+            LAKE_JOIN_ID_COLUMN,
+            stable_object_id_from_string,
+        )
+
+        lake = tmp_path / "lake"
+        norder = 5
+        npix = 42
+        tile_dir = lake / "catalogs" / "ZCOS" / healpix_dir(norder, npix)
+        tile_dir.mkdir(parents=True)
+        hp_col = f"_healpix_norder{norder}"
+        filenames = ["foo.fits", "bar.fits"]
+        expected = [stable_object_id_from_string(n) for n in filenames]
+        pq.write_table(
+            pa.table({
+                "id": pa.array([1, 2], type=pa.int64()),
+                "filename": pa.array(filenames, type=pa.string()),
+                "ra": pa.array([10.0, 11.0], type=pa.float64()),
+                "dec": pa.array([0.0, 0.1], type=pa.float64()),
+                hp_col: pa.array([npix, npix], type=pa.int64()),
+                LAKE_JOIN_ID_COLUMN: pa.array([1, 2], type=pa.int64()),
+                "_cutout_index": pa.array([0, 1], type=pa.int64()),
+                "_spectrum_index": pa.array([5, 10], type=pa.int64()),
+            }),
+            tile_dir / f"Npix={npix}.parquet",
+        )
+        (lake / "catalogs" / "ZCOS" / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": norder,
+                "ra_column": "ra",
+                "dec_column": "dec",
+                "source_id_mode": "column:id",
+                "source_id_column": LAKE_JOIN_ID_COLUMN,
+                "native_id_column": "id",
+            })
+        )
+
+        catalog_root = lake / "catalogs" / "ZCOS"
+        res = repair_catalog_metadata(
+            catalog_root, "ZCOS", rebuild_link_id="filename",
+        )
+        assert res.ok, res.error
+        assert res.parquet_tiles_rebuilt == 1
+        assert res.source_id_mode_after == "label:filename"
+
+        tbl = pq.ParquetFile(tile_dir / f"Npix={npix}.parquet").read()
+        assert tbl.column("id").to_pylist() == [1, 2]
+        assert tbl.column(LAKE_JOIN_ID_COLUMN).to_pylist() == expected
+        assert tbl.column("_spectrum_index").to_pylist() == [-1, -1]
+        assert tbl.column("_cutout_index").to_pylist() == [-1, -1]
+
+        info = json.loads((catalog_root / "catalog_info.json").read_text())
+        assert info["source_id_mode"] == "label:filename"
+        assert info.get("native_id_column") == "filename"
+
+    def test_rebuild_link_id_mutually_exclusive_with_migrate(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        _write_id_only_tile(lake, "X", norder=5, npix=1, ids=[1])
+        import pytest
+
+        with pytest.raises(ValueError, match="not both"):
+            repair_catalog_metadata(
+                lake / "catalogs" / "X",
+                "X",
+                migrate_join_column=True,
+                rebuild_link_id="id",
+            )
+
+    def test_rebuild_link_id_missing_column(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        _write_id_only_tile(lake, "Y", norder=5, npix=1, ids=[1])
+
+        res = repair_catalog_metadata(
+            lake / "catalogs" / "Y",
+            "Y",
+            rebuild_link_id="filename",
+        )
+        assert not res.ok
+        assert res.error is not None
+        assert "filename" in res.error

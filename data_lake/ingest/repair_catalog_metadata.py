@@ -24,6 +24,7 @@ from data_lake.ingest.fits_to_parquet import (
     finalize_catalog_survey,
     migrate_parquet_tile_join_column,
     native_id_column_from_mode,
+    rebuild_parquet_tile_link_id,
     resolve_source_id_column,
 )
 from data_lake.lake_registry import iter_catalog_surveys
@@ -45,6 +46,7 @@ class RepairCatalogMetadataResult:
     source_id_mode_after: str | None = None
     total_rows: int | None = None
     parquet_tiles_renamed: int = 0
+    parquet_tiles_rebuilt: int = 0
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,23 @@ def migrate_catalog_join_columns(
     return renamed, ok, missing
 
 
+def rebuild_catalog_link_ids(
+    catalog_root: Path | str,
+    link_col: str,
+) -> tuple[int, str]:
+    """Recompute ``_source_id`` from *link_col* on every catalog tile.
+
+    Returns ``(n_rebuilt, source_id_mode)``.
+    """
+    catalog_root = Path(catalog_root)
+    rebuilt = 0
+    mode = "sequential"
+    for path in _iter_valid_parquet_tiles(catalog_root):
+        _, mode = rebuild_parquet_tile_link_id(path, link_col)
+        rebuilt += 1
+    return rebuilt, mode
+
+
 def migrate_zarr_survey_join_columns(survey_root: Path | str) -> tuple[int, int, int]:
     """Rename legacy join array in all Zarr tiles under a survey."""
     renamed = ok = missing = 0
@@ -196,6 +215,7 @@ def repair_catalog_metadata(
     ra_col: str | None = None,
     dec_col: str | None = None,
     migrate_join_column: bool = False,
+    rebuild_link_id: str | None = None,
 ) -> RepairCatalogMetadataResult:
     """
     Rebuild metadata sidecars for one ingested catalog from its Parquet tiles.
@@ -204,21 +224,32 @@ def repair_catalog_metadata(
     *catalog_root*.
     """
     catalog_root = Path(catalog_root)
+    if migrate_join_column and rebuild_link_id:
+        raise ValueError(
+            "Use either migrate_join_column or rebuild_link_id, not both."
+        )
     before = _read_catalog_info(catalog_root)
     hats_order = int(norder if norder is not None else before.get("hats_order", 5))
     ra = ra_col or str(before.get("ra_column", "ra"))
     dec = dec_col or str(before.get("dec_column", "dec"))
     n_renamed = 0
+    n_rebuilt = 0
+    rebuilt_mode: str | None = None
 
     try:
         if migrate_join_column:
             n_renamed, _, _ = migrate_catalog_join_columns(catalog_root)
+        if rebuild_link_id:
+            n_rebuilt, rebuilt_mode = rebuild_catalog_link_ids(
+                catalog_root, rebuild_link_id,
+            )
         ok = finalize_catalog_survey(
             catalog_root,
             survey_name,
             hats_order,
             ra_col=ra,
             dec_col=dec,
+            source_id_mode=rebuilt_mode,
         )
     except Exception as exc:
         log.exception("Repair failed for %s", survey_name)
@@ -252,6 +283,7 @@ def repair_catalog_metadata(
         source_id_mode_after=after.get("source_id_mode"),
         total_rows=after.get("total_rows"),
         parquet_tiles_renamed=n_renamed,
+        parquet_tiles_rebuilt=n_rebuilt,
     )
 
 
@@ -261,6 +293,7 @@ def repair_catalogs_under_lake(
     *,
     norder: int | None = None,
     migrate_join_column: bool = False,
+    rebuild_link_id: str | None = None,
 ) -> list[RepairCatalogMetadataResult]:
     """Repair metadata for each named survey under ``<lake_root>/catalogs/``."""
     lake_root = Path(lake_root)
@@ -284,6 +317,7 @@ def repair_catalogs_under_lake(
                 name,
                 norder=norder,
                 migrate_join_column=migrate_join_column,
+                rebuild_link_id=rebuild_link_id,
             )
         )
     return results
@@ -372,6 +406,15 @@ try:
         is_flag=True,
         help="Rename legacy source_id → _source_id in Parquet (and Zarr when --spectra/--cutouts).",
     )
+    @click.option(
+        "--rebuild-link-id",
+        default=None,
+        metavar="COL",
+        help=(
+            "Recompute catalog _source_id from column COL on every tile (catalog only). "
+            "Resets _spectrum_index and _cutout_index; run dl-rebuild-catalog-indices afterward."
+        ),
+    )
     @click.option("--spectra", "migrate_spectra", is_flag=True, help="With --migrate-join-column, migrate spectra Zarr tiles.")
     @click.option("--cutouts", "migrate_cutouts", is_flag=True, help="With --migrate-join-column, migrate cutout Zarr tiles.")
     @click.option("-v", "--verbose", is_flag=True)
@@ -383,6 +426,7 @@ try:
         norder: int | None,
         check_only: bool,
         migrate_join_column: bool,
+        rebuild_link_id: str | None,
         migrate_spectra: bool,
         migrate_cutouts: bool,
         verbose: bool,
@@ -396,12 +440,18 @@ try:
 
             dl-repair-catalog-metadata /data/lake --survey ultraVISTA_DR6 --check-only
             dl-repair-catalog-metadata /data/lake --survey ultraVISTA_DR6 --migrate-join-column
+            dl-repair-catalog-metadata /data/lake --survey zCOSMOS_DR3 --rebuild-link-id filename
             dl-repair-catalog-metadata /data/lake --all --migrate-join-column --spectra
         """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="catalogs")
+
+        if migrate_join_column and rebuild_link_id:
+            raise click.ClickException(
+                "Use either --migrate-join-column or --rebuild-link-id, not both."
+            )
 
         if repair_all and surveys:
             raise click.ClickException("Use either --survey or --all, not both.")
@@ -446,6 +496,7 @@ try:
             names,
             norder=norder,
             migrate_join_column=migrate_join_column,
+            rebuild_link_id=rebuild_link_id,
         )
         n_ok = 0
         n_fail = 0
@@ -468,9 +519,16 @@ try:
                 )
             if res.parquet_tiles_renamed:
                 suffix += f"; {res.parquet_tiles_renamed} Parquet tile(s) migrated"
+            if res.parquet_tiles_rebuilt:
+                suffix += f"; {res.parquet_tiles_rebuilt} Parquet tile(s) link-id rebuilt"
             rows = res.total_rows
             row_txt = f", {rows:,} rows" if rows is not None else ""
             click.echo(f"{res.survey}: OK → {res.catalog_root}{row_txt}{suffix}")
+            if res.parquet_tiles_rebuilt:
+                click.echo(
+                    f"  → run dl-rebuild-catalog-indices --survey {res.survey} "
+                    f"--kind spectrum (and dl-validate-catalog-spectra-link)"
+                )
 
         if migrate_join_column and (migrate_spectra or migrate_cutouts):
             for name in names:

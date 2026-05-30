@@ -370,6 +370,16 @@ dl-repair-catalog-metadata /lake --survey MY_SURVEY --migrate-join-column
 dl-repair-catalog-metadata /lake --survey MY_SURVEY --migrate-join-column --spectra --cutouts
 ```
 
+**Reassign catalog link column** (recompute ``_source_id`` from another column without FITS re-ingest; catalog Parquet only):
+
+```bash
+dl-repair-catalog-metadata /lake --survey zCOSMOS_DR3 --rebuild-link-id filename
+dl-rebuild-catalog-indices --survey zCOSMOS_DR3 --kind spectrum
+dl-validate-catalog-spectra-link --survey zCOSMOS_DR3
+```
+
+Science columns (e.g. ``id``) are unchanged; ``_spectrum_index`` is reset and must be repatched.
+
 ### Ingest cutouts
 
 Cutouts are stored as **Zarr v3** stacks (one group per HEALPix tile). Each ingested
@@ -996,6 +1006,7 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
 | `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
 | `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
+| `dl-repair-catalog-metadata` | `--rebuild-link-id` | column name | Recompute catalog ``_source_id`` from column (catalog only); then run ``dl-rebuild-catalog-indices`` |
 | `dl-repair-catalog-metadata` | — | — | Repair ``catalog_info.json``; ``--check-only``; ``--migrate-join-column`` renames legacy ``source_id`` → ``_source_id`` (``--spectra`` / ``--cutouts`` for Zarr) |
 | `dl-ingest-cutouts` | `--on-duplicate` | `skip`, `error`, `append` | Default **`skip`**; per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
