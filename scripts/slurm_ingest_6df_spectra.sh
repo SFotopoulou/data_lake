@@ -10,7 +10,6 @@
 #   DATA_LAKE_REPO       # default: repo root inferred from scripts/
 #   SURVEY               # default: SIXDF_DR3
 #   NORDER               # default: 5
-#   SOURCE_ID_COL        # catalog column used for _spectrum_index patch (default: targetname)
 #
 # Submit:
 #   mkdir -p logs
@@ -41,7 +40,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${DATA_LAKE_REPO:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 SURVEY="${SURVEY:-SIXDF_DR3}"
 NORDER="${NORDER:-5}"
-SOURCE_ID_COL="${SOURCE_ID_COL:-targetname}"
 
 CONFIG_DIR="$(dirname "${DATA_LAKE_CONFIG}")"
 STATE_DIR="${CONFIG_DIR}/ingest_state/6df"
@@ -63,7 +61,6 @@ dl-ingest-spectra-from-list \
   --config "${DATA_LAKE_CONFIG}" \
   --survey "${SURVEY}" \
   --fmt 6df \
-  --source-id-col "${SOURCE_ID_COL}" \
   --norder "${NORDER}" \
   --wavelength-mode shared \
   --on-duplicate skip \

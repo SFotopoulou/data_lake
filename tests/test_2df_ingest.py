@@ -474,7 +474,7 @@ class TestIngest2df:
 
         index_map = ingest_spectra_from_fits(
             p, lake, "2DFG_DR3",
-            fmt="2df", norder=5, source_id_col="SPFILE",
+            fmt="2df", norder=5,
         )
 
         # Patch catalog explicitly (the CLI does this automatically)
@@ -486,7 +486,7 @@ class TestIngest2df:
             source_id_to_index=index_map,
             kind="spectrum",
             norder=5,
-            source_id_col="SPFILE",
+            source_id_col=None,
         )
 
         # Re-read catalog tile
@@ -540,7 +540,7 @@ class TestIngest2df:
         )
 
         index_map = ingest_spectra_from_fits(
-            p, lake, "2DFG_DR3", fmt="2df", norder=5, source_id_col="SPFILE",
+            p, lake, "2DFG_DR3", fmt="2df", norder=5,
         )
         assert len(index_map) == 2
 
@@ -550,7 +550,7 @@ class TestIngest2df:
             source_id_to_index=index_map,
             kind="spectrum",
             norder=5,
-            source_id_col="SPFILE",
+            source_id_col=None,
         )
 
         refreshed = pq.read_table(cat_file)
@@ -568,7 +568,7 @@ class TestIngest2df:
         p = repo_root / "data" / "389442.fits"
         lake = tmp_path / "lake"
         index_map = ingest_spectra_from_fits(
-            p, lake, "2DFG_DR3", fmt="2df", norder=5, source_id_col="SPFILE",
+            p, lake, "2DFG_DR3", fmt="2df", norder=5,
         )
         expected = {
             normalize_object_id("sgp805_001203_2z.fits"),

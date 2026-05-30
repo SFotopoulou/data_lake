@@ -508,6 +508,27 @@ dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
   --source-id-col SPECOBJID
 ```
 
+#### Catalog vs spectrum CLI flags
+
+``--source-id-col``, ``--ra-col``, and ``--dec-col`` on **catalog** ingest define
+how native columns map to ``_source_id`` and sky position in Parquet.  Format-specific
+spectrum readers (2dF, 6dF, OzDES, VANDELS, WiggleZ, zCOSMOS, VIPERS, VUDS, VVDS)
+resolve object IDs and coordinates **internally** from FITS headers or filenames —
+you do **not** repeat those flags on ``dl-ingest-spectra`` for those formats.
+
+For SDSS/BOSS, DESI coadds, generic 1-D FITS, and spPlate, pass ``--source-id-col``
+(and sky columns when headers differ from defaults) so the reader matches your
+catalog.  After ingest, ``--update-catalog`` patches ``_spectrum_index`` by joining
+on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
+``--source-id-col``.
+
+| Stage | ``--source-id-col`` | ``--ra-col`` / ``--dec-col`` |
+|-------|---------------------|------------------------------|
+| Catalog ingest | Required for production (native column → ``_source_id``) | Survey sky columns in degrees |
+| Spectrum ingest (2df, 6df, OzDES, …) | **Not used** — reader picks FITS link key | **Not used** — reader picks FITS sky keys |
+| Spectrum ingest (SDSS, DESI, generic, spPlate) | Header keyword / fibermap column | FITS header keywords |
+| Catalog patch after spectrum ingest | **Not used** — joins on ``_source_id`` | — |
+
 #### SDSS spPlate ingest (640 or 1000 fibers per file)
 
 ``spPlate-PLATE-MJD.fits`` holds plate-run spectra for all fibers (SDSS: 640 rows;
@@ -649,17 +670,15 @@ dl-ingest-catalog 2dfgrs_catalog.fits --survey 2DFGRS_DR3 \
   --source-id-col SPFILE --ra-col RA --dec-col DEC
 
 # Single file (smoke test) — one Zarr row per SPECTRUM HDU
-dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 \
-  --fmt 2df --source-id-col SPFILE
+dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 --fmt 2df
 
 # Auto-detection also works (SPECTRUM HDU + SEQNUM/BJSEL triggers 2df format)
-dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 --source-id-col SPFILE
+dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3
 
 # File list (sequential, with checkpoint for restarts)
 dl-ingest-spectra-from-list 2df_files.txt \
   --survey 2DFGRS_DR3 \
   --fmt 2df \
-  --source-id-col SPFILE \
   --on-duplicate skip \
   --on-length-mismatch pad \
   --checkpoint /path/to/lake/ingest_state/2df/checkpoint.json \
@@ -762,20 +781,23 @@ exists it is preferred; otherwise wavelength is reconstructed from WCS header
 keywords.
 
 Source IDs are read from the VR extension header ``TARGET`` keyword (same
-value as catalog ``targetname``, e.g. ``g2259418-254505``).  Pass
-``--source-id-col targetname`` at ingest time; it maps to FITS ``TARGET``.
+value as catalog ``targetname``, e.g. ``g2259418-254505``).  Ingest the catalog
+with ``--source-id-col targetname`` so ``_source_id`` matches ``TARGET``.
 When ``TARGET`` is missing, the filename stem is used as a fallback.
+
+Sky coordinates for HEALPix assignment come from the VR extension ``OBSRA`` /
+``OBSDEC`` keywords (degrees).  These match the catalog ``ra``/``dec`` columns
+when the catalog is ingested in degrees.  Sexagesimal ``OBJCTRA``/``OBJCTDEC``
+on the PRIMARY stamp are parsed as a fallback when ``OBSRA`` is absent.
 
 ```bash
 # Single-file smoke test
-dl-ingest-spectra g0001234-123456.fits --survey SIXDF_DR3 \
-  --fmt 6df --source-id-col targetname
+dl-ingest-spectra g0001234-123456.fits --survey SIXDF_DR3 --fmt 6df
 
 # File-list ingest
 dl-ingest-spectra-from-list 6df_files.txt \
   --survey SIXDF_DR3 \
   --fmt 6df \
-  --source-id-col targetname \
   --wavelength-mode shared \
   --on-duplicate skip \
   --checkpoint /path/to/lake/ingest_state/6df/checkpoint.json \
@@ -792,7 +814,6 @@ export DATA_LAKE_CONFIG=/path/to/lake_config.toml
 export LAKE_INGEST_TOKEN='your-secret'
 export FILE_LIST="$(pwd)/6df_files.txt"
 export SURVEY=SIXDF_DR3
-export SOURCE_ID_COL=targetname
 sbatch scripts/slurm_ingest_6df_spectra.sh
 ```
 
@@ -813,11 +834,10 @@ ingest derives ``_source_id`` from the FITS basename.  The ``SOURCE`` header
 dl-ingest-catalog ozdes_catalog.fits --survey OZDES_DR2 \
   --source-id-col filename --ra-col RA --dec-col DEC
 
-dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 \
-  --fmt ozdes --source-id-col filename
+dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --fmt ozdes
 
 # Auto-detect when the basename starts with OzDES and HDU layout matches
-dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --source-id-col filename
+dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2
 ```
 
 #### VANDELS spectra ingest (stacked only)
@@ -853,11 +873,10 @@ reads the same ``ID`` keyword from the table header (e.g. ``406064719``).
 dl-ingest-catalog vipers_catalog.fits --survey VIPERS \
   --source-id-col ID --ra-col RA --dec-col DEC
 
-dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS \
-  --fmt vipers --source-id-col ID
+dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS --fmt vipers
 
 # Auto-detect works for VIPERS_*.fits with the spectral table layout
-dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS --source-id-col ID
+dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS
 ```
 
 #### VUDS spectra ingest
@@ -868,19 +887,17 @@ and ``LAM CESAM VO Z``.  No uncertainty or mask extensions are expected (IVAR=1,
 mask=0).
 
 **Catalog linkage:** ingest the catalog with ``--source-id-col ID``; spectrum
-ingest reads ``LAM CESAM VO IDENT`` (``--source-id-col ID`` is accepted as an
-alias).
+ingest reads ``LAM CESAM VO IDENT`` from the FITS header.
 
 ```bash
 dl-ingest-catalog vuds_catalog.fits --survey VUDS \
   --source-id-col ID --ra-col RA --dec-col DEC
 
 dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS \
-  --fmt vuds --source-id-col ID
+  --fmt vuds
 
 # Auto-detect works for sc_*.fits with LAM CESAM VO metadata
-dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS \
-  --source-id-col ID
+dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS
 ```
 
 #### VVDS spectra ingest

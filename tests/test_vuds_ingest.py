@@ -39,7 +39,7 @@ class TestVudsIngest:
         _write_vuds_like(p)
 
         with fits.open(p, memmap=True) as hdul:
-            records, wcs = _read_vuds_spectrum(hdul, p, source_id_col="ID")
+            records, wcs = _read_vuds_spectrum(hdul, p)
 
         r = records[0]
         assert r.source_id == normalize_object_id(5101243705)
@@ -69,7 +69,7 @@ class TestVudsIngest:
         )
         assert _detect_format_from_path(p) == "vuds"
         with fits.open(p, memmap=True) as hdul:
-            records, _ = _read_vuds_spectrum(hdul, p, source_id_col="ID")
+            records, _ = _read_vuds_spectrum(hdul, p)
         r = records[0]
         assert r.source_id == normalize_object_id(5101243705)
         assert r.flux.shape == (1117,)

@@ -548,7 +548,7 @@ try:
                     source_id_to_index=index_map,
                     kind="cutout",
                     norder=resolved_norder,
-                    source_id_col=source_id_col,
+                    source_id_col=None,
                 )
                 click.echo(f"Patched _cutout_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:

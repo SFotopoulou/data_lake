@@ -1153,9 +1153,6 @@ def _is_ozdes_hdul(hdul: fits.HDUList, path: Path) -> bool:
 def _read_ozdes_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
-    *,
-    ra_col: str = "RA",
-    dec_col: str = "DEC",
 ) -> tuple[list[SpectrumRecord], dict]:
     """
     Read an OzDES stacked 1-D spectrum (PRIMARY + VARIANCE + BADPIX).
@@ -1189,7 +1186,7 @@ def _read_ozdes_spectrum(
     mask = (bad != 0).astype(np.uint8)
 
     source_id = normalize_object_id(source_path.name)
-    ra, dec = sky_from_fits_header(header, ra_col, dec_col)
+    ra, dec = sky_from_fits_header(header, "RA", "DEC")
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
@@ -1443,10 +1440,6 @@ def _is_vipers_hdul(hdul: fits.HDUList, path: Path) -> bool:
 def _read_vipers_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
-    *,
-    source_id_col: str | None = None,
-    ra_col: str = "RA",
-    dec_col: str = "DEC",
 ) -> tuple[list[SpectrumRecord], dict]:
     """
     Read a VIPERS 1-D spectrum from a row-per-pixel binary table.
@@ -1476,10 +1469,9 @@ def _read_vipers_spectrum(
 
     header = thdu.header
     phdr = hdul[0].header
-    sid_key = source_id_col or "ID"
-    source_id = object_id_from_fits_header(header, sid_key, hdu_index=0)
-    ra = float(header.get(ra_col, phdr.get(ra_col, 0.0)))
-    dec = float(header.get(dec_col, phdr.get(dec_col, 0.0)))
+    source_id = object_id_from_fits_header(header, "ID", hdu_index=0)
+    ra = float(header.get("RA", phdr.get("RA", 0.0)))
+    dec = float(header.get("DEC", phdr.get("DEC", 0.0)))
 
     meta: dict[str, Any] = {
         "z": float(header.get("REDSHIFT", header.get("Z", 0.0))),
@@ -1533,8 +1525,6 @@ def _is_vuds_hdul(hdul: fits.HDUList, path: Path) -> bool:
 def _read_vuds_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
-    *,
-    source_id_col: str | None = None,
 ) -> tuple[list[SpectrumRecord], dict]:
     """
     Read a VUDS 1-D spectrum from PRIMARY (flux + spectral WCS).
@@ -1555,9 +1545,7 @@ def _read_vuds_spectrum(
     flux = np.asarray(flux_hdu.data, dtype=np.float32)
     n_pix = int(flux.shape[0])
 
-    sid_key = source_id_col or _VUDS_ID_KEY
-    if sid_key.strip().upper() == "ID":
-        sid_key = _VUDS_ID_KEY
+    sid_key = _VUDS_ID_KEY
     if sid_key not in header:
         source_id = object_id_from_fits_header(header, sid_key, hdu_index=0)
     else:
@@ -1642,9 +1630,6 @@ def _is_vvds_hdul(hdul: fits.HDUList, path: Path) -> bool:
 def _read_vvds_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
-    *,
-    ra_col: str = "RA",
-    dec_col: str = "DEC",
 ) -> tuple[list[SpectrumRecord], dict]:
     """
     Read a VVDS 1-D spectrum from PRIMARY (flux + spectral WCS).
@@ -1664,8 +1649,8 @@ def _read_vvds_spectrum(
     flux = _flatten_vvds_primary_flux(flux_hdu.data)
     n_pix = int(flux.shape[0])
     source_id = _vvds_source_id_from_path(source_path)
-    ra = float(header.get(ra_col, 0.0))
-    dec = float(header.get(dec_col, 0.0))
+    ra = float(header.get("RA", 0.0))
+    dec = float(header.get("DEC", 0.0))
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
@@ -1801,14 +1786,13 @@ def _2df_link_label_from_header(
     shdr: fits.Header,
     phdr: fits.Header,
     source_path: Path,
-    source_id_col: str,
 ) -> tuple[str, bool]:
     """Resolve the catalog link label from a 2dF spectrum HDU header.
 
     Returns ``(label, used_fallback)`` where *used_fallback* is True when the
-    filename stem was used because *source_id_col* was absent from headers.
+    filename stem was used because ``SPFILE`` was absent from headers.
     """
-    key = source_id_col.strip().upper()
+    key = _2DF_DEFAULT_SOURCE_ID_COL
     for hdr in (shdr, phdr):
         if key in hdr:
             label = str(hdr[key]).strip()
@@ -1841,8 +1825,6 @@ def _2df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
 def _read_2df_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
-    *,
-    source_id_col: str = _2DF_DEFAULT_SOURCE_ID_COL,
 ) -> tuple[list[SpectrumRecord], dict]:
     """Read a 2dFGRS 1-D spectrum FITS file (one row per SPECTRUM HDU).
 
@@ -1878,7 +1860,7 @@ def _read_2df_spectrum(
 
         shdr = shdu.header
         link_label, fallback = _2df_link_label_from_header(
-            shdr, phdr, source_path, source_id_col,
+            shdr, phdr, source_path,
         )
         if fallback:
             used_stem_fallback = True
@@ -1886,7 +1868,7 @@ def _read_2df_spectrum(
         if source_id in seen_ids:
             raise ValueError(
                 f"duplicate 2dF source_id in {source_path.name}: "
-                f"{source_id_col}={link_label!r} and {seen_ids[source_id]!r} "
+                f"SPFILE={link_label!r} and {seen_ids[source_id]!r} "
                 f"both map to the same _source_id"
             )
         seen_ids[source_id] = link_label
@@ -1925,10 +1907,9 @@ def _read_2df_spectrum(
 
     if used_stem_fallback:
         log.warning(
-            "2dF: %s missing %r in spectrum header(s); using filename stem %r "
-            "as link key (prefer catalog --source-id-col SPFILE)",
+            "2dF: %s missing SPFILE in spectrum header(s); using filename stem %r "
+            "as link key (catalog --source-id-col SPFILE at catalog ingest)",
             source_path.name,
-            source_id_col.strip().upper(),
             _2df_filename_stem(source_path),
         )
 
@@ -1973,8 +1954,6 @@ def _ensure_batch_meta(batch_meta: np.ndarray, n_rows: int) -> np.ndarray:
     return meta
 
 
-_6DF_DEFAULT_SOURCE_ID_COL = "TARGET"
-
 
 def _6df_hdu_spectrum_role(name: str) -> str | None:
     """Classify a 6dFGS extension name as ``v``, ``r``, or ``vr`` spectrum HDU."""
@@ -1988,36 +1967,88 @@ def _6df_hdu_spectrum_role(name: str) -> str | None:
     return None
 
 
-def _6df_header_key_for_link(source_id_col: str) -> str:
-    """Map catalog link column names to FITS header keywords."""
-    key = source_id_col.strip().upper()
-    if key == "TARGETNAME":
-        return "TARGET"
-    return key
-
-
 def _6df_link_label_from_header(
     vhdr: fits.Header,
     phdr: fits.Header,
     source_path: Path,
-    source_id_col: str,
 ) -> tuple[str, bool]:
     """Resolve the catalog link label for a 6dFGS spectrum.
 
-    Returns ``(label, used_fallback)`` where *used_fallback* is True when the
-    filename stem was used because the requested header key was absent.
+    Uses VR/PRIMARY ``TARGET`` (same string as catalog ``targetname``).  Returns
+    ``(label, used_fallback)`` where *used_fallback* is True when the filename
+    stem was used because ``TARGET``/``TARGETNAME`` were absent.
     """
-    key = _6df_header_key_for_link(source_id_col)
-    search_keys = [key]
-    if key == "TARGET":
-        search_keys.append("TARGETNAME")
     for hdr in (vhdr, phdr):
-        for hdr_key in search_keys:
+        for hdr_key in ("TARGET", "TARGETNAME"):
             if hdr_key in hdr:
                 label = str(hdr[hdr_key]).strip()
                 if label:
                     return label, False
     return source_path.stem, True
+
+
+def _looks_like_sky_degrees(ra: float, dec: float) -> bool:
+    """True when *ra*/*dec* plausibly represent equatorial degrees."""
+    if not (np.isfinite(ra) and np.isfinite(dec)):
+        return False
+    return abs(ra) <= 360.0 and abs(dec) <= 90.0
+
+
+def _parse_fits_sexagesimal_sky(ra_val: object, dec_val: object) -> tuple[float, float] | None:
+    """Parse HMS/DMS-style FITS sky strings (e.g. 6dF ``OBJCTRA``/``OBJCTDEC``)."""
+    try:
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+
+        ra_text = str(ra_val).strip()
+        dec_text = str(dec_val).strip()
+        if not ra_text or not dec_text:
+            return None
+        coord = SkyCoord(ra_text, dec_text, unit=(u.hourangle, u.deg))
+        return float(coord.ra.deg), float(coord.dec.deg)
+    except Exception:
+        return None
+
+
+def _6df_sky_from_headers(
+    vhdr: fits.Header,
+    phdr: fits.Header,
+) -> tuple[float, float]:
+    """Resolve 6dFGS sky position in degrees for spectrum HEALPix assignment.
+
+    Production 6dF target files store per-observation coordinates as ``OBSRA`` /
+    ``OBSDEC`` (degrees) on the VR extension.  PRIMARY headers often carry
+    sexagesimal ``OBJCTRA``/``OBJCTDEC`` or image WCS ``CRVAL1``/``CRVAL2``
+    instead of numeric ``RA``/``DEC``.
+    """
+    if "OBSRA" in vhdr and "OBSDEC" in vhdr:
+        ra = float(vhdr["OBSRA"])
+        dec = float(vhdr["OBSDEC"])
+        if _looks_like_sky_degrees(ra, dec):
+            return ra, dec
+
+    for hdr in (vhdr, phdr):
+        if "RA" in hdr and "DEC" in hdr:
+            ra = float(hdr["RA"])
+            dec = float(hdr["DEC"])
+            if _looks_like_sky_degrees(ra, dec):
+                return ra, dec
+
+    if "CRVAL1" in phdr and "CRVAL2" in phdr:
+        ra = float(phdr["CRVAL1"])
+        dec = float(phdr["CRVAL2"])
+        if _looks_like_sky_degrees(ra, dec):
+            return ra, dec
+
+    if "OBJCTRA" in phdr and "OBJCTDEC" in phdr:
+        parsed = _parse_fits_sexagesimal_sky(phdr["OBJCTRA"], phdr["OBJCTDEC"])
+        if parsed is not None:
+            return parsed
+
+    log.warning(
+        "6dF: could not resolve sky position from VR/PRIMARY headers; using (0, 0)"
+    )
+    return 0.0, 0.0
 
 
 def _is_6df_hdul(hdul: fits.HDUList) -> bool:
@@ -2041,32 +2072,30 @@ def _select_6df_vr_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
 def _read_6df_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
-    *,
-    source_id_col: str = _6DF_DEFAULT_SOURCE_ID_COL,
 ) -> tuple[list[SpectrumRecord], dict]:
     """Read a 6dFGS FITS file, ingesting only the combined VR extension.
 
-    ``source_id`` defaults to the ``TARGET`` keyword on the VR extension header
-    (same string as catalog ``targetname``, e.g. ``g2259418-254505``).  When
+    ``source_id`` is the ``TARGET`` keyword on the VR extension header (same
+    string as catalog ``targetname``, e.g. ``g2259418-254505``).  When
     ``TARGET`` is absent, falls back to the filename stem with a warning.
+
+    Sky coordinates are taken from VR ``OBSRA``/``OBSDEC`` (degrees), with
+    fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or sexagesimal
+    ``OBJCTRA``/``OBJCTDEC``.
     """
     from data_lake.ingest.fits_to_parquet import normalize_object_id
 
     phdr = hdul[0].header
-    ra = float(phdr.get("RA", 0.0))
-    dec = float(phdr.get("DEC", 0.0))
 
     _, vr_hdu = _select_6df_vr_hdu(hdul)
     vhdr = vr_hdu.header
-    link_label, used_fallback = _6df_link_label_from_header(
-        vhdr, phdr, source_path, source_id_col,
-    )
+    ra, dec = _6df_sky_from_headers(vhdr, phdr)
+    link_label, used_fallback = _6df_link_label_from_header(vhdr, phdr, source_path)
     if used_fallback:
         log.warning(
-            "6dF: %s missing %r on VR/PRIMARY header; using filename stem %r "
+            "6dF: %s missing TARGET on VR/PRIMARY header; using filename stem %r "
             "as link key (catalog --source-id-col targetname should match TARGET)",
             source_path.name,
-            _6df_header_key_for_link(source_id_col),
             source_path.stem,
         )
     source_id = normalize_object_id(link_label)
@@ -2359,51 +2388,23 @@ def ingest_spectra_from_fits(
                     dec_col=dec_col,
                 )
             elif detected_fmt == "2df":
-                records, wcs_attrs = _read_2df_spectrum(
-                    hdul,
-                    source_path,
-                    source_id_col=source_id_col or _2DF_DEFAULT_SOURCE_ID_COL,
-                )
+                records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
             elif detected_fmt == "6df":
-                records, wcs_attrs = _read_6df_spectrum(
-                    hdul,
-                    source_path,
-                    source_id_col=source_id_col or _6DF_DEFAULT_SOURCE_ID_COL,
-                )
+                records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
             elif detected_fmt == "wig":
                 records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
             elif detected_fmt == "ozdes":
-                records, wcs_attrs = _read_ozdes_spectrum(
-                    hdul,
-                    source_path,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
+                records, wcs_attrs = _read_ozdes_spectrum(hdul, source_path)
             elif detected_fmt == "zcosmos":
                 records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
             elif detected_fmt == "vandels":
                 records, wcs_attrs = _read_vandels_spectrum(hdul, source_path)
             elif detected_fmt == "vipers":
-                records, wcs_attrs = _read_vipers_spectrum(
-                    hdul,
-                    source_path,
-                    source_id_col=source_id_col,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
+                records, wcs_attrs = _read_vipers_spectrum(hdul, source_path)
             elif detected_fmt == "vuds":
-                records, wcs_attrs = _read_vuds_spectrum(
-                    hdul,
-                    source_path,
-                    source_id_col=source_id_col,
-                )
+                records, wcs_attrs = _read_vuds_spectrum(hdul, source_path)
             elif detected_fmt == "vvds":
-                records, wcs_attrs = _read_vvds_spectrum(
-                    hdul,
-                    source_path,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
+                records, wcs_attrs = _read_vvds_spectrum(hdul, source_path)
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
@@ -2794,7 +2795,11 @@ try:
     @click.option(
         "--source-id-col",
         default=None,
-        help="Object ID: FITS header keyword (generic/SDSS) or fibermap column (DESI).",
+        help=(
+            "Object ID for SDSS/DESI/generic/spPlate ingest: FITS header keyword "
+            "(generic/SDSS) or fibermap column (DESI). Ignored by format-specific "
+            "readers (2df, 6df, OzDES, …) which resolve IDs internally."
+        ),
     )
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
@@ -2941,7 +2946,6 @@ try:
             specobj_id_layout=specobj_id_layout.lower(),
         )
 
-        sid_col = source_id_col or "SPECOBJID"
         if update_catalog and index_map:
             try:
                 from data_lake.ingest.update_catalog_indices import update_index_column
@@ -2951,7 +2955,7 @@ try:
                     source_id_to_index=index_map,
                     kind="spectrum",
                     norder=resolved_norder,
-                    source_id_col=sid_col,
+                    source_id_col=None,
                 )
                 click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:

@@ -97,7 +97,7 @@ def test_read_6df_uses_target_header_not_filename(tmp_path: Path) -> None:
         hdul.flush()
 
     with fits.open(p, memmap=True) as hdul:
-        records, _ = _read_6df_spectrum(hdul, p, source_id_col="targetname")
+        records, _ = _read_6df_spectrum(hdul, p)
 
     assert records[0].source_id == normalize_object_id("g2259418-254505")
 
@@ -116,8 +116,10 @@ def test_real_6df_detects_and_uses_target_header() -> None:
     p = Path(__file__).resolve().parents[1] / "data" / "g2259418-254505.fits"
     assert _detect_format_from_path(p) == "6df"
     with fits.open(p, memmap=True) as hdul:
-        records, _ = _read_6df_spectrum(hdul, p, source_id_col="targetname")
+        records, _ = _read_6df_spectrum(hdul, p)
     assert records[0].source_id == normalize_object_id("g2259418-254505")
+    assert records[0].ra == pytest.approx(344.92415833, abs=1e-5)
+    assert records[0].dec == pytest.approx(-25.75148056, abs=1e-5)
 
 
 def test_ingest_6df_end_to_end(tmp_path: Path) -> None:

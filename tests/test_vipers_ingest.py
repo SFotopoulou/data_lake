@@ -53,7 +53,7 @@ class TestVipersIngest:
         _write_vipers_like(p, obj_id=406064719)
 
         with fits.open(p, memmap=True) as hdul:
-            records, wcs = _read_vipers_spectrum(hdul, p, source_id_col="ID")
+            records, wcs = _read_vipers_spectrum(hdul, p)
 
         r = records[0]
         assert r.source_id == normalize_object_id(406064719)
@@ -79,7 +79,7 @@ class TestVipersIngest:
         p = Path("data/VIPERS_406064719.fits")
         assert _detect_format_from_path(p) == "vipers"
         with fits.open(p, memmap=True) as hdul:
-            records, _ = _read_vipers_spectrum(hdul, p, source_id_col="ID")
+            records, _ = _read_vipers_spectrum(hdul, p)
         r = records[0]
         assert r.source_id == normalize_object_id(406064719)
         assert r.flux.shape == (557,)

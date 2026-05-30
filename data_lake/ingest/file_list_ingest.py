@@ -425,7 +425,7 @@ try:
                     source_id_to_index=total_index_map,
                     kind="cutout",
                     norder=n,
-                    source_id_col=source_id_col,
+                    source_id_col=None,
                 )
                 click.echo(f"Patched _cutout_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:
@@ -599,7 +599,6 @@ try:
             default_checkpoint=default_ck,
         )
 
-        sid_col = source_id_col or "SPECOBJID"
         if update_catalog and total_index_map:
             try:
                 from data_lake.ingest.update_catalog_indices import update_index_column
@@ -609,7 +608,7 @@ try:
                     source_id_to_index=total_index_map,
                     kind="spectrum",
                     norder=n,
-                    source_id_col=sid_col,
+                    source_id_col=None,
                 )
                 click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:
