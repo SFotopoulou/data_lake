@@ -615,6 +615,15 @@ def resolve_source_id_column(
     return LAKE_JOIN_ID_COLUMN
 
 
+def read_parquet_tile(tile_path: Path | str) -> pa.Table:
+    """Read one catalog tile file without hive partition discovery.
+
+    ``pq.read_table`` on paths under ``Norder=…/Dir=…/`` can attach partition
+    columns and fail when ``Norder`` types differ across tiles.
+    """
+    return pq.ParquetFile(tile_path).read()
+
+
 def migrate_parquet_tile_join_column(
     tile_path: Path | str,
     *,
@@ -626,7 +635,7 @@ def migrate_parquet_tile_join_column(
     Returns ``"renamed"``, ``"ok"`` (already has ``_source_id``), or ``"missing"``.
     """
     tile_path = Path(tile_path)
-    table = pq.read_table(str(tile_path))
+    table = read_parquet_tile(tile_path)
     names = table.schema.names
     opts = catalog_parquet_options or CatalogParquetOptions()
 

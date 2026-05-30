@@ -72,3 +72,42 @@ class TestRepairCatalogMetadata:
         results = repair_catalogs_under_lake(tmp_path / "lake", ["NOPE"])
         assert len(results) == 1
         assert not results[0].ok
+
+    def test_migrate_join_column_with_dictionary_partition_cols(self, tmp_path: Path) -> None:
+        """Migration must read tiles under Norder=/Dir= without hive merge errors."""
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "DICT_PART" / healpix_dir(1, 42)
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "id": pa.array([1, 2], type=pa.int64()),
+                "ra": pa.array([10.0, 11.0], type=pa.float64()),
+                "dec_": pa.array([0.0, 0.1], type=pa.float64()),
+                "_healpix_norder1": pa.array([42, 42], type=pa.int64()),
+                "Norder": pa.DictionaryArray.from_arrays(
+                    pa.array([0, 0], type=pa.int32()),
+                    pa.array([1], type=pa.int32()),
+                ),
+            }),
+            tile_dir / "Npix=42.parquet",
+        )
+        (lake / "catalogs" / "DICT_PART" / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": 1,
+                "ra_column": "ra",
+                "dec_column": "dec_",
+                "source_id_mode": "column:id",
+                "source_id_column": "id",
+            })
+        )
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
+        res = repair_catalog_metadata(
+            lake / "catalogs" / "DICT_PART",
+            "DICT_PART",
+            migrate_join_column=True,
+        )
+        assert res.ok, res.error
+        tbl = pq.ParquetFile(tile_dir / "Npix=42.parquet").read()
+        assert LAKE_JOIN_ID_COLUMN in tbl.schema.names
+        assert tbl.column(LAKE_JOIN_ID_COLUMN).to_pylist() == [1, 2]
