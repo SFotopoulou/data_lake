@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+from data_lake.ingest.fits_to_parquet import healpix_dir, resolve_source_id_column
 
 log = logging.getLogger(__name__)
 
@@ -209,6 +209,11 @@ class CatalogAccessor:
     # Convenience accessors
     # ------------------------------------------------------------------
 
+    def _tile_parquet_path(self, npix: int) -> Path | None:
+        """Return the on-disk Parquet path for a HEALPix tile, or ``None`` if absent."""
+        path = self._catalog_root / healpix_dir(self.norder, int(npix)) / f"Npix={int(npix)}.parquet"
+        return path if path.is_file() else None
+
     def sources_in_tile(
         self,
         npix: int,
@@ -216,10 +221,66 @@ class CatalogAccessor:
         fmt: ReturnFormat = "polars",
     ):
         """Return all sources in a HEALPix tile."""
-        col_expr = ", ".join(columns) if columns else "*"
-        hp_col = f"_healpix_norder{self.norder}"
-        sql = f"SELECT {col_expr} FROM catalog WHERE {hp_col} = {npix}"
+        return self.sources_in_healpix_pixels([npix], columns=columns, fmt=fmt)
+
+    def sources_in_healpix_pixels(
+        self,
+        npixels: Sequence[int],
+        columns: list[str] | None = None,
+        fmt: ReturnFormat = "polars",
+        *,
+        ra_col: str | None = None,
+        dec_col: str | None = None,
+        ra_min: float | None = None,
+        ra_max: float | None = None,
+        dec_min: float | None = None,
+        dec_max: float | None = None,
+    ):
+        """Load sources from explicit HEALPix tile Parquet files (no full-catalog scan).
+
+        Only existing ``Npix=*.parquet`` paths are read.  Optional RA/Dec bounds
+        (degrees) add a cheap row filter — useful when survey-B tiles are coarse.
+        """
+        paths = [
+            p for npix in npixels
+            if (p := self._tile_parquet_path(int(npix))) is not None
+        ]
+        if not paths:
+            return self._empty_result(fmt, columns)
+
+        col_expr = ", ".join(_quote_sql_ident(c) for c in columns) if columns else "*"
+        escaped = ", ".join("'" + str(p).replace("'", "''") + "'" for p in paths)
+        sql = f"SELECT {col_expr} FROM read_parquet([{escaped}])"
+
+        filters: list[str] = []
+        if dec_min is not None:
+            dec_name = dec_col or self._info.get("dec_column", "dec")
+            dec_sql = _quote_sql_ident(dec_name)
+            filters.append(f"{dec_sql} >= {dec_min}")
+        if dec_max is not None:
+            dec_name = dec_col or self._info.get("dec_column", "dec")
+            dec_sql = _quote_sql_ident(dec_name)
+            filters.append(f"{dec_sql} <= {dec_max}")
+        if ra_min is not None and ra_max is not None:
+            ra_name = ra_col or self._info.get("ra_column", "ra")
+            ra_sql = _quote_sql_ident(ra_name)
+            if ra_min <= ra_max:
+                filters.append(f"{ra_sql} >= {ra_min} AND {ra_sql} <= {ra_max}")
+            else:
+                filters.append(f"({ra_sql} >= {ra_min} OR {ra_sql} <= {ra_max})")
+        if filters:
+            sql += " WHERE " + " AND ".join(filters)
         return self.query(sql, fmt=fmt)
+
+    def _empty_result(self, fmt: ReturnFormat, columns: list[str] | None):
+        import polars as pl
+
+        if fmt == "polars":
+            return pl.DataFrame()
+        if fmt == "arrow":
+            return pa.table({})
+        from astropy.table import Table
+        return Table()
 
     def sources_in_cone(
         self,

@@ -19,6 +19,7 @@ from data_lake.io.crossmatch import (
     resolve_crossmatch_settings,
     resolve_crossmatch_sky_columns,
     filter_survey_a_tiles_overlapping_survey_b,
+    healpix_pixels_covering_tile,
     survey_b_pixels_for_tile,
     tile_search_cone,
     _crossmatch_tile_worker,
@@ -184,6 +185,20 @@ class TestCrossmatchHelpers:
             radius_rad=np.radians(1.0 / 3600.0),
         )
         assert kept == [npix_overlap]
+
+    def test_healpix_pixels_covering_tile(self) -> None:
+        import healpy as hp
+
+        norder_a, norder_b = 6, 4
+        nside_a = hp.order2nside(norder_a)
+        nside_b = hp.order2nside(norder_b)
+        npix_a = int(assign_healpix(np.array([120.0]), np.array([45.0]), norder_a)[0])
+        pixels = healpix_pixels_covering_tile(
+            nside_a, npix_a, np.radians(0.5 / 3600.0), nside_b=nside_b,
+        )
+        npix_b = int(assign_healpix(np.array([120.0]), np.array([45.0]), norder_b)[0])
+        assert npix_b in pixels
+        assert len(pixels) < hp.nside2npix(nside_b) // 10
 
 
 class TestBuildCrossmatch:

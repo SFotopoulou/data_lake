@@ -305,6 +305,39 @@ def tile_search_cone(
     return ra_deg, dec_deg, search_deg
 
 
+def healpix_pixels_covering_tile(
+    nside_a: int,
+    npix_a: int,
+    radius_rad: float,
+    *,
+    nside_b: int,
+) -> list[int]:
+    """Survey-B HEALPix pixels overlapping survey-A tile *npix_a* (incl. match radius)."""
+    theta, phi = hp.pix2ang(nside_a, int(npix_a), nest=True)
+    vec = hp.ang2vec(theta, phi)
+    search_rad = _tile_search_radius_rad(nside_a, npix_a, radius_rad)
+    return sorted(int(p) for p in hp.query_disc(
+        nside_b, vec, search_rad, nest=True, inclusive=True,
+    ))
+
+
+def _source_bbox_deg(
+    ra: np.ndarray,
+    dec: np.ndarray,
+    margin_deg: float,
+) -> tuple[float, float, float, float]:
+    """RA/Dec bounding box (degrees) around sources with angular margin."""
+    dec_min = float(np.min(dec) - margin_deg)
+    dec_max = float(np.max(dec) + margin_deg)
+    cos_dec = max(float(np.cos(np.radians(np.mean(dec)))), 1e-6)
+    ra_pad = margin_deg / cos_dec
+    ra_min = float(np.min(ra) - ra_pad)
+    ra_max = float(np.max(ra) + ra_pad)
+    if ra_max - ra_min >= 360.0:
+        return 0.0, 360.0, dec_min, dec_max
+    return ra_min, ra_max, dec_min, dec_max
+
+
 def _tile_search_radius_rad(nside_a: int, npix_a: int, radius_rad: float) -> float:
     """Angular radius (rad) covering survey-A pixel extent plus match radius."""
     theta, phi = hp.pix2ang(nside_a, int(npix_a), nest=True)
@@ -351,10 +384,9 @@ def filter_survey_a_tiles_overlapping_survey_b(
 
     keep_list: list[int] = []
     for npix_a in sorted(npix_a_set):
-        theta, phi = hp.pix2ang(nside_a, npix_a, nest=True)
-        vec = hp.ang2vec(theta, phi)
-        search_rad = _tile_search_radius_rad(nside_a, npix_a, radius_rad)
-        tiles_b = hp.query_disc(nside_b, vec, search_rad, nest=True, inclusive=True)
+        tiles_b = healpix_pixels_covering_tile(
+            nside_a, npix_a, radius_rad, nside_b=nside_b,
+        )
         if b_pop.intersection(tiles_b):
             keep_list.append(npix_a)
     return keep_list
@@ -384,6 +416,7 @@ def _crossmatch_one_tile(
 ) -> int:
     """Match one survey-A tile; write Parquet. Returns number of match rows."""
     nside_a = hp.order2nside(norder_a)
+    nside_b = hp.order2nside(norder_b)
     hp_col = f"_healpix_norder{norder_a}"
     id_col_a = acc_a.source_id_column
     id_col_b = acc_b.source_id_column
@@ -401,15 +434,20 @@ def _crossmatch_one_tile(
     dec_a = df_a[dec_col_a].to_numpy().astype(np.float64)
     ids_a = _catalog_ids_to_int64(df_a[id_col_a].to_list())
 
-    ra_center, dec_center, search_deg = tile_search_cone(nside_a, npix_a, radius_rad)
-    df_b = acc_b.sources_in_cone(
-        ra_center,
-        dec_center,
-        search_deg,
+    b_pixels = healpix_pixels_covering_tile(
+        nside_a, npix_a, radius_rad, nside_b=nside_b,
+    )
+    ra_min, ra_max, dec_min, dec_max = _source_bbox_deg(ra_a, dec_a, radius_deg)
+    df_b = acc_b.sources_in_healpix_pixels(
+        b_pixels,
         columns=cols_b,
         fmt="polars",
         ra_col=ra_col_b,
         dec_col=dec_col_b,
+        ra_min=ra_min,
+        ra_max=ra_max,
+        dec_min=dec_min,
+        dec_max=dec_max,
     )
     if df_b.is_empty():
         return 0
@@ -526,7 +564,8 @@ def build_crossmatch(
     Uses tile-by-tile nearest-neighbour matching.  Survey-A tiles are limited to
     those overlapping the survey-B populated footprint (see
     :func:`filter_survey_a_tiles_overlapping_survey_b`).  Survey-B candidates
-    per tile are fetched with a cone query (pixel extent + match radius).
+    per tile are read from the matching survey-B HEALPix tile Parquet files only,
+    with an RA/Dec bounding-box filter around survey-A sources.
 
     Parameters
     ----------
