@@ -143,6 +143,58 @@ class TestExtractFromLake:
         assert (out_dir / "Norder=5" / "Dir=0" / "Npix=1.parquet").is_file()
         assert (out_dir / "Norder=5" / "Dir=0" / "Npix=2.parquet").is_file()
 
+    def test_lake_tile_read_avoids_hive_partition_merge(self, tmp_path: Path) -> None:
+        """Reading under Norder=/Dir= must not merge partition columns into the export."""
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "PART" / "Norder=1" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "_spectrum_index": pa.array([0, 1], type=pa.int64()),
+                "Norder": pa.DictionaryArray.from_arrays(
+                    pa.array([0, 0], type=pa.int32()),
+                    pa.array([1], type=pa.int32()),
+                ),
+            }),
+            tile_dir / "Npix=42.parquet",
+        )
+        (lake / "catalogs" / "PART" / "catalog_info.json").write_text(
+            '{"hats_order": 1, "ra_column": "ra", "dec_column": "dec", '
+            '"source_id_mode": "sequential", "total_rows": 2}',
+        )
+        out = tmp_path / "idx.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["_spectrum_index"],
+            lake_root=lake,
+            survey="PART",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        tbl = pq.read_table(out)
+        assert tbl.column_names == ["_spectrum_index"]
+
+    def test_lake_csv_output_rejected(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "S" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"x": [1]}),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "S" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"source_id_mode": "sequential", "total_rows": 1}',
+        )
+        with pytest.raises(ValueError, match="Parquet only"):
+            extract_catalog(
+                output=tmp_path / "out.csv",
+                specs=["x"],
+                lake_root=lake,
+                survey="S",
+            )
+
 
 class TestFilterValidSky:
     def test_requires_sky_columns(self) -> None:

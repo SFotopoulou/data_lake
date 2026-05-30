@@ -180,6 +180,49 @@ def _sql_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _read_catalog_tile(
+    tile_path: Path,
+    columns: Sequence[str],
+) -> pa.Table:
+    """Read one on-disk Parquet tile without hive partition discovery.
+
+    ``pq.read_table`` on paths under ``Norder=…/Dir=…/`` can attach partition
+    columns and merge incompatible types across tiles; ``ParquetFile`` reads
+  only the file payload.
+    """
+    pf = pq.ParquetFile(tile_path)
+    available = set(pf.schema_arrow.names)
+    missing = [c for c in columns if c not in available]
+    if missing:
+        raise KeyError(
+            f"{tile_path}: column(s) not in tile: {missing!r} "
+            f"(available: {sorted(available)[:30]})"
+        )
+    return pf.read(columns=list(columns))
+
+
+def _canonicalize_column_types(table: pa.Table) -> pa.Table:
+    """Decode dictionary columns and normalize chunks for stable Parquet writes."""
+    cols: dict[str, pa.ChunkedArray] = {}
+    for name in table.schema.names:
+        col = table.column(name).combine_chunks()
+        if pa.types.is_dictionary(col.type):
+            col = pc.cast(col, col.type.value_type)
+        cols[name] = col
+    return pa.table(cols)
+
+
+def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Cast *table* to *schema* so a multi-tile ``ParquetWriter`` stays consistent."""
+    arrays: list[pa.ChunkedArray] = []
+    for field in schema:
+        col = table.column(field.name).combine_chunks()
+        if col.type != field.type:
+            col = pc.cast(col, field.type, safe=False)
+        arrays.append(col)
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
 def _lake_catalog_root(lake_root: Path | str, survey: str) -> Path:
     root = Path(lake_root) / "catalogs" / survey
     if not root.is_dir():
@@ -265,14 +308,19 @@ def stream_extract_from_lake_catalog(
     src_cols = [src for src, _ in mapping]
     out_names = tuple(out for _, out in mapping)
 
-    use_duckdb = engine == "duckdb" or (
-        engine == "auto" and output is not None and output_dir is None
+    out_is_parquet = (
+        output is not None
+        and (output.suffix.lower() == ".parquet" or output.suffix == "")
+    )
+    use_duckdb = (
+        tiles
+        and out_is_parquet
+        and (engine == "duckdb" or (engine == "auto" and output_dir is None))
     )
     if use_duckdb and output is not None:
         try:
             return _stream_lake_via_duckdb(
-                catalog_root,
-                order,
+                tiles,
                 mapping,
                 output=output,
                 valid_sky_only=valid_sky_only,
@@ -317,8 +365,7 @@ def _duckdb_sky_predicate(
 
 
 def _stream_lake_via_duckdb(
-    catalog_root: Path,
-    norder: int,
+    tile_paths: Sequence[Path],
     mapping: Sequence[tuple[str, str]],
     *,
     output: Path,
@@ -328,7 +375,6 @@ def _stream_lake_via_duckdb(
 ) -> ExtractResult:
     import duckdb
 
-    glob = str(catalog_root / f"Norder={norder}" / "**" / "*.parquet")
     col_sql = ", ".join(
         f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping
     )
@@ -336,20 +382,23 @@ def _stream_lake_via_duckdb(
     if valid_sky_only:
         where = f" WHERE {_duckdb_sky_predicate(mapping, ra_col=ra_col, dec_col=dec_col)}"
 
-    output = Path(output)
+    output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         output.unlink()
 
+    files = [str(Path(p).resolve()) for p in tile_paths]
     con = duckdb.connect(database=":memory:")
     try:
-        sql = (
-            f"COPY (SELECT {col_sql} FROM read_parquet(?, hive_partitioning=false)"
-            f"{where}) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)"
+        # Explicit file list avoids hive_partitioning on Norder=/Dir= paths and
+        # dodges COPY placeholder ordering quirks with read vs write targets.
+        con.execute(
+            f"COPY (SELECT {col_sql} FROM read_parquet($files, hive_partitioning=false)"
+            f"{where}) TO $out (FORMAT PARQUET, COMPRESSION ZSTD)",
+            {"files": files, "out": str(output)},
         )
-        con.execute(sql, [glob, str(output)])
         n_rows = int(
-            con.execute("SELECT count(*) FROM read_parquet(?)", [str(output)]).fetchone()[0]
+            con.execute("SELECT count(*) FROM read_parquet($out)", {"out": str(output)}).fetchone()[0]
         )
     finally:
         con.close()
@@ -378,6 +427,7 @@ def _stream_lake_tile_by_tile(
     show_progress: bool,
 ) -> ExtractResult:
     writer: pq.ParquetWriter | None = None
+    writer_schema: pa.Schema | None = None
     n_rows = 0
     n_written_tiles = 0
 
@@ -396,7 +446,9 @@ def _stream_lake_tile_by_tile(
 
     try:
         for tile_path in iterator:
-            raw = pq.read_table(str(tile_path), columns=list(src_cols))
+            raw = _canonicalize_column_types(
+                _read_catalog_tile(tile_path, src_cols)
+            )
             chunk = _process_tile_chunk(
                 raw,
                 mapping,
@@ -416,12 +468,15 @@ def _stream_lake_tile_by_tile(
                 assert output is not None
                 if writer is None:
                     output.parent.mkdir(parents=True, exist_ok=True)
+                    writer_schema = chunk.schema
                     writer = pq.ParquetWriter(
                         str(output),
-                        chunk.schema,
+                        writer_schema,
                         compression="zstd",
                         compression_level=_ZSTD_LEVEL,
                     )
+                elif writer_schema is not None and not chunk.schema.equals(writer_schema):
+                    chunk = _align_table_to_schema(chunk, writer_schema)
                 writer.write_table(chunk)
 
             n_rows += chunk.num_rows
@@ -724,6 +779,13 @@ def extract_catalog(
             raise ValueError("--survey is required with --lake-root")
         if paths:
             raise ValueError("pass catalog paths or --lake-root/--survey, not both")
+        if output is not None:
+            fmt = infer_output_format(Path(output), output_format)
+            if fmt != "parquet":
+                raise ValueError(
+                    "Lake export writes Parquet only. Use a .parquet path (or convert "
+                    "offline), or export from the original FITS/CSV catalog file."
+                )
         result = stream_extract_from_lake_catalog(
             lake_root,
             survey,
@@ -737,12 +799,6 @@ def extract_catalog(
             engine=engine,
             show_progress=show_progress,
         )
-        if output is not None and output_format not in (None, "parquet"):
-            fmt = infer_output_format(Path(output), output_format)
-            if fmt != "parquet":
-                raise ValueError(
-                    "Lake streaming export writes Parquet; convert offline or use raw file input."
-                )
         return result
 
     if not paths:
