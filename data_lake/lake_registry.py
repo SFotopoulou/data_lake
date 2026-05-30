@@ -108,7 +108,11 @@ def _iter_zarr_tiles(survey_root: Path) -> Iterator[Path]:
 
 def _zarr_tile_n_sources(tile_path: Path) -> int | None:
     """Row count for one spectrum/cutout tile (reads ``source_id`` array metadata only)."""
-    meta_path = tile_path / "source_id" / "zarr.json"
+    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN
+
+    meta_path = tile_path / LAKE_JOIN_ID_COLUMN / "zarr.json"
+    if not meta_path.is_file():
+        meta_path = tile_path / LEGACY_JOIN_ID_COLUMN / "zarr.json"
     if meta_path.is_file():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -125,7 +129,9 @@ def _zarr_tile_n_sources(tile_path: Path) -> int | None:
             mode="r",
             zarr_format=3,
         )
-        return int(root["source_id"].shape[0])
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        return int(zarr_join_array(root).shape[0])
     except Exception:
         log.debug("Could not count sources in Zarr tile %s", tile_path, exc_info=True)
         return None

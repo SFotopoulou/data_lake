@@ -280,7 +280,9 @@ class SpectrumTileStore:
 
     def get_source_ids(self) -> np.ndarray:
         root = self._open()
-        return np.array(root["source_id"])
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        return np.array(zarr_join_array(root))
 
     def build_index(self) -> dict[int, int]:
         """Return {source_id: local_index} mapping."""
@@ -933,8 +935,10 @@ class SpectrumAccessor:
         out_root.create_array(
             "wavelength", shape=(n_pix,), chunks=(n_pix,), dtype=np.float64, fill_value=0.0,
         )
-        out_root.create_array(
-            "source_id",
+        from data_lake.ingest.zarr_ids import create_zarr_join_array
+
+        create_zarr_join_array(
+            out_root,
             shape=(n_written,),
             chunks=(min(4096, n_written),),
             dtype=np.int64,
@@ -974,7 +978,9 @@ class SpectrumAccessor:
             out_root["flux"][slc, :] = flux_batch
             out_root["ivar"][slc, :] = ivar_batch
             out_root["mask"][slc, :] = mask_batch
-            out_root["source_id"][slc] = sorted_sids
+            from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
+            out_root[LAKE_JOIN_ID_COLUMN][slc] = sorted_sids
             out_root["redshift"][slc] = z_batch
 
             for j, sid in enumerate(sorted_sids.tolist()):
@@ -1151,7 +1157,11 @@ class SpectrumAccessor:
             mask_ds = f.create_dataset(
                 "mask", shape=(n_written, n_pix), dtype=plan.mask_dtype, **dset_kw,
             )
-            sid_ds = f.create_dataset("source_id", shape=(n_written,), dtype=np.int64)
+            from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
+            sid_ds = f.create_dataset(
+                LAKE_JOIN_ID_COLUMN, shape=(n_written,), dtype=np.int64,
+            )
             z_ds = f.create_dataset("redshift", shape=(n_written,), dtype=np.float32)
 
             write_offset = 0

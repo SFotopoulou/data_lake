@@ -31,7 +31,11 @@ from data_lake.ingest.fits_to_spectra_zarr import (
     _open_or_create_spectrum_tile,
     _write_spectrum_info,
 )
-from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+from data_lake.ingest.fits_to_parquet import (
+    LAKE_JOIN_ID_COLUMN,
+    assign_healpix,
+    healpix_dir,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +120,9 @@ def _ingest_synthetic_lake(lake_root: Path) -> dict[int, int]:
         root["flux"].append(np.stack([r.flux for r in recs]))
         root["ivar"].append(np.stack([r.ivar for r in recs]))
         root["mask"].append(np.stack([r.mask for r in recs]))
-        root["source_id"].append(np.array([r.source_id for r in recs], dtype=np.int64))
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        zarr_join_array(root).append(np.array([r.source_id for r in recs], dtype=np.int64))
 
         meta_buf = np.frombuffer(
             b"".join(_meta_to_bytes(r.meta) for r in recs),
@@ -184,7 +190,7 @@ class TestExtractSubsetToZarr:
         flux = np.asarray(out_root["flux"][:])
         ivar = np.asarray(out_root["ivar"][:])
         mask = np.asarray(out_root["mask"][:])
-        sids = np.asarray(out_root["source_id"][:])
+        sids = np.asarray(out_root[LAKE_JOIN_ID_COLUMN][:])
         z    = np.asarray(out_root["redshift"][:])
         wave = np.asarray(out_root["wavelength"][:])
 
@@ -334,7 +340,7 @@ class TestExtractSubsetToZarr:
             assert f.attrs["source_survey"] == SURVEY
             assert f.attrs["wavelength_mode"] == "shared"
             assert f["flux"].shape == (3, N_PIX)
-            sids = np.asarray(f["source_id"][:])
+            sids = np.asarray(f[LAKE_JOIN_ID_COLUMN][:])
             flux0 = np.asarray(f["flux"][0, :])
             assert int(sids[0]) == 101
             assert np.all(flux0 == 101)
@@ -365,7 +371,6 @@ class TestExtractSubsetToZarr:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
         from data_lake.io.catalog import CatalogAccessor
         from data_lake.io.spectra import SpectrumAccessor
 
@@ -383,6 +388,7 @@ class TestExtractSubsetToZarr:
             pq.write_table(
                 pa.table({
                     "TARGETID": pa.array(sids, type=pa.int64()),
+                    LAKE_JOIN_ID_COLUMN: pa.array(sids, type=pa.int64()),
                     "Z": pa.array(zs, type=pa.float64()),
                     f"_healpix_norder{NORDER}": pa.array([npix] * len(sids), type=pa.int64()),
                     "_spectrum_index": pa.array(range(len(sids)), type=pa.int64()),
@@ -390,7 +396,12 @@ class TestExtractSubsetToZarr:
                 tile_dir / f"Npix={npix}.parquet",
             )
         (cat_root / "catalog_info.json").write_text(
-            '{"hats_order": 5, "source_id_mode": "native", "source_id_column": "TARGETID"}'
+            json.dumps({
+                "hats_order": 5,
+                "source_id_mode": "column:TARGETID",
+                "source_id_column": LAKE_JOIN_ID_COLUMN,
+                "native_id_column": "TARGETID",
+            })
         )
 
         cat = CatalogAccessor(synthetic_lake, SURVEY)

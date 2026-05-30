@@ -249,7 +249,8 @@ def _count_spectra_in_archive(arc: Path, norder: int, npix: int) -> int | None:
             for member in t.getmembers():
                 # Look for a source_id zarr.json inside any spectra sub-tree
                 if (zarr_prefix in member.name
-                        and "source_id/zarr.json" in member.name):
+                        and ("_source_id/zarr.json" in member.name
+                             or "source_id/zarr.json" in member.name)):
                     fh = t.extractfile(member)
                     if fh:
                         sid_array_meta = _json.load(fh)

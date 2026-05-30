@@ -33,7 +33,7 @@ On-disk layout per tile
       wavelength/   (N_pix,)                        float64  shared mode  (default)
                     (N_sources, N_pix)               float32  per-source mode
       resolution/   (N_sources, n_diag, N_pix)      float32  sharded  [opt-in, DESI only]
-      source_id/    (N_sources,)                    int64
+      _source_id/   (N_sources,)                    int64
       meta/         (N_sources,)                    void (structured: z, z_err, snr, exptime, R, instr)
   spectrum_info.json
 
@@ -90,12 +90,14 @@ import zarr.codecs
 from astropy.io import fits
 
 from data_lake.ingest.fits_to_parquet import (
+    LAKE_JOIN_ID_COLUMN,
     assign_healpix,
     healpix_dir,
     is_valid_sky_position,
     object_id_from_fits_header,
     sky_from_fits_header,
 )
+from data_lake.ingest.zarr_ids import create_zarr_join_array, zarr_join_array
 
 log = logging.getLogger(__name__)
 
@@ -269,7 +271,7 @@ def _open_or_create_spectrum_tile(
     else:
         _sharded_array("wavelength", np.float32, fill=0.0)
 
-    root.create_array("source_id", shape=(0,), chunks=(4096,), dtype=np.int64, fill_value=-1)
+    create_zarr_join_array(root, shape=(0,), chunks=(4096,), dtype=np.int64, fill_value=-1)
     root.create_array(
         "meta",
         shape=(0,),
@@ -322,7 +324,7 @@ def widen_spectrum_tile(
     - ``wavelength`` (per_source) → pad rows with ``0.0``
     - ``wavelength`` (shared)     → extend 1-D vector with ``0.0``
     - ``resolution`` (if present) → pad pixel axis with ``0.0``
-    - ``source_id``, ``meta``     → copied unchanged
+    - ``_source_id``, ``meta``    → copied unchanged
     """
     tmp_path = tile_path.parent / (tile_path.name + ".__widening__")
     backup_path = tile_path.parent / (tile_path.name + ".__widening_backup__")
@@ -379,7 +381,9 @@ def widen_spectrum_tile(
         new_root["wavelength"][:] = new_wave
 
     if n_rows > 0:
-        new_root["source_id"].append(np.asarray(old_root["source_id"][:]))
+        new_root[LAKE_JOIN_ID_COLUMN].append(
+            np.asarray(zarr_join_array(old_root)[:])
+        )
         new_root["meta"].append(np.asarray(old_root["meta"][:]))
 
     if "resolution" in old_root and n_rows > 0:
@@ -1994,12 +1998,12 @@ def _detect_format_from_path(path: Path) -> str:
             return "vipers"
         if _is_vuds_hdul(hdul, path):
             return "vuds"
+        if _is_vandels_hdul(hdul, path):
+            return "vandels"
         if _is_vvds_hdul(hdul, path):
             return "vvds"
         if _is_zcosmos_hdul(hdul, path):
             return "zcosmos"
-        if _is_vandels_hdul(hdul, path):
-            return "vandels"
         if _is_ozdes_hdul(hdul, path):
             return "ozdes"
         if stem.startswith("wig") and _is_wig_spectrum_layout(hdul):
@@ -2337,10 +2341,10 @@ def ingest_spectra_from_fits(
                 root.attrs.get("wavelength_mode", wavelength_mode_effective)
             )
 
-        n_existing = int(root["source_id"].shape[0])
+        n_existing = int(zarr_join_array(root).shape[0])
         existing: set[int] = set()
         if n_existing > 0:
-            existing = set(np.asarray(root["source_id"][:]).tolist())
+            existing = set(np.asarray(zarr_join_array(root)[:]).tolist())
 
         tile_records = _filter_spectrum_tile_duplicates(
             tile_records, existing, on_duplicate_source_id,
@@ -2393,7 +2397,7 @@ def ingest_spectra_from_fits(
         root["flux"].append(batch_flux)
         root["ivar"].append(batch_ivar)
         root["mask"].append(batch_mask)
-        root["source_id"].append(batch_ids)
+        zarr_join_array(root).append(batch_ids)
         root["meta"].append(batch_meta)
 
         if tile_wavelength_mode == "per_source":

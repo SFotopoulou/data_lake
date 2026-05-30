@@ -129,7 +129,9 @@ class TileStore:
 
     def get_source_ids(self) -> np.ndarray:
         root = self._open()
-        return np.array(root["source_id"])
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        return np.array(zarr_join_array(root))
 
     def build_index(self) -> dict[int, int]:
         """Build source_id → local index mapping for this tile."""

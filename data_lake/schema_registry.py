@@ -306,8 +306,10 @@ def build_spectra_schema_manifest(spectra_root: Path | str, survey_name: str) ->
 
     n_pix = int(info["n_pix"])
     wl_mode = info.get("wavelength_mode", "shared")
+    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
     columns: list[dict[str, Any]] = [
-        {"name": "source_id", "dtype": "int64", "nullable": False, "role": ROLE_ID},
+        {"name": LAKE_JOIN_ID_COLUMN, "dtype": "int64", "nullable": False, "role": ROLE_ID},
         {"name": "flux", "dtype": f"float32[{n_pix}]", "nullable": True, "role": ROLE_FLUX},
         {"name": "ivar", "dtype": f"float32[{n_pix}]", "nullable": True, "role": ROLE_IVAR},
         {"name": "mask", "dtype": f"uint8[{n_pix}]", "nullable": True, "role": ROLE_MASK},
@@ -355,7 +357,7 @@ def build_spectra_schema_manifest(spectra_root: Path | str, survey_name: str) ->
         "survey": survey_name,
         "modality": MODALITY_SPECTRA,
         "hats_order": info.get("hats_order"),
-        "source_id_column": "source_id",
+        "source_id_column": LAKE_JOIN_ID_COLUMN,
         "ra_column": None,
         "dec_column": None,
         "redshift_column": None,
@@ -389,8 +391,10 @@ def build_cutout_schema_manifest(cutout_root: Path | str, survey_name: str) -> d
     n_b = int(info["n_bands"])
     h, w = int(info["height"]), int(info["width"])
     band_names = list(info.get("band_names", []))
+    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
     columns: list[dict[str, Any]] = [
-        {"name": "source_id", "dtype": "int64", "nullable": False, "role": ROLE_ID},
+        {"name": LAKE_JOIN_ID_COLUMN, "dtype": "int64", "nullable": False, "role": ROLE_ID},
         {
             "name": "images",
             "dtype": f"{info.get('dtype', 'float32')}[{n_b},{h},{w}]",
@@ -413,7 +417,7 @@ def build_cutout_schema_manifest(cutout_root: Path | str, survey_name: str) -> d
         "survey": survey_name,
         "modality": MODALITY_CUTOUT,
         "hats_order": info.get("hats_order"),
-        "source_id_column": "source_id",
+        "source_id_column": LAKE_JOIN_ID_COLUMN,
         "ra_column": None,
         "dec_column": None,
         "redshift_column": None,

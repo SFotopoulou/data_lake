@@ -160,7 +160,9 @@ class TestParallelIngestBasic:
             store=zarr.storage.LocalStore(str(tile_100_zarr_paths[0])),
             mode="r", zarr_format=3,
         )
-        sids_100 = np.asarray(root["source_id"][:])
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        sids_100 = np.asarray(zarr_join_array(root)[:])
         flux_100 = np.asarray(root["flux"][:])
         assert root["flux"].shape == (3, N_PIX)
         assert set(sids_100.tolist()) == {1001, 1002, 2001}
@@ -341,7 +343,9 @@ class TestInflightJournal:
         root["flux"].append(np.ones((5, N_PIX), dtype=np.float32))
         root["ivar"].append(np.ones((5, N_PIX), dtype=np.float32))
         root["mask"].append(np.zeros((5, N_PIX), dtype=np.uint8))
-        root["source_id"].append(np.arange(5, dtype=np.int64))
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        zarr_join_array(root).append(np.arange(5, dtype=np.int64))
         root["meta"].append(meta_arr)
         assert root["flux"].shape[0] == 5
 

@@ -5,12 +5,12 @@ Each HEALPix tile is stored as a separate Zarr group:
 
   <root>/cutouts/<survey>/Norder=<N>/Npix=<pix>.zarr/
       images/    shape=(N_sources, N_bands, H, W)  float32, sharded
-      source_id/ shape=(N_sources,)                 int64
+      _source_id/ shape=(N_sources,)                int64
       wcs/       shape=(N_sources,)                 structured array with WCS scalars
 
 After ingest, update the survey Parquet catalog with ``_cutout_index`` (tile-local
 row index) using :func:`data_lake.ingest.update_catalog_indices.update_index_column`.
-Fast random access uses that index together with the tile's ``source_id`` array;
+Fast random access uses that index together with the tile's ``_source_id`` array;
 there is **no** separate ``index.parquet`` sidecar on disk.
 """
 
@@ -29,6 +29,7 @@ import zarr.codecs
 from astropy.io import fits
 from astropy.wcs import WCS
 
+from data_lake.ingest.zarr_ids import create_zarr_join_array, zarr_join_array
 from data_lake.ingest.fits_to_parquet import (
     assign_healpix,
     healpix_dir,
@@ -152,7 +153,7 @@ def _open_or_create_tile_store(
         compressors=blosc,
         fill_value=np.nan,
     )
-    root.create_array("source_id", shape=(0,), chunks=(4096,), dtype=np.int64, fill_value=-1)
+    create_zarr_join_array(root, shape=(0,), chunks=(4096,), dtype=np.int64, fill_value=-1)
 
     # WCS stored as 1-D array of structured dtype; Zarr stores it as uint8 bytes
     root.create_array(
@@ -271,7 +272,7 @@ def ingest_cutouts_from_fits(
 
         root = _open_or_create_tile_store(tile_path, n_bands, h, w, dtype)
         images_arr = root["images"]
-        sid_arr = root["source_id"]
+        sid_arr = zarr_join_array(root)
         wcs_arr = root["wcs"]
 
         n_existing = int(sid_arr.shape[0])

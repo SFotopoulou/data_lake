@@ -19,7 +19,7 @@ from data_lake.ingest.checkpoint_sidecars import (
     validate_ingest_sidecars,
 )
 
-_ROW_ARRAYS = ("flux", "ivar", "mask", "source_id", "meta")
+_ROW_ARRAYS = ("flux", "ivar", "mask", "_source_id", "meta")
 
 
 @dataclass
@@ -143,8 +143,11 @@ def validate_tile(tile_path: Path, info: dict[str, Any], rep: ValidationReport) 
                 f"{tile_path}: resolution row count {res.shape[0]} != flux {n_row}"
             )
 
-    if n_row > 0 and "source_id" in root:
-        sids = root["source_id"][:]
+    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN
+    from data_lake.ingest.zarr_ids import zarr_join_array
+
+    if n_row > 0 and (LAKE_JOIN_ID_COLUMN in root or LEGACY_JOIN_ID_COLUMN in root):
+        sids = zarr_join_array(root)[:]
         if len(sids) != n_row:
             rep.errors.append(f"{tile_path}: source_id length mismatch")
         else:

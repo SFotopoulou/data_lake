@@ -140,7 +140,9 @@ class TestSdssVariableLengthIngest:
         tile_n_pix = root["flux"].shape[1]
         assert tile_n_pix >= 4627
 
-        ids = set(int(x) for x in root["source_id"][:])
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        ids = set(int(x) for x in zarr_join_array(root)[:])
         assert len(ids) == 2
 
         for sid in ids:

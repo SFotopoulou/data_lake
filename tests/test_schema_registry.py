@@ -94,7 +94,7 @@ def test_ingest_writes_schema_manifest(tmp_path: Path) -> None:
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text())
     assert manifest["survey"] == "manifest_test"
-    assert manifest["source_id_column"] == "TARGETID"
+    assert manifest["source_id_column"] == "_source_id"
     assert manifest["redshift_column"] == "Z"
     assert manifest["n_columns"] >= 7  # includes healpix + indices
     names = {c["name"] for c in manifest["columns"]}

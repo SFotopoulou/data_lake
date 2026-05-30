@@ -375,9 +375,11 @@ class TestIngestCatalogEndToEnd:
         assert pa.types.is_string(merged.schema.field("NAME").type) or pa.types.is_large_string(
             merged.schema.field("NAME").type
         )
-        assert merged.schema.field("source_id").type == pa.int64()
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
+        assert merged.schema.field(LAKE_JOIN_ID_COLUMN).type == pa.int64()
         name0 = str(merged.column("NAME")[0].as_py()).strip()
-        sid0 = int(merged.column("source_id")[0].as_py())
+        sid0 = int(merged.column(LAKE_JOIN_ID_COLUMN)[0].as_py())
         assert sid0 == stable_object_id_from_string(name0)
 
     def test_ingest_string_targetid_column(self, tmp_path: Path) -> None:
@@ -594,8 +596,10 @@ class TestStreamingIngest:
 
         merged = self._read_merged(lake_root, "noid")
         assert merged.num_rows == 4
-        assert "source_id" in merged.schema.names
-        assert set(np.asarray(merged.column("source_id")).tolist()) == {0, 1, 2, 3}
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
+        assert LAKE_JOIN_ID_COLUMN in merged.schema.names
+        assert set(np.asarray(merged.column(LAKE_JOIN_ID_COLUMN)).tolist()) == {0, 1, 2, 3}
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +698,7 @@ class TestNumericTypeNormalization:
             tile_dir = catalog_root / healpix_dir(norder, npix)
             tile_dir.mkdir(parents=True, exist_ok=True)
             tbl = pa.table({
-                "source_id": pa.array([npix], type=pa.int64()),
+                "_source_id": pa.array([npix], type=pa.int64()),
                 f"_healpix_norder{norder}": pa.array([npix], type=pa.int64()),
                 "flux": pa.array([1.0], type=flux_type),
             })
@@ -784,7 +788,7 @@ class TestTileMode:
 
     def test_reingest_same_file_append_skip_is_idempotent(self, tmp_path: Path) -> None:
         """Second ingest of the same catalog: append + skip duplicates → no change."""
-        from data_lake.ingest.fits_to_parquet import ingest_catalog
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, ingest_catalog
 
         tbl = _make_jname_id_table(n_rows=8)
         fits_path = tmp_path / "same.fits"
@@ -806,8 +810,8 @@ class TestTileMode:
         _, second = _read_merged_catalog(lake, "reingest")
         assert second.num_rows == first.num_rows
         np.testing.assert_array_equal(
-            np.sort(np.asarray(second.column("source_id"))),
-            np.sort(np.asarray(first.column("source_id"))),
+            np.sort(np.asarray(second.column(LAKE_JOIN_ID_COLUMN))),
+            np.sort(np.asarray(first.column(LAKE_JOIN_ID_COLUMN))),
         )
 
     def test_append_duplicate_id_last(self, tmp_path: Path):

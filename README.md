@@ -321,31 +321,36 @@ clustered footprints.
 
 #### Object identifiers (`--source-id-col`)
 
-The lake uses **int64** keys in Zarr ``source_id/`` arrays and for cross-modal
-joins. Catalog ingest normalizes the column you pass with ``--source-id-col``
-according to its contents (recorded in ``catalog_info.json`` as ``source_id_mode``):
+The lake uses a single internal join column ``_source_id`` (int64) in Parquet
+catalogs and Zarr ``_source_id/`` arrays. Survey-native columns (e.g. ultraVISTA
+``SOURCE_ID``, DESI ``TARGETID``) are kept unchanged. Anything starting with ``_``
+is lake-owned bookkeeping (like ``_healpix_norder*``, ``_cutout_index``,
+``_spectrum_index``).
 
-| Input type | Example | Parquet result | ``source_id_mode`` |
-|------------|---------|----------------|---------------------|
-| Integer column | DESI ``TARGETID`` | Same column cast to ``int64`` | ``column:TARGETID`` |
-| Unsigned / uint64 column | SDSS ``objid`` (> ``2**63-1``) | Bit pattern in ``int64`` (same as CAS) | ``column:objid`` |
-| Decimal string column | ``"39627658462934656"`` in FITS ASCII | Parsed to ``int64`` in place | ``column:TARGETID`` |
+Catalog ingest records ``source_id_mode`` in ``catalog_info.json``; the join
+column is always ``source_id_column: "_source_id"``. When you pass
+``--source-id-col``, that native column is also stored as ``native_id_column``.
+
+| Input type | Example | Parquet columns | ``source_id_mode`` |
+|------------|---------|-----------------|---------------------|
+| Integer column | DESI ``TARGETID`` | ``TARGETID`` (int64) + ``_source_id`` (same values) | ``column:TARGETID`` |
+| Unsigned / uint64 column | SDSS ``objid`` (> ``2**63-1``) | Native cast + ``_source_id`` | ``column:objid`` |
+| Decimal string column | ``"39627658462934656"`` in FITS ASCII | Parsed native + ``_source_id`` | ``column:TARGETID`` |
 | Vector ID column | SDSS ``OBJID`` shape ``(5,)`` | **Error** — use scalar ``objid`` | — |
-| Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | Label column kept as string; new ``source_id`` = stable hash | ``label:NAME`` |
-| (none) | — | Auto ``source_id`` 0…N−1 | ``sequential`` |
+| Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | ``NAME`` kept; ``_source_id`` = stable hash | ``label:NAME`` |
+| (none) | — | ``_source_id`` 0…N−1 only | ``sequential`` |
 
 **Whitespace:** leading and trailing spaces are stripped before parsing or
 hashing (common for fixed-width FITS strings). Internal spaces are preserved.
 
 **Alphanumeric labels:** the human-readable name stays in your column (e.g.
-``NAME``). A separate ``source_id`` column is added so spectra/cutouts can
-join on int64. The hash is deterministic (BLAKE2b → 64-bit signed int).
+``NAME``). ``_source_id`` holds the deterministic hash (BLAKE2b → 64-bit signed int).
 
 ```python
-from data_lake.ingest.fits_to_parquet import normalize_object_id
+from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, normalize_object_id
 
 label = "J000000.00-314627.5"
-sid = normalize_object_id(label)   # same int64 as catalog source_id / Zarr row
+sid = normalize_object_id(label)   # same int64 as catalog _source_id / Zarr row
 acc.get_spectrum(sid)
 ```
 
@@ -354,12 +359,21 @@ Use the **same** spelling (after strip) in cutout/spectrum FITS headers via
 ``--source-id-col NAME`` so ingest hashes match the catalog.
 
 If no ``--source-id-col`` is given, ingest tries common column names
-(``TARGETID``, ``SOURCE_ID``, …) or generates sequential IDs.
+(``TARGETID``, ``SOURCE_ID``, …) or generates sequential ``_source_id`` values.
+
+**Upgrading existing lakes** (tiles still have legacy ``source_id``):
+
+```bash
+dl-repair-catalog-metadata /lake --survey MY_SURVEY --check-only
+dl-repair-catalog-metadata /lake --survey MY_SURVEY --migrate-join-column
+# spectra/cutouts Zarr tiles:
+dl-repair-catalog-metadata /lake --survey MY_SURVEY --migrate-join-column --spectra --cutouts
+```
 
 ### Ingest cutouts
 
 Cutouts are stored as **Zarr v3** stacks (one group per HEALPix tile). Each ingested
-FITS contributes one or more rows in the tile's ``source_id/``, ``images/``, and
+FITS contributes one or more rows in the tile's ``_source_id/``, ``images/``, and
 ``wcs/`` arrays. With default ``--update-catalog``, matching Parquet rows get
 ``_cutout_index`` set to that row offset.
 
@@ -982,7 +996,7 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
 | `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
 | `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
-| `dl-repair-catalog-metadata` | — | — | Same as finalize; fixes ``source_id_column`` / ``source_id_mode`` from tiles (``--survey`` or ``--all``) |
+| `dl-repair-catalog-metadata` | — | — | Repair ``catalog_info.json``; ``--check-only``; ``--migrate-join-column`` renames legacy ``source_id`` → ``_source_id`` (``--spectra`` / ``--cutouts`` for Zarr) |
 | `dl-ingest-cutouts` | `--on-duplicate` | `skip`, `error`, `append` | Default **`skip`**; per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
@@ -1183,7 +1197,7 @@ qso_subset.zarr/
   ivar/        (N_written, N_pix) float32 sharded
   mask/        (N_written, N_pix) uint8   sharded
   wavelength/  (N_pix,)           float64 shared grid
-  source_id/   (N_written,)       int64
+  _source_id/  (N_written,)       int64
   redshift/    (N_written,)       float32  (from catalog ``Z`` when catalog is used)
 ```
 
@@ -1191,7 +1205,7 @@ Rows are written in HEALPix-tile-traversal order for fast contiguous
 writes; the returned `id_to_row` mapping lets you reorder if needed.
 Lookup uses the catalog's `_spectrum_index` column when available
 (O(catalog SQL) batched), otherwise falls back to a vectorised tile
-scan (one `source_id` array read per tile + `np.isin`).
+scan (one `_source_id` array read per tile + `np.isin`).
 
 **Redshift provenance** (Zarr `redshift/`, Parquet `redshift`, FITS `Z`):
 when a Parquet catalog is attached (`catalog_accessor` / CLI
@@ -1289,7 +1303,7 @@ examples/
     <survey>/
       Norder=5/Dir=0/Npix=0.zarr/   ← one Zarr group per tile
         images/   (N, B, H, W) float32, sharded
-        source_id/ (N,) int64
+        _source_id/ (N,) int64
         wcs/      (N,) structured bytes
       cutout_info.json
   spectra/
@@ -1299,13 +1313,14 @@ examples/
         ivar/       (N, N_pix) float32, sharded
         mask/       (N, N_pix) uint8,   sharded
         wavelength/ (N_pix,)   float64  (shared) or (N, N_pix) float32 (per-source)
-        source_id/  (N,) int64
+        _source_id/  (N,) int64
         meta/       (N,) structured bytes (z, z_err, snr, exptime, R, instr)
       spectrum_info.json
 ```
 
 Each catalog row carries:
-- `source_id` — stable int64 for Zarr joins (native integer ID, or hash of a label column when ``source_id_mode`` is ``label:…``)
+- `_source_id` — stable int64 join key for Zarr/cross-match (sequential 0…N−1, copy of native int ID, or hash of a label column)
+- native survey ID columns (e.g. `TARGETID`, `SOURCE_ID`) when ``source_id_mode`` is ``column:…`` or ``label:…``
 - `_healpix_norder5` — HEALPix tile pixel (partitioning key)
 - `_cutout_index` — position inside the tile's Zarr cutout array (O(1) lookup)
 - `_spectrum_index` — position inside the tile's Zarr spectrum array (O(1) lookup; -1 = not ingested)
@@ -1315,7 +1330,7 @@ Each catalog row carries:
 The library does **not** emit one automatic “master file” that lists every survey
 and object in the lake. **Discovery** is by convention: each modality keeps its
 own metadata (`catalog_info.json`, `cutout_info.json`, `spectrum_info.json`,
-Parquet `_metadata`, Zarr `source_id` arrays, and optional ingest checkpoints).
+Parquet `_metadata`, Zarr `_source_id` arrays, and optional ingest checkpoints).
 For **multi-survey science** you maintain a separate **association table**
 (usually columnar Parquet or CSV) that records how identifiers line up and,
 when needed, how to open the right Zarr row.

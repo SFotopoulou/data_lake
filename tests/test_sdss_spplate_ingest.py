@@ -334,7 +334,9 @@ def _make_tile(tile_path, records, n_pix, *, wavelength_mode, n_diag=None):
     root["flux"].append(flux)
     root["ivar"].append(ivar)
     root["mask"].append(mask)
-    root["source_id"].append(ids)
+    from data_lake.ingest.zarr_ids import zarr_join_array
+
+    zarr_join_array(root).append(ids)
     root["meta"].append(meta)
 
     if wavelength_mode == "per_source":
@@ -375,7 +377,9 @@ class TestWidenSpectrumTile:
         assert root["ivar"].shape == (3, n_new)
         assert root["mask"].shape == (3, n_new)
         assert root["wavelength"].shape == (3, n_new)
-        assert root["source_id"].shape == (3,)
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        assert zarr_join_array(root).shape == (3,)
 
         flux_arr = np.asarray(root["flux"][:])
         # Original values preserved in the first n_old columns

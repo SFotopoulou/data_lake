@@ -38,7 +38,12 @@ def _write_mini_catalog(
     source_id_mode: str | None = None,
 ) -> None:
     """Write a minimal HEALPix-partitioned Parquet catalog for testing."""
-    from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir, _ZSTD_LEVEL
+    from data_lake.ingest.fits_to_parquet import (
+        LAKE_JOIN_ID_COLUMN,
+        assign_healpix,
+        healpix_dir,
+        _ZSTD_LEVEL,
+    )
 
     ids_arr = np.array(ids, dtype=np.int64)
     ra_arr = np.array(ra, dtype=np.float64)
@@ -46,14 +51,17 @@ def _write_mini_catalog(
     pix_arr = assign_healpix(ra_arr, dec_arr, norder)
     hp_col = f"_healpix_norder{norder}"
 
-    table = pa.table({
-        id_col: pa.array(ids_arr, type=pa.int64()),
+    cols: dict = {
+        LAKE_JOIN_ID_COLUMN: pa.array(ids_arr, type=pa.int64()),
         "ra": pa.array(ra_arr, type=pa.float64()),
         "dec": pa.array(dec_arr, type=pa.float64()),
         hp_col: pa.array(pix_arr, type=pa.int64()),
         "_cutout_index": pa.array(np.full(len(ids), -1, dtype=np.int64), type=pa.int64()),
         "_spectrum_index": pa.array(np.full(len(ids), -1, dtype=np.int64), type=pa.int64()),
-    })
+    }
+    if id_col != LAKE_JOIN_ID_COLUMN:
+        cols[id_col] = pa.array(ids_arr, type=pa.int64())
+    table = pa.table(cols)
 
     survey_dir = catalog_root / "catalogs" / survey_name
     unique_pixels = np.unique(pix_arr)
@@ -70,16 +78,20 @@ def _write_mini_catalog(
         )
 
     sid_mode = source_id_mode or (
-        f"column:{id_col}" if id_col != "source_id" else "sequential"
+        f"column:{id_col}" if id_col != LAKE_JOIN_ID_COLUMN else "sequential"
     )
+    info = {
+        "catalog_name": survey_name,
+        "hats_order": norder,
+        "ra_column": "ra",
+        "dec_column": "dec",
+        "source_id_mode": sid_mode,
+        "source_id_column": LAKE_JOIN_ID_COLUMN,
+    }
+    if id_col != LAKE_JOIN_ID_COLUMN:
+        info["native_id_column"] = id_col
     with open(survey_dir / "catalog_info.json", "w") as fh:
-        json.dump({
-            "catalog_name": survey_name,
-            "hats_order": norder,
-            "ra_column": "ra",
-            "dec_column": "dec",
-            "source_id_mode": sid_mode,
-        }, fh)
+        json.dump(info, fh)
 
 
 def _write_mini_spectra_zarr(
@@ -93,6 +105,7 @@ def _write_mini_spectra_zarr(
     """Write synthetic Zarr spectrum tiles and return the expected index_map."""
     import zarr
     from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+    from data_lake.ingest.zarr_ids import create_zarr_join_array, zarr_join_array
 
     ids_arr = np.array(ids, dtype=np.int64)
     ra_arr = np.array(ra, dtype=np.float64)
@@ -111,8 +124,8 @@ def _write_mini_spectra_zarr(
         tile_path = tile_dir / f"Npix={int(npix)}.zarr"
         store = zarr.storage.LocalStore(str(tile_path))
         root = zarr.open_group(store=store, mode="w", zarr_format=3)
-        root.create_array("source_id", shape=(0,), chunks=(4096,), dtype=np.int64, fill_value=-1)
-        root["source_id"].append(np.array(tile_ids, dtype=np.int64))
+        create_zarr_join_array(root, shape=(0,), chunks=(4096,), dtype=np.int64, fill_value=-1)
+        zarr_join_array(root).append(np.array(tile_ids, dtype=np.int64))
         for local_i, sid in enumerate(tile_ids):
             index_map[sid] = local_i
 
@@ -176,58 +189,66 @@ class TestNormalizeObjectId:
 
 class TestResolveSourceIdColumn:
     def test_targetid_catalog(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
 
-        info = {"source_id_mode": "column:TARGETID"}
+        info = {"source_id_mode": "column:TARGETID", "source_id_column": LAKE_JOIN_ID_COLUMN}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        assert resolve_source_id_column(tmp_path) == "TARGETID"
+        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_sequential_catalog(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
 
-        info = {"source_id_mode": "sequential"}
+        info = {"source_id_mode": "sequential", "source_id_column": LAKE_JOIN_ID_COLUMN}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        assert resolve_source_id_column(tmp_path) == "source_id"
+        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_missing_info_file_defaults_to_source_id(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
 
-        assert resolve_source_id_column(tmp_path) == "source_id"
+        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_arbitrary_column_name(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
 
-        info = {"source_id_mode": "column:OBJ_ID"}
+        info = {
+            "source_id_mode": "column:OBJ_ID",
+            "source_id_column": LAKE_JOIN_ID_COLUMN,
+            "native_id_column": "OBJ_ID",
+        }
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        assert resolve_source_id_column(tmp_path) == "OBJ_ID"
+        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_schema_fallback_targetid_when_info_says_sequential(self, tmp_path: Path) -> None:
-        """DESI catalogs often have TARGETID in Parquet but sequential in catalog_info."""
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        """Tiles with TARGETID + _source_id resolve to the lake join column."""
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
 
         info = {"source_id_mode": "sequential"}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        schema_names = ["TARGETID", "ra", "dec", "_healpix_norder5", "_spectrum_index"]
-        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == "TARGETID"
+        schema_names = [
+            "TARGETID", LAKE_JOIN_ID_COLUMN, "ra", "dec",
+            "_healpix_norder5", "_spectrum_index",
+        ]
+        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
 
     def test_schema_fallback_id_when_info_says_sequential(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
 
         info = {"source_id_mode": "sequential", "source_id_column": "source_id"}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        schema_names = ["id", "ALPHA_J2000", "DELTA_J2000", "_healpix_norder5"]
-        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == "id"
+        schema_names = ["id", LAKE_JOIN_ID_COLUMN, "ALPHA_J2000", "DELTA_J2000", "_healpix_norder5"]
+        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
 
     def test_recorded_source_id_column_in_info(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
 
         info = {
             "source_id_mode": "column:id",
-            "source_id_column": "id",
+            "source_id_column": LAKE_JOIN_ID_COLUMN,
+            "native_id_column": "id",
         }
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        schema_names = ["id", "ra", "dec"]
-        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == "id"
+        schema_names = ["id", LAKE_JOIN_ID_COLUMN, "ra", "dec"]
+        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
 
 
 # ---------------------------------------------------------------------------

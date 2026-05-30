@@ -318,7 +318,9 @@ class TestIngest2df:
         tiles = list((lake / "spectra" / "2DFG_DR3").rglob("*.zarr"))
         assert len(tiles) == 1
         root = zarr.open_group(str(tiles[0]), mode="r")
-        assert root["source_id"].shape[0] == 1
+        from data_lake.ingest.zarr_ids import zarr_join_array
+
+        assert zarr_join_array(root).shape[0] == 1
 
     def test_spectrum_index_updated_in_catalog(self, tmp_path: Path) -> None:
         """After ingest, _spectrum_index must be patched in the Parquet catalog."""

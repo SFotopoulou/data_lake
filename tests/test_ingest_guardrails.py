@@ -8,6 +8,7 @@ import click
 import pytest
 
 from data_lake.cli_utils import (
+    INGEST_TOKEN_ENV,
     hash_ingest_token,
     require_ingest_permission,
     write_ingest_token_hash,
@@ -55,8 +56,9 @@ root = "{(dep / 'data').as_posix()}"
         require_ingest_permission(cfg, "secret")
 
 
-def test_ingest_requires_token(tmp_path: Path) -> None:
+def test_ingest_requires_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(tmp_path)
+    monkeypatch.delenv(INGEST_TOKEN_ENV, raising=False)
     with pytest.raises(click.ClickException, match="requires an ingest token"):
         require_ingest_permission(cfg, None)
 

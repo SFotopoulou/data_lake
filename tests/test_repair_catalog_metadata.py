@@ -50,14 +50,19 @@ class TestRepairCatalogMetadata:
         _write_id_only_tile(lake, "SURVEY_X", norder=5, npix=42, ids=[1, 2, 3])
 
         catalog_root = lake / "catalogs" / "SURVEY_X"
-        res = repair_catalog_metadata(catalog_root, "SURVEY_X")
+        res = repair_catalog_metadata(
+            catalog_root, "SURVEY_X", migrate_join_column=True,
+        )
         assert res.ok
-        assert res.source_id_column_after == "id"
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+
+        assert res.source_id_column_after == LAKE_JOIN_ID_COLUMN
         assert res.source_id_mode_after == "column:id"
 
         info = json.loads((catalog_root / "catalog_info.json").read_text())
-        assert info["source_id_column"] == "id"
+        assert info["source_id_column"] == LAKE_JOIN_ID_COLUMN
         assert info["source_id_mode"] == "column:id"
+        assert info.get("native_id_column") == "id"
         assert (catalog_root / "_metadata").is_file()
         assert (catalog_root / "schema_manifest.json").is_file()
 

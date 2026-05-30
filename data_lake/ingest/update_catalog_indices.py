@@ -25,6 +25,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import (
+    LAKE_JOIN_ID_COLUMN,
+    LEGACY_JOIN_ID_COLUMN,
     _ZSTD_LEVEL,
     _regenerate_metadata_from_all_tiles,
     healpix_dir,
@@ -32,6 +34,7 @@ from data_lake.ingest.fits_to_parquet import (
     resolve_source_id_column,
     warn_if_id_column_unsafe,
 )
+from data_lake.ingest.zarr_ids import zarr_join_array
 
 log = logging.getLogger(__name__)
 
@@ -149,9 +152,9 @@ def update_index_column_from_zarr_tiles(
                 mode="r",
                 zarr_format=3,
             )
-            if "source_id" not in root:
+            if LAKE_JOIN_ID_COLUMN not in root and LEGACY_JOIN_ID_COLUMN not in root:
                 continue
-            sids = np.asarray(root["source_id"][:], dtype=np.int64)
+            sids = np.asarray(zarr_join_array(root)[:], dtype=np.int64)
             partial_map = {
                 normalize_object_id(int(sid)): int(i)
                 for i, sid in enumerate(sids.tolist())
@@ -179,7 +182,7 @@ def update_index_column_from_zarr_tiles(
         index_col, n_modified, survey_name, sid_col,
     )
     if n_modified > 0:
-        _regenerate_metadata(catalog_root)
+        _regenerate_metadata_from_all_tiles(catalog_root)
     return n_modified
 
 
@@ -319,9 +322,9 @@ def build_index_map_from_zarr(
                 mode="r",
                 zarr_format=3,
             )
-            if "source_id" not in root:
+            if LAKE_JOIN_ID_COLUMN not in root and LEGACY_JOIN_ID_COLUMN not in root:
                 continue
-            sids = root["source_id"][:]
+            sids = zarr_join_array(root)[:]
             for local_i, sid in enumerate(sids.tolist()):
                 index_map[normalize_object_id(sid)] = local_i
         except Exception as exc:

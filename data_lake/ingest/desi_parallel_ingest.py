@@ -257,11 +257,14 @@ def _close_spectrum_tile_group(root: Any) -> None:
 
 
 def _load_tile_source_id_set(root: Any) -> set[int]:
-    """Read ``source_id`` into a set once when a tile is opened for duplicate checks."""
-    n = int(root["source_id"].shape[0])
+    """Read ``_source_id`` into a set once when a tile is opened for duplicate checks."""
+    from data_lake.ingest.zarr_ids import zarr_join_array
+
+    sid = zarr_join_array(root)
+    n = int(sid.shape[0])
     if n == 0:
         return set()
-    return set(np.asarray(root["source_id"][:], dtype=np.int64).tolist())
+    return set(np.asarray(sid[:], dtype=np.int64).tolist())
 
 
 class _TileGroupCache:
@@ -397,7 +400,7 @@ def _load_checkpoint(path: Path | None) -> set[str]:
 
 
 # Row-aligned arrays in a spectrum tile (2-D source axis + wavelength metadata).
-_SPECTRUM_ROW_ALIGNED = ("flux", "ivar", "mask", "source_id", "meta")
+_SPECTRUM_ROW_ALIGNED = ("flux", "ivar", "mask", "_source_id", "meta")
 
 
 def _truncate_spectrum_tile_row_arrays(root: Any, n_rows: int) -> None:
@@ -820,7 +823,9 @@ def ingest_spectra_parallel(
             root["flux"].append(b.flux)
             root["ivar"].append(b.ivar)
             root["mask"].append(b.mask)
-            root["source_id"].append(b.source_ids)
+            from data_lake.ingest.zarr_ids import zarr_join_array
+
+            zarr_join_array(root).append(b.source_ids)
             meta_arr = np.frombuffer(
                 b.meta_bytes,
                 dtype="|V" + str(_META_DTYPE.itemsize),

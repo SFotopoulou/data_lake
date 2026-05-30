@@ -8,7 +8,11 @@ import pytest
 from click.testing import CliRunner
 
 from data_lake.admin.init_lake import dl_init, init_lake
-from data_lake.cli_utils import hash_ingest_token, require_ingest_permission
+from data_lake.cli_utils import (
+    INGEST_TOKEN_ENV,
+    hash_ingest_token,
+    require_ingest_permission,
+)
 from data_lake.config import LakeConfig
 
 _TEST_TOKEN = "test-ingest-token"
@@ -115,7 +119,11 @@ def test_cli_creates_deployment(tmp_path: Path) -> None:
 
 def test_cli_requires_ingest_token(tmp_path: Path) -> None:
     runner = CliRunner()
-    result = runner.invoke(dl_init, ["x", str(tmp_path)])
+    result = runner.invoke(
+        dl_init,
+        ["x", str(tmp_path)],
+        env={INGEST_TOKEN_ENV: ""},
+    )
     assert result.exit_code != 0
 
 

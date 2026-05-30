@@ -9,7 +9,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, assign_healpix, healpix_dir
 from data_lake.io.crossmatch import (
     CrossmatchAccessor,
     CrossmatchTileConfig,
@@ -39,32 +39,40 @@ def _write_catalog_tile(
     dec: list[float],
     ra_col: str = "ra",
     dec_col: str = "dec",
-    id_col: str = "source_id",
+    id_col: str = LAKE_JOIN_ID_COLUMN,
     source_id_mode: str | None = None,
 ) -> None:
     tile_dir = lake / "catalogs" / survey / healpix_dir(norder, npix)
     tile_dir.mkdir(parents=True, exist_ok=True)
     hp_col = f"_healpix_norder{norder}"
+    cols: dict = {
+        LAKE_JOIN_ID_COLUMN: pa.array(source_ids, type=pa.int64()),
+        ra_col: pa.array(ra, type=pa.float64()),
+        dec_col: pa.array(dec, type=pa.float64()),
+        hp_col: pa.array([npix] * len(source_ids), type=pa.int64()),
+        "_cutout_index": pa.array([-1] * len(source_ids), type=pa.int64()),
+        "_spectrum_index": pa.array([-1] * len(source_ids), type=pa.int64()),
+    }
+    if id_col != LAKE_JOIN_ID_COLUMN:
+        cols[id_col] = pa.array(source_ids, type=pa.int64())
     pq.write_table(
-        pa.table({
-            id_col: pa.array(source_ids, type=pa.int64()),
-            ra_col: pa.array(ra, type=pa.float64()),
-            dec_col: pa.array(dec, type=pa.float64()),
-            hp_col: pa.array([npix] * len(source_ids), type=pa.int64()),
-            "_cutout_index": pa.array([-1] * len(source_ids), type=pa.int64()),
-            "_spectrum_index": pa.array([-1] * len(source_ids), type=pa.int64()),
-        }),
+        pa.table(cols),
         tile_dir / f"Npix={npix}.parquet",
     )
-    mode = source_id_mode or (f"column:{id_col}" if id_col != "source_id" else "sequential")
+    mode = source_id_mode or (
+        f"column:{id_col}" if id_col != LAKE_JOIN_ID_COLUMN else "sequential"
+    )
     info = {
         "hats_order": norder,
         "ra_column": ra_col,
         "dec_column": dec_col,
         "source_id_mode": mode,
+        "source_id_column": LAKE_JOIN_ID_COLUMN,
         "total_rows": len(source_ids),
-        "total_columns": 6,
+        "total_columns": len(cols),
     }
+    if id_col != LAKE_JOIN_ID_COLUMN:
+        info["native_id_column"] = id_col
     (lake / "catalogs" / survey / "catalog_info.json").write_text(json.dumps(info))
 
 

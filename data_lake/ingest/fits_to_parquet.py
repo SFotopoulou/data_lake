@@ -42,6 +42,11 @@ log = logging.getLogger(__name__)
 
 _HATS_DIR_STRIDE = 10_000  # tiles per Dir= folder (HATS convention)
 _ZSTD_LEVEL = 3             # default balance of speed vs ratio (catalog ingest)
+
+# Lake-internal int64 join key (Parquet catalogs and Zarr); not a survey column name.
+LAKE_JOIN_ID_COLUMN = "_source_id"
+# Legacy catalog column name (pre-rename); migration maps this → LAKE_JOIN_ID_COLUMN.
+LEGACY_JOIN_ID_COLUMN = "source_id"
 # ``string`` uses int32 offsets (2 GiB UTF-8 cap per column chunk). Dense tiles
 # (e.g. DESI zall-pix) can exceed that when narrowing ``large_string``.
 _MAX_ROWS_STRING_SHRINK = 2_000_000
@@ -86,7 +91,6 @@ _COMMON_ID_COLUMNS = (
     "OBJECT_ID",
     "object_id",
     "SOURCE_ID",
-    "source_id",
     "id",
     "ID",
     "Id",
@@ -110,7 +114,7 @@ def stable_object_id_from_string(text: str) -> int:
 
   Used when survey catalogs use alphanumeric names instead of numeric
   ``TARGETID``s.  The same UTF-8 text always yields the same integer for
-  joins between Parquet catalog rows and Zarr ``source_id`` arrays.
+  joins between Parquet catalog rows and Zarr ``_source_id`` arrays.
     """
     normalized = text.strip()
     if not normalized:
@@ -153,7 +157,7 @@ def storage_int64_from_integer(value: int) -> int:
 def normalize_object_id(value: object) -> int:
     """Coerce one catalog/Zarr object ID to int64 **storage** (signed int64 column).
 
-    All cross-store matching (catalog Parquet ↔ Zarr ``source_id`` ↔
+    All cross-store matching (catalog Parquet ↔ Zarr ``_source_id`` ↔
     ``index_map`` keys) should use this so ``numpy.int64``, ``int``, and
     accidental string forms compare consistently.
 
@@ -311,9 +315,24 @@ def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Arr
     )
 
 
+def match_schema_column(requested: str, schema_names: Sequence[str]) -> str | None:
+    """Return the exact Parquet/FITS column name matching *requested* (case-insensitive)."""
+    if requested in schema_names:
+        return requested
+    by_upper = {n.upper(): n for n in schema_names}
+    return by_upper.get(requested.upper())
+
+
+def native_id_column_from_mode(mode: str) -> str | None:
+    """Survey-native ID column from ``source_id_mode``, or ``None`` for sequential."""
+    if isinstance(mode, str) and (mode.startswith("column:") or mode.startswith("label:")):
+        return mode.split(":", 1)[1]
+    return None
+
+
 def infer_native_id_column(schema_names: Sequence[str]) -> str | None:
     """Return the first plausible native object-ID column name in *schema_names*."""
-    names_set = set(schema_names)
+    names_set = set(schema_names) - {LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN}
     for cand in _COMMON_ID_COLUMNS:
         if cand in names_set:
             return cand
@@ -335,10 +354,27 @@ def catalog_tile_schema_names(catalog_root: Path | str) -> list[str] | None:
 
 
 def source_id_column_from_mode(mode: str) -> str:
-    """Map ``catalog_info.json`` ``source_id_mode`` to the Parquet column name."""
-    if isinstance(mode, str) and mode.startswith("column:"):
-        return mode[len("column:"):]
-    return "source_id"
+    """Map ``catalog_info.json`` ``source_id_mode`` to the lake join column name."""
+    return LAKE_JOIN_ID_COLUMN
+
+
+def _drop_join_id_columns(table: pa.Table) -> pa.Table:
+    for name in (LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN):
+        if name in table.schema.names:
+            table = table.drop_columns([name])
+    return table
+
+
+def _set_lake_join_id_column(table: pa.Table, join_values: pa.Array) -> pa.Table:
+    """Attach or replace ``_source_id`` with *join_values* (int64)."""
+    table = _drop_join_id_columns(table)
+    return table.append_column(LAKE_JOIN_ID_COLUMN, join_values)
+
+
+def _sync_lake_join_id_from_native(table: pa.Table, native_col: str) -> pa.Table:
+    """Copy cast native IDs into ``_source_id`` (``column:`` ingest)."""
+    join = cast_object_id_column_to_int64(table.column(native_col))
+    return _set_lake_join_id_column(table, join)
 
 
 def ensure_catalog_source_ids(
@@ -350,18 +386,23 @@ def ensure_catalog_source_ids(
     Returns ``(table, source_id_mode)`` where *source_id_mode* is written to
     ``catalog_info.json``:
 
-    * ``sequential`` — auto-generated ``source_id`` column
-    * ``column:COL`` — native integer column *COL* (cast to int64 in place)
-    * ``label:COL`` — human-readable labels stay in *COL*; ``source_id`` is a
+    * ``sequential`` — auto-generated ``_source_id`` column
+    * ``column:COL`` — native integer column *COL* (cast to int64 in place) plus ``_source_id``
+    * ``label:COL`` — human-readable labels stay in *COL*; ``_source_id`` is a
       stable hash of each label (for cross-store matching)
     """
+    if source_id_col:
+        matched = match_schema_column(source_id_col, table.schema.names)
+        if matched is not None:
+            source_id_col = matched
+
     if not source_id_col or source_id_col not in table.schema.names:
         inferred = infer_native_id_column(table.schema.names)
-        if inferred is not None and inferred != "source_id":
+        if inferred is not None:
             return ensure_catalog_source_ids(table, inferred)
-        if "source_id" not in table.schema.names:
-            table = table.append_column(
-                "source_id",
+        if LAKE_JOIN_ID_COLUMN not in table.schema.names:
+            table = _set_lake_join_id_column(
+                table,
                 pa.array(np.arange(len(table), dtype=np.int64), type=pa.int64()),
             )
         return table, "sequential"
@@ -386,6 +427,7 @@ def ensure_catalog_source_ids(
         )
 
     if sid_field.type == pa.int64():
+        table = _sync_lake_join_id_from_native(table, source_id_col)
         return table, f"column:{source_id_col}"
 
     if pa.types.is_unsigned_integer(sid_field.type):
@@ -399,6 +441,7 @@ def ensure_catalog_source_ids(
             source_id_col,
             cast_object_id_column_to_int64(col),
         )
+        table = _sync_lake_join_id_from_native(table, source_id_col)
         return table, f"column:{source_id_col}"
 
     if pa.types.is_integer(sid_field.type):
@@ -407,6 +450,7 @@ def ensure_catalog_source_ids(
             source_id_col,
             cast_object_id_column_to_int64(col),
         )
+        table = _sync_lake_join_id_from_native(table, source_id_col)
         return table, f"column:{source_id_col}"
 
     if pa.types.is_floating(sid_field.type):
@@ -425,6 +469,7 @@ def ensure_catalog_source_ids(
             source_id_col,
             cast_object_id_column_to_int64(col),
         )
+        table = _sync_lake_join_id_from_native(table, source_id_col)
         return table, f"column:{source_id_col}"
 
     if object_id_column_is_integer_ids(col):
@@ -433,31 +478,30 @@ def ensure_catalog_source_ids(
             source_id_col,
             cast_object_id_column_to_int64(col),
         )
+        table = _sync_lake_join_id_from_native(table, source_id_col)
         return table, f"column:{source_id_col}"
 
     labels = [_object_id_text(v) for v in col.to_pylist()]
     sample = labels[0] if labels else ""
     log.warning(
         "Object-ID column %r has non-integer labels (e.g. %r). Keeping it "
-        "unchanged and adding int64 column source_id (stable hash) for "
+        "unchanged and adding int64 column _source_id (stable hash) for "
         "spectrum/cutout joins. SQL: filter on %r; Python API: "
         "normalize_object_id(label) or stable_object_id_from_string(label).",
         source_id_col,
         sample,
         source_id_col,
     )
-    if source_id_col == "source_id":
+    if source_id_col in (LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN):
         raise ValueError(
-            "Column 'source_id' cannot hold non-integer labels; use "
-            "--source-id-col with your survey name column (e.g. NAME)."
+            f"Column {source_id_col!r} cannot hold non-integer labels; use "
+            "--source-id-col with your survey name column (e.g. NAME or SOURCE_ID)."
         )
-    if "source_id" in table.schema.names:
-        table = table.drop_columns(["source_id"])
     hashes = pa.array(
         [stable_object_id_from_string(text) for text in labels],
         type=pa.int64(),
     )
-    table = table.append_column("source_id", hashes)
+    table = _set_lake_join_id_column(table, hashes)
     return table, f"label:{source_id_col}"
 
 
@@ -499,81 +543,118 @@ def resolve_source_id_column(
     schema_names: list[str] | None = None,
     override: str | None = None,
 ) -> str:
-    """Return the column name used as the object identifier in a catalog.
+    """Return the lake join column for catalog ↔ Zarr / cross-match (``_source_id``).
 
-    Reads ``source_id_mode`` from ``catalog_info.json``:
-
-    * ``"sequential"``      → ``"source_id"``  (auto-generated integer)
-    * ``"column:COLNAME"``  → ``"COLNAME"``    (native FITS column, e.g. ``TARGETID``)
-
-    When ``schema_names`` is supplied (or can be read from the first Parquet
-    tile), the first candidate that actually exists in the schema is returned.
-    This covers catalogs where ``catalog_info.json`` is missing or still says
-    ``sequential`` but tiles store ``TARGETID`` from a DESI ingest.
+    Reads ``catalog_info.json`` when present.  The join column is always
+    :data:`LAKE_JOIN_ID_COLUMN` on current catalogs; legacy tiles may still
+    store :data:`LEGACY_JOIN_ID_COLUMN` until migration.
 
     Parameters
     ----------
     override:
-        If set, use this column name when it appears in ``schema_names``
+        If set, use this column when it appears in ``schema_names``
         (or unconditionally when no schema is available).
     """
     catalog_root = Path(catalog_root)
 
     if override:
-        if schema_names is None or override in schema_names:
-            return override
+        matched = (
+            match_schema_column(override, schema_names)
+            if schema_names is not None
+            else override
+        )
+        if schema_names is None or matched is not None:
+            return matched or override
         raise KeyError(
             f"Requested source-ID column {override!r} not in catalog schema. "
             f"Available: {sorted(schema_names)[:30]}"
             f"{'…' if len(schema_names) > 30 else ''}"
         )
 
-    candidates: list[str] = []
-    info_path = catalog_root / "catalog_info.json"
-    if info_path.exists():
-        with open(info_path) as fh:
-            info = json.load(fh)
-        mode = info.get("source_id_mode", "sequential")
-        recorded = info.get("source_id_column")
-        if isinstance(recorded, str) and recorded.strip():
-            candidates.append(recorded.strip())
-        if isinstance(mode, str) and mode.startswith("column:"):
-            col = mode[len("column:"):]
-            if col not in candidates:
-                candidates.append(col)
-        elif isinstance(mode, str) and mode.startswith("label:"):
-            if "source_id" not in candidates:
-                candidates.append("source_id")
-        elif "source_id" not in candidates:
-            candidates.append("source_id")
-    else:
-        candidates.append("source_id")
-
-    for name in _COMMON_ID_COLUMNS:
-        if name not in candidates:
-            candidates.append(name)
-
     if schema_names is None:
         schema_names = catalog_tile_schema_names(catalog_root)
 
     if schema_names is not None:
         names_set = set(schema_names)
-        for col in candidates:
-            if col in names_set:
-                if col != candidates[0]:
-                    log.info(
-                        "Resolved catalog ID column to %r "
-                        "(catalog_info.json preferred %r, not in Parquet schema).",
-                        col, candidates[0],
-                    )
-                return col
+        if LAKE_JOIN_ID_COLUMN in names_set:
+            return LAKE_JOIN_ID_COLUMN
+        if LEGACY_JOIN_ID_COLUMN in names_set:
+            log.warning(
+                "Catalog %s uses legacy join column %r; run "
+                "dl-repair-catalog-metadata --migrate-join-column.",
+                catalog_root.name,
+                LEGACY_JOIN_ID_COLUMN,
+            )
+            return LEGACY_JOIN_ID_COLUMN
+
+    info_path = catalog_root / "catalog_info.json"
+    if info_path.exists():
+        with open(info_path) as fh:
+            info = json.load(fh)
+        recorded = info.get("source_id_column")
+        if isinstance(recorded, str) and recorded.strip() == LAKE_JOIN_ID_COLUMN:
+            if schema_names is None or LAKE_JOIN_ID_COLUMN in schema_names:
+                return LAKE_JOIN_ID_COLUMN
+
+    if schema_names is not None:
+        native = infer_native_id_column(schema_names)
+        if native is not None:
+            log.info(
+                "Catalog %s: no %r column in tiles; inferred native ID %r "
+                "(re-ingest or run dl-repair-catalog-metadata --migrate-join-column).",
+                catalog_root.name,
+                LAKE_JOIN_ID_COLUMN,
+                native,
+            )
         raise KeyError(
-            f"No source-ID column found in catalog under {catalog_root}. "
-            f"Tried {candidates!r}; Parquet columns include: "
+            f"No lake join column {LAKE_JOIN_ID_COLUMN!r} in catalog under {catalog_root}. "
+            f"Parquet columns include: "
             f"{sorted(schema_names)[:25]}{'…' if len(schema_names) > 25 else ''}"
         )
 
-    return candidates[0]
+    return LAKE_JOIN_ID_COLUMN
+
+
+def migrate_parquet_tile_join_column(
+    tile_path: Path | str,
+    *,
+    catalog_parquet_options: CatalogParquetOptions | None = None,
+    native_col: str | None = None,
+) -> str:
+    """Ensure one catalog tile has ``_source_id`` (rename legacy or copy native).
+
+    Returns ``"renamed"``, ``"ok"`` (already has ``_source_id``), or ``"missing"``.
+    """
+    tile_path = Path(tile_path)
+    table = pq.read_table(str(tile_path))
+    names = table.schema.names
+    opts = catalog_parquet_options or CatalogParquetOptions()
+
+    def _write(t: pa.Table) -> str:
+        pq.write_table(
+            t,
+            str(tile_path),
+            compression="zstd",
+            compression_level=opts.compression_level,
+            write_statistics=opts.write_statistics,
+        )
+        return "renamed"
+
+    if LAKE_JOIN_ID_COLUMN in names:
+        if LEGACY_JOIN_ID_COLUMN in names:
+            table = table.drop_columns([LEGACY_JOIN_ID_COLUMN])
+            return _write(table)
+        return "ok"
+    if LEGACY_JOIN_ID_COLUMN in names:
+        col = table.column(LEGACY_JOIN_ID_COLUMN)
+        table = table.drop_columns([LEGACY_JOIN_ID_COLUMN])
+        table = table.append_column(LAKE_JOIN_ID_COLUMN, col)
+        return _write(table)
+    native = native_col or infer_native_id_column(names)
+    if native is not None and native in names:
+        table = _sync_lake_join_id_from_native(table, native)
+        return _write(table)
+    return "missing"
 
 
 def is_valid_sky_position(ra: float, dec: float) -> bool:
@@ -1018,8 +1099,7 @@ def _filter_table_columns(
     required = {ra_col, dec_col, hp_col, "_cutout_index", "_spectrum_index"}
     if source_id_col:
         required.add(source_id_col)
-    else:
-        required.add("source_id")
+    required.add(LAKE_JOIN_ID_COLUMN)
     keep: list[str] = []
     seen: set[str] = set()
     for name in list(columns) + sorted(required):
@@ -1302,8 +1382,10 @@ def _align_incoming_to_schema(incoming: pa.Table, target: pa.Schema) -> pa.Table
 
 
 def _id_column_for_dedup(table: pa.Table, source_id_col: str | None) -> str | None:
-    if "source_id" in table.schema.names:
-        return "source_id"
+    if LAKE_JOIN_ID_COLUMN in table.schema.names:
+        return LAKE_JOIN_ID_COLUMN
+    if LEGACY_JOIN_ID_COLUMN in table.schema.names:
+        return LEGACY_JOIN_ID_COLUMN
     if source_id_col and source_id_col in table.schema.names:
         return source_id_col
     return None
@@ -1528,22 +1610,27 @@ def _finalize_catalog_writes(
             "catalog_info and schema_manifest will still be updated",
             catalog_root,
         )
-    sid_col = source_id_column_from_mode(source_id_mode)
+    native_col: str | None = native_id_column_from_mode(source_id_mode)
     if tile_paths:
-        sid_col = resolve_source_id_column(
-            catalog_root,
-            schema_names=pq.read_schema(str(tile_paths[0])).names,
-        )
-        if source_id_mode == "sequential" and sid_col != "source_id":
-            source_id_mode = f"column:{sid_col}"
-            log.info(
-                "Catalog %s: catalog_info had sequential source_id_mode but tiles use %r; "
-                "recording source_id_mode=%r.",
-                survey_name,
-                sid_col,
-                source_id_mode,
-            )
+        tile_schema = pq.read_schema(str(tile_paths[0])).names
+        try:
+            resolve_source_id_column(catalog_root, schema_names=tile_schema)
+        except KeyError:
+            pass
+        if LAKE_JOIN_ID_COLUMN in tile_schema and source_id_mode == "sequential":
+            inferred = infer_native_id_column(tile_schema)
+            if inferred is not None:
+                source_id_mode = f"column:{inferred}"
+                native_col = inferred
+                log.info(
+                    "Catalog %s: recording source_id_mode=%r from tile schema.",
+                    survey_name,
+                    source_id_mode,
+                )
+        if native_col is None and source_id_mode.startswith(("column:", "label:")):
+            native_col = native_id_column_from_mode(source_id_mode)
 
+    join_col = LAKE_JOIN_ID_COLUMN
     info_path = catalog_root / "catalog_info.json"
     if info_path.exists():
         with open(info_path) as fh:
@@ -1551,8 +1638,12 @@ def _finalize_catalog_writes(
         info["total_rows"] = total_rows
         info["total_columns"] = n_cols
         info["hats_order"] = norder
-        info["source_id_column"] = sid_col
+        info["source_id_column"] = join_col
         info["source_id_mode"] = source_id_mode
+        if native_col:
+            info["native_id_column"] = native_col
+        elif "native_id_column" in info:
+            del info["native_id_column"]
         with open(info_path, "w") as fh:
             json.dump(info, fh, indent=2)
     else:
@@ -1565,7 +1656,8 @@ def _finalize_catalog_writes(
             ra_column=ra_col,
             dec_column=dec_col,
             source_id_mode=source_id_mode,
-            source_id_column=sid_col,
+            source_id_column=join_col,
+            native_id_column=native_col,
             streaming=streaming,
         )
 
@@ -1952,8 +2044,8 @@ def _ingest_catalog_streaming(
             if not sid_in_fits:
                 if sid_mode is None:
                     sid_mode = "sequential"
-                tile_table = tile_table.append_column(
-                    "source_id",
+                tile_table = _set_lake_join_id_column(
+                    tile_table,
                     pa.array(sids[row_idx], type=pa.int64()),
                 )
             else:
@@ -2045,9 +2137,10 @@ def _write_catalog_info(
     dec_column: str,
     source_id_mode: str,
     source_id_column: str | None = None,
+    native_id_column: str | None = None,
     streaming: bool,
 ) -> None:
-    sid_col = source_id_column or source_id_column_from_mode(source_id_mode)
+    join_col = source_id_column or LAKE_JOIN_ID_COLUMN
     info = {
         "catalog_name": survey_name,
         "catalog_type": "object",
@@ -2059,10 +2152,12 @@ def _write_catalog_info(
         "ra_column": ra_column,
         "dec_column": dec_column,
         "source_id_mode": source_id_mode,
-        "source_id_column": sid_col,
+        "source_id_column": join_col,
         "ingest_streaming": streaming,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if native_id_column:
+        info["native_id_column"] = native_id_column
     with open(catalog_root / "catalog_info.json", "w") as fh:
         json.dump(info, fh, indent=2)
 

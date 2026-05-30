@@ -17,6 +17,7 @@ from typing import Any, Iterator
 import pyarrow.parquet as pq
 
 from data_lake.ingest.checkpoint_sidecars import validate_ingest_sidecars
+from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN
 
 
 @dataclass
@@ -67,9 +68,15 @@ def validate_catalog_tile(tile_path: Path, info: dict[str, Any], rep: Validation
         rep.errors.append(f"{tile_path}: cannot read Parquet schema: {exc}")
         return
     names = set(schema.names)
-    for need in (ra_col, dec_col, "source_id"):
+    join_col = str(info.get("source_id_column") or LAKE_JOIN_ID_COLUMN)
+    for need in (ra_col, dec_col):
         if need not in names:
-            rep.errors.append(f"{tile_path}: schema missing column {need!r} (catalog_info names sky/ID)")
+            rep.errors.append(f"{tile_path}: schema missing column {need!r}")
+    if join_col not in names and LAKE_JOIN_ID_COLUMN not in names and LEGACY_JOIN_ID_COLUMN not in names:
+        rep.errors.append(
+            f"{tile_path}: schema missing join column {LAKE_JOIN_ID_COLUMN!r} "
+            f"(or legacy {LEGACY_JOIN_ID_COLUMN!r})"
+        )
     hp = f"_healpix_norder{int(info['hats_order'])}"
     if hp not in names:
         rep.warnings.append(f"{tile_path}: missing expected HEALPix column {hp!r}")
