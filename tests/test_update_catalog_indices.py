@@ -210,6 +210,25 @@ class TestResolveSourceIdColumn:
         schema_names = ["TARGETID", "ra", "dec", "_healpix_norder5", "_spectrum_index"]
         assert resolve_source_id_column(tmp_path, schema_names=schema_names) == "TARGETID"
 
+    def test_schema_fallback_id_when_info_says_sequential(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+
+        info = {"source_id_mode": "sequential", "source_id_column": "source_id"}
+        (tmp_path / "catalog_info.json").write_text(json.dumps(info))
+        schema_names = ["id", "ALPHA_J2000", "DELTA_J2000", "_healpix_norder5"]
+        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == "id"
+
+    def test_recorded_source_id_column_in_info(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+
+        info = {
+            "source_id_mode": "column:id",
+            "source_id_column": "id",
+        }
+        (tmp_path / "catalog_info.json").write_text(json.dumps(info))
+        schema_names = ["id", "ra", "dec"]
+        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == "id"
+
 
 # ---------------------------------------------------------------------------
 # update_index_column – TARGETID catalog (the production bug)

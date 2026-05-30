@@ -422,10 +422,8 @@ def _crossmatch_one_tile(
     nside_a = hp.order2nside(norder_a)
     nside_b = hp.order2nside(norder_b)
     hp_col = f"_healpix_norder{norder_a}"
-    id_col_a = acc_a.source_id_column
-    id_col_b = acc_b.source_id_column
+    id_col_a = acc_a.resolve_id_column_for_tile(npix_a)
     cols_a = [id_col_a, ra_col_a, dec_col_a]
-    cols_b = [id_col_b, ra_col_b, dec_col_b]
 
     out_dir = out_root / healpix_dir(norder_a, npix_a)
     out_file = out_dir / f"Npix={npix_a}.parquet"
@@ -441,6 +439,12 @@ def _crossmatch_one_tile(
     b_pixels = healpix_pixels_covering_tile(
         nside_a, npix_a, radius_rad, nside_b=nside_b,
     )
+    id_col_b = (
+        acc_b.resolve_id_column_for_tile(b_pixels[0])
+        if b_pixels
+        else acc_b.source_id_column
+    )
+    cols_b = [id_col_b, ra_col_b, dec_col_b]
     ra_min, ra_max, dec_min, dec_max = _source_bbox_deg(ra_a, dec_a, radius_deg)
     df_b = acc_b.sources_in_healpix_pixels(
         b_pixels,

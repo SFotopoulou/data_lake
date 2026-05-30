@@ -78,7 +78,19 @@ def healpix_dir(norder: int, npix: int) -> str:
     return f"Norder={norder}/Dir={dir_index}"
 
 
-_COMMON_ID_COLUMNS = ("TARGETID", "targetid", "OBJID", "objid", "SOURCE_ID", "source_id")
+_COMMON_ID_COLUMNS = (
+    "TARGETID",
+    "targetid",
+    "OBJID",
+    "objid",
+    "OBJECT_ID",
+    "object_id",
+    "SOURCE_ID",
+    "source_id",
+    "id",
+    "ID",
+    "Id",
+)
 
 # Header keywords tried for Zarr ingest when --source-id-col is not set (in order).
 _FITS_HEADER_ID_KEYWORDS = (
@@ -299,6 +311,36 @@ def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Arr
     )
 
 
+def infer_native_id_column(schema_names: Sequence[str]) -> str | None:
+    """Return the first plausible native object-ID column name in *schema_names*."""
+    names_set = set(schema_names)
+    for cand in _COMMON_ID_COLUMNS:
+        if cand in names_set:
+            return cand
+    by_upper = {n.upper(): n for n in schema_names}
+    for cand in _COMMON_ID_COLUMNS:
+        hit = by_upper.get(cand.upper())
+        if hit is not None:
+            return hit
+    return None
+
+
+def catalog_tile_schema_names(catalog_root: Path | str) -> list[str] | None:
+    """Column names from the first on-disk ``Npix=*.parquet`` tile, if any."""
+    catalog_root = Path(catalog_root)
+    first_tile = next(catalog_root.rglob("Npix=*.parquet"), None)
+    if first_tile is None:
+        return None
+    return list(pq.read_schema(str(first_tile)).names)
+
+
+def source_id_column_from_mode(mode: str) -> str:
+    """Map ``catalog_info.json`` ``source_id_mode`` to the Parquet column name."""
+    if isinstance(mode, str) and mode.startswith("column:"):
+        return mode[len("column:"):]
+    return "source_id"
+
+
 def ensure_catalog_source_ids(
     table: pa.Table,
     source_id_col: str | None,
@@ -314,6 +356,9 @@ def ensure_catalog_source_ids(
       stable hash of each label (for cross-store matching)
     """
     if not source_id_col or source_id_col not in table.schema.names:
+        inferred = infer_native_id_column(table.schema.names)
+        if inferred is not None and inferred != "source_id":
+            return ensure_catalog_source_ids(table, inferred)
         if "source_id" not in table.schema.names:
             table = table.append_column(
                 "source_id",
@@ -487,12 +532,19 @@ def resolve_source_id_column(
     info_path = catalog_root / "catalog_info.json"
     if info_path.exists():
         with open(info_path) as fh:
-            mode = json.load(fh).get("source_id_mode", "sequential")
+            info = json.load(fh)
+        mode = info.get("source_id_mode", "sequential")
+        recorded = info.get("source_id_column")
+        if isinstance(recorded, str) and recorded.strip():
+            candidates.append(recorded.strip())
         if isinstance(mode, str) and mode.startswith("column:"):
-            candidates.append(mode[len("column:"):])
+            col = mode[len("column:"):]
+            if col not in candidates:
+                candidates.append(col)
         elif isinstance(mode, str) and mode.startswith("label:"):
-            candidates.append("source_id")
-        else:
+            if "source_id" not in candidates:
+                candidates.append("source_id")
+        elif "source_id" not in candidates:
             candidates.append("source_id")
     else:
         candidates.append("source_id")
@@ -502,9 +554,7 @@ def resolve_source_id_column(
             candidates.append(name)
 
     if schema_names is None:
-        first_tile = next(catalog_root.rglob("Npix=*.parquet"), None)
-        if first_tile is not None:
-            schema_names = pq.read_schema(str(first_tile)).names
+        schema_names = catalog_tile_schema_names(catalog_root)
 
     if schema_names is not None:
         names_set = set(schema_names)
@@ -1478,6 +1528,22 @@ def _finalize_catalog_writes(
             "catalog_info and schema_manifest will still be updated",
             catalog_root,
         )
+    sid_col = source_id_column_from_mode(source_id_mode)
+    if tile_paths:
+        sid_col = resolve_source_id_column(
+            catalog_root,
+            schema_names=pq.read_schema(str(tile_paths[0])).names,
+        )
+        if source_id_mode == "sequential" and sid_col != "source_id":
+            source_id_mode = f"column:{sid_col}"
+            log.info(
+                "Catalog %s: catalog_info had sequential source_id_mode but tiles use %r; "
+                "recording source_id_mode=%r.",
+                survey_name,
+                sid_col,
+                source_id_mode,
+            )
+
     info_path = catalog_root / "catalog_info.json"
     if info_path.exists():
         with open(info_path) as fh:
@@ -1485,6 +1551,8 @@ def _finalize_catalog_writes(
         info["total_rows"] = total_rows
         info["total_columns"] = n_cols
         info["hats_order"] = norder
+        info["source_id_column"] = sid_col
+        info["source_id_mode"] = source_id_mode
         with open(info_path, "w") as fh:
             json.dump(info, fh, indent=2)
     else:
@@ -1497,6 +1565,7 @@ def _finalize_catalog_writes(
             ra_column=ra_col,
             dec_column=dec_col,
             source_id_mode=source_id_mode,
+            source_id_column=sid_col,
             streaming=streaming,
         )
 
@@ -1975,8 +2044,10 @@ def _write_catalog_info(
     ra_column: str,
     dec_column: str,
     source_id_mode: str,
+    source_id_column: str | None = None,
     streaming: bool,
 ) -> None:
+    sid_col = source_id_column or source_id_column_from_mode(source_id_mode)
     info = {
         "catalog_name": survey_name,
         "catalog_type": "object",
@@ -1988,6 +2059,7 @@ def _write_catalog_info(
         "ra_column": ra_column,
         "dec_column": dec_column,
         "source_id_mode": source_id_mode,
+        "source_id_column": sid_col,
         "ingest_streaming": streaming,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

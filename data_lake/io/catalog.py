@@ -24,7 +24,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from data_lake.ingest.fits_to_parquet import healpix_dir, resolve_source_id_column
+from data_lake.ingest.fits_to_parquet import (
+    catalog_tile_schema_names,
+    healpix_dir,
+    resolve_source_id_column,
+)
 
 log = logging.getLogger(__name__)
 
@@ -117,9 +121,11 @@ class CatalogAccessor:
 
         self._info = self._load_info()
         self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
+        tile_schema = catalog_tile_schema_names(self._catalog_root)
+        schema_for_ids = tile_schema if tile_schema is not None else list(self.schema.names)
         self._source_id_column: str = resolve_source_id_column(
             self._catalog_root,
-            schema_names=list(self.schema.names) if self._catalog_root.exists() else None,
+            schema_names=schema_for_ids,
         )
         self._redshift_column: str | None = resolve_redshift_column(self.columns)
 
@@ -213,6 +219,26 @@ class CatalogAccessor:
         """Return the on-disk Parquet path for a HEALPix tile, or ``None`` if absent."""
         path = self._catalog_root / healpix_dir(self.norder, int(npix)) / f"Npix={int(npix)}.parquet"
         return path if path.is_file() else None
+
+    def resolve_id_column_for_tile(self, npix: int) -> str:
+        """Return the object-ID column present in the on-disk tile (and catalog metadata)."""
+        col = self._source_id_column
+        path = self._tile_parquet_path(npix)
+        if path is None:
+            return col
+        names = pq.read_schema(str(path)).names
+        if col in names:
+            return col
+        resolved = resolve_source_id_column(self._catalog_root, schema_names=names)
+        if resolved != col:
+            log.warning(
+                "Catalog %s tile Npix=%d: metadata ID column %r missing; using %r from tile schema.",
+                self.survey_name,
+                npix,
+                col,
+                resolved,
+            )
+        return resolved
 
     def sources_in_tile(
         self,
