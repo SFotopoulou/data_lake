@@ -1973,19 +1973,66 @@ def _ensure_batch_meta(batch_meta: np.ndarray, n_rows: int) -> np.ndarray:
     return meta
 
 
+_6DF_DEFAULT_SOURCE_ID_COL = "TARGET"
+
+
+def _6df_hdu_spectrum_role(name: str) -> str | None:
+    """Classify a 6dFGS extension name as ``v``, ``r``, or ``vr`` spectrum HDU."""
+    n = (name or "").strip().upper()
+    if n in ("VR", "VRSPEC", "VR_SPECTRUM", "SPECTRUM VR") or n.endswith(" VR"):
+        return "vr"
+    if n in ("V", "VSPEC", "SPECTRUM V") or (n.endswith(" V") and " VR" not in n):
+        return "v"
+    if n in ("R", "RSPEC", "SPECTRUM R") or (n.endswith(" R") and " VR" not in n):
+        return "r"
+    return None
+
+
+def _6df_header_key_for_link(source_id_col: str) -> str:
+    """Map catalog link column names to FITS header keywords."""
+    key = source_id_col.strip().upper()
+    if key == "TARGETNAME":
+        return "TARGET"
+    return key
+
+
+def _6df_link_label_from_header(
+    vhdr: fits.Header,
+    phdr: fits.Header,
+    source_path: Path,
+    source_id_col: str,
+) -> tuple[str, bool]:
+    """Resolve the catalog link label for a 6dFGS spectrum.
+
+    Returns ``(label, used_fallback)`` where *used_fallback* is True when the
+    filename stem was used because the requested header key was absent.
+    """
+    key = _6df_header_key_for_link(source_id_col)
+    search_keys = [key]
+    if key == "TARGET":
+        search_keys.append("TARGETNAME")
+    for hdr in (vhdr, phdr):
+        for hdr_key in search_keys:
+            if hdr_key in hdr:
+                label = str(hdr[hdr_key]).strip()
+                if label:
+                    return label, False
+    return source_path.stem, True
+
+
 def _is_6df_hdul(hdul: fits.HDUList) -> bool:
     """Return True if the FITS HDU list looks like a 6dFGS target file."""
-    names = [(h.name or "").strip().upper() for h in hdul]
-    return "VR" in names and ("V" in names or "R" in names)
+    roles = {_6df_hdu_spectrum_role(h.name or "") for h in hdul}
+    roles.discard(None)
+    return "vr" in roles and ("v" in roles or "r" in roles)
 
 
 def _select_6df_vr_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
     """Pick the combined 6dFGS VR spectral extension."""
     for i, hdu in enumerate(hdul):
-        name = (hdu.name or "").strip().upper()
-        if name in ("VR", "VRSPEC", "VR_SPECTRUM") and hdu.data is not None:
+        if _6df_hdu_spectrum_role(hdu.name or "") == "vr" and hdu.data is not None:
             return i, hdu  # type: ignore[return-value]
-    # 6dF docs: 8th extension (index 7) is typically combined/spliced VR.
+    # Legacy layout: 8th extension (index 7) is typically combined/spliced VR.
     if len(hdul) > 7 and hdul[7].data is not None:
         return 7, hdul[7]  # type: ignore[return-value]
     raise ValueError("6dFGS file has no VR spectral extension")
@@ -1994,19 +2041,35 @@ def _select_6df_vr_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
 def _read_6df_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
+    *,
+    source_id_col: str = _6DF_DEFAULT_SOURCE_ID_COL,
 ) -> tuple[list[SpectrumRecord], dict]:
-    """Read a 6dFGS FITS file, ingesting only the combined VR extension."""
+    """Read a 6dFGS FITS file, ingesting only the combined VR extension.
+
+    ``source_id`` defaults to the ``TARGET`` keyword on the VR extension header
+    (same string as catalog ``targetname``, e.g. ``g2259418-254505``).  When
+    ``TARGET`` is absent, falls back to the filename stem with a warning.
+    """
     from data_lake.ingest.fits_to_parquet import normalize_object_id
 
     phdr = hdul[0].header
     ra = float(phdr.get("RA", 0.0))
     dec = float(phdr.get("DEC", 0.0))
 
-    # Match catalog key by target filename stem (e.g. "g0001234-123456")
-    source_id = normalize_object_id(source_path.stem)
-
     _, vr_hdu = _select_6df_vr_hdu(hdul)
     vhdr = vr_hdu.header
+    link_label, used_fallback = _6df_link_label_from_header(
+        vhdr, phdr, source_path, source_id_col,
+    )
+    if used_fallback:
+        log.warning(
+            "6dF: %s missing %r on VR/PRIMARY header; using filename stem %r "
+            "as link key (catalog --source-id-col targetname should match TARGET)",
+            source_path.name,
+            _6df_header_key_for_link(source_id_col),
+            source_path.stem,
+        )
+    source_id = normalize_object_id(link_label)
     data = np.asarray(vr_hdu.data, dtype=np.float64)
     if data.ndim != 2:
         raise ValueError(
@@ -2302,7 +2365,11 @@ def ingest_spectra_from_fits(
                     source_id_col=source_id_col or _2DF_DEFAULT_SOURCE_ID_COL,
                 )
             elif detected_fmt == "6df":
-                records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
+                records, wcs_attrs = _read_6df_spectrum(
+                    hdul,
+                    source_path,
+                    source_id_col=source_id_col or _6DF_DEFAULT_SOURCE_ID_COL,
+                )
             elif detected_fmt == "wig":
                 records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
             elif detected_fmt == "ozdes":

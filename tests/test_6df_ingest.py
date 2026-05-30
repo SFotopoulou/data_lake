@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from astropy.io import fits
 
 
@@ -28,9 +29,13 @@ def _write_minimal_6df(path: Path, *, n_pix: int = 1024) -> None:
     var = np.ones(n_pix, dtype=np.float32) * 4.0
     sky = np.zeros(n_pix, dtype=np.float32)
 
+    target = path.stem
     hdu_v = fits.ImageHDU(np.stack([v_flux, var, sky]), name="V")
     hdu_r = fits.ImageHDU(np.stack([r_flux, var, sky]), name="R")
     hdu_vr = fits.ImageHDU(np.stack([vr_flux, var, sky, wave]), name="VR")
+    hdu_v.header["TARGET"] = target
+    hdu_r.header["TARGET"] = target
+    hdu_vr.header["TARGET"] = target
     hdu_vr.header["CRVAL1"] = 4000.0  # intentionally different from explicit wave row
     hdu_vr.header["CRPIX1"] = 1.0
     hdu_vr.header["CDELT1"] = 1.0
@@ -77,6 +82,42 @@ def test_read_6df_prefers_explicit_wave_row(tmp_path: Path) -> None:
     # Explicit row uses 5000 + 2*pix, while WCS header says 4000 + 1*pix.
     assert np.isclose(wave[0], 5000.0)
     assert np.isclose(wave[1], 5002.0)
+
+
+def test_read_6df_uses_target_header_not_filename(tmp_path: Path) -> None:
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+    from data_lake.ingest.fits_to_spectra_zarr import _read_6df_spectrum
+
+    p = tmp_path / "wrong_name.fits"
+    _write_minimal_6df(p)
+    with fits.open(p, mode="update") as hdul:
+        for hdu in hdul:
+            if (hdu.name or "").strip().upper() == "VR":
+                hdu.header["TARGET"] = "g2259418-254505"
+        hdul.flush()
+
+    with fits.open(p, memmap=True) as hdul:
+        records, _ = _read_6df_spectrum(hdul, p, source_id_col="targetname")
+
+    assert records[0].source_id == normalize_object_id("g2259418-254505")
+
+
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[1] / "data" / "g2259418-254505.fits").is_file(),
+    reason="requires data/g2259418-254505.fits",
+)
+def test_real_6df_detects_and_uses_target_header() -> None:
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+    from data_lake.ingest.fits_to_spectra_zarr import (
+        _detect_format_from_path,
+        _read_6df_spectrum,
+    )
+
+    p = Path(__file__).resolve().parents[1] / "data" / "g2259418-254505.fits"
+    assert _detect_format_from_path(p) == "6df"
+    with fits.open(p, memmap=True) as hdul:
+        records, _ = _read_6df_spectrum(hdul, p, source_id_col="targetname")
+    assert records[0].source_id == normalize_object_id("g2259418-254505")
 
 
 def test_ingest_6df_end_to_end(tmp_path: Path) -> None:

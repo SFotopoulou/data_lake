@@ -761,9 +761,10 @@ the combined ``VR`` spectral extension (not ``V`` or ``R``), with rows:
 exists it is preferred; otherwise wavelength is reconstructed from WCS header
 keywords.
 
-Source IDs are derived from the file stem (for example
-``g0001234-123456.fits`` → ``g0001234-123456``) and normalized with the same
-stable hashing path used by catalog ingest for string IDs.
+Source IDs are read from the VR extension header ``TARGET`` keyword (same
+value as catalog ``targetname``, e.g. ``g2259418-254505``).  Pass
+``--source-id-col targetname`` at ingest time; it maps to FITS ``TARGET``.
+When ``TARGET`` is missing, the filename stem is used as a fallback.
 
 ```bash
 # Single-file smoke test
