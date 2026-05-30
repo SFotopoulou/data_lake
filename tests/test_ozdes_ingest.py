@@ -43,7 +43,7 @@ class TestOzdesIngest:
 
         p = tmp_path / "OzDES-DR2_00099.fits"
         _write_ozdes_like(p, source="04D1qt", bad_fraction=0.1)
-        catalog_id = normalize_object_id("04D1qt")
+        catalog_id = normalize_object_id(p.name)
 
         with fits.open(p, memmap=True) as hdul:
             records, _ = _read_ozdes_spectrum(hdul, p)
@@ -77,9 +77,9 @@ class TestOzdesIngest:
         p = Path("data/OzDES-DR2_00001.fits")
         assert _detect_format_from_path(p) == "ozdes"
         with fits.open(p, memmap=True) as hdul:
-            records, _ = _read_ozdes_spectrum(hdul, p, source_id_col="SOURCE")
+            records, _ = _read_ozdes_spectrum(hdul, p)
         r = records[0]
-        assert r.source_id == normalize_object_id("04D1qt")
+        assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (5000,)
         assert r.mask.sum() == 10
         assert (r.ivar > 0).sum() == 4990

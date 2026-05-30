@@ -1154,7 +1154,6 @@ def _read_ozdes_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
     *,
-    source_id_col: str | None = None,
     ra_col: str = "RA",
     dec_col: str = "DEC",
 ) -> tuple[list[SpectrumRecord], dict]:
@@ -1162,8 +1161,12 @@ def _read_ozdes_spectrum(
     Read an OzDES stacked 1-D spectrum (PRIMARY + VARIANCE + BADPIX).
 
     Only the stacked HDUs 0–2 are ingested; per-epoch ``SPECTRUM_*`` extensions
-    are ignored.  ``source_id`` comes from the ``SOURCE`` header keyword by default.
+    are ignored.  ``source_id`` is ``normalize_object_id(path.name)`` so it
+    matches a catalog column that stores the spectrum filename
+    (e.g. ``OzDES-DR2_00001.fits``).
     """
+    from data_lake.ingest.fits_to_parquet import normalize_object_id
+
     if not _is_ozdes_stacked_layout(hdul):
         summary = _summarize_fits_hdus(hdul)
         raise ValueError(
@@ -1185,8 +1188,7 @@ def _read_ozdes_spectrum(
     bad = np.where(np.isfinite(bad), bad, 0.0)
     mask = (bad != 0).astype(np.uint8)
 
-    sid_key = source_id_col or "SOURCE"
-    source_id = object_id_from_fits_header(header, sid_key, hdu_index=0)
+    source_id = normalize_object_id(source_path.name)
     ra, dec = sky_from_fits_header(header, ra_col, dec_col)
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
@@ -2307,7 +2309,6 @@ def ingest_spectra_from_fits(
                 records, wcs_attrs = _read_ozdes_spectrum(
                     hdul,
                     source_path,
-                    source_id_col=source_id_col,
                     ra_col=ra_col,
                     dec_col=dec_col,
                 )

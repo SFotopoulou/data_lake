@@ -803,18 +803,20 @@ OzDES target FITS files store the **stacked** spectrum in the first three HDUs:
 PRIMARY (flux), ``VARIANCE``, ``BADPIX`` (``0`` = good, ``1`` = bad).  Per-epoch
 ``SPECTRUM_*`` extensions are not ingested.
 
-**Catalog linkage:** use ``--source-id-col SOURCE`` when ingesting the catalog
-(the spectrum header keyword ``SOURCE``, e.g. ``04D1qt``).
+**Catalog linkage:** ingest the catalog with ``--source-id-col`` set to the column
+that stores the spectrum **filename** (e.g. ``OzDES-DR2_00001.fits``). Spectrum
+ingest derives ``_source_id`` from the FITS basename.  The ``SOURCE`` header
+(e.g. ``04D1qt``) remains a science column in the catalog.
 
 ```bash
 dl-ingest-catalog ozdes_catalog.fits --survey OZDES_DR2 \
-  --source-id-col SOURCE --ra-col RA --dec-col DEC
+  --source-id-col filename --ra-col RA --dec-col DEC
 
 dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 \
-  --fmt ozdes --source-id-col SOURCE
+  --fmt ozdes --source-id-col filename
 
 # Auto-detect when the basename starts with OzDES and HDU layout matches
-dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --source-id-col SOURCE
+dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --source-id-col filename
 ```
 
 #### VANDELS spectra ingest (stacked only)
