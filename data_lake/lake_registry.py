@@ -445,7 +445,7 @@ def format_lake_registry_table(table: pa.Table) -> str:
 
     df = pl.from_arrow(table).sort(["modality", "survey"])
     lines = [
-        f"{'survey':<24} {'modality':<10} {'hats':>4} {'cols':>6} {'rows':>12}  "
+        f"{'survey':<24} {'modality':<10} {'hats':>4} {'cols':>6} {'rows':>14}  "
         f"{'id_col':<16} manifest",
         "-" * 90,
     ]
@@ -456,7 +456,7 @@ def format_lake_registry_table(table: pa.Table) -> str:
         hats_s = str(hats) if hats is not None else "—"
         manifest = "yes" if row.get("has_schema_manifest") else "no"
         lines.append(
-            f"{row['survey']:<24} {row['modality']:<10} {hats_s:>4} {cols_s:>6} {rows_s:>12}  "
+            f"{row['survey']:<24} {row['modality']:<10} {hats_s:>4} {cols_s:>6} {rows_s:>14}  "
             f"{str(row.get('source_id_column') or '—'):<16} {manifest}"
         )
     return "\n".join(lines)
