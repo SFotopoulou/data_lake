@@ -1978,6 +1978,23 @@ def _6df_header_text(vhdr: fits.Header, phdr: fits.Header, *keys: str) -> str | 
     return None
 
 
+def _6df_kbestr_from_header(vhdr: fits.Header, phdr: fits.Header) -> str | None:
+    """Return ``KBESTR`` from VR/PRIMARY as a stable link-label component."""
+    for hdr in (vhdr, phdr):
+        if "KBESTR" not in hdr:
+            continue
+        val = hdr["KBESTR"]
+        if val is None or (isinstance(val, str) and not val.strip()):
+            continue
+        if isinstance(val, (int, float, np.integer, np.floating)):
+            if np.isfinite(val):
+                return str(int(val))
+        text = str(val).strip()
+        if text:
+            return text
+    return None
+
+
 def _6df_link_label_from_header(
     vhdr: fits.Header,
     phdr: fits.Header,
@@ -1985,19 +2002,28 @@ def _6df_link_label_from_header(
 ) -> tuple[str, bool]:
     """Resolve the catalog link label for a 6dFGS VR spectrum.
 
-    Uses ``TARGET`` (catalog ``targetname``) and ``NAME_V`` when both are
-    present: ``target|name_v``.  When ``NAME_V`` is absent, falls back to
-    ``TARGET`` alone.  Returns ``(label, used_fallback)`` where *used_fallback*
-    is True when the filename stem was used because ``TARGET`` was absent.
+    Uses ``TARGET`` (catalog ``targetname``), ``NAME_V``, and ``KBESTR`` when
+    present: ``target|name_v|kbestr``.  When ``NAME_V`` is absent, omits that
+    segment; ``KBESTR`` is still appended when present.  Returns
+    ``(label, used_fallback)`` where *used_fallback* is True when the filename
+    stem was used because ``TARGET`` was absent.
     """
     from data_lake.ingest.fits_to_parquet import composite_link_label
 
     target = _6df_header_text(vhdr, phdr, "TARGET", "TARGETNAME")
     name_v = _6df_header_text(vhdr, phdr, "NAME_V")
-    if target and name_v:
-        return composite_link_label(target, name_v), False
+    kbestr = _6df_kbestr_from_header(vhdr, phdr)
+
+    parts: list[str] = []
     if target:
-        return target, False
+        parts.append(target)
+    if name_v:
+        parts.append(name_v)
+    if kbestr is not None:
+        parts.append(kbestr)
+
+    if parts:
+        return composite_link_label(*parts), target is None
     return source_path.stem, True
 
 
@@ -2118,8 +2144,8 @@ def _read_6df_vr_record(
     if used_fallback:
         log.warning(
             "6dF: %s HDU %r missing TARGET on VR/PRIMARY header; using filename stem %r "
-            "as link key (catalog --source-id-col targetname,NAME_V should match "
-            "TARGET and NAME_V)",
+            "as link key (catalog --source-id-col targetname,NAME_V,KBESTR should match "
+            "TARGET, NAME_V, and KBESTR)",
             source_path.name,
             vr_hdu.name,
             source_path.stem,
@@ -2190,10 +2216,10 @@ def _read_6df_spectrum(
     """Read a 6dFGS FITS file, ingesting every combined VR extension.
 
     Each VR HDU becomes one spectrum row.  ``source_id`` is built from VR
-    ``TARGET`` and ``NAME_V`` (``target|name_v``), matching catalog ingest with
-    ``--source-id-col targetname,NAME_V``.  When ``NAME_V`` is absent, only
-    ``TARGET`` is used.  When ``TARGET`` is absent, falls back to the filename
-    stem with a warning.
+    ``TARGET``, ``NAME_V``, and ``KBESTR`` (``target|name_v|kbestr``), matching
+    catalog ingest with ``--source-id-col targetname,NAME_V,KBESTR``.  When
+    ``NAME_V`` is absent, ``TARGET`` and ``KBESTR`` are still used when present.
+    When ``TARGET`` is absent, falls back to the filename stem with a warning.
 
     Sky coordinates are taken from each VR extension's ``OBSRA``/``OBSDEC``
     (degrees), with fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or
