@@ -1967,60 +1967,83 @@ def _6df_hdu_spectrum_role(name: str) -> str | None:
     return None
 
 
+def _6df_header_text_single(hdr: fits.Header, *keys: str) -> str | None:
+    """Return the first non-empty FITS header string among *keys* on one header."""
+    for key in keys:
+        if key in hdr:
+            text = str(hdr[key]).strip()
+            if text:
+                return text
+    return None
+
+
 def _6df_header_text(vhdr: fits.Header, phdr: fits.Header, *keys: str) -> str | None:
     """Return the first non-empty FITS header string among *keys* on VR/PRIMARY."""
     for hdr in (vhdr, phdr):
-        for key in keys:
-            if key in hdr:
-                text = str(hdr[key]).strip()
-                if text:
-                    return text
+        found = _6df_header_text_single(hdr, *keys)
+        if found:
+            return found
     return None
 
 
-def _6df_kbestr_from_header(vhdr: fits.Header, phdr: fits.Header) -> str | None:
-    """Return ``KBESTR`` from VR/PRIMARY as a stable link-label component."""
-    for hdr in (vhdr, phdr):
-        if "KBESTR" not in hdr:
+def _6df_warn_triple_header_mismatch(
+    source_path: Path,
+    v_hdr: fits.Header,
+    vr_hdr: fits.Header,
+    *,
+    v_idx: int,
+    vr_idx: int,
+) -> None:
+    """Log when paired V/VR headers disagree on internal match keys."""
+    for key in ("KBESTR", "Z"):
+        if key not in v_hdr or key not in vr_hdr:
             continue
-        val = hdr["KBESTR"]
-        if val is None or (isinstance(val, str) and not val.strip()):
-            continue
-        if isinstance(val, (int, float, np.integer, np.floating)):
-            if np.isfinite(val):
-                return str(int(val))
-        text = str(val).strip()
-        if text:
-            return text
-    return None
+        v_val = v_hdr[key]
+        vr_val = vr_hdr[key]
+        if v_val != vr_val:
+            log.warning(
+                "6dF: %s V HDU %d and VR HDU %d disagree on %s (%r vs %r)",
+                source_path.name,
+                v_idx,
+                vr_idx,
+                key,
+                v_val,
+                vr_val,
+            )
 
 
-def _6df_link_label_from_header(
-    vhdr: fits.Header,
+def _6df_link_label_from_triple(
+    v_hdr: fits.Header,
+    vr_hdr: fits.Header,
     phdr: fits.Header,
     source_path: Path,
 ) -> tuple[str, bool]:
-    """Resolve the catalog link label for a 6dFGS VR spectrum.
+    """Resolve the catalog link label for a paired 6dFGS V/VR spectrum block.
 
-    Uses ``TARGET`` (catalog ``targetname``), ``NAME_V``, and ``KBESTR`` when
-    present: ``target|name_v|kbestr``.  When ``NAME_V`` is absent, omits that
-    segment; ``KBESTR`` is still appended when present.  Returns
-    ``(label, used_fallback)`` where *used_fallback* is True when the filename
-    stem was used because ``TARGET`` was absent.
+    Uses ``TARGET`` and ``NAME_V`` from the VR header and ``TITLE_V`` from the
+    paired V header: ``target|name_v|title_v``.  Returns ``(label, used_fallback)``
+    where *used_fallback* is True when the filename stem was used because
+    ``TARGET`` was absent.
     """
     from data_lake.ingest.fits_to_parquet import composite_link_label
 
-    target = _6df_header_text(vhdr, phdr, "TARGET", "TARGETNAME")
-    name_v = _6df_header_text(vhdr, phdr, "NAME_V")
-    kbestr = _6df_kbestr_from_header(vhdr, phdr)
+    target = _6df_header_text(vr_hdr, phdr, "TARGET", "TARGETNAME")
+    name_v = _6df_header_text(vr_hdr, phdr, "NAME_V")
+    title_v = _6df_header_text_single(v_hdr, "TITLE_V")
 
     parts: list[str] = []
     if target:
         parts.append(target)
     if name_v:
         parts.append(name_v)
-    if kbestr is not None:
-        parts.append(kbestr)
+    if title_v:
+        parts.append(title_v)
+    elif target or name_v:
+        log.warning(
+            "6dF: %s VR block missing TITLE_V on paired V header; link key omits "
+            "title segment (catalog --source-id-col targetname,NAME_V,TITLE_V)",
+            source_path.name,
+        )
 
     if parts:
         return composite_link_label(*parts), target is None
@@ -2098,22 +2121,62 @@ def _is_6df_hdul(hdul: fits.HDUList) -> bool:
     return "vr" in roles and ("v" in roles or "r" in roles)
 
 
-def _iter_6df_vr_hdus(hdul: fits.HDUList) -> list[tuple[int, fits.ImageHDU]]:
-    """Return all combined 6dFGS VR spectral extensions with data."""
-    hdus: list[tuple[int, fits.ImageHDU]] = []
-    for i, hdu in enumerate(hdul):
-        if _6df_hdu_spectrum_role(hdu.name or "") == "vr" and hdu.data is not None:
-            hdus.append((i, hdu))  # type: ignore[arg-type]
-    if hdus:
-        return hdus
-    # Legacy layout: 8th extension (index 7) is typically combined/spliced VR.
-    if len(hdul) > 7 and hdul[7].data is not None:
-        return [(7, hdul[7])]  # type: ignore[list-item]
+def _iter_6df_vr_triples(
+    hdul: fits.HDUList,
+) -> list[tuple[fits.ImageHDU, fits.ImageHDU, fits.ImageHDU, tuple[int, int, int]]]:
+    """Return V/R/VR spectral triples in HDU order (one VR row per triple).
+
+    Production 6dF target files repeat ``(SPECTRUM V, SPECTRUM R, SPECTRUM VR)``
+    after stamp image extensions.  Each VR HDU is paired with the immediately
+    preceding V and R extensions in the same block.
+    """
+    triples: list[
+        tuple[fits.ImageHDU, fits.ImageHDU, fits.ImageHDU, tuple[int, int, int]]
+    ] = []
+    n = len(hdul)
+    i = 0
+    while i + 2 < n:
+        roles = [_6df_hdu_spectrum_role(hdul[j].name or "") for j in (i, i + 1, i + 2)]
+        if roles == ["v", "r", "vr"]:
+            v_hdu = hdul[i]  # type: ignore[assignment]
+            r_hdu = hdul[i + 1]  # type: ignore[assignment]
+            vr_hdu = hdul[i + 2]  # type: ignore[assignment]
+            if v_hdu.data is not None and vr_hdu.data is not None:
+                triples.append((v_hdu, r_hdu, vr_hdu, (i, i + 1, i + 2)))
+            i += 3
+            continue
+        i += 1
+
+    if triples:
+        return triples
+
+    # Legacy layout: single VR at index 7 with a preceding V extension.
+    if len(hdul) > 7 and _6df_hdu_spectrum_role(hdul[7].name or "") == "vr":
+        vr_hdu = hdul[7]  # type: ignore[assignment]
+        if vr_hdu.data is not None:
+            v_hdu = None
+            r_hdu = hdul[6] if len(hdul) > 6 else hdul[0]
+            for j in range(6, -1, -1):
+                if _6df_hdu_spectrum_role(hdul[j].name or "") == "v" and hdul[j].data is not None:
+                    v_hdu = hdul[j]  # type: ignore[assignment]
+                    break
+            if v_hdu is not None:
+                log.warning(
+                    "6dF: using legacy VR-at-index-7 layout; paired V at HDU %d",
+                    hdul.index(v_hdu),
+                )
+                return [(v_hdu, r_hdu, vr_hdu, (hdul.index(v_hdu), 6, 7))]  # type: ignore[list-item]
+
     summary = _summarize_fits_hdus(hdul)
     raise ValueError(
-        "6dFGS file has no VR spectral extension. "
+        "6dFGS file has no V/R/VR spectral triple. "
         f"Found: {summary}"
     )
+
+
+def _iter_6df_vr_hdus(hdul: fits.HDUList) -> list[tuple[int, fits.ImageHDU]]:
+    """Return all combined 6dFGS VR spectral extensions with data."""
+    return [(idx[2], vr) for _, _, vr, idx in _iter_6df_vr_triples(hdul)]
 
 
 def _6df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
@@ -2131,21 +2194,35 @@ def _6df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
 
 
 def _read_6df_vr_record(
+    v_hdu: fits.ImageHDU,
     vr_hdu: fits.ImageHDU,
     phdr: fits.Header,
     source_path: Path,
+    *,
+    triple_indices: tuple[int, int, int] | None = None,
 ) -> SpectrumRecord:
-    """Parse one 6dFGS VR extension into a :class:`SpectrumRecord`."""
+    """Parse one 6dFGS VR extension (with paired V header) into a record."""
     from data_lake.ingest.fits_to_parquet import normalize_object_id
 
+    v_hdr = v_hdu.header
     vhdr = vr_hdu.header
+    if triple_indices is not None:
+        _6df_warn_triple_header_mismatch(
+            source_path,
+            v_hdr,
+            vhdr,
+            v_idx=triple_indices[0],
+            vr_idx=triple_indices[2],
+        )
+
     ra, dec = _6df_sky_from_headers(vhdr, phdr)
-    link_label, used_fallback = _6df_link_label_from_header(vhdr, phdr, source_path)
+    link_label, used_fallback = _6df_link_label_from_triple(
+        v_hdr, vhdr, phdr, source_path,
+    )
     if used_fallback:
         log.warning(
-            "6dF: %s HDU %r missing TARGET on VR/PRIMARY header; using filename stem %r "
-            "as link key (catalog --source-id-col targetname,NAME_V,KBESTR should match "
-            "TARGET, NAME_V, and KBESTR)",
+            "6dF: %s VR HDU %r missing TARGET; using filename stem %r as link key "
+            "(catalog --source-id-col targetname,NAME_V,TITLE_V)",
             source_path.name,
             vr_hdu.name,
             source_path.stem,
@@ -2215,31 +2292,33 @@ def _read_6df_spectrum(
 ) -> tuple[list[SpectrumRecord], dict]:
     """Read a 6dFGS FITS file, ingesting every combined VR extension.
 
-    Each VR HDU becomes one spectrum row.  ``source_id`` is built from VR
-    ``TARGET``, ``NAME_V``, and ``KBESTR`` (``target|name_v|kbestr``), matching
-    catalog ingest with ``--source-id-col targetname,NAME_V,KBESTR``.  When
-    ``NAME_V`` is absent, ``TARGET`` and ``KBESTR`` are still used when present.
-    When ``TARGET`` is absent, falls back to the filename stem with a warning.
+    Each ``(SPECTRUM V, SPECTRUM R, SPECTRUM VR)`` block yields one spectrum
+    row from the VR HDU.  ``source_id`` is built from VR ``TARGET`` and
+    ``NAME_V`` plus ``TITLE_V`` on the paired V extension
+    (``target|name_v|title_v``), matching catalog ingest with
+    ``--source-id-col targetname,NAME_V,TITLE_V``.
 
     Sky coordinates are taken from each VR extension's ``OBSRA``/``OBSDEC``
     (degrees), with fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or
     sexagesimal ``OBJCTRA``/``OBJCTDEC``.
     """
     phdr = hdul[0].header
-    vr_hdus = _iter_6df_vr_hdus(hdul)
+    triples = _iter_6df_vr_triples(hdul)
     records: list[SpectrumRecord] = []
     wcs_attrs: dict = {}
     seen_ids: dict[int, str] = {}
 
-    for _, vr_hdu in vr_hdus:
-        rec = _read_6df_vr_record(vr_hdu, phdr, source_path)
+    for v_hdu, _, vr_hdu, indices in triples:
+        rec = _read_6df_vr_record(
+            v_hdu, vr_hdu, phdr, source_path, triple_indices=indices,
+        )
         if rec.source_id in seen_ids:
             raise ValueError(
                 f"duplicate 6dF source_id in {source_path.name}: "
-                f"VR HDU {vr_hdu.name!r} link label maps to the same _source_id "
-                f"as {seen_ids[rec.source_id]!r}"
+                f"VR HDU {vr_hdu.name!r} (index {indices[2]}) link label maps to "
+                f"the same _source_id as {seen_ids[rec.source_id]!r}"
             )
-        seen_ids[rec.source_id] = vr_hdu.name or ""
+        seen_ids[rec.source_id] = vr_hdu.name or f"HDU{indices[2]}"
         if not wcs_attrs:
             wcs_attrs = _wcs_attrs_from_header(vr_hdu.header, len(rec.flux))
         records.append(rec)
