@@ -169,13 +169,18 @@ def test_registry_spectra_total_rows(tmp_path: Path) -> None:
 
 
 def test_describe_lake_version_flag() -> None:
+    import tomllib
     from click.testing import CliRunner
 
     from data_lake import __version__
     from data_lake.lake_registry import cli_describe_lake
 
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with open(pyproject, "rb") as fh:
+        expected = tomllib.load(fh)["project"]["version"]
+
     assert cli_describe_lake is not None
+    assert __version__ == expected
     result = CliRunner().invoke(cli_describe_lake, ["--version"])
     assert result.exit_code == 0
-    assert result.output.strip() == f"data-lake, version {__version__}"
-    assert __version__ != "unknown"
+    assert result.output.strip() == f"data-lake, version {expected}"
