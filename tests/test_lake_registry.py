@@ -166,3 +166,16 @@ def test_registry_spectra_total_rows(tmp_path: Path) -> None:
     ]
     assert len(spec_rows) == 1
     assert spec_rows[0]["total_rows"] == 2
+
+
+def test_describe_lake_version_flag() -> None:
+    from click.testing import CliRunner
+
+    from data_lake import __version__
+    from data_lake.lake_registry import cli_describe_lake
+
+    assert cli_describe_lake is not None
+    result = CliRunner().invoke(cli_describe_lake, ["--version"])
+    assert result.exit_code == 0
+    assert result.output.strip() == f"data-lake, version {__version__}"
+    assert __version__ != "unknown"

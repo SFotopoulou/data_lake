@@ -518,6 +518,7 @@ def format_master_report(
 try:
     import click
 
+    from data_lake import __version__ as _package_version
     from data_lake.cli_utils import config_option, load_optional_config
 
     def _resolve_lake_root(output_root: Path | None, config_path: Path | None) -> Path:
@@ -538,6 +539,7 @@ try:
         click.echo(f"Wrote {out} ({pq.read_metadata(str(out)).num_rows} surveys/modalities)")
 
     @click.command("dl-describe-lake")
+    @click.version_option(version=_package_version, prog_name="data-lake")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
     @click.option(
