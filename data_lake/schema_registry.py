@@ -133,8 +133,10 @@ def build_catalog_schema_manifest(
     schema: pa.Schema | None = None,
 ) -> dict[str, Any]:
     """Build a JSON-serialisable manifest from on-disk catalog Parquet."""
-    from data_lake.ingest.fits_to_parquet import resolve_source_id_column
-    from data_lake.io.catalog import resolve_redshift_column
+    from data_lake.ingest.fits_to_parquet import (
+        resolve_redshift_column,
+        resolve_source_id_column,
+    )
 
     catalog_root = Path(catalog_root)
     if schema is None:

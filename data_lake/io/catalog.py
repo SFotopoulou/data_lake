@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 from data_lake.ingest.fits_to_parquet import (
     catalog_tile_schema_names,
     healpix_dir,
+    resolve_redshift_column,
     resolve_source_id_column,
 )
 
@@ -34,30 +35,10 @@ log = logging.getLogger(__name__)
 
 ReturnFormat = Literal["polars", "astropy", "arrow"]
 
-# First match wins (case-insensitive against catalog Parquet columns).
-_REDSHIFT_COLUMN_CANDIDATES: tuple[str, ...] = (
-    "Z",
-    "ZCOSMO",
-    "Z_HP",
-    "Z_PHOT",
-    "REDSHIFT",
-    "Z_QSO",
-    "Z_RED",
-)
-
 
 def _quote_sql_ident(name: str) -> str:
     """Double-quote a SQL identifier (DuckDB)."""
     return '"' + name.replace('"', '""') + '"'
-
-
-def resolve_redshift_column(column_names: list[str]) -> str | None:
-    """Return the catalog column name to use for spectroscopic redshift."""
-    by_upper = {n.upper(): n for n in column_names}
-    for cand in _REDSHIFT_COLUMN_CANDIDATES:
-        if cand in by_upper:
-            return by_upper[cand]
-    return None
 
 
 def _arrow_array_to_numpy_or_sequence(arr: pa.Array):

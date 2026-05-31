@@ -123,43 +123,6 @@ def stable_object_id_from_string(text: str) -> int:
     return int.from_bytes(digest, byteorder="big", signed=True)
 
 
-def composite_link_label(*parts: object, sep: str = "|") -> str:
-    """Join non-empty label parts into one stable link string (e.g. ``a|b``)."""
-    values = [_object_id_text(p) for p in parts if _object_id_text(p)]
-    if not values:
-        raise ValueError("composite link label requires at least one non-empty part")
-    return sep.join(values)
-
-
-def parse_source_id_column_spec(source_id_col: str) -> list[str]:
-    """Split a catalog ``--source-id-col`` spec into one or more column names."""
-    return [part.strip() for part in source_id_col.split(",") if part.strip()]
-
-
-def resolve_source_id_column_names(
-    source_id_col: str,
-    schema_names: list[str],
-) -> list[str]:
-    """Resolve a single or comma-separated source-ID column spec against *schema_names*."""
-    matched: list[str] = []
-    missing: list[str] = []
-    for part in parse_source_id_column_spec(source_id_col):
-        name = match_schema_column(part, schema_names)
-        if name is None:
-            missing.append(part)
-        else:
-            matched.append(name)
-    if missing:
-        raise ValueError(
-            f"Source-ID column(s) not in catalog schema: {missing!r}. "
-            f"Available: {sorted(schema_names)[:30]}"
-            f"{'…' if len(schema_names) > 30 else ''}"
-        )
-    if not matched:
-        raise ValueError("source-id column spec is empty")
-    return matched
-
-
 def _object_id_text(value: object) -> str:
     if value is None:
         raise ValueError("object ID is None")
@@ -360,9 +323,71 @@ def match_schema_column(requested: str, schema_names: Sequence[str]) -> str | No
     return by_upper.get(requested.upper())
 
 
+def composite_link_label(*parts: object, sep: str = "|") -> str:
+    """Join non-empty label parts into one stable link string (e.g. ``a|b``)."""
+    values = [_object_id_text(p) for p in parts if _object_id_text(p)]
+    if not values:
+        raise ValueError("composite link label requires at least one non-empty part")
+    return sep.join(values)
+
+
+def parse_source_id_column_spec(source_id_col: str) -> list[str]:
+    """Split a catalog ``--source-id-col`` spec into one or more column names."""
+    return [part.strip() for part in source_id_col.split(",") if part.strip()]
+
+
+def resolve_source_id_column_names(
+    source_id_col: str,
+    schema_names: list[str],
+) -> list[str]:
+    """Resolve a single or comma-separated source-ID column spec against *schema_names*."""
+    matched: list[str] = []
+    missing: list[str] = []
+    for part in parse_source_id_column_spec(source_id_col):
+        name = match_schema_column(part, schema_names)
+        if name is None:
+            missing.append(part)
+        else:
+            matched.append(name)
+    if missing:
+        raise ValueError(
+            f"Source-ID column(s) not in catalog schema: {missing!r}. "
+            f"Available: {sorted(schema_names)[:30]}"
+            f"{'…' if len(schema_names) > 30 else ''}"
+        )
+    if not matched:
+        raise ValueError("source-id column spec is empty")
+    return matched
+
+
+# First match wins (case-insensitive against catalog Parquet columns).
+_REDSHIFT_COLUMN_CANDIDATES: tuple[str, ...] = (
+    "Z",
+    "ZCOSMO",
+    "Z_HP",
+    "Z_PHOT",
+    "REDSHIFT",
+    "Z_QSO",
+    "Z_RED",
+)
+
+
+def resolve_redshift_column(column_names: list[str]) -> str | None:
+    """Return the catalog column name to use for spectroscopic redshift."""
+    by_upper = {n.upper(): n for n in column_names}
+    for cand in _REDSHIFT_COLUMN_CANDIDATES:
+        if cand in by_upper:
+            return by_upper[cand]
+    return None
+
+
 def native_id_column_from_mode(mode: str) -> str | None:
     """Survey-native ID column from ``source_id_mode``, or ``None`` for sequential."""
-    if isinstance(mode, str) and (mode.startswith("column:") or mode.startswith("label:")):
+    if isinstance(mode, str) and (
+        mode.startswith("column:")
+        or mode.startswith("label:")
+        or mode.startswith("composite:")
+    ):
         return mode.split(":", 1)[1]
     return None
 
