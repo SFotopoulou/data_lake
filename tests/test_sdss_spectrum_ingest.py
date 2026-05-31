@@ -59,7 +59,7 @@ class TestReadSdssBoss:
         path = tmp_path / "spec-test.fits"
         _write_sdss_spec_fits(path, include_and_mask=False)
         with fits.open(path) as hdul:
-            records, wcs = _read_sdss_boss(hdul, source_id_col="OBJID")
+            records, wcs = _read_sdss_boss(hdul, link_id_col="OBJID")
         assert len(records) == 1
         assert len(records[0].flux) == 32
         assert records[0].mask.shape == (32,)
@@ -71,7 +71,7 @@ class TestReadSdssBoss:
         path = tmp_path / "spec-mask.fits"
         _write_sdss_spec_fits(path, include_and_mask=True, mask_name="AND_MASK")
         with fits.open(path) as hdul:
-            records, _ = _read_sdss_boss(hdul, source_id_col="OBJID")
+            records, _ = _read_sdss_boss(hdul, link_id_col="OBJID")
         assert len(records[0].mask) == 32
 
     def test_detect_format(self, tmp_path: Path) -> None:
@@ -93,7 +93,7 @@ class TestReadSdssBoss:
             header_objid=None,
         )
         with fits.open(path) as hdul:
-            records, _ = _read_sdss_boss(hdul, source_id_col="SPECOBJID")
+            records, _ = _read_sdss_boss(hdul, link_id_col="SPECOBJID")
         from data_lake.ingest.fits_to_parquet import normalize_object_id
 
         assert records[0].source_id == normalize_object_id(specobjid)
@@ -121,7 +121,7 @@ class TestSdssVariableLengthIngest:
                 p,
                 lake,
                 survey,
-                source_id_col="SPECOBJID",
+                link_id_col="SPECOBJID",
                 norder=5,
             )
 

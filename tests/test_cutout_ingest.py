@@ -72,8 +72,8 @@ def test_on_duplicate_error(tmp_path: Path) -> None:
         )
 
 
-def test_source_id_col_targetid(tmp_path: Path) -> None:
-    """--source-id-col reads TARGETID (DESI-style) for catalog linkage."""
+def test_link_id_col_targetid(tmp_path: Path) -> None:
+    """--link-id-col reads TARGETID (DESI-style) for catalog linkage."""
     f = tmp_path / "desi_like.fits"
     data = np.ones((16, 16), dtype=np.float32)
     hdu = fits.PrimaryHDU(data)
@@ -97,19 +97,19 @@ def test_source_id_col_targetid(tmp_path: Path) -> None:
     m = ingest_cutouts_from_fits(
         f, tmp_path, "tid_survey",
         ra_col="TARGET_RA", dec_col="TARGET_DEC",
-        source_id_col="TARGETID",
+        link_id_col="TARGETID",
         norder=3,
     )
     assert m[tid] == 0
 
 
-def test_source_id_col_missing_raises(tmp_path: Path) -> None:
+def test_link_id_col_missing_raises(tmp_path: Path) -> None:
     f = tmp_path / "noid.fits"
     _write_cutout_fits(f, sid=1, ra=10.0, dec=20.0)
     with pytest.raises(KeyError, match="TARGETID"):
         ingest_cutouts_from_fits(
             f, tmp_path, "x",
-            source_id_col="TARGETID",
+            link_id_col="TARGETID",
             norder=3,
         )
 

@@ -76,7 +76,7 @@ def test_generate_multiband_and_ingest(tmp_path: Path) -> None:
         "syn",
         ra_col="TARGET_RA",
         dec_col="TARGET_DEC",
-        source_id_col="TARGETID",
+        link_id_col="TARGETID",
         norder=5,
         band_names=["r", "i", "z"],
     )

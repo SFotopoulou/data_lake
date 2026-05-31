@@ -8,11 +8,11 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_lake.ingest.fits_to_parquet import healpix_dir
+from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, healpix_dir
 from data_lake.ingest.repair_catalog_metadata import repair_catalog_metadata
 
 
-def _write_id_only_tile(
+def _write_catalog_tile(
     lake: Path,
     survey: str,
     *,
@@ -26,6 +26,7 @@ def _write_id_only_tile(
     pq.write_table(
         pa.table({
             "id": pa.array(ids, type=pa.int64()),
+            LAKE_JOIN_ID_COLUMN: pa.array(ids, type=pa.int64()),
             "ra": pa.array([10.0] * len(ids), type=pa.float64()),
             "dec": pa.array([0.0] * len(ids), type=pa.float64()),
             hp_col: pa.array([npix] * len(ids), type=pa.int64()),
@@ -38,30 +39,31 @@ def _write_id_only_tile(
         "hats_order": norder,
         "ra_column": "ra",
         "dec_column": "dec",
-        "source_id_mode": "sequential",
+        "link_id_mode": "column:id",
+        "link_id_column": LAKE_JOIN_ID_COLUMN,
+        "native_id_column": "id",
         "total_rows": len(ids),
     }
     (lake / "catalogs" / survey / "catalog_info.json").write_text(json.dumps(info))
 
 
 class TestRepairCatalogMetadata:
-    def test_fixes_source_id_column_from_tiles(self, tmp_path: Path) -> None:
+    def test_refreshes_metadata_from_tiles(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
-        _write_id_only_tile(lake, "SURVEY_X", norder=5, npix=42, ids=[1, 2, 3])
+        _write_catalog_tile(lake, "SURVEY_X", norder=5, npix=42, ids=[1, 2, 3])
 
         catalog_root = lake / "catalogs" / "SURVEY_X"
-        res = repair_catalog_metadata(
-            catalog_root, "SURVEY_X", migrate_join_column=True,
+        (catalog_root / "catalog_info.json").write_text(
+            json.dumps({"hats_order": 5, "link_id_column": "id", "link_id_mode": "sequential"})
         )
+        res = repair_catalog_metadata(catalog_root, "SURVEY_X")
         assert res.ok
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
-
-        assert res.source_id_column_after == LAKE_JOIN_ID_COLUMN
-        assert res.source_id_mode_after == "column:id"
+        assert res.link_id_column_after == LAKE_JOIN_ID_COLUMN
+        assert res.link_id_mode_after == "column:id"
 
         info = json.loads((catalog_root / "catalog_info.json").read_text())
-        assert info["source_id_column"] == LAKE_JOIN_ID_COLUMN
-        assert info["source_id_mode"] == "column:id"
+        assert info["link_id_column"] == LAKE_JOIN_ID_COLUMN
+        assert info["link_id_mode"] == "column:id"
         assert info.get("native_id_column") == "id"
         assert (catalog_root / "_metadata").is_file()
         assert (catalog_root / "schema_manifest.json").is_file()
@@ -73,53 +75,11 @@ class TestRepairCatalogMetadata:
         assert len(results) == 1
         assert not results[0].ok
 
-    def test_migrate_join_column_with_dictionary_partition_cols(self, tmp_path: Path) -> None:
-        """Migration must read tiles under Norder=/Dir= without hive merge errors."""
-        lake = tmp_path / "lake"
-        tile_dir = lake / "catalogs" / "DICT_PART" / healpix_dir(1, 42)
-        tile_dir.mkdir(parents=True)
-        pq.write_table(
-            pa.table({
-                "id": pa.array([1, 2], type=pa.int64()),
-                "ra": pa.array([10.0, 11.0], type=pa.float64()),
-                "dec_": pa.array([0.0, 0.1], type=pa.float64()),
-                "_healpix_norder1": pa.array([42, 42], type=pa.int64()),
-                "Norder": pa.DictionaryArray.from_arrays(
-                    pa.array([0, 0], type=pa.int32()),
-                    pa.array([1], type=pa.int32()),
-                ),
-            }),
-            tile_dir / "Npix=42.parquet",
-        )
-        (lake / "catalogs" / "DICT_PART" / "catalog_info.json").write_text(
-            json.dumps({
-                "hats_order": 1,
-                "ra_column": "ra",
-                "dec_column": "dec_",
-                "source_id_mode": "column:id",
-                "source_id_column": "id",
-            })
-        )
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
-
-        res = repair_catalog_metadata(
-            lake / "catalogs" / "DICT_PART",
-            "DICT_PART",
-            migrate_join_column=True,
-        )
-        assert res.ok, res.error
-        tbl = pq.ParquetFile(tile_dir / "Npix=42.parquet").read()
-        assert LAKE_JOIN_ID_COLUMN in tbl.schema.names
-        assert tbl.column(LAKE_JOIN_ID_COLUMN).to_pylist() == [1, 2]
-
 
 class TestRebuildLinkId:
     def test_rebuild_link_id_filename(self, tmp_path: Path) -> None:
         """Recompute _source_id from filename; science id and indices updated."""
-        from data_lake.ingest.fits_to_parquet import (
-            LAKE_JOIN_ID_COLUMN,
-            stable_object_id_from_string,
-        )
+        from data_lake.ingest.fits_to_parquet import stable_object_id_from_string
 
         lake = tmp_path / "lake"
         norder = 5
@@ -147,8 +107,8 @@ class TestRebuildLinkId:
                 "hats_order": norder,
                 "ra_column": "ra",
                 "dec_column": "dec",
-                "source_id_mode": "column:id",
-                "source_id_column": LAKE_JOIN_ID_COLUMN,
+                "link_id_mode": "column:id",
+                "link_id_column": LAKE_JOIN_ID_COLUMN,
                 "native_id_column": "id",
             })
         )
@@ -159,7 +119,7 @@ class TestRebuildLinkId:
         )
         assert res.ok, res.error
         assert res.parquet_tiles_rebuilt == 1
-        assert res.source_id_mode_after == "label:filename"
+        assert res.link_id_mode_after == "label:filename"
 
         tbl = pq.ParquetFile(tile_dir / f"Npix={npix}.parquet").read()
         assert tbl.column("id").to_pylist() == [1, 2]
@@ -168,25 +128,12 @@ class TestRebuildLinkId:
         assert tbl.column("_cutout_index").to_pylist() == [-1, -1]
 
         info = json.loads((catalog_root / "catalog_info.json").read_text())
-        assert info["source_id_mode"] == "label:filename"
+        assert info["link_id_mode"] == "label:filename"
         assert info.get("native_id_column") == "filename"
-
-    def test_rebuild_link_id_mutually_exclusive_with_migrate(self, tmp_path: Path) -> None:
-        lake = tmp_path / "lake"
-        _write_id_only_tile(lake, "X", norder=5, npix=1, ids=[1])
-        import pytest
-
-        with pytest.raises(ValueError, match="not both"):
-            repair_catalog_metadata(
-                lake / "catalogs" / "X",
-                "X",
-                migrate_join_column=True,
-                rebuild_link_id="id",
-            )
 
     def test_rebuild_link_id_missing_column(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
-        _write_id_only_tile(lake, "Y", norder=5, npix=1, ids=[1])
+        _write_catalog_tile(lake, "Y", norder=5, npix=1, ids=[1])
 
         res = repair_catalog_metadata(
             lake / "catalogs" / "Y",

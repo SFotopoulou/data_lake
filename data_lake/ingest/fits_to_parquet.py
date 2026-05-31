@@ -45,8 +45,6 @@ _ZSTD_LEVEL = 3             # default balance of speed vs ratio (catalog ingest)
 
 # Lake-internal int64 join key (Parquet catalogs and Zarr); not a survey column name.
 LAKE_JOIN_ID_COLUMN = "_source_id"
-# Legacy catalog column name (pre-rename); migration maps this → LAKE_JOIN_ID_COLUMN.
-LEGACY_JOIN_ID_COLUMN = "source_id"
 # ``string`` uses int32 offsets (2 GiB UTF-8 cap per column chunk). Dense tiles
 # (e.g. DESI zall-pix) can exceed that when narrowing ``large_string``.
 _MAX_ROWS_STRING_SHRINK = 2_000_000
@@ -96,7 +94,7 @@ _COMMON_ID_COLUMNS = (
     "Id",
 )
 
-# Header keywords tried for Zarr ingest when --source-id-col is not set (in order).
+# Header keywords tried for Zarr ingest when --link-id-col is not set (in order).
 _FITS_HEADER_ID_KEYWORDS = (
     "SOURCE_ID", "OBJ_ID", "OBJID", "TARGETID", "targetid",
     "FIBERID", "fiberid", "source_id",
@@ -199,24 +197,24 @@ def normalize_object_id(value: object) -> int:
 
 def object_id_from_fits_header(
     header,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
     *,
     hdu_index: int = 0,
 ) -> int:
     """Read one integer object ID from a FITS header for cutout/spectrum ingest.
 
-    When *source_id_col* is set, only that keyword is used (same convention as
-    catalog ``--source-id-col``).  Otherwise a fixed fallback chain ending in
+    When *link_id_col* is set, only that keyword is used (same convention as
+    catalog ``--link-id-col``).  Otherwise a fixed fallback chain ending in
     *hdu_index* when no ID keyword is present.
     """
-    if source_id_col:
-        if source_id_col not in header:
+    if link_id_col:
+        if link_id_col not in header:
             keys = [k for k in header.keys() if k and not str(k).startswith("HISTORY")]
             raise KeyError(
-                f"Header keyword {source_id_col!r} not found for object ID. "
+                f"Header keyword {link_id_col!r} not found for object ID. "
                 f"Sample keys: {keys[:25]}{'…' if len(keys) > 25 else ''}"
             )
-        return normalize_object_id(header[source_id_col])
+        return normalize_object_id(header[link_id_col])
 
     for key in _FITS_HEADER_ID_KEYWORDS:
         if key in header:
@@ -224,7 +222,7 @@ def object_id_from_fits_header(
 
     log.warning(
         "No object-ID keyword in FITS header (tried %s); using HDU index %d. "
-        "Pass --source-id-col to match the catalog (e.g. TARGETID).",
+        "Pass --link-id-col to match the catalog (e.g. TARGETID).",
         _FITS_HEADER_ID_KEYWORDS,
         hdu_index,
     )
@@ -331,19 +329,19 @@ def composite_link_label(*parts: object, sep: str = "|") -> str:
     return sep.join(values)
 
 
-def parse_source_id_column_spec(source_id_col: str) -> list[str]:
-    """Split a catalog ``--source-id-col`` spec into one or more column names."""
-    return [part.strip() for part in source_id_col.split(",") if part.strip()]
+def parse_link_id_column_spec(link_id_col: str) -> list[str]:
+    """Split a catalog ``--link-id-col`` spec into one or more column names."""
+    return [part.strip() for part in link_id_col.split(",") if part.strip()]
 
 
-def resolve_source_id_column_names(
-    source_id_col: str,
+def resolve_link_id_column_names(
+    link_id_col: str,
     schema_names: list[str],
 ) -> list[str]:
     """Resolve a single or comma-separated source-ID column spec against *schema_names*."""
     matched: list[str] = []
     missing: list[str] = []
-    for part in parse_source_id_column_spec(source_id_col):
+    for part in parse_link_id_column_spec(link_id_col):
         name = match_schema_column(part, schema_names)
         if name is None:
             missing.append(part)
@@ -382,7 +380,7 @@ def resolve_redshift_column(column_names: list[str]) -> str | None:
 
 
 def native_id_column_from_mode(mode: str) -> str | None:
-    """Survey-native ID column from ``source_id_mode``, or ``None`` for sequential."""
+    """Survey-native ID column from ``link_id_mode``, or ``None`` for sequential."""
     if isinstance(mode, str) and (
         mode.startswith("column:")
         or mode.startswith("label:")
@@ -394,7 +392,7 @@ def native_id_column_from_mode(mode: str) -> str | None:
 
 def infer_native_id_column(schema_names: Sequence[str]) -> str | None:
     """Return the first plausible native object-ID column name in *schema_names*."""
-    names_set = set(schema_names) - {LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN}
+    names_set = set(schema_names) - {LAKE_JOIN_ID_COLUMN}
     for cand in _COMMON_ID_COLUMNS:
         if cand in names_set:
             return cand
@@ -415,15 +413,14 @@ def catalog_tile_schema_names(catalog_root: Path | str) -> list[str] | None:
     return list(pq.read_schema(str(first_tile)).names)
 
 
-def source_id_column_from_mode(mode: str) -> str:
-    """Map ``catalog_info.json`` ``source_id_mode`` to the lake join column name."""
+def link_id_column_from_mode(mode: str) -> str:
+    """Map ``catalog_info.json`` ``link_id_mode`` to the lake join column name."""
     return LAKE_JOIN_ID_COLUMN
 
 
 def _drop_join_id_columns(table: pa.Table) -> pa.Table:
-    for name in (LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN):
-        if name in table.schema.names:
-            table = table.drop_columns([name])
+    if LAKE_JOIN_ID_COLUMN in table.schema.names:
+        table = table.drop_columns([LAKE_JOIN_ID_COLUMN])
     return table
 
 
@@ -441,11 +438,11 @@ def _sync_lake_join_id_from_native(table: pa.Table, native_col: str) -> pa.Table
 
 def ensure_catalog_source_ids(
     table: pa.Table,
-    source_id_col: str | None,
+    link_id_col: str | None,
 ) -> tuple[pa.Table, str]:
     """Ensure the table has int64 object IDs for Zarr/spectrum joins.
 
-    Returns ``(table, source_id_mode)`` where *source_id_mode* is written to
+    Returns ``(table, link_id_mode)`` where *link_id_mode* is written to
     ``catalog_info.json``:
 
     * ``sequential`` — auto-generated ``_source_id`` column
@@ -453,13 +450,13 @@ def ensure_catalog_source_ids(
     * ``label:COL`` — human-readable labels stay in *COL*; ``_source_id`` is a
       stable hash of each label (for cross-store matching)
     """
-    if source_id_col:
-        matched = match_schema_column(source_id_col, table.schema.names)
+    if link_id_col:
+        matched = match_schema_column(link_id_col, table.schema.names)
         if matched is not None:
-            source_id_col = matched
+            link_id_col = matched
 
-    if source_id_col and "," in source_id_col:
-        col_names = resolve_source_id_column_names(source_id_col, table.schema.names)
+    if link_id_col and "," in link_id_col:
+        col_names = resolve_link_id_column_names(link_id_col, table.schema.names)
         labels = [
             composite_link_label(*row)
             for row in zip(*(table.column(name).to_pylist() for name in col_names))
@@ -477,7 +474,7 @@ def ensure_catalog_source_ids(
         )
         return table, f"composite:{spec}"
 
-    if not source_id_col or source_id_col not in table.schema.names:
+    if not link_id_col or link_id_col not in table.schema.names:
         inferred = infer_native_id_column(table.schema.names)
         if inferred is not None:
             return ensure_catalog_source_ids(table, inferred)
@@ -488,19 +485,19 @@ def ensure_catalog_source_ids(
             )
         return table, "sequential"
 
-    sid_field = table.schema.field(source_id_col)
-    col = table.column(source_id_col)
+    sid_field = table.schema.field(link_id_col)
+    col = table.column(link_id_col)
 
     if pa.types.is_fixed_size_list(sid_field.type) or pa.types.is_list(sid_field.type):
         hints = [
             n
             for n in table.schema.names
-            if n != source_id_col
+            if n != link_id_col
             and n.lower() in ("objid", "obj_id", "bestobjid", "targetid", "thingid", "source_id")
         ]
         raise ValueError(
-            f"Column {source_id_col!r} is a vector column ({sid_field.type}); "
-            f"--source-id-col must name a scalar integer ID column. "
+            f"Column {link_id_col!r} is a vector column ({sid_field.type}); "
+            f"--link-id-col must name a scalar integer ID column. "
             f"For SDSS specObj use the scalar ``objid`` field, not the "
             f"multidim ``OBJID`` array. "
             f"Other scalar ID-like columns in this table: {hints[:12]}"
@@ -508,59 +505,59 @@ def ensure_catalog_source_ids(
         )
 
     if sid_field.type == pa.int64():
-        table = _sync_lake_join_id_from_native(table, source_id_col)
-        return table, f"column:{source_id_col}"
+        table = _sync_lake_join_id_from_native(table, link_id_col)
+        return table, f"column:{link_id_col}"
 
     if pa.types.is_unsigned_integer(sid_field.type):
         log.info(
             "Object-ID column %r is unsigned; storing values as int64 bit patterns "
             "(SDSS-style objid > 2**63-1).",
-            source_id_col,
+            link_id_col,
         )
         table = table.set_column(
-            table.schema.get_field_index(source_id_col),
-            source_id_col,
+            table.schema.get_field_index(link_id_col),
+            link_id_col,
             cast_object_id_column_to_int64(col),
         )
-        table = _sync_lake_join_id_from_native(table, source_id_col)
-        return table, f"column:{source_id_col}"
+        table = _sync_lake_join_id_from_native(table, link_id_col)
+        return table, f"column:{link_id_col}"
 
     if pa.types.is_integer(sid_field.type):
         table = table.set_column(
-            table.schema.get_field_index(source_id_col),
-            source_id_col,
+            table.schema.get_field_index(link_id_col),
+            link_id_col,
             cast_object_id_column_to_int64(col),
         )
-        table = _sync_lake_join_id_from_native(table, source_id_col)
-        return table, f"column:{source_id_col}"
+        table = _sync_lake_join_id_from_native(table, link_id_col)
+        return table, f"column:{link_id_col}"
 
     if pa.types.is_floating(sid_field.type):
-        warn_if_id_column_unsafe(source_id_col, sid_field.type)
+        warn_if_id_column_unsafe(link_id_col, sid_field.type)
         col_np = col.to_numpy(zero_copy_only=False)
         finite = col_np[np.isfinite(col_np)]
         if finite.size and np.max(np.abs(finite)) > _FLOAT64_SAFE_INTEGER:
             raise ValueError(
-                f"Column {source_id_col!r} contains values above 2**53 "
+                f"Column {link_id_col!r} contains values above 2**53 "
                 f"but is stored as {sid_field.type}; casting to int64 would "
                 f"corrupt TARGETIDs. Fix the FITS dtype or read as int64 "
                 f"before ingest."
             )
         table = table.set_column(
-            table.schema.get_field_index(source_id_col),
-            source_id_col,
+            table.schema.get_field_index(link_id_col),
+            link_id_col,
             cast_object_id_column_to_int64(col),
         )
-        table = _sync_lake_join_id_from_native(table, source_id_col)
-        return table, f"column:{source_id_col}"
+        table = _sync_lake_join_id_from_native(table, link_id_col)
+        return table, f"column:{link_id_col}"
 
     if object_id_column_is_integer_ids(col):
         table = table.set_column(
-            table.schema.get_field_index(source_id_col),
-            source_id_col,
+            table.schema.get_field_index(link_id_col),
+            link_id_col,
             cast_object_id_column_to_int64(col),
         )
-        table = _sync_lake_join_id_from_native(table, source_id_col)
-        return table, f"column:{source_id_col}"
+        table = _sync_lake_join_id_from_native(table, link_id_col)
+        return table, f"column:{link_id_col}"
 
     labels = [_object_id_text(v) for v in col.to_pylist()]
     sample = labels[0] if labels else ""
@@ -569,21 +566,21 @@ def ensure_catalog_source_ids(
         "unchanged and adding int64 column _source_id (stable hash) for "
         "spectrum/cutout joins. SQL: filter on %r; Python API: "
         "normalize_object_id(label) or stable_object_id_from_string(label).",
-        source_id_col,
+        link_id_col,
         sample,
-        source_id_col,
+        link_id_col,
     )
-    if source_id_col in (LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN):
+    if link_id_col == LAKE_JOIN_ID_COLUMN:
         raise ValueError(
-            f"Column {source_id_col!r} cannot hold non-integer labels; use "
-            "--source-id-col with your survey name column (e.g. NAME or SOURCE_ID)."
+            f"Column {link_id_col!r} cannot hold non-integer labels; use "
+            "--link-id-col with your survey name column (e.g. NAME or SOURCE_ID)."
         )
     hashes = pa.array(
         [stable_object_id_from_string(text) for text in labels],
         type=pa.int64(),
     )
     table = _set_lake_join_id_column(table, hashes)
-    return table, f"label:{source_id_col}"
+    return table, f"label:{link_id_col}"
 
 
 def warn_if_id_column_unsafe(
@@ -618,7 +615,7 @@ def warn_if_id_column_unsafe(
         )
 
 
-def resolve_source_id_column(
+def resolve_link_id_column(
     catalog_root: Path | str,
     *,
     schema_names: list[str] | None = None,
@@ -627,14 +624,7 @@ def resolve_source_id_column(
     """Return the lake join column for catalog ↔ Zarr / cross-match (``_source_id``).
 
     Reads ``catalog_info.json`` when present.  The join column is always
-    :data:`LAKE_JOIN_ID_COLUMN` on current catalogs; legacy tiles may still
-    store :data:`LEGACY_JOIN_ID_COLUMN` until migration.
-
-    Parameters
-    ----------
-    override:
-        If set, use this column when it appears in ``schema_names``
-        (or unconditionally when no schema is available).
+    :data:`LAKE_JOIN_ID_COLUMN`.
     """
     catalog_root = Path(catalog_root)
 
@@ -647,7 +637,7 @@ def resolve_source_id_column(
         if schema_names is None or matched is not None:
             return matched or override
         raise KeyError(
-            f"Requested source-ID column {override!r} not in catalog schema. "
+            f"Requested link-ID column {override!r} not in catalog schema. "
             f"Available: {sorted(schema_names)[:30]}"
             f"{'…' if len(schema_names) > 30 else ''}"
         )
@@ -656,37 +646,8 @@ def resolve_source_id_column(
         schema_names = catalog_tile_schema_names(catalog_root)
 
     if schema_names is not None:
-        names_set = set(schema_names)
-        if LAKE_JOIN_ID_COLUMN in names_set:
+        if LAKE_JOIN_ID_COLUMN in schema_names:
             return LAKE_JOIN_ID_COLUMN
-        if LEGACY_JOIN_ID_COLUMN in names_set:
-            log.warning(
-                "Catalog %s uses legacy join column %r; run "
-                "dl-repair-catalog-metadata --migrate-join-column.",
-                catalog_root.name,
-                LEGACY_JOIN_ID_COLUMN,
-            )
-            return LEGACY_JOIN_ID_COLUMN
-
-    info_path = catalog_root / "catalog_info.json"
-    if info_path.exists():
-        with open(info_path) as fh:
-            info = json.load(fh)
-        recorded = info.get("source_id_column")
-        if isinstance(recorded, str) and recorded.strip() == LAKE_JOIN_ID_COLUMN:
-            if schema_names is None or LAKE_JOIN_ID_COLUMN in schema_names:
-                return LAKE_JOIN_ID_COLUMN
-
-    if schema_names is not None:
-        native = infer_native_id_column(schema_names)
-        if native is not None:
-            log.info(
-                "Catalog %s: no %r column in tiles; inferred native ID %r "
-                "(re-ingest or run dl-repair-catalog-metadata --migrate-join-column).",
-                catalog_root.name,
-                LAKE_JOIN_ID_COLUMN,
-                native,
-            )
         raise KeyError(
             f"No lake join column {LAKE_JOIN_ID_COLUMN!r} in catalog under {catalog_root}. "
             f"Parquet columns include: "
@@ -705,48 +666,6 @@ def read_parquet_tile(tile_path: Path | str) -> pa.Table:
     return pq.ParquetFile(tile_path).read()
 
 
-def migrate_parquet_tile_join_column(
-    tile_path: Path | str,
-    *,
-    catalog_parquet_options: CatalogParquetOptions | None = None,
-    native_col: str | None = None,
-) -> str:
-    """Ensure one catalog tile has ``_source_id`` (rename legacy or copy native).
-
-    Returns ``"renamed"``, ``"ok"`` (already has ``_source_id``), or ``"missing"``.
-    """
-    tile_path = Path(tile_path)
-    table = read_parquet_tile(tile_path)
-    names = table.schema.names
-    opts = catalog_parquet_options or CatalogParquetOptions()
-
-    def _write(t: pa.Table) -> str:
-        pq.write_table(
-            t,
-            str(tile_path),
-            compression="zstd",
-            compression_level=opts.compression_level,
-            write_statistics=opts.write_statistics,
-        )
-        return "renamed"
-
-    if LAKE_JOIN_ID_COLUMN in names:
-        if LEGACY_JOIN_ID_COLUMN in names:
-            table = table.drop_columns([LEGACY_JOIN_ID_COLUMN])
-            return _write(table)
-        return "ok"
-    if LEGACY_JOIN_ID_COLUMN in names:
-        col = table.column(LEGACY_JOIN_ID_COLUMN)
-        table = table.drop_columns([LEGACY_JOIN_ID_COLUMN])
-        table = table.append_column(LAKE_JOIN_ID_COLUMN, col)
-        return _write(table)
-    native = native_col or infer_native_id_column(names)
-    if native is not None and native in names:
-        table = _sync_lake_join_id_from_native(table, native)
-        return _write(table)
-    return "missing"
-
-
 def rebuild_parquet_tile_link_id(
     tile_path: Path | str,
     link_col: str,
@@ -756,9 +675,8 @@ def rebuild_parquet_tile_link_id(
 ) -> tuple[str, str]:
     """Recompute ``_source_id`` from *link_col* on one catalog tile.
 
-    Unlike :func:`migrate_parquet_tile_join_column`, this always replaces an
-    existing ``_source_id`` column (e.g. switch zCOSMOS from ``id`` to
-    ``filename`` hash).  Returns ``(status, source_id_mode)`` where *status*
+    This always replaces an existing ``_source_id`` column (e.g. switch zCOSMOS from ``id`` to
+    ``filename`` hash).  Returns ``(status, link_id_mode)`` where *status*
     is ``"rebuilt"``.
     """
     tile_path = Path(tile_path)
@@ -1225,7 +1143,7 @@ def _filter_table_columns(
     *,
     ra_col: str,
     dec_col: str,
-    source_id_col: str | None,
+    link_id_col: str | None,
     norder: int,
 ) -> pa.Table:
     """Keep only requested columns plus sky, ID, HEALPix, and index placeholders."""
@@ -1233,8 +1151,8 @@ def _filter_table_columns(
         return table
     hp_col = f"_healpix_norder{norder}"
     required = {ra_col, dec_col, hp_col, "_cutout_index", "_spectrum_index"}
-    if source_id_col:
-        required.add(source_id_col)
+    if link_id_col:
+        required.add(link_id_col)
     required.add(LAKE_JOIN_ID_COLUMN)
     keep: list[str] = []
     seen: set[str] = set()
@@ -1285,24 +1203,6 @@ def _shrink_tile_table_for_disk(table: pa.Table) -> pa.Table:
             )
             arrays.append(col)
     return pa.Table.from_arrays(arrays, names=table.schema.names)
-
-
-def _resolve_tile_mode(
-    tile_mode: TileMode | None,
-    overwrite: bool,
-) -> TileMode:
-    """Map deprecated ``overwrite`` flag to ``tile_mode`` when needed."""
-    if tile_mode is not None:
-        if overwrite and tile_mode != "overwrite":
-            log.warning(
-                "--overwrite is deprecated; --tile-mode=%r takes precedence.",
-                tile_mode,
-            )
-        return tile_mode
-    if overwrite:
-        log.warning("--overwrite is deprecated; use --tile-mode overwrite.")
-        return "overwrite"
-    return "skip"
 
 
 def _parquet_tile_tmp_path(out_file: Path) -> Path:
@@ -1517,13 +1417,11 @@ def _align_incoming_to_schema(incoming: pa.Table, target: pa.Schema) -> pa.Table
     return pa.Table.from_arrays(arrays, schema=target)
 
 
-def _id_column_for_dedup(table: pa.Table, source_id_col: str | None) -> str | None:
+def _id_column_for_dedup(table: pa.Table, link_id_col: str | None) -> str | None:
     if LAKE_JOIN_ID_COLUMN in table.schema.names:
         return LAKE_JOIN_ID_COLUMN
-    if LEGACY_JOIN_ID_COLUMN in table.schema.names:
-        return LEGACY_JOIN_ID_COLUMN
-    if source_id_col and source_id_col in table.schema.names:
-        return source_id_col
+    if link_id_col and link_id_col in table.schema.names:
+        return link_id_col
     return None
 
 
@@ -1595,7 +1493,7 @@ def _write_tile_for_mode(
     *,
     tile_mode: TileMode,
     on_duplicate_id: DuplicateIdMode,
-    source_id_col: str | None,
+    link_id_col: str | None,
     parquet_options: CatalogParquetOptions,
 ) -> pq.FileMetaData | None:
     """Write one ``Npix=*.parquet`` tile; return metadata if written, else None."""
@@ -1619,7 +1517,7 @@ def _write_tile_for_mode(
         return _write_catalog_parquet_tile(incoming, out_file, parquet_options)
 
     existing = _read_catalog_tile(out_file)
-    sid = _id_column_for_dedup(existing, source_id_col)
+    sid = _id_column_for_dedup(existing, link_id_col)
     merged = _merge_tile_tables(
         existing,
         incoming,
@@ -1677,19 +1575,19 @@ def finalize_catalog_survey(
     *,
     ra_col: str = "ra",
     dec_col: str = "dec",
-    source_id_mode: str | None = None,
+    link_id_mode: str | None = None,
     streaming: bool = False,
     fallback_n_cols: int = 0,
 ) -> bool:
     """Refresh ``catalog_info.json``, ``_metadata``, and ``schema_manifest.json`` from tiles.
 
-    Merges ``ra``/``dec``/``source_id_mode``/``hats_order`` from existing
+    Merges ``ra``/``dec``/``link_id_mode``/``hats_order`` from existing
     ``catalog_info.json`` when present.  Returns False when there are no valid tiles.
     """
     catalog_root = Path(catalog_root)
     ra = ra_col
     dec = dec_col
-    sid = source_id_mode if source_id_mode is not None else "sequential"
+    sid = link_id_mode if link_id_mode is not None else "sequential"
     hats_order = norder
     stream = streaming
     info_path = catalog_root / "catalog_info.json"
@@ -1698,8 +1596,8 @@ def finalize_catalog_survey(
             info = json.load(fh)
         ra = info.get("ra_column", ra)
         dec = info.get("dec_column", dec)
-        if source_id_mode is None:
-            sid = info.get("source_id_mode", sid)
+        if link_id_mode is None:
+            sid = info.get("link_id_mode", sid)
         hats_order = int(info.get("hats_order", hats_order))
         stream = bool(info.get("ingest_streaming", stream))
 
@@ -1712,7 +1610,7 @@ def finalize_catalog_survey(
         hats_order,
         ra_col=ra,
         dec_col=dec,
-        source_id_mode=sid,
+        link_id_mode=sid,
         streaming=stream,
         fallback_n_cols=fallback_n_cols,
     )
@@ -1726,7 +1624,7 @@ def _finalize_catalog_writes(
     *,
     ra_col: str,
     dec_col: str,
-    source_id_mode: str,
+    link_id_mode: str,
     streaming: bool,
     fallback_n_cols: int,
 ) -> None:
@@ -1747,25 +1645,25 @@ def _finalize_catalog_writes(
             "catalog_info and schema_manifest will still be updated",
             catalog_root,
         )
-    native_col: str | None = native_id_column_from_mode(source_id_mode)
+    native_col: str | None = native_id_column_from_mode(link_id_mode)
     if tile_paths:
         tile_schema = pq.read_schema(str(tile_paths[0])).names
         try:
-            resolve_source_id_column(catalog_root, schema_names=tile_schema)
+            resolve_link_id_column(catalog_root, schema_names=tile_schema)
         except KeyError:
             pass
-        if LAKE_JOIN_ID_COLUMN in tile_schema and source_id_mode == "sequential":
+        if LAKE_JOIN_ID_COLUMN in tile_schema and link_id_mode == "sequential":
             inferred = infer_native_id_column(tile_schema)
             if inferred is not None:
-                source_id_mode = f"column:{inferred}"
+                link_id_mode = f"column:{inferred}"
                 native_col = inferred
                 log.info(
-                    "Catalog %s: recording source_id_mode=%r from tile schema.",
+                    "Catalog %s: recording link_id_mode=%r from tile schema.",
                     survey_name,
-                    source_id_mode,
+                    link_id_mode,
                 )
-        if native_col is None and source_id_mode.startswith(("column:", "label:")):
-            native_col = native_id_column_from_mode(source_id_mode)
+        if native_col is None and link_id_mode.startswith(("column:", "label:")):
+            native_col = native_id_column_from_mode(link_id_mode)
 
     join_col = LAKE_JOIN_ID_COLUMN
     info_path = catalog_root / "catalog_info.json"
@@ -1775,8 +1673,8 @@ def _finalize_catalog_writes(
         info["total_rows"] = total_rows
         info["total_columns"] = n_cols
         info["hats_order"] = norder
-        info["source_id_column"] = join_col
-        info["source_id_mode"] = source_id_mode
+        info["link_id_column"] = join_col
+        info["link_id_mode"] = link_id_mode
         if native_col:
             info["native_id_column"] = native_col
         elif "native_id_column" in info:
@@ -1792,8 +1690,8 @@ def _finalize_catalog_writes(
             n_cols,
             ra_column=ra_col,
             dec_column=dec_col,
-            source_id_mode=source_id_mode,
-            source_id_column=join_col,
+            link_id_mode=link_id_mode,
+            link_id_column=join_col,
             native_id_column=native_col,
             streaming=streaming,
         )
@@ -1807,7 +1705,7 @@ def _finalize_catalog_writes(
             hats_order=norder,
             ra_column=ra_col,
             dec_column=dec_col,
-            source_id_mode=source_id_mode,
+            link_id_mode=link_id_mode,
             total_rows=total_rows,
         )
 
@@ -1859,8 +1757,7 @@ def ingest_catalog(
     ra_col: str = "ra",
     dec_col: str = "dec",
     norder: int = 5,
-    source_id_col: str | None = None,
-    overwrite: bool = False,
+    link_id_col: str | None = None,
     tile_mode: TileMode | None = None,
     on_duplicate_id: DuplicateIdMode = "skip",
     streaming: bool = False,
@@ -1884,20 +1781,17 @@ def ingest_catalog(
         Column names for right ascension and declination in degrees.
     norder:
         HEALPix order for partitioning (default 5 → ~12k tiles of ~3.7 deg²).
-    source_id_col:
+    link_id_col:
         If provided, used as the object identifier.  Integer columns are stored
         as ``int64``.  Non-integer string labels (e.g. ``J000000.00-314627.5``)
         are kept in that column and a ``source_id`` int64 hash column is added
         for spectrum/cutout joins.  Decimal ASCII strings (DESI ``TARGETID``) are
         parsed as integers.  Otherwise a sequential ``source_id`` is generated.
-    overwrite:
-        Deprecated. Use ``tile_mode`` instead. When True, equivalent to
-        ``tile_mode="overwrite"``.
     tile_mode:
         How to handle an existing ``Npix=*.parquet`` tile: ``skip`` (default),
         ``overwrite`` (replace), or ``append`` (read–concat–write).
     on_duplicate_id:
-        When ``tile_mode="append"`` and an ID column exists (``source_id_col``
+        When ``tile_mode="append"`` and an ID column exists (``link_id_col``
         or auto ``source_id``): ``skip`` drops incoming duplicates, ``error``
         fails, ``last`` replaces existing rows with the same ID.
     streaming:
@@ -1928,7 +1822,7 @@ def ingest_catalog(
         if compact
         else (parquet_options or CatalogParquetOptions())
     )
-    resolved_tile_mode = _resolve_tile_mode(tile_mode, overwrite)
+    resolved_tile_mode: TileMode = tile_mode if tile_mode is not None else "skip"
 
     if streaming:
         _ingest_catalog_streaming(
@@ -1938,7 +1832,7 @@ def ingest_catalog(
             ra_col=ra_col,
             dec_col=dec_col,
             norder=norder,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
             tile_mode=resolved_tile_mode,
             on_duplicate_id=on_duplicate_id,
             columns=columns,
@@ -1949,12 +1843,12 @@ def ingest_catalog(
     table = _read_source_table(source_path)
     log.info("Loaded %d rows × %d columns", len(table), len(table.schema))
 
-    table, sid_mode = ensure_catalog_source_ids(table, source_id_col)
+    table, sid_mode = ensure_catalog_source_ids(table, link_id_col)
 
     table = _add_healpix_columns(table, ra_col, dec_col, norder)
     table = _filter_table_columns(
         table, columns, ra_col=ra_col, dec_col=dec_col,
-        source_id_col=source_id_col, norder=norder,
+        link_id_col=link_id_col, norder=norder,
     )
     hp_col = f"_healpix_norder{norder}"
 
@@ -1986,7 +1880,7 @@ def ingest_catalog(
             tile_table,
             tile_mode=resolved_tile_mode,
             on_duplicate_id=on_duplicate_id,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
             parquet_options=pq_opts,
         ) is not None:
             tiles_written += 1
@@ -2003,7 +1897,7 @@ def ingest_catalog(
         norder,
         ra_col=ra_col,
         dec_col=dec_col,
-        source_id_mode=sid_mode,
+        link_id_mode=sid_mode,
         streaming=False,
         fallback_n_cols=len(table.schema),
     )
@@ -2038,24 +1932,24 @@ def decode_catalog_file_to_batches(
     ra_col: str,
     dec_col: str,
     norder: int,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
     columns: Sequence[str] | None = None,
 ) -> tuple[list[tuple[int, pa.Table]], str, int]:
     """Read one catalog file and partition rows by HEALPix tile (in-memory).
 
-    Returns ``(tile_batches, source_id_mode, n_rows)``.  Used by the parallel
+    Returns ``(tile_batches, link_id_mode, n_rows)``.  Used by the parallel
     file-list ingest; each worker holds one full file in RAM.
     """
     source_path = Path(source_path)
     table = _read_source_table(source_path)
-    table, sid_mode = ensure_catalog_source_ids(table, source_id_col)
+    table, sid_mode = ensure_catalog_source_ids(table, link_id_col)
     table = _add_healpix_columns(table, ra_col, dec_col, norder)
     table = _filter_table_columns(
         table,
         columns,
         ra_col=ra_col,
         dec_col=dec_col,
-        source_id_col=source_id_col,
+        link_id_col=link_id_col,
         norder=norder,
     )
     table = normalize_catalog_table_types(table)
@@ -2070,7 +1964,7 @@ def _ingest_catalog_streaming(
     ra_col: str,
     dec_col: str,
     norder: int,
-    source_id_col: str | None,
+    link_id_col: str | None,
     tile_mode: TileMode,
     on_duplicate_id: DuplicateIdMode = "skip",
     columns: Sequence[str] | None = None,
@@ -2083,7 +1977,7 @@ def _ingest_catalog_streaming(
 
     1. ``fits.open(memmap=True)`` exposes the BINTABLE as a memory-mapped
        numpy recarray; no decompression / copy yet.
-    2. Read only ``ra_col``, ``dec_col``, and (optionally) ``source_id_col``
+    2. Read only ``ra_col``, ``dec_col``, and (optionally) ``link_id_col``
        into RAM.  Compute HEALPix and an argsort permutation by tile.
     3. For each HEALPix tile (contiguous slice of the sorted order):
        a. Use numpy fancy indexing into the memmap to materialise only
@@ -2143,7 +2037,7 @@ def _ingest_catalog_streaming(
         ra = np.ascontiguousarray(np.asarray(data[ra_col], dtype=np.float64))
         dec = np.ascontiguousarray(np.asarray(data[dec_col], dtype=np.float64))
 
-        if source_id_col and source_id_col in col_names:
+        if link_id_col and link_id_col in col_names:
             sid_in_fits = True
         else:
             sid_in_fits = False
@@ -2187,7 +2081,7 @@ def _ingest_catalog_streaming(
                 )
             else:
                 tile_table, tile_sid_mode = ensure_catalog_source_ids(
-                    tile_table, source_id_col,
+                    tile_table, link_id_col,
                 )
                 if sid_mode is None:
                     sid_mode = tile_sid_mode
@@ -2207,7 +2101,7 @@ def _ingest_catalog_streaming(
 
             tile_table = _filter_table_columns(
                 tile_table, columns, ra_col=ra_col, dec_col=dec_col,
-                source_id_col=source_id_col, norder=norder,
+                link_id_col=link_id_col, norder=norder,
             )
 
             if tile_schema is None:
@@ -2222,7 +2116,7 @@ def _ingest_catalog_streaming(
                 tile_table,
                 tile_mode=tile_mode,
                 on_duplicate_id=on_duplicate_id,
-                source_id_col=source_id_col,
+                link_id_col=link_id_col,
                 parquet_options=pq_opts,
             ) is not None:
                 tiles_written += 1
@@ -2243,7 +2137,7 @@ def _ingest_catalog_streaming(
                 norder,
                 ra_col=ra_col,
                 dec_col=dec_col,
-                source_id_mode=sid_mode,
+                link_id_mode=sid_mode,
                 streaming=True,
                 fallback_n_cols=len(tile_schema),
             )
@@ -2272,12 +2166,12 @@ def _write_catalog_info(
     *,
     ra_column: str,
     dec_column: str,
-    source_id_mode: str,
-    source_id_column: str | None = None,
+    link_id_mode: str,
+    link_id_column: str | None = None,
     native_id_column: str | None = None,
     streaming: bool,
 ) -> None:
-    join_col = source_id_column or LAKE_JOIN_ID_COLUMN
+    join_col = link_id_column or LAKE_JOIN_ID_COLUMN
     info = {
         "catalog_name": survey_name,
         "catalog_type": "object",
@@ -2288,8 +2182,8 @@ def _write_catalog_info(
         "epoch": "J2000",
         "ra_column": ra_column,
         "dec_column": dec_column,
-        "source_id_mode": source_id_mode,
-        "source_id_column": join_col,
+        "link_id_mode": link_id_mode,
+        "link_id_column": join_col,
         "ingest_streaming": streaming,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -2311,8 +2205,7 @@ def ingest_catalog_batch(
     ra_col: str = "ra",
     dec_col: str = "dec",
     norder: int = 5,
-    source_id_col: str | None = None,
-    overwrite: bool = False,
+    link_id_col: str | None = None,
     tile_mode: TileMode | None = None,
     on_duplicate_id: DuplicateIdMode = "skip",
 ) -> None:
@@ -2330,8 +2223,7 @@ def ingest_catalog_batch(
             ra_col=ra_col,
             dec_col=dec_col,
             norder=norder,
-            source_id_col=source_id_col,
-            overwrite=overwrite,
+            link_id_col=link_id_col,
             tile_mode=tile_mode,
             on_duplicate_id=on_duplicate_id,
         )
@@ -2364,7 +2256,7 @@ try:
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
-    @click.option("--source-id-col", default=None)
+    @click.option("--link-id-col", default=None)
     @click.option(
         "--tile-mode",
         type=click.Choice(["skip", "overwrite", "append"], case_sensitive=False),
@@ -2378,7 +2270,6 @@ try:
         show_default=True,
         help="When --tile-mode=append and an ID column exists.",
     )
-    @click.option("--overwrite", is_flag=True, help="Deprecated: use --tile-mode overwrite.")
     @click.option(
         "--streaming/--no-streaming", default=False, show_default=True,
         help="FITS-only: memmap the input and write one tile at a time. "
@@ -2414,10 +2305,9 @@ try:
         ra_col: str,
         dec_col: str,
         norder: int | None,
-        source_id_col: str | None,
+        link_id_col: str | None,
         tile_mode: str | None,
         on_duplicate_id: str,
-        overwrite: bool,
         streaming: bool,
         columns: str | None,
         compact: bool,
@@ -2449,8 +2339,7 @@ try:
             dec_col=dec_col,
             norder=pick(norder,
                         cfg.partitioning.hats_order if cfg else None, 5),
-            source_id_col=source_id_col,
-            overwrite=overwrite,
+            link_id_col=link_id_col,
             tile_mode=tile_mode.lower() if tile_mode else None,  # type: ignore[arg-type]
             on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
             streaming=streaming,

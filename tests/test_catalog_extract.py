@@ -99,7 +99,7 @@ class TestExtractFromLake:
         )
         (lake / "catalogs" / "TEST_SURVEY" / "catalog_info.json").write_text(
             '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
-            '"source_id_mode": "sequential", "total_rows": 2}',
+            '"link_id_mode": "sequential", "total_rows": 2}',
         )
         out = tmp_path / "export.parquet"
         result = extract_catalog(
@@ -128,7 +128,7 @@ class TestExtractFromLake:
             )
         (lake / "catalogs" / "BIG" / "catalog_info.json").write_text(
             '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
-            '"source_id_mode": "sequential", "total_rows": 2}',
+            '"link_id_mode": "sequential", "total_rows": 2}',
         )
         out_dir = tmp_path / "tiles"
         result = stream_extract_from_lake_catalog(
@@ -160,7 +160,7 @@ class TestExtractFromLake:
         )
         (lake / "catalogs" / "PART" / "catalog_info.json").write_text(
             '{"hats_order": 1, "ra_column": "ra", "dec_column": "dec", '
-            '"source_id_mode": "sequential", "total_rows": 2}',
+            '"link_id_mode": "sequential", "total_rows": 2}',
         )
         out = tmp_path / "idx.parquet"
         result = extract_catalog(
@@ -188,7 +188,7 @@ class TestExtractFromLake:
         )
         (lake / "catalogs" / "S" / "catalog_info.json").write_text(
             '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
-            '"source_id_mode": "sequential", "total_rows": 1}',
+            '"link_id_mode": "sequential", "total_rows": 1}',
         )
         out = tmp_path / "out.csv"
         result = extract_catalog(
@@ -217,7 +217,7 @@ class TestExtractFromLake:
         )
         (lake / "catalogs" / "S" / "catalog_info.json").write_text(
             '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
-            '"source_id_mode": "sequential", "total_rows": 1}',
+            '"link_id_mode": "sequential", "total_rows": 1}',
         )
         out = tmp_path / "out.fits"
         result = extract_catalog(

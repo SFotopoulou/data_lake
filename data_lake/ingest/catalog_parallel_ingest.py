@@ -32,7 +32,6 @@ from data_lake.ingest.fits_to_parquet import (
     TileMode,
     finalize_catalog_survey,
     _remove_stale_parquet_tmp_files,
-    _resolve_tile_mode,
     _write_tile_for_mode,
     decode_catalog_file_to_batches,
     healpix_dir,
@@ -49,7 +48,7 @@ class CatalogDecodeConfig:
     norder: int
     ra_col: str
     dec_col: str
-    source_id_col: str | None
+    link_id_col: str | None
     columns: tuple[str, ...] | None
 
 
@@ -75,7 +74,7 @@ class CatalogWorkerResult:
     batch_refs: list[CatalogTileBatchRef] = field(default_factory=list)
     spool_dir: str | None = None
     n_rows: int = 0
-    source_id_mode: str = "sequential"
+    link_id_mode: str = "sequential"
     error: str | None = None
     tb: str | None = None
     elapsed_s: float = 0.0
@@ -96,7 +95,7 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
         ra_col=config.ra_col,
         dec_col=config.dec_col,
         norder=config.norder,
-        source_id_col=config.source_id_col,
+        link_id_col=config.link_id_col,
         columns=cols,
     )
     # Do not pickle pa.Table across processes (ALLWISE/Gaia-scale tables OOM the
@@ -126,7 +125,7 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
         batch_refs=batch_refs,
         spool_dir=spool_dir,
         n_rows=n_rows,
-        source_id_mode=sid_mode,
+        link_id_mode=sid_mode,
         elapsed_s=time.perf_counter() - t0,
     )
 
@@ -155,11 +154,10 @@ def ingest_catalogs_parallel(
     ra_col: str = "ra",
     dec_col: str = "dec",
     norder: int = 5,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
     columns: Sequence[str] | None = None,
     tile_mode: TileMode | None = None,
     on_duplicate_id: DuplicateIdMode = "skip",
-    overwrite: bool = False,
     parquet_options: CatalogParquetOptions | None = None,
     compact: bool = False,
     checkpoint_path: Path | str | None = None,
@@ -182,7 +180,7 @@ def ingest_catalogs_parallel(
     catalog_root.mkdir(parents=True, exist_ok=True)
     _remove_stale_parquet_tmp_files(catalog_root)
 
-    resolved_tile_mode = _resolve_tile_mode(tile_mode, overwrite)
+    resolved_tile_mode: TileMode = tile_mode if tile_mode is not None else "append"
     if resolved_tile_mode != "append":
         log.warning(
             "Parallel catalog ingest is intended for --tile-mode append; got %r.",
@@ -199,7 +197,7 @@ def ingest_catalogs_parallel(
         norder=norder,
         ra_col=ra_col,
         dec_col=dec_col,
-        source_id_col=source_id_col,
+        link_id_col=link_id_col,
         columns=tuple(columns) if columns else None,
     )
     decoder = decoder or _decode_one_catalog_safe
@@ -223,7 +221,7 @@ def ingest_catalogs_parallel(
             norder,
             ra_col=ra_col,
             dec_col=dec_col,
-            source_id_mode=None,
+            link_id_mode=None,
             fallback_n_cols=0,
         )
         return {
@@ -310,7 +308,7 @@ def ingest_catalogs_parallel(
             batch.table,
             tile_mode=resolved_tile_mode,
             on_duplicate_id=on_duplicate_id,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
             parquet_options=pq_opts,
         )
         tiles_touched.add(batch.npix)
@@ -333,7 +331,7 @@ def ingest_catalogs_parallel(
             return
 
         if sid_mode is None:
-            sid_mode = res.source_id_mode
+            sid_mode = res.link_id_mode
         try:
             if res.batch_refs:
                 import pyarrow.parquet as pq
@@ -429,7 +427,7 @@ def ingest_catalogs_parallel(
         norder,
         ra_col=ra_col,
         dec_col=dec_col,
-        source_id_mode=sid_mode,
+        link_id_mode=sid_mode,
         streaming=False,
         fallback_n_cols=fallback_n_cols,
     )
@@ -481,7 +479,7 @@ try:
     @click.option("--ra-col", default="ra", show_default=True)
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int)
-    @click.option("--source-id-col", default=None)
+    @click.option("--link-id-col", default=None)
     @click.option(
         "--tile-mode",
         type=click.Choice(["skip", "overwrite", "append"], case_sensitive=False),
@@ -495,7 +493,6 @@ try:
         default="skip",
         show_default=True,
     )
-    @click.option("--overwrite", is_flag=True, help="Deprecated: use --tile-mode overwrite.")
     @click.option(
         "--columns",
         default=None,
@@ -537,10 +534,9 @@ try:
         ra_col: str,
         dec_col: str,
         norder: int | None,
-        source_id_col: str | None,
+        link_id_col: str | None,
         tile_mode: str,
         on_duplicate_id: str,
-        overwrite: bool,
         columns: str | None,
         compact: bool,
         n_workers: int,
@@ -570,11 +566,10 @@ try:
             ra_col=ra_col,
             dec_col=dec_col,
             norder=n,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
             columns=col_list,
             tile_mode=tile_mode.lower(),  # type: ignore[arg-type]
             on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
-            overwrite=overwrite,
             compact=compact,
             checkpoint_path=checkpoint or default_ck,
             failures_log=failures_log,

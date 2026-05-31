@@ -480,7 +480,7 @@ def _fits_bintable_scalar(data: np.ndarray, row_index: int, *candidates: str) ->
     return None
 
 
-def _sdss_source_id(hdul: fits.HDUList, source_id_col: str | None) -> int:
+def _sdss_source_id(hdul: fits.HDUList, link_id_col: str | None) -> int:
     """Resolve object ID for ``spec-PLATE-MJD-FIBER.fits`` (header + SPALL HDU).
 
     ``SPECOBJID`` and most spAll columns live in the **SPALL** BINTABLE (HDU 2),
@@ -492,8 +492,8 @@ def _sdss_source_id(hdul: fits.HDUList, source_id_col: str | None) -> int:
     spall = _sdss_spall_hdu(hdul)
 
     candidates: list[str] = []
-    if source_id_col:
-        candidates.append(source_id_col)
+    if link_id_col:
+        candidates.append(link_id_col)
     for name in (
         "SPECOBJID",
         "SPEC_OBJID",
@@ -520,7 +520,7 @@ def _sdss_source_id(hdul: fits.HDUList, source_id_col: str | None) -> int:
     spall_names = list(spall.data.dtype.names or ()) if spall is not None else []
     raise KeyError(
         "Could not resolve SDSS spectrum object ID"
-        + (f" (requested {source_id_col!r})" if source_id_col else "")
+        + (f" (requested {link_id_col!r})" if link_id_col else "")
         + ". Looked in the primary header and SPALL (HDU 2). "
         f"Header sample: {hdr_keys[:25]}{'…' if len(hdr_keys) > 25 else ''}"
         + (
@@ -534,7 +534,7 @@ def _sdss_source_id(hdul: fits.HDUList, source_id_col: str | None) -> int:
 def _read_sdss_boss(
     hdul: fits.HDUList,
     *,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
     ra_col: str = "RA",
     dec_col: str = "DEC",
 ) -> tuple[list[SpectrumRecord], dict]:
@@ -569,7 +569,7 @@ def _read_sdss_boss(
         ra = float(phdr["PLUG_RA"])
     if dec_col not in phdr and "PLUG_DEC" in phdr:
         dec = float(phdr["PLUG_DEC"])
-    source_id = _sdss_source_id(hdul, source_id_col)
+    source_id = _sdss_source_id(hdul, link_id_col)
     meta = {
         "z":       float(phdr.get("Z", 0.0)),
         "z_err":   float(phdr.get("Z_ERR", 0.0)),
@@ -825,7 +825,7 @@ def _desi_read_spectra_skip_hdus(*, with_resolution: bool) -> set[str]:
 def _read_desi_with_desispec(
     path: Path,
     with_resolution: bool = False,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
 ) -> tuple[list[SpectrumRecord], dict, list[np.ndarray] | None, np.ndarray | None]:
     """
     Read a DESI coadd-*.fits file using desispec.
@@ -902,7 +902,7 @@ def _read_desi_with_desispec(
         row = fmap[i]
         ra  = float(_fmap_col(row, "TARGET_RA",  "RA_TARGET",  "FIBER_RA",  default=0.0))
         dec = float(_fmap_col(row, "TARGET_DEC", "DEC_TARGET", "FIBER_DEC", default=0.0))
-        sid_key = source_id_col or "TARGETID"
+        sid_key = link_id_col or "TARGETID"
         if sid_key not in fmap.colnames:
             raise KeyError(
                 f"Fibermap column {sid_key!r} not found for object ID. "
@@ -995,7 +995,7 @@ def _read_generic_1d(
     hdul: fits.HDUList,
     image_hdu: int = 0,
     *,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
     ra_col: str = "RA",
     dec_col: str = "DEC",
 ) -> tuple[list[SpectrumRecord], dict]:
@@ -1021,7 +1021,7 @@ def _read_generic_1d(
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
-    base_id = object_id_from_fits_header(header, source_id_col, hdu_index=image_hdu)
+    base_id = object_id_from_fits_header(header, link_id_col, hdu_index=image_hdu)
     base_ra, base_dec = sky_from_fits_header(header, ra_col, dec_col)
     ivar_2d = _load_generic_ivar_2d(
         hdul, flux_hdu_idx=image_hdu, n_spec=n_spec, n_pix=n_pix,
@@ -1908,7 +1908,7 @@ def _read_2df_spectrum(
     if used_stem_fallback:
         log.warning(
             "2dF: %s missing SPFILE in spectrum header(s); using filename stem %r "
-            "as link key (catalog --source-id-col SPFILE at catalog ingest)",
+            "as link key (catalog --link-id-col SPFILE at catalog ingest)",
             source_path.name,
             _2df_filename_stem(source_path),
         )
@@ -2041,7 +2041,7 @@ def _6df_link_label_from_triple(
     elif target or name_v:
         log.warning(
             "6dF: %s VR block missing TITLE_V on paired V header; link key omits "
-            "title segment (catalog --source-id-col targetname,NAME_V,TITLE_V)",
+            "title segment (catalog --link-id-col targetname,NAME_V,TITLE_V)",
             source_path.name,
         )
 
@@ -2174,11 +2174,6 @@ def _iter_6df_vr_triples(
     )
 
 
-def _iter_6df_vr_hdus(hdul: fits.HDUList) -> list[tuple[int, fits.ImageHDU]]:
-    """Return all combined 6dFGS VR spectral extensions with data."""
-    return [(idx[2], vr) for _, _, vr, idx in _iter_6df_vr_triples(hdul)]
-
-
 def _6df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
     """True when 6dF VR records in one file have incompatible wavelength grids."""
     if len(records) <= 1:
@@ -2222,7 +2217,7 @@ def _read_6df_vr_record(
     if used_fallback:
         log.warning(
             "6dF: %s VR HDU %r missing TARGET; using filename stem %r as link key "
-            "(catalog --source-id-col targetname,NAME_V,TITLE_V)",
+            "(catalog --link-id-col targetname,NAME_V,TITLE_V)",
             source_path.name,
             vr_hdu.name,
             source_path.stem,
@@ -2281,11 +2276,6 @@ def _read_6df_vr_record(
     )
 
 
-def _select_6df_vr_hdu(hdul: fits.HDUList) -> tuple[int, fits.ImageHDU]:
-    """Pick the first combined 6dFGS VR spectral extension."""
-    return _iter_6df_vr_hdus(hdul)[0]
-
-
 def _read_6df_spectrum(
     hdul: fits.HDUList,
     source_path: Path,
@@ -2296,7 +2286,7 @@ def _read_6df_spectrum(
     row from the VR HDU.  ``source_id`` is built from VR ``TARGET`` and
     ``NAME_V`` plus ``TITLE_V`` on the paired V extension
     (``target|name_v|title_v``), matching catalog ingest with
-    ``--source-id-col targetname,NAME_V,TITLE_V``.
+    ``--link-id-col targetname,NAME_V,TITLE_V``.
 
     Sky coordinates are taken from each VR extension's ``OBSRA``/``OBSDEC``
     (degrees), with fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or
@@ -2407,7 +2397,7 @@ def ingest_spectra_from_fits(
     ra_col: str = "RA",
     dec_col: str = "DEC",
     norder: int = 5,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
     wavelength_mode: str = "shared",
     mask_dtype: np.dtype | type = _DEFAULT_MASK_DTYPE,
     fmt: str | None = None,
@@ -2435,7 +2425,7 @@ def ingest_spectra_from_fits(
     ra_col / dec_col:
         Header keywords for sky coordinates (generic format; SDSS plug RA/Dec
         fallbacks when the named keys are absent).
-    source_id_col:
+    link_id_col:
         Header keyword or DESI fibermap column for object ID (e.g. ``TARGETID``).
         Must match the catalog ID column.  DESI coadds default to ``TARGETID``.
     norder:
@@ -2458,7 +2448,7 @@ def ingest_spectra_from_fits(
         (defaults to ``survey_name``).
     specobj_lookup_from_catalog:
         If True, join ``catalogs/<survey_name>/`` on plate/mjd/fiber and take
-        IDs from ``source_id_col`` or the catalog's ID column (not required to
+        IDs from ``link_id_col`` or the catalog's ID column (not required to
         be named ``specobjid``).
     n_pix_expected:
         If set, enforce that all spectra have this pixel count.
@@ -2500,7 +2490,7 @@ def ingest_spectra_from_fits(
         records, wcs_attrs, res_diags, res_offsets = _read_desi_with_desispec(
             source_path,
             with_resolution=with_resolution,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
         )
     else:
         if with_resolution:
@@ -2512,7 +2502,7 @@ def ingest_spectra_from_fits(
             if detected_fmt == "sdss_boss":
                 records, wcs_attrs = _read_sdss_boss(
                     hdul,
-                    source_id_col=source_id_col,
+                    link_id_col=link_id_col,
                     ra_col=ra_col,
                     dec_col=dec_col,
                 )
@@ -2552,7 +2542,7 @@ def ingest_spectra_from_fits(
                     spplate_hdul=hdul,
                     lookup_from_plate=specobj_lookup_from_plate,
                     specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
-                    catalog_id_col=source_id_col,
+                    catalog_id_col=link_id_col,
                 )
                 records, wcs_attrs = _read_sdss_spplate(
                     hdul,
@@ -2582,7 +2572,7 @@ def ingest_spectra_from_fits(
             else:
                 records, wcs_attrs = _read_generic_1d(
                     hdul,
-                    source_id_col=source_id_col,
+                    link_id_col=link_id_col,
                     ra_col=ra_col,
                     dec_col=dec_col,
                 )
@@ -2977,7 +2967,7 @@ try:
     @click.option("--ra-col", default="RA", show_default=True)
     @click.option("--dec-col", default="DEC", show_default=True)
     @click.option(
-        "--source-id-col",
+        "--link-id-col",
         default=None,
         help=(
             "Object ID for SDSS/DESI/generic/spPlate ingest: FITS header keyword "
@@ -3074,7 +3064,7 @@ try:
         survey_name: str,
         ra_col: str,
         dec_col: str,
-        source_id_col: str | None,
+        link_id_col: str | None,
         norder: int | None,
         wavelength_mode: str | None,
         mask_dtype: str | None,
@@ -3109,7 +3099,7 @@ try:
             survey_name=survey_name,
             ra_col=ra_col,
             dec_col=dec_col,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
             norder=resolved_norder,
             wavelength_mode=pick(wavelength_mode,
                                  cfg.defaults.wavelength_mode if cfg else None,
@@ -3139,7 +3129,7 @@ try:
                     source_id_to_index=index_map,
                     kind="spectrum",
                     norder=resolved_norder,
-                    source_id_col=None,
+                    link_id_col=None,
                 )
                 click.echo(f"Patched _spectrum_index in {n_modified} catalog tile(s).")
             except FileNotFoundError:

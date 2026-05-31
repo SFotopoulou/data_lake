@@ -73,13 +73,13 @@ def _dtype_to_str(dtype: pa.DataType) -> str:
 def infer_column_role(
     name: str,
     *,
-    source_id_column: str,
+    link_id_column: str,
     ra_column: str,
     dec_column: str,
     redshift_column: str | None,
 ) -> str:
     upper = name.upper()
-    if name == source_id_column:
+    if name == link_id_column:
         return ROLE_ID
     if name in (ra_column, dec_column) or upper in ("RA", "DEC", "TARGET_RA", "TARGET_DEC"):
         return ROLE_SKY
@@ -128,14 +128,14 @@ def build_catalog_schema_manifest(
     hats_order: int,
     ra_column: str,
     dec_column: str,
-    source_id_mode: str,
+    link_id_mode: str,
     total_rows: int | None = None,
     schema: pa.Schema | None = None,
 ) -> dict[str, Any]:
     """Build a JSON-serialisable manifest from on-disk catalog Parquet."""
     from data_lake.ingest.fits_to_parquet import (
         resolve_redshift_column,
-        resolve_source_id_column,
+        resolve_link_id_column,
     )
 
     catalog_root = Path(catalog_root)
@@ -143,7 +143,7 @@ def build_catalog_schema_manifest(
         schema = read_catalog_arrow_schema(catalog_root)
 
     names = list(schema.names)
-    source_id_column = resolve_source_id_column(
+    link_id_column = resolve_link_id_column(
         catalog_root,
         schema_names=names,
     )
@@ -158,7 +158,7 @@ def build_catalog_schema_manifest(
                 "nullable": field.nullable,
                 "role": infer_column_role(
                     field.name,
-                    source_id_column=source_id_column,
+                    link_id_column=link_id_column,
                     ra_column=ra_column,
                     dec_column=dec_column,
                     redshift_column=redshift_column,
@@ -176,11 +176,11 @@ def build_catalog_schema_manifest(
         "survey": survey_name,
         "modality": "catalog",
         "hats_order": hats_order,
-        "source_id_column": source_id_column,
+        "link_id_column": link_id_column,
         "ra_column": ra_column,
         "dec_column": dec_column,
         "redshift_column": redshift_column,
-        "source_id_mode": source_id_mode,
+        "link_id_mode": link_id_mode,
         "n_columns": len(columns),
         "total_rows": total_rows,
         "columns": columns,
@@ -197,7 +197,7 @@ def write_catalog_schema_manifest(
     hats_order: int,
     ra_column: str,
     dec_column: str,
-    source_id_mode: str,
+    link_id_mode: str,
     total_rows: int | None = None,
 ) -> Path:
     """Write ``schema_manifest.json`` under the survey catalog directory."""
@@ -208,7 +208,7 @@ def write_catalog_schema_manifest(
         hats_order=hats_order,
         ra_column=ra_column,
         dec_column=dec_column,
-        source_id_mode=source_id_mode,
+        link_id_mode=link_id_mode,
         total_rows=total_rows,
     )
     out_path = catalog_root / MANIFEST_FILENAME
@@ -359,7 +359,7 @@ def build_spectra_schema_manifest(spectra_root: Path | str, survey_name: str) ->
         "survey": survey_name,
         "modality": MODALITY_SPECTRA,
         "hats_order": info.get("hats_order"),
-        "source_id_column": LAKE_JOIN_ID_COLUMN,
+        "link_id_column": LAKE_JOIN_ID_COLUMN,
         "ra_column": None,
         "dec_column": None,
         "redshift_column": None,
@@ -419,7 +419,7 @@ def build_cutout_schema_manifest(cutout_root: Path | str, survey_name: str) -> d
         "survey": survey_name,
         "modality": MODALITY_CUTOUT,
         "hats_order": info.get("hats_order"),
-        "source_id_column": LAKE_JOIN_ID_COLUMN,
+        "link_id_column": LAKE_JOIN_ID_COLUMN,
         "ra_column": None,
         "dec_column": None,
         "redshift_column": None,
@@ -459,7 +459,7 @@ def rebuild_schema_manifest(
             hats_order=int(info.get("hats_order", 5)),
             ra_column=str(info.get("ra_column", "ra")),
             dec_column=str(info.get("dec_column", "dec")),
-            source_id_mode=str(info.get("source_id_mode", "sequential")),
+            link_id_mode=str(info.get("link_id_mode", "sequential")),
             total_rows=info.get("total_rows"),
         )
     elif modality == MODALITY_SPECTRA:
@@ -506,7 +506,7 @@ def format_manifest_table(
     ]
     if modality == MODALITY_CATALOG:
         lines.append(
-            f"rows: {manifest.get('total_rows')}  join: {manifest.get('source_id_column')!r}  "
+            f"rows: {manifest.get('total_rows')}  join: {manifest.get('link_id_column')!r}  "
             f"sky: {manifest.get('ra_column')!r}, {manifest.get('dec_column')!r}  "
             f"redshift: {manifest.get('redshift_column')!r}"
         )

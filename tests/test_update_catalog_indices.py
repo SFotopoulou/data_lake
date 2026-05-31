@@ -1,5 +1,5 @@
 """
-Tests for update_catalog_indices: resolve_source_id_column, update_index_column,
+Tests for update_catalog_indices: resolve_link_id_column, update_index_column,
 and build_index_map_from_zarr.
 
 Key cases covered:
@@ -35,7 +35,7 @@ def _write_mini_catalog(
     ra: list[float],
     dec: list[float],
     norder: int = 5,
-    source_id_mode: str | None = None,
+    link_id_mode: str | None = None,
 ) -> None:
     """Write a minimal HEALPix-partitioned Parquet catalog for testing."""
     from data_lake.ingest.fits_to_parquet import (
@@ -77,7 +77,7 @@ def _write_mini_catalog(
             compression_level=_ZSTD_LEVEL,
         )
 
-    sid_mode = source_id_mode or (
+    sid_mode = link_id_mode or (
         f"column:{id_col}" if id_col != LAKE_JOIN_ID_COLUMN else "sequential"
     )
     info = {
@@ -85,8 +85,8 @@ def _write_mini_catalog(
         "hats_order": norder,
         "ra_column": "ra",
         "dec_column": "dec",
-        "source_id_mode": sid_mode,
-        "source_id_column": LAKE_JOIN_ID_COLUMN,
+        "link_id_mode": sid_mode,
+        "link_id_column": LAKE_JOIN_ID_COLUMN,
     }
     if id_col != LAKE_JOIN_ID_COLUMN:
         info["native_id_column"] = id_col
@@ -133,7 +133,7 @@ def _write_mini_spectra_zarr(
 
 
 # ---------------------------------------------------------------------------
-# resolve_source_id_column
+# resolve_link_id_column
 # ---------------------------------------------------------------------------
 
 class TestNormalizeObjectId:
@@ -189,66 +189,66 @@ class TestNormalizeObjectId:
 
 class TestResolveSourceIdColumn:
     def test_targetid_catalog(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_link_id_column
 
-        info = {"source_id_mode": "column:TARGETID", "source_id_column": LAKE_JOIN_ID_COLUMN}
+        info = {"link_id_mode": "column:TARGETID", "link_id_column": LAKE_JOIN_ID_COLUMN}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
+        assert resolve_link_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_sequential_catalog(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_link_id_column
 
-        info = {"source_id_mode": "sequential", "source_id_column": LAKE_JOIN_ID_COLUMN}
+        info = {"link_id_mode": "sequential", "link_id_column": LAKE_JOIN_ID_COLUMN}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
+        assert resolve_link_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_missing_info_file_defaults_to_source_id(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_link_id_column
 
-        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
+        assert resolve_link_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_arbitrary_column_name(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_link_id_column
 
         info = {
-            "source_id_mode": "column:OBJ_ID",
-            "source_id_column": LAKE_JOIN_ID_COLUMN,
+            "link_id_mode": "column:OBJ_ID",
+            "link_id_column": LAKE_JOIN_ID_COLUMN,
             "native_id_column": "OBJ_ID",
         }
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
-        assert resolve_source_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
+        assert resolve_link_id_column(tmp_path) == LAKE_JOIN_ID_COLUMN
 
     def test_schema_fallback_targetid_when_info_says_sequential(self, tmp_path: Path) -> None:
         """Tiles with TARGETID + _source_id resolve to the lake join column."""
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_link_id_column
 
-        info = {"source_id_mode": "sequential"}
+        info = {"link_id_mode": "sequential"}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
         schema_names = [
             "TARGETID", LAKE_JOIN_ID_COLUMN, "ra", "dec",
             "_healpix_norder5", "_spectrum_index",
         ]
-        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
+        assert resolve_link_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
 
     def test_schema_fallback_id_when_info_says_sequential(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_link_id_column
 
-        info = {"source_id_mode": "sequential", "source_id_column": "source_id"}
+        info = {"link_id_mode": "sequential", "link_id_column": "source_id"}
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
         schema_names = ["id", LAKE_JOIN_ID_COLUMN, "ALPHA_J2000", "DELTA_J2000", "_healpix_norder5"]
-        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
+        assert resolve_link_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
 
-    def test_recorded_source_id_column_in_info(self, tmp_path: Path) -> None:
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_source_id_column
+    def test_recorded_link_id_column_in_info(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, resolve_link_id_column
 
         info = {
-            "source_id_mode": "column:id",
-            "source_id_column": LAKE_JOIN_ID_COLUMN,
+            "link_id_mode": "column:id",
+            "link_id_column": LAKE_JOIN_ID_COLUMN,
             "native_id_column": "id",
         }
         (tmp_path / "catalog_info.json").write_text(json.dumps(info))
         schema_names = ["id", LAKE_JOIN_ID_COLUMN, "ra", "dec"]
-        assert resolve_source_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
+        assert resolve_link_id_column(tmp_path, schema_names=schema_names) == LAKE_JOIN_ID_COLUMN
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +317,7 @@ class TestUpdateIndexColumnTargetId:
 # ---------------------------------------------------------------------------
 
 class TestUpdateIndexColumnSourceId:
-    def test_patches_via_source_id_column(self, tmp_path: Path) -> None:
+    def test_patches_via_link_id_column(self, tmp_path: Path) -> None:
         from data_lake.ingest.update_catalog_indices import update_index_column
 
         ids = [0, 1, 2, 3]
@@ -325,7 +325,7 @@ class TestUpdateIndexColumnSourceId:
         dec = [0.0, 0.0, 0.0, 0.0]
         _write_mini_catalog(
             tmp_path, "seq_survey", "source_id", ids, ra, dec,
-            source_id_mode="sequential",
+            link_id_mode="sequential",
         )
 
         index_map = {0: 10, 2: 20}
@@ -356,7 +356,7 @@ class TestUpdateIndexColumnSourceId:
         dec = [0.0, 0.0]
         _write_mini_catalog(
             tmp_path, "seq_survey", "source_id", ids, ra, dec,
-            source_id_mode="sequential",
+            link_id_mode="sequential",
         )
 
         # IDs that don't exist in the catalog

@@ -62,7 +62,7 @@ def _catalog_info(path: Path, survey: str, norder: int, n_rows: int, n_cols: int
         "epoch": "J2000",
         "ra_column": "ra",
         "dec_column": "dec",
-        "source_id_mode": "column:source_id",
+        "link_id_mode": "column:source_id",
         "ingest_streaming": False,
         "created_utc": "2099-01-01T00:00:00Z",
     }

@@ -3,7 +3,7 @@ sdss_specobj_lookup – resolve (survey, plate, mjd, fiber) → source_id for sp
 
 spPlate FITS files do not carry a spectroscopic ID; ingest joins on **PLATE, MJD,
 FIBERID** against a sidecar Parquet/CSV or lake catalog, then reads the catalog's
-ID column (``source_id``, ``specobjid``, ``TARGETID``, or ``--source-id-col``).
+ID column (``source_id``, ``specobjid``, ``TARGETID``, or ``--link-id-col``).
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ def _resolve_spplate_catalog_id_column(
         col = _resolve_column(names, (override,))
         if col is None:
             raise ValueError(
-                f"Requested --source-id-col {override!r} not in table; "
+                f"Requested --link-id-col {override!r} not in table; "
                 f"columns: {list(names)[:30]}"
             )
         return col
@@ -162,7 +162,7 @@ def _resolve_spplate_catalog_id_column(
         return col
 
     if catalog_dir is not None:
-        from data_lake.ingest.fits_to_parquet import resolve_source_id_column
+        from data_lake.ingest.fits_to_parquet import resolve_link_id_column
 
         names_no_photo = [
             n
@@ -171,7 +171,7 @@ def _resolve_spplate_catalog_id_column(
         ]
         if names_no_photo:
             try:
-                return resolve_source_id_column(
+                return resolve_link_id_column(
                     catalog_dir, schema_names=names_no_photo,
                 )
             except KeyError:
@@ -180,7 +180,7 @@ def _resolve_spplate_catalog_id_column(
     raise ValueError(
         "spPlate catalog join needs an ID column (e.g. source_id, specobjid, TARGETID) "
         f"after matching on {_PLATE_MJD_FIBER_REQUIRED}; "
-        f"pass --source-id-col. Columns: {list(names)[:30]}"
+        f"pass --link-id-col. Columns: {list(names)[:30]}"
     )
 
 
@@ -477,7 +477,7 @@ def build_fiber_to_specobjid_map(
     Return ``{fiber_id: source_id}`` for one plate–MJD within a survey.
 
     Catalog/sidecar rows are matched on **PLATE, MJD, FIBERID** only.  The ID value
-  comes from ``catalog_id_col`` (e.g. CLI ``--source-id-col``) or the first of
+  comes from ``catalog_id_col`` (e.g. CLI ``--link-id-col``) or the first of
     ``source_id``, ``specobjid``, ``TARGETID`` in the table.
     """
     if lookup_from_plate:

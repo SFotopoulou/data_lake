@@ -108,11 +108,11 @@ def _iter_zarr_tiles(survey_root: Path) -> Iterator[Path]:
 
 def _zarr_tile_n_sources(tile_path: Path) -> int | None:
     """Row count for one spectrum/cutout tile (reads ``source_id`` array metadata only)."""
-    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN
+    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
 
     meta_path = tile_path / LAKE_JOIN_ID_COLUMN / "zarr.json"
     if not meta_path.is_file():
-        meta_path = tile_path / LEGACY_JOIN_ID_COLUMN / "zarr.json"
+        meta_path = tile_path / LAKE_JOIN_ID_COLUMN / "zarr.json"
     if meta_path.is_file():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -167,7 +167,7 @@ def _load_catalog_manifest_or_none(catalog_root: Path, survey: str) -> dict[str,
             hats_order=int(info.get("hats_order", 5)),
             ra_column=str(info.get("ra_column", "ra")),
             dec_column=str(info.get("dec_column", "dec")),
-            source_id_mode=str(info.get("source_id_mode", "sequential")),
+            link_id_mode=str(info.get("link_id_mode", "sequential")),
             total_rows=info.get("total_rows"),
         )
         return load_catalog_schema_manifest(catalog_root)
@@ -205,7 +205,7 @@ def guess_master_meta(
         for survey, manifest in manifests.items():
             if survey in used_surveys:
                 continue
-            cat_id = manifest["source_id_column"]
+            cat_id = manifest["link_id_column"]
             cat_lower = cat_id.lower()
             survey_key = survey.lower().replace("-", "_")
 
@@ -301,7 +301,7 @@ def _catalog_registry_row(
     if manifest_path.is_file():
         with open(manifest_path) as fh:
             m = json.load(fh)
-        source_id = m.get("source_id_column")
+        source_id = m.get("link_id_column")
         ra = m.get("ra_column")
         dec = m.get("dec_column")
 
@@ -310,7 +310,7 @@ def _catalog_registry_row(
         "modality": "catalog",
         "path": str(survey_root.relative_to(lake_root)),
         "hats_order": info.get("hats_order"),
-        "source_id_column": source_id,
+        "link_id_column": source_id,
         "ra_column": ra,
         "dec_column": dec,
         "n_columns": info.get("total_columns"),
@@ -362,7 +362,7 @@ def _info_registry_row(
     if manifest is not None:
         manifest_rel = str(manifest_path.relative_to(lake_root))
         n_columns = manifest.get("n_columns")
-        source_id = manifest.get("source_id_column") or source_id
+        source_id = manifest.get("link_id_column") or source_id
 
     total_rows: int | None = None
     if modality == MODALITY_SPECTRA:
@@ -378,7 +378,7 @@ def _info_registry_row(
         "modality": modality,
         "path": str(survey_root.relative_to(lake_root)),
         "hats_order": info.get("hats_order"),
-        "source_id_column": source_id,
+        "link_id_column": source_id,
         "ra_column": info.get("ra_column"),
         "dec_column": info.get("dec_column"),
         "n_columns": n_columns,
@@ -457,7 +457,7 @@ def format_lake_registry_table(table: pa.Table) -> str:
         manifest = "yes" if row.get("has_schema_manifest") else "no"
         lines.append(
             f"{row['survey']:<24} {row['modality']:<10} {hats_s:>4} {cols_s:>6} {rows_s:>14}  "
-            f"{str(row.get('source_id_column') or '—'):<16} {manifest}"
+            f"{str(row.get('link_id_column') or '—'):<16} {manifest}"
         )
     return "\n".join(lines)
 

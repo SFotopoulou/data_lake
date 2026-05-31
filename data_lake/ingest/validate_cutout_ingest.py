@@ -78,13 +78,13 @@ def validate_cutout_tile(tile_path: Path, info: dict[str, Any], rep: ValidationR
         rep.errors.append(f"Cannot open Zarr group {tile_path}: {exc}")
         return
 
-    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN
+    from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
 
     for name in ("images", "wcs"):
         if name not in root:
             rep.errors.append(f"{tile_path}: missing array {name!r}")
             return
-    if LAKE_JOIN_ID_COLUMN not in root and LEGACY_JOIN_ID_COLUMN not in root:
+    if LAKE_JOIN_ID_COLUMN not in root:
         rep.errors.append(
             f"{tile_path}: missing join array {LAKE_JOIN_ID_COLUMN!r}"
         )

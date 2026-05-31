@@ -22,10 +22,9 @@ import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import (
     LAKE_JOIN_ID_COLUMN,
-    LEGACY_JOIN_ID_COLUMN,
     healpix_dir,
     normalize_object_id,
-    resolve_source_id_column,
+    resolve_link_id_column,
 )
 from data_lake.ingest.zarr_ids import zarr_join_array
 
@@ -148,7 +147,7 @@ def validate_tile_link(
         rep.errors.append(f"Cannot open Zarr tile {zarr_tile}: {exc}")
         return
 
-    if LAKE_JOIN_ID_COLUMN not in root and LEGACY_JOIN_ID_COLUMN not in root:
+    if LAKE_JOIN_ID_COLUMN not in root:
         rep.errors.append(f"{zarr_tile}: missing join array")
         return
 
@@ -258,7 +257,7 @@ def run_validation(
     survey: str,
     *,
     norder: int | None = None,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
     max_tiles: int | None = None,
     sample: int | None = None,
     seed: int = 0,
@@ -285,10 +284,10 @@ def run_validation(
     if sample_parquet is not None:
         schema_names = pq.read_schema(str(sample_parquet)).names
     try:
-        sid_col = resolve_source_id_column(
+        sid_col = resolve_link_id_column(
             catalog_root,
             schema_names=schema_names,
-            override=source_id_col,
+            override=link_id_col,
         )
     except Exception as exc:
         rep.errors.append(f"Cannot resolve join ID column: {exc}")
@@ -340,7 +339,7 @@ try:
     @click.option("--survey", "survey_name", required=True, help="Survey name.")
     @click.option("--norder", type=int, default=None, help="HEALPix order (default: info JSON).")
     @click.option(
-        "--source-id-col",
+        "--link-id-col",
         default=None,
         help="Override catalog join column (default: resolve from catalog_info.json).",
     )
@@ -367,7 +366,7 @@ try:
         config_path: Path | None,
         survey_name: str,
         norder: int | None,
-        source_id_col: str | None,
+        link_id_col: str | None,
         max_tiles: int | None,
         sample: int | None,
         seed: int,
@@ -381,7 +380,7 @@ try:
             lake,
             survey_name,
             norder=norder,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
             max_tiles=max_tiles,
             sample=sample,
             seed=seed,

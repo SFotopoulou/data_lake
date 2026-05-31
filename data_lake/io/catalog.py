@@ -28,7 +28,7 @@ from data_lake.ingest.fits_to_parquet import (
     catalog_tile_schema_names,
     healpix_dir,
     resolve_redshift_column,
-    resolve_source_id_column,
+    resolve_link_id_column,
 )
 
 log = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ class CatalogAccessor:
         self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
         tile_schema = catalog_tile_schema_names(self._catalog_root)
         schema_for_ids = tile_schema if tile_schema is not None else list(self.schema.names)
-        self._source_id_column: str = resolve_source_id_column(
+        self._link_id_column: str = resolve_link_id_column(
             self._catalog_root,
             schema_names=schema_for_ids,
         )
@@ -133,9 +133,9 @@ class CatalogAccessor:
         return self._info
 
     @property
-    def source_id_column(self) -> str:
+    def link_id_column(self) -> str:
         """Column name that holds the integer object identifier (e.g. ``TARGETID`` for DESI)."""
-        return self._source_id_column
+        return self._link_id_column
 
     @property
     def redshift_column(self) -> str | None:
@@ -203,14 +203,14 @@ class CatalogAccessor:
 
     def resolve_id_column_for_tile(self, npix: int) -> str:
         """Return the object-ID column present in the on-disk tile (and catalog metadata)."""
-        col = self._source_id_column
+        col = self._link_id_column
         path = self._tile_parquet_path(npix)
         if path is None:
             return col
         names = pq.read_schema(str(path)).names
         if col in names:
             return col
-        resolved = resolve_source_id_column(self._catalog_root, schema_names=names)
+        resolved = resolve_link_id_column(self._catalog_root, schema_names=names)
         if resolved != col:
             log.warning(
                 "Catalog %s tile Npix=%d: metadata ID column %r missing; using %r from tile schema.",
@@ -356,7 +356,7 @@ class CatalogAccessor:
         """Fetch rows by a list of source_ids (using the catalog's actual ID column)."""
         col_expr = ", ".join(columns) if columns else "*"
         id_list = ", ".join(str(i) for i in source_ids)
-        sid_col = self._source_id_column
+        sid_col = self._link_id_column
         sql = f"SELECT {col_expr} FROM catalog WHERE {sid_col} IN ({id_list})"
         return self.query(sql, fmt=fmt)
 
@@ -395,7 +395,7 @@ class CatalogAccessor:
         if ids.size == 0:
             return {}
 
-        sid_col = self._source_id_column
+        sid_col = self._link_id_column
         out: dict[int, float] = {}
         for start in range(0, int(ids.size), batch_size):
             chunk = ids[start : start + batch_size]
@@ -427,7 +427,7 @@ class CatalogAccessor:
             raise ValueError(f"kind must be 'cutout' or 'spectrum', got {kind!r}")
         index_col = f"_{kind}_index"
         hp_col = f"_healpix_norder{self.norder}"
-        sid_col = self._source_id_column
+        sid_col = self._link_id_column
 
         # _spectrum_index may not exist in catalogs ingested before this change
         cols_available = self.columns

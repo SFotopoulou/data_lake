@@ -180,7 +180,7 @@ tile at a time via per-tile fancy indexing into the memmap:
 
 ```bash
 dl-ingest-catalog zall-pix-iron.fits --survey desi_dr1 \
-    --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+    --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID \
     --streaming
 ```
 
@@ -199,7 +199,7 @@ To reduce size on re-ingest:
 ```bash
 # Smaller tiles (ZSTD-9, no stats/dictionary, narrow strings per tile)
 dl-ingest-catalog zall-pix-iron.fits --survey desi_dr1 \
-  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+  --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID \
   --streaming --overwrite --compact
 
 # Largest win: drop unused DESI columns (keep what you query/join on)
@@ -215,7 +215,7 @@ HEALPix pixel, use **append** (read–concat–write per tile):
 
 ```bash
 dl-ingest-catalog-from-list desi_files.txt --survey desi_dr1 \
-  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+  --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID \
   --streaming --tile-mode append
 ```
 
@@ -224,7 +224,7 @@ When appending with a native ID column (`TARGETID`), control duplicates with
 FITS with ``append`` + ``skip`` is idempotent: rows already on disk (matched by
 ``source_id``) are dropped per tile; unchanged tiles are not rewritten. Use
 ``--tile-mode overwrite`` to rebuild a tile from one file only. ``--overwrite`` is
-deprecated but still maps to ``--tile-mode overwrite``. After every ingest (and at
+use ``--tile-mode overwrite`` to replace an existing tile. After every ingest (and at
 the end of ``dl-ingest-catalog-batch``), ``_metadata``, ``catalog_info.json``
 (``total_rows``), and ``schema_manifest.json`` are refreshed from **all** tiles on
 disk. If a batch job was killed before finalize, or the manifest is missing after a
@@ -299,7 +299,7 @@ Override the deployment default per run:
 
 ```bash
 dl-ingest-catalog sparse_allsky.fits --survey my_sparse --norder 4 \
-  --ra-col RA --dec-col DEC --source-id-col ID --streaming
+  --ra-col RA --dec-col DEC --link-id-col ID --streaming
 ```
 
 **Pre-ingest norder scan** (reads FITS headers + a subsample of RA/Dec; no Parquet write):
@@ -319,7 +319,7 @@ Prints a table of candidate orders with estimated **rows/tile**, **tile count**,
 occupied pixel (default target 50 000). Re-run with more `--sample-rows` for large,
 clustered footprints.
 
-#### Object identifiers (`--source-id-col`)
+#### Link identifiers (`--link-id-col`)
 
 The lake uses a single internal join column ``_source_id`` (int64) in Parquet
 catalogs and Zarr ``_source_id/`` arrays. Survey-native columns (e.g. ultraVISTA
@@ -327,11 +327,11 @@ catalogs and Zarr ``_source_id/`` arrays. Survey-native columns (e.g. ultraVISTA
 is lake-owned bookkeeping (like ``_healpix_norder*``, ``_cutout_index``,
 ``_spectrum_index``).
 
-Catalog ingest records ``source_id_mode`` in ``catalog_info.json``; the join
-column is always ``source_id_column: "_source_id"``. When you pass
-``--source-id-col``, that native column is also stored as ``native_id_column``.
+Catalog ingest records ``link_id_mode`` in ``catalog_info.json``; the join
+column is always ``link_id_column: "_source_id"``. When you pass
+``--link-id-col``, that native column is also stored as ``native_id_column``.
 
-| Input type | Example | Parquet columns | ``source_id_mode`` |
+| Input type | Example | Parquet columns | ``link_id_mode`` |
 |------------|---------|-----------------|---------------------|
 | Integer column | DESI ``TARGETID`` | ``TARGETID`` (int64) + ``_source_id`` (same values) | ``column:TARGETID`` |
 | Unsigned / uint64 column | SDSS ``objid`` (> ``2**63-1``) | Native cast + ``_source_id`` | ``column:objid`` |
@@ -357,25 +357,18 @@ acc.get_spectrum(sid)
 
 SQL on names: ``SELECT * FROM catalog WHERE NAME = 'J000000.00-314627.5'``.
 Use the **same** spelling (after strip) in cutout/spectrum FITS headers via
-``--source-id-col NAME`` so ingest hashes match the catalog.
+``--link-id-col NAME`` so ingest hashes match the catalog.
 
-If no ``--source-id-col`` is given, ingest tries common column names
+If no ``--link-id-col`` is given, ingest tries common column names
 (``TARGETID``, ``SOURCE_ID``, …) or generates sequential ``_source_id`` values.
 
 For surveys where the join key spans multiple catalog columns (6dF ``targetname`` +
 ``NAME_V`` + ``TITLE_V``), pass a comma-separated spec:
-``--source-id-col targetname,NAME_V,TITLE_V``.  All columns are preserved;
+``--link-id-col targetname,NAME_V,TITLE_V``.  All columns are preserved;
 ``_source_id`` is the stable hash of ``targetname|NAME_V|TITLE_V`` (same string
 built from FITS ``TARGET`` and ``NAME_V`` on the VR header plus ``TITLE_V`` on
 the paired V extension).
 
-**Upgrading existing lakes** (tiles still have legacy ``source_id``):
-
-```bash
-dl-repair-catalog-metadata /lake --survey MY_SURVEY --check-only
-dl-repair-catalog-metadata /lake --survey MY_SURVEY --migrate-join-column
-# spectra/cutouts Zarr tiles:
-dl-repair-catalog-metadata /lake --survey MY_SURVEY --migrate-join-column --spectra --cutouts
 ```
 
 **Reassign catalog link column** (recompute ``_source_id`` from another column without FITS re-ingest; catalog Parquet only):
@@ -403,22 +396,22 @@ the same ``TARGETID`` as the catalog):
 ```bash
 # 1. Catalog already ingested with native IDs
 dl-ingest-catalog zall-pix-iron.fits --survey desi_dr1 \
-  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID --streaming
+  --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID --streaming
 
 # 2. One cutout FITS per object (paths in cutout_files.txt)
 dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \
-  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+  --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID \
   --on-duplicate skip
 ```
 
-Use the **same** ``--survey``, sky columns, and ``--source-id-col`` as the catalog
+Use the **same** ``--survey``, sky columns, and ``--link-id-col`` as the catalog
 so ``update_index_column`` can patch ``_cutout_index``.
 
 #### FITS header requirements (per cutout file)
 
 | Purpose | CLI flag | Header keyword(s) | Notes |
 |--------|----------|-------------------|--------|
-| Object ID (join to catalog) | ``--source-id-col`` | e.g. ``TARGETID``, ``NAME`` | **Required** for production. Must match catalog ingest (int64 or hashed label). See [Object identifiers](#object-identifiers---source-id-col). If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index. |
+| Object ID (join to catalog) | ``--link-id-col`` | e.g. ``TARGETID``, ``NAME`` | **Required** for production. Must match catalog ingest (int64 or hashed label). See [Object identifiers](#object-identifiers---link-id-col). If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index. |
 | Sky position (tile routing) | ``--ra-col`` / ``--dec-col`` | e.g. ``TARGET_RA``, ``TARGET_DEC`` | Degrees; fallbacks include ``RA_TARG``/``DEC_TARG``, ``CRVAL1``/``CRVAL2``. Should match catalog coordinates. |
 | Astrometry (export) | — | Standard 2-D WCS | ``CTYPE*``, ``CRVAL*``, ``CRPIX*``, ``CD*_*`` (or CDELT/CROTA); stored in ``wcs/`` for FITS round-trip. |
 | Image data | — | Primary or image HDU | 2-D ``(H,W)`` → one band; 3-D → set ``--band-axis``. Fixed ``(H,W)`` per survey tile after the first file. |
@@ -458,7 +451,7 @@ Ingest:
 
 ```bash
 dl-ingest-cutouts cutout_9876543210123456.fits --survey desi_dr1 \
-  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID
+  --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID
 ```
 
 Single-file and file-list CLIs accept the same flags.
@@ -480,7 +473,7 @@ dl-generate-cutout-fits targets.parquet /data/stamps \\
 
 find /data/stamps -name 'cutout_*.fits' | sort > cutout_files.txt
 dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \\
-  --source-id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
+  --link-id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
   --band-names r,i,z
 ```
 
@@ -496,9 +489,9 @@ use ``astropy.nddata.Cutout2D`` with ``mode='partial'`` (edge sources may includ
 ```bash
 # Single file (debug / smoke-testing).
 # With $DATA_LAKE_CONFIG set, OUTPUT_ROOT is taken from the config.
-# DESI coadds: object ID comes from fibermap TARGETID (default); override with --source-id-col.
+# DESI coadds: object ID comes from fibermap TARGETID (default); override with --link-id-col.
 dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits --survey desi_edr \
-  --source-id-col TARGETID
+  --link-id-col TARGETID
 
 # With resolution matrix (needed for redshift fitting / SPS / kinematic measurements)
 # Storage cost: ~3× flux+ivar footprint (~170–200 GB per million coadded BRZ spectra)
@@ -513,24 +506,24 @@ dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits /data/lake --survey desi
 # Pixel count varies slightly file-to-file; ingest uses per_source wavelength and pads
 # to the tile's n_pix (override with --on-length-mismatch truncate).
 dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
-  --source-id-col SPECOBJID
+  --link-id-col SPECOBJID
 ```
 
 #### Catalog vs spectrum CLI flags
 
-``--source-id-col``, ``--ra-col``, and ``--dec-col`` on **catalog** ingest define
+``--link-id-col``, ``--ra-col``, and ``--dec-col`` on **catalog** ingest define
 how native columns map to ``_source_id`` and sky position in Parquet.  Format-specific
 spectrum readers (2dF, 6dF, OzDES, VANDELS, WiggleZ, zCOSMOS, VIPERS, VUDS, VVDS)
 resolve object IDs and coordinates **internally** from FITS headers or filenames —
 you do **not** repeat those flags on ``dl-ingest-spectra`` for those formats.
 
-For SDSS/BOSS, DESI coadds, generic 1-D FITS, and spPlate, pass ``--source-id-col``
+For SDSS/BOSS, DESI coadds, generic 1-D FITS, and spPlate, pass ``--link-id-col``
 (and sky columns when headers differ from defaults) so the reader matches your
 catalog.  After ingest, ``--update-catalog`` patches ``_spectrum_index`` by joining
 on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
-``--source-id-col``.
+``--link-id-col``.
 
-| Stage | ``--source-id-col`` | ``--ra-col`` / ``--dec-col`` |
+| Stage | ``--link-id-col`` | ``--ra-col`` / ``--dec-col`` |
 |-------|---------------------|------------------------------|
 | Catalog ingest | Required for production (native column → ``_source_id``) | Survey sky columns in degrees |
 | Spectrum ingest (2df, 6df, OzDES, …) | **Not used** — reader picks FITS link key | **Not used** — reader picks FITS sky keys |
@@ -545,7 +538,7 @@ SPECOBJID** column in the FITS file.  Ingest maps each **FIBERID** to
 ``source_id`` via one of:
 
 1. **Sidecar / catalog** — join on ``(survey,) PLATE, MJD, FIBERID``; ID from
-   ``source_id``, ``specobjid``, ``TARGETID``, or ``--source-id-col`` (not
+   ``source_id``, ``specobjid``, ``TARGETID``, or ``--link-id-col`` (not
    photometric ``objid`` unless you set that column explicitly)
 2. **Plate header** — synthesize CAS ``specObjID`` from plate/mjd/fiber
    (``--specobj-lookup-from-plate``).  **DR7 and DR8+ use different 64-bit layouts**
@@ -583,29 +576,29 @@ widening and truncates longer spectra instead.
 # Quick ingest without a specObj sidecar (DR8+/BOSS: primary header RUN2D only;
 # VERS2D/VERSCOMB are pipeline versions, not used for specObjID)
 dl-ingest-spectra data/spPlate-3523-55144.fits --survey boss_dr12 \
-  --format sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr8plus
+  --fmt sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr8plus
 
 # SDSS-II / DR7 plates (low bits; no RUN2D) — force DR7 packing:
 dl-ingest-spectra spPlate-287-52251.fits --survey sdss_dr7 \
-  --format sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr7
+  --fmt sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr7
 
 # Sidecar Parquet/CSV: survey, PLATE, MJD, FIBERID, plus an ID column
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
-  --format sdss_spplate \
+  --fmt sdss_spplate \
   --specobj-lookup /path/to/specobj_lookup.parquet
 
 # BOSS spPlates with an explicit specObj table
 dl-ingest-spectra spPlate-5695-56191.fits --survey boss_dr12 \
-  --format sdss_spplate \
+  --fmt sdss_spplate \
   --specobj-lookup /path/to/boss_specobj_lookup.parquet
 
 # Lake catalog: join on plate/mjd/fiber; ID from catalog source_id or specobjid
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
-  --format sdss_spplate --specobj-lookup-from-catalog
+  --fmt sdss_spplate --specobj-lookup-from-catalog
 
 # If the catalog used a non-default ID column at ingest time:
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
-  --format sdss_spplate --specobj-lookup-from-catalog --source-id-col TARGETID
+  --fmt sdss_spplate --specobj-lookup-from-catalog --link-id-col TARGETID
 ```
 
 If catalog lookup finds **0 fibers**, run the debug helper before re-ingesting:
@@ -654,7 +647,7 @@ as a supplemental catalog (with ``ra``/``dec`` for HEALPix) or use it as a
 
 ```bash
 dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
-  --format sdss_spplate --specobj-lookup /path/to/lookup.parquet \
+  --fmt sdss_spplate --specobj-lookup /path/to/lookup.parquet \
   --on-duplicate skip
 ```
 
@@ -670,12 +663,12 @@ carries object metadata (``SEQNUM`` = catalog ``serial``, ``NAME``, ``RA``,
 **Link key:** use ``SPFILE`` (unique per observation) for ``_source_id``, not
 ``serial``.  Many catalog rows share the same ``serial`` (multiple observations
 of one target).  Keep ``serial`` as the science ID; ingest the catalog with
-``--source-id-col SPFILE`` so ``_source_id = hash(SPFILE)`` on both sides.
+``--link-id-col SPFILE`` so ``_source_id = hash(SPFILE)`` on both sides.
 
 ```bash
 # Catalog: serial kept; _source_id built from SPFILE
 dl-ingest-catalog 2dfgrs_catalog.fits --survey 2DFGRS_DR3 \
-  --source-id-col SPFILE --ra-col RA --dec-col DEC
+  --link-id-col SPFILE --ra-col RA --dec-col DEC
 
 # Single file (smoke test) — one Zarr row per SPECTRUM HDU
 dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 --fmt 2df
@@ -799,7 +792,7 @@ the paired V header → ``target|name_v|title_v`` (e.g.
 
 ```bash
 dl-ingest-catalog 6df_catalog.fits --survey SIXDF_DR3 \
-  --source-id-col targetname,NAME_V,TITLE_V --ra-col ra --dec-col dec
+  --link-id-col targetname,NAME_V,TITLE_V --ra-col ra --dec-col dec
 ```
 
 Spectrum ingest resolves the same composite label from FITS headers internally
@@ -857,14 +850,14 @@ OzDES target FITS files store the **stacked** spectrum in the first three HDUs:
 PRIMARY (flux), ``VARIANCE``, ``BADPIX`` (``0`` = good, ``1`` = bad).  Per-epoch
 ``SPECTRUM_*`` extensions are not ingested.
 
-**Catalog linkage:** ingest the catalog with ``--source-id-col`` set to the column
+**Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
 that stores the spectrum **filename** (e.g. ``OzDES-DR2_00001.fits``). Spectrum
 ingest derives ``_source_id`` from the FITS basename.  The ``SOURCE`` header
 (e.g. ``04D1qt``) remains a science column in the catalog.
 
 ```bash
 dl-ingest-catalog ozdes_catalog.fits --survey OZDES_DR2 \
-  --source-id-col filename --ra-col RA --dec-col DEC
+  --link-id-col filename --ra-col RA --dec-col DEC
 
 dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --fmt ozdes
 
@@ -878,13 +871,13 @@ VANDELS multi-extension FITS files store the stacked 1-D spectrum in PRIMARY wit
 matching ``NOISE`` extension (1-σ noise estimate → IVAR). Per-epoch ``EXR2D`` / ``SKY`` /
 ``THUMB`` extensions are ignored.
 
-**Catalog linkage:** ingest the catalog with ``--source-id-col`` set to the column that
+**Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column that
 stores the spectrum **filename** (e.g. ``sc_UDS313141_P3M1Q4_008_1.fits``). Spectrum
 ingest derives the same ``source_id`` from ``normalize_object_id(path.name)``.
 
 ```bash
 dl-ingest-catalog vandels_catalog.fits --survey VANDELS \
-  --source-id-col <filename_column> --ra-col RA --dec-col DEC
+  --link-id-col <filename_column> --ra-col RA --dec-col DEC
 
 dl-ingest-spectra sc_UDS313141_P3M1Q4_008_1.fits --survey VANDELS --fmt vandels
 
@@ -898,12 +891,12 @@ VIPERS 1-D spectra are stored as a row-per-pixel binary table with columns
 ``WAVES``, ``FLUXES``, ``NOISE``, and ``MASK``.  ``MASK`` values are stored as
 ingested (no remapping).  Redshift is read from ``REDSHIFT``.
 
-**Catalog linkage:** ingest the catalog with ``--source-id-col ID``; spectrum ingest
+**Catalog linkage:** ingest the catalog with ``--link-id-col ID``; spectrum ingest
 reads the same ``ID`` keyword from the table header (e.g. ``406064719``).
 
 ```bash
 dl-ingest-catalog vipers_catalog.fits --survey VIPERS \
-  --source-id-col ID --ra-col RA --dec-col DEC
+  --link-id-col ID --ra-col RA --dec-col DEC
 
 dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS --fmt vipers
 
@@ -918,12 +911,12 @@ Object metadata uses ``LAM CESAM VO IDENT``, ``LAM CESAM VO ALPHA`` / ``DELTA``,
 and ``LAM CESAM VO Z``.  No uncertainty or mask extensions are expected (IVAR=1,
 mask=0).
 
-**Catalog linkage:** ingest the catalog with ``--source-id-col ID``; spectrum
+**Catalog linkage:** ingest the catalog with ``--link-id-col ID``; spectrum
 ingest reads ``LAM CESAM VO IDENT`` from the FITS header.
 
 ```bash
 dl-ingest-catalog vuds_catalog.fits --survey VUDS \
-  --source-id-col ID --ra-col RA --dec-col DEC
+  --link-id-col ID --ra-col RA --dec-col DEC
 
 dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS \
   --fmt vuds
@@ -938,14 +931,14 @@ VVDS 1-D spectra use a PRIMARY flux array (1-D or ``(1, n_pix)``) with spectral 
 Sky coordinates are in ``RA`` / ``DEC``.  No uncertainty or mask extensions are
 expected (IVAR=1, mask=0).
 
-**Catalog linkage:** ingest the catalog with ``--source-id-col ID``; spectrum ingest
+**Catalog linkage:** ingest the catalog with ``--link-id-col ID``; spectrum ingest
 derives ``source_id`` from the numeric segment in the filename prefix
 ``sc_<ID>_...`` (e.g. ``sc_000030078_...`` → ``30078``).  Files with VUDS
 ``LAM CESAM VO IDENT`` metadata are routed to the ``vuds`` reader instead.
 
 ```bash
 dl-ingest-catalog vvds_catalog.fits --survey VVDS \
-  --source-id-col ID --ra-col RA --dec-col DEC
+  --link-id-col ID --ra-col RA --dec-col DEC
 
 dl-ingest-spectra sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits --survey VVDS \
   --fmt vvds
@@ -959,7 +952,7 @@ dl-ingest-spectra sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits --survey VVD
 WiggleZ 1-D FITS files use a 1-D flux array (PRIMARY / ``EXTNAME='spectrum'``) plus a
 sibling ``VARIANCE`` extension.  Sky coordinates are in ``RA_OBJ`` / ``DEC_OBJ``.
 
-**Catalog linkage:** ingest the catalog with ``--source-id-col`` set to the column
+**Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
 that stores the spectrum **filename** (e.g. ``wig225415.fits``).  Spectrum ingest
 derives the same ``source_id`` from the file basename (``normalize_object_id`` of
 ``wig225415.fits``), so the stem alone (``wig225415``) will **not** match.
@@ -967,7 +960,7 @@ derives the same ``source_id`` from the file basename (``normalize_object_id`` o
 ```bash
 # Catalog (already ingested example)
 dl-ingest-catalog wigglez_catalog.fits --survey WIGGLEZ \
-  --source-id-col <filename_column> --ra-col RA --dec-col DEC
+  --link-id-col <filename_column> --ra-col RA --dec-col DEC
 
 # Single spectrum
 dl-ingest-spectra wig225415.fits --survey WIGGLEZ --fmt wig
@@ -1028,7 +1021,7 @@ Key properties:
   `_spectrum_index` in the Parquet catalog (`--no-update-catalog` to
   skip; silently no-ops if no catalog exists yet for the survey).
   The ID column is read from `catalog_info.json` so DESI catalogs
-  ingested with `--source-id-col TARGETID` are handled correctly.
+  ingested with `--link-id-col TARGETID` are handled correctly.
 - **`--n-workers` is required** — no implicit default; pick consciously
   (typical: `cpu_count - 1` to keep one core for the writer / OS).
 - **Threads do not help here**: `read_spectra` is mostly Python under
@@ -1072,7 +1065,7 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
 | `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
 | `dl-repair-catalog-metadata` | `--rebuild-link-id` | column name | Recompute catalog ``_source_id`` from column (catalog only); then run ``dl-rebuild-catalog-indices`` |
-| `dl-repair-catalog-metadata` | — | — | Repair ``catalog_info.json``; ``--check-only``; ``--migrate-join-column`` renames legacy ``source_id`` → ``_source_id`` (``--spectra`` / ``--cutouts`` for Zarr) |
+| `dl-repair-catalog-metadata` | — | — | Repair ``catalog_info.json``; ``--check-only``; ``--rebuild-link-id`` |
 | `dl-ingest-cutouts` | `--on-duplicate` | `skip`, `error`, `append` | Default **`skip`**; per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
@@ -1091,7 +1084,7 @@ are merged safely:
 
 ```bash
 dl-ingest-catalog-batch gaia_files.txt --survey GAIA_DR3_source \
-  --ra-col ra --dec-col dec --source-id-col source_id --norder 5 \
+  --ra-col ra --dec-col dec --link-id-col source_id --norder 5 \
   --tile-mode append --on-duplicate-id skip --n-workers 8
 ```
 
@@ -1122,7 +1115,7 @@ dl-ingest-catalog-from-list cat_files.txt --survey my_survey --ra-col RA --dec-c
 
 find /data/cutouts -name '*.fits' > cutout_files.txt
 dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \
-  --ra-col TARGET_RA --dec-col TARGET_DEC --source-id-col TARGETID \
+  --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID \
   --band-names r,i,z --on-duplicate skip
 
 ls coadds.txt  # one DESI coadd path per line
@@ -1131,11 +1124,11 @@ dl-ingest-spectra-batch --survey desi_dr1 --file-list coadds.txt --n-workers 16 
 
 # Generic / SDSS spectra (sequential, not parallel DESI batch):
 dl-ingest-spectra-from-list spec_files.txt --survey sdss_dr17 \
-  --source-id-col SPECOBJID --on-duplicate skip
+  --link-id-col SPECOBJID --on-duplicate skip
 
 # spPlate file lists (same flags as dl-ingest-spectra):
 dl-ingest-spectra-from-list spPlate_files.txt --survey boss_dr12 \
-  --format sdss_spplate --specobj-lookup /path/to/lookup.parquet --on-duplicate skip
+  --fmt sdss_spplate --specobj-lookup /path/to/lookup.parquet --on-duplicate skip
 
 SDSS spec lists: pixel lengths differ slightly; ingest auto-pads (or widens the
 existing tile) when format is ``sdss_boss`` or ``sdss_spplate``.  Override with
@@ -1326,7 +1319,7 @@ the code warns and falls back to `meta.z`.
 The `dl-ingest-spectra`, `dl-ingest-cutouts`, and `dl-ingest-cutouts-from-list`
 CLIs patch the catalog automatically after each ingest run (`--no-update-catalog`
 to skip).  The ID column is resolved from `catalog_info.json`, so surveys
-ingested with `--source-id-col TARGETID` (or any other native column) work
+ingested with `--link-id-col TARGETID` (or any other native column) work
 without extra configuration.
 
 To backfill an existing lake where spectra or cutouts were ingested without
@@ -1428,7 +1421,7 @@ examples/
 
 Each catalog row carries:
 - `_source_id` — stable int64 join key for Zarr/cross-match (sequential 0…N−1, copy of native int ID, or hash of a label column)
-- native survey ID columns (e.g. `TARGETID`, `SOURCE_ID`) when ``source_id_mode`` is ``column:…`` or ``label:…``
+- native survey ID columns (e.g. `TARGETID`, `SOURCE_ID`) when ``link_id_mode`` is ``column:…`` or ``label:…``
 - `_healpix_norder5` — HEALPix tile pixel (partitioning key)
 - `_cutout_index` — position inside the tile's Zarr cutout array (O(1) lookup)
 - `_spectrum_index` — position inside the tile's Zarr spectrum array (O(1) lookup; -1 = not ingested)
@@ -1449,7 +1442,7 @@ Shape it for how you query (DuckDB, Polars, ADQL). Typical columns:
 
 | Column | Purpose |
 |--------|--------|
-| Primary `source_id` | int64 key for your “home” survey catalog row (or hash of a string label; see [Object identifiers](#object-identifiers---source-id-col)) |
+| Primary `source_id` | int64 key for your “home” survey catalog row (or hash of a string label; see [Object identifiers](#object-identifiers---link-id-col)) |
 | Partner IDs | e.g. `desi_targetid`, `euclid_source_id` — whatever the other survey stores |
 | `sep_arcsec` | Sky separation from the matcher (optional but good for QA) |
 | `match_rank` / `find` flag | If the matcher can return multiple neighbours, disambiguate |
@@ -1745,7 +1738,7 @@ INNER JOIN desi AS d ON d.TARGETID = w.id
 INNER JOIN euclid AS e ON e.SOURCE_ID = m.euclid_source_id;
 ```
 
-Replace `TARGETID` / `SOURCE_ID` with the real ID columns (`CatalogAccessor(...).source_id_column`).
+Replace `TARGETID` / `SOURCE_ID` with the real ID columns (`CatalogAccessor(...).link_id_column`).
 
 **Python** — single survey, batched `IN` queries:
 

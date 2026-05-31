@@ -18,7 +18,7 @@ Example
         --id-hdu-key TARGETID --ra-hdu-key TARGET_RA --dec-hdu-key TARGET_DEC
 
     dl-ingest-cutouts-from-list cutout_paths.txt --survey desi_dr1 \\
-        --source-id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
+        --link-id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
         --band-names r,i,z
 """
 

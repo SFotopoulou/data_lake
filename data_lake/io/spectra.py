@@ -511,7 +511,7 @@ class SpectrumAccessor:
             try:
                 cat_cols = self._catalog.columns
                 hp_col = f"_healpix_norder{self._catalog.norder}"
-                sid_col = self._catalog.source_id_column
+                sid_col = self._catalog.link_id_column
                 if "_spectrum_index" in cat_cols and hp_col in cat_cols:
                     batch_size = 10_000
                     for start in tqdm(

@@ -398,8 +398,8 @@ class TestExtractSubsetToZarr:
         (cat_root / "catalog_info.json").write_text(
             json.dumps({
                 "hats_order": 5,
-                "source_id_mode": "column:TARGETID",
-                "source_id_column": LAKE_JOIN_ID_COLUMN,
+                "link_id_mode": "column:TARGETID",
+                "link_id_column": LAKE_JOIN_ID_COLUMN,
                 "native_id_column": "TARGETID",
             })
         )

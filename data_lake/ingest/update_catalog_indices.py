@@ -10,7 +10,7 @@ Only tiles that actually contain matched source_ids are rewritten – every
 other tile is left untouched, making this efficient even for large catalogs.
 
 The ID column name is read automatically from ``catalog_info.json``
-(``source_id_mode``), so catalogs using native columns such as ``TARGETID``
+(``link_id_mode``), so catalogs using native columns such as ``TARGETID``
 are handled correctly without any manual configuration.
 """
 
@@ -27,12 +27,11 @@ import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import (
     LAKE_JOIN_ID_COLUMN,
-    LEGACY_JOIN_ID_COLUMN,
     _ZSTD_LEVEL,
     _regenerate_metadata_from_all_tiles,
     healpix_dir,
     normalize_object_id,
-    resolve_source_id_column,
+    resolve_link_id_column,
     warn_if_id_column_unsafe,
 )
 from data_lake.ingest.zarr_ids import zarr_join_array
@@ -116,7 +115,7 @@ def _patch_catalog_parquet_file(
     if sid_col not in table.schema.names:
         log.warning(
             "Source-ID column %r not found in %s. "
-            "Check survey name, catalog ingest, or pass --source-id-col.",
+            "Check survey name, catalog ingest, or pass --link-id-col.",
             sid_col, tile_file.name,
         )
         return False
@@ -172,7 +171,7 @@ def update_index_column_from_zarr_tiles(
     survey_name: str,
     kind: IndexKind = "spectrum",
     norder: int | None = None,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
 ) -> int:
     """Patch catalog indices one Zarr tile at a time (bounded memory).
 
@@ -197,8 +196,8 @@ def update_index_column_from_zarr_tiles(
     sample_parquet = next(catalog_root.rglob("Npix=*.parquet"), None)
     if sample_parquet is not None:
         schema_names = pq.read_schema(str(sample_parquet)).names
-    sid_col = resolve_source_id_column(
-        catalog_root, schema_names=schema_names, override=source_id_col,
+    sid_col = resolve_link_id_column(
+        catalog_root, schema_names=schema_names, override=link_id_col,
     )
     resolved_norder = _resolve_catalog_norder(
         catalog_root, zarr_root, kind=kind, override=norder,
@@ -217,7 +216,7 @@ def update_index_column_from_zarr_tiles(
                 mode="r",
                 zarr_format=3,
             )
-            if LAKE_JOIN_ID_COLUMN not in root and LEGACY_JOIN_ID_COLUMN not in root:
+            if LAKE_JOIN_ID_COLUMN not in root:
                 continue
             sids = np.asarray(zarr_join_array(root)[:], dtype=np.int64)
             if sids.size == 0:
@@ -274,7 +273,7 @@ def update_index_column(
     source_id_to_index: dict[int, int],
     kind: IndexKind = "spectrum",
     norder: int = 5,
-    source_id_col: str | None = None,
+    link_id_col: str | None = None,
 ) -> int:
     """
     Update ``_cutout_index`` or ``_spectrum_index`` in the affected Parquet tiles.
@@ -284,7 +283,7 @@ def update_index_column(
     the tile file in-place with the same Zstd compression.
 
     The ID column name is resolved automatically from ``catalog_info.json``:
-    catalogs ingested with ``--source-id-col TARGETID`` (or any other native
+    catalogs ingested with ``--link-id-col TARGETID`` (or any other native
     column) are handled without extra configuration.
 
     Parameters
@@ -299,7 +298,7 @@ def update_index_column(
         Which index column to update: ``"cutout"`` or ``"spectrum"``.
     norder:
         HEALPix partitioning order.
-    source_id_col:
+    link_id_col:
         Force the catalog ID column (e.g. ``TARGETID``).  When omitted, resolved
         from ``catalog_info.json`` and validated against the Parquet schema.
 
@@ -319,8 +318,8 @@ def update_index_column(
     schema_names: list[str] | None = None
     if all_parquet:
         schema_names = pq.read_schema(str(all_parquet[0])).names
-    sid_col = resolve_source_id_column(
-        catalog_root, schema_names=schema_names, override=source_id_col,
+    sid_col = resolve_link_id_column(
+        catalog_root, schema_names=schema_names, override=link_id_col,
     )
     if not all_parquet:
         log.warning("No Parquet tiles found in %s", catalog_root)
@@ -404,7 +403,7 @@ def build_index_map_from_zarr(
                 mode="r",
                 zarr_format=3,
             )
-            if LAKE_JOIN_ID_COLUMN not in root and LEGACY_JOIN_ID_COLUMN not in root:
+            if LAKE_JOIN_ID_COLUMN not in root:
                 continue
             sids = zarr_join_array(root)[:]
             for local_i, sid in enumerate(sids.tolist()):
@@ -451,7 +450,7 @@ try:
         help="HEALPix order for catalog tile paths (default: hats_order from catalog_info.json).",
     )
     @click.option(
-        "--source-id-col",
+        "--link-id-col",
         default=None,
         help="Override catalog ID column (e.g. TARGETID). "
              "Auto-detected from Parquet schema when omitted.",
@@ -463,7 +462,7 @@ try:
         survey_name: str,
         kind: str,
         norder: int | None,
-        source_id_col: str | None,
+        link_id_col: str | None,
         lake_root: Path | None,
         config_path: Path | None,
         ingest_token: str | None,
@@ -487,7 +486,7 @@ try:
             survey_name=survey_name,
             kind=kind,  # type: ignore[arg-type]
             norder=norder,
-            source_id_col=source_id_col,
+            link_id_col=link_id_col,
         )
         click.echo(f"Done: patched _{kind}_index in {n_modified} catalog tile(s).")
 

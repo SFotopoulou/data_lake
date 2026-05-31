@@ -54,9 +54,9 @@ def _ingest_mini_catalog(
         survey_name=survey,
         ra_col="TARGET_RA",
         dec_col="TARGET_DEC",
-        source_id_col="TARGETID",
+        link_id_col="TARGETID",
         norder=5,
-        overwrite=True,
+        tile_mode="overwrite",
     )
 
 

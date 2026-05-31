@@ -2,7 +2,7 @@
 repair_catalog_metadata – rebuild catalog sidecars from on-disk Parquet tiles.
 
 Fixes stale or incorrect ``catalog_info.json`` fields (especially
-``source_id_column`` / ``source_id_mode``), aggregate ``_metadata``, and
+``link_id_column`` / ``link_id_mode``), aggregate ``_metadata``, and
 ``schema_manifest.json`` without re-ingesting FITS.
 
 Console entry point: ``dl-repair-catalog-metadata``.
@@ -19,13 +19,10 @@ import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import (
     LAKE_JOIN_ID_COLUMN,
-    LEGACY_JOIN_ID_COLUMN,
     _iter_valid_parquet_tiles,
     finalize_catalog_survey,
-    migrate_parquet_tile_join_column,
-    native_id_column_from_mode,
     rebuild_parquet_tile_link_id,
-    resolve_source_id_column,
+    resolve_link_id_column,
 )
 from data_lake.lake_registry import iter_catalog_surveys
 
@@ -40,12 +37,11 @@ class RepairCatalogMetadataResult:
     catalog_root: Path
     ok: bool
     error: str | None = None
-    source_id_column_before: str | None = None
-    source_id_column_after: str | None = None
-    source_id_mode_before: str | None = None
-    source_id_mode_after: str | None = None
+    link_id_column_before: str | None = None
+    link_id_column_after: str | None = None
+    link_id_mode_before: str | None = None
+    link_id_mode_after: str | None = None
     total_rows: int | None = None
-    parquet_tiles_renamed: int = 0
     parquet_tiles_rebuilt: int = 0
 
 
@@ -57,46 +53,13 @@ class JoinColumnCheckResult:
     modality: str
     root: Path
     ok: bool
-    source_id_mode: str | None = None
-    source_id_column: str | None = None
+    link_id_mode: str | None = None
+    link_id_column: str | None = None
     native_id_column: str | None = None
     tiles_checked: int = 0
     tiles_missing_join: int = 0
-    tiles_legacy_only: int = 0
     sample_columns: list[str] = field(default_factory=list)
     error: str | None = None
-
-
-def migrate_zarr_tile_join_array(tile_path: Path | str) -> str:
-    """Rename legacy Zarr ``source_id`` array to ``_source_id``. Returns status string."""
-    import numpy as np
-    import zarr
-
-    tile_path = Path(tile_path)
-    store = zarr.storage.LocalStore(str(tile_path))
-    root = zarr.open_group(store=store, mode="r+")
-    keys = list(root.array_keys()) if hasattr(root, "array_keys") else [
-        k for k in root.keys() if k not in root.attrs and hasattr(root[k], "shape")
-    ]
-    if LAKE_JOIN_ID_COLUMN in keys:
-        if LEGACY_JOIN_ID_COLUMN in keys:
-            del root[LEGACY_JOIN_ID_COLUMN]
-            return "renamed"
-        return "ok"
-    if LEGACY_JOIN_ID_COLUMN not in keys:
-        return "missing"
-    old = root[LEGACY_JOIN_ID_COLUMN]
-    data = np.asarray(old[:])
-    chunks = getattr(old, "chunks", None) or (min(4096, max(1, len(data))),)
-    root.create_array(
-        LAKE_JOIN_ID_COLUMN,
-        shape=data.shape,
-        chunks=chunks,
-        dtype=np.int64,
-    )
-    root[LAKE_JOIN_ID_COLUMN][:] = data
-    del root[LEGACY_JOIN_ID_COLUMN]
-    return "renamed"
 
 
 def _read_catalog_info(catalog_root: Path) -> dict:
@@ -121,58 +84,27 @@ def check_catalog_join_column(catalog_root: Path | str, survey: str) -> JoinColu
             error="no valid Parquet tiles",
         )
     missing = 0
-    legacy_only = 0
     sample: list[str] = []
     for path in tiles:
         names = pq.read_schema(str(path)).names
         if not sample:
             sample = list(names)[:20]
-        has_join = LAKE_JOIN_ID_COLUMN in names
-        has_legacy = LEGACY_JOIN_ID_COLUMN in names
-        if not has_join and has_legacy:
-            legacy_only += 1
-        if not has_join and not has_legacy:
+        if LAKE_JOIN_ID_COLUMN not in names:
             missing += 1
-    ok = missing == 0 and legacy_only == 0
+    ok = missing == 0
     return JoinColumnCheckResult(
         survey=survey,
         modality="catalog",
         root=catalog_root,
         ok=ok,
-        source_id_mode=info.get("source_id_mode"),
-        source_id_column=info.get("source_id_column"),
+        link_id_mode=info.get("link_id_mode"),
+        link_id_column=info.get("link_id_column"),
         native_id_column=info.get("native_id_column"),
         tiles_checked=len(tiles),
         tiles_missing_join=missing,
-        tiles_legacy_only=legacy_only,
         sample_columns=sample,
-        error=None if ok else (
-            f"{missing} tile(s) missing join column; "
-            f"{legacy_only} tile(s) have only legacy {LEGACY_JOIN_ID_COLUMN!r}"
-        ),
+        error=None if ok else f"{missing} tile(s) missing {LAKE_JOIN_ID_COLUMN!r}",
     )
-
-
-def migrate_catalog_join_columns(
-    catalog_root: Path | str,
-    *,
-    native_col: str | None = None,
-) -> tuple[int, int, int]:
-    """Rename legacy join column in all catalog tiles. Returns (renamed, ok, missing)."""
-    info = _read_catalog_info(Path(catalog_root))
-    native = native_col or info.get("native_id_column") or native_id_column_from_mode(
-        str(info.get("source_id_mode", "sequential"))
-    )
-    renamed = ok = missing = 0
-    for path in _iter_valid_parquet_tiles(Path(catalog_root)):
-        status = migrate_parquet_tile_join_column(path, native_col=native)
-        if status == "renamed":
-            renamed += 1
-        elif status == "ok":
-            ok += 1
-        else:
-            missing += 1
-    return renamed, ok, missing
 
 
 def rebuild_catalog_link_ids(
@@ -181,7 +113,7 @@ def rebuild_catalog_link_ids(
 ) -> tuple[int, str]:
     """Recompute ``_source_id`` from *link_col* on every catalog tile.
 
-    Returns ``(n_rebuilt, source_id_mode)``.
+    Returns ``(n_rebuilt, link_id_mode)``.
     """
     catalog_root = Path(catalog_root)
     rebuilt = 0
@@ -192,21 +124,6 @@ def rebuild_catalog_link_ids(
     return rebuilt, mode
 
 
-def migrate_zarr_survey_join_columns(survey_root: Path | str) -> tuple[int, int, int]:
-    """Rename legacy join array in all Zarr tiles under a survey."""
-    renamed = ok = missing = 0
-    survey_root = Path(survey_root)
-    for path in sorted(survey_root.rglob("Npix=*.zarr")):
-        status = migrate_zarr_tile_join_array(path)
-        if status == "renamed":
-            renamed += 1
-        elif status == "ok":
-            ok += 1
-        else:
-            missing += 1
-    return renamed, ok, missing
-
-
 def repair_catalog_metadata(
     catalog_root: Path | str,
     survey_name: str,
@@ -214,31 +131,18 @@ def repair_catalog_metadata(
     norder: int | None = None,
     ra_col: str | None = None,
     dec_col: str | None = None,
-    migrate_join_column: bool = False,
     rebuild_link_id: str | None = None,
 ) -> RepairCatalogMetadataResult:
-    """
-    Rebuild metadata sidecars for one ingested catalog from its Parquet tiles.
-
-    Returns a result with ``ok=False`` when no valid tiles exist under
-    *catalog_root*.
-    """
+    """Rebuild metadata sidecars for one ingested catalog from its Parquet tiles."""
     catalog_root = Path(catalog_root)
-    if migrate_join_column and rebuild_link_id:
-        raise ValueError(
-            "Use either migrate_join_column or rebuild_link_id, not both."
-        )
     before = _read_catalog_info(catalog_root)
     hats_order = int(norder if norder is not None else before.get("hats_order", 5))
     ra = ra_col or str(before.get("ra_column", "ra"))
     dec = dec_col or str(before.get("dec_column", "dec"))
-    n_renamed = 0
     n_rebuilt = 0
     rebuilt_mode: str | None = None
 
     try:
-        if migrate_join_column:
-            n_renamed, _, _ = migrate_catalog_join_columns(catalog_root)
         if rebuild_link_id:
             n_rebuilt, rebuilt_mode = rebuild_catalog_link_ids(
                 catalog_root, rebuild_link_id,
@@ -249,7 +153,7 @@ def repair_catalog_metadata(
             hats_order,
             ra_col=ra,
             dec_col=dec,
-            source_id_mode=rebuilt_mode,
+            link_id_mode=rebuilt_mode,
         )
     except Exception as exc:
         log.exception("Repair failed for %s", survey_name)
@@ -258,8 +162,8 @@ def repair_catalog_metadata(
             catalog_root=catalog_root,
             ok=False,
             error=str(exc),
-            source_id_column_before=before.get("source_id_column"),
-            source_id_mode_before=before.get("source_id_mode"),
+            link_id_column_before=before.get("link_id_column"),
+            link_id_mode_before=before.get("link_id_mode"),
         )
 
     if not ok:
@@ -268,8 +172,8 @@ def repair_catalog_metadata(
             catalog_root=catalog_root,
             ok=False,
             error="no valid Parquet tiles",
-            source_id_column_before=before.get("source_id_column"),
-            source_id_mode_before=before.get("source_id_mode"),
+            link_id_column_before=before.get("link_id_column"),
+            link_id_mode_before=before.get("link_id_mode"),
         )
 
     after = _read_catalog_info(catalog_root)
@@ -277,12 +181,11 @@ def repair_catalog_metadata(
         survey=survey_name,
         catalog_root=catalog_root,
         ok=True,
-        source_id_column_before=before.get("source_id_column"),
-        source_id_column_after=after.get("source_id_column"),
-        source_id_mode_before=before.get("source_id_mode"),
-        source_id_mode_after=after.get("source_id_mode"),
+        link_id_column_before=before.get("link_id_column"),
+        link_id_column_after=after.get("link_id_column"),
+        link_id_mode_before=before.get("link_id_mode"),
+        link_id_mode_after=after.get("link_id_mode"),
         total_rows=after.get("total_rows"),
-        parquet_tiles_renamed=n_renamed,
         parquet_tiles_rebuilt=n_rebuilt,
     )
 
@@ -292,7 +195,6 @@ def repair_catalogs_under_lake(
     survey_names: list[str],
     *,
     norder: int | None = None,
-    migrate_join_column: bool = False,
     rebuild_link_id: str | None = None,
 ) -> list[RepairCatalogMetadataResult]:
     """Repair metadata for each named survey under ``<lake_root>/catalogs/``."""
@@ -316,11 +218,36 @@ def repair_catalogs_under_lake(
                 catalog_root,
                 name,
                 norder=norder,
-                migrate_join_column=migrate_join_column,
                 rebuild_link_id=rebuild_link_id,
             )
         )
     return results
+
+
+def check_zarr_join_arrays(survey_root: Path | str) -> JoinColumnCheckResult:
+    """Validate that every Zarr tile has ``_source_id``."""
+    import zarr
+
+    survey_root = Path(survey_root)
+    tiles = list(survey_root.rglob("Npix=*.zarr"))
+    missing = 0
+    for zp in tiles:
+        root = zarr.open_group(
+            store=zarr.storage.LocalStore(str(zp)), mode="r",
+        )
+        keys = list(root.array_keys()) if hasattr(root, "array_keys") else []
+        if LAKE_JOIN_ID_COLUMN not in keys:
+            missing += 1
+    ok = len(tiles) > 0 and missing == 0
+    return JoinColumnCheckResult(
+        survey=survey_root.name,
+        modality="zarr",
+        root=survey_root,
+        ok=ok,
+        tiles_checked=len(tiles),
+        tiles_missing_join=missing,
+        error=None if ok else f"{missing} Zarr tile(s) missing {LAKE_JOIN_ID_COLUMN!r}",
+    )
 
 
 def check_lake_join_columns(
@@ -340,26 +267,31 @@ def check_lake_join_columns(
         if include_spectra:
             spec_root = lake_root / "spectra" / name
             if spec_root.is_dir():
-                chk = check_catalog_join_column(spec_root, name)
-                tiles = list(spec_root.rglob("Npix=*.zarr"))
-                legacy = renamed = 0
-                for zp in tiles:
-                    import zarr
-                    root = zarr.open_group(
-                        store=zarr.storage.LocalStore(str(zp)), mode="r",
-                    )
-                    keys = list(root.array_keys()) if hasattr(root, "array_keys") else []
-                    if LAKE_JOIN_ID_COLUMN not in keys and LEGACY_JOIN_ID_COLUMN in keys:
-                        legacy += 1
+                chk = check_zarr_join_arrays(spec_root)
                 out.append(
                     JoinColumnCheckResult(
                         survey=name,
                         modality="spectra",
                         root=spec_root,
-                        ok=legacy == 0 and len(tiles) > 0,
-                        tiles_checked=len(tiles),
-                        tiles_legacy_only=legacy,
-                        error=None if legacy == 0 else f"{legacy} Zarr tile(s) need --migrate-join-column",
+                        ok=chk.ok,
+                        tiles_checked=chk.tiles_checked,
+                        tiles_missing_join=chk.tiles_missing_join,
+                        error=chk.error,
+                    )
+                )
+        if include_cutouts:
+            cut_root = lake_root / "cutouts" / name
+            if cut_root.is_dir():
+                chk = check_zarr_join_arrays(cut_root)
+                out.append(
+                    JoinColumnCheckResult(
+                        survey=name,
+                        modality="cutouts",
+                        root=cut_root,
+                        ok=chk.ok,
+                        tiles_checked=chk.tiles_checked,
+                        tiles_missing_join=chk.tiles_missing_join,
+                        error=chk.error,
                     )
                 )
     return out
@@ -402,11 +334,6 @@ try:
         help="Report join-column status; exit 1 if any tile is missing _source_id.",
     )
     @click.option(
-        "--migrate-join-column",
-        is_flag=True,
-        help="Rename legacy source_id → _source_id in Parquet (and Zarr when --spectra/--cutouts).",
-    )
-    @click.option(
         "--rebuild-link-id",
         default=None,
         metavar="COL",
@@ -415,8 +342,8 @@ try:
             "Resets _spectrum_index and _cutout_index; run dl-rebuild-catalog-indices afterward."
         ),
     )
-    @click.option("--spectra", "migrate_spectra", is_flag=True, help="With --migrate-join-column, migrate spectra Zarr tiles.")
-    @click.option("--cutouts", "migrate_cutouts", is_flag=True, help="With --migrate-join-column, migrate cutout Zarr tiles.")
+    @click.option("--spectra", "check_spectra", is_flag=True, help="With --check-only, include spectra Zarr tiles.")
+    @click.option("--cutouts", "check_cutouts", is_flag=True, help="With --check-only, include cutout Zarr tiles.")
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         output_root: Path | None,
@@ -425,33 +352,26 @@ try:
         repair_all: bool,
         norder: int | None,
         check_only: bool,
-        migrate_join_column: bool,
         rebuild_link_id: str | None,
-        migrate_spectra: bool,
-        migrate_cutouts: bool,
+        check_spectra: bool,
+        check_cutouts: bool,
         verbose: bool,
     ) -> None:
         """Rebuild catalog metadata from Parquet tiles (no FITS re-ingest).
 
-        Refreshes ``catalog_info.json`` (``source_id_column`` is always ``_source_id``),
+        Refreshes ``catalog_info.json`` (``link_id_column`` is always ``_source_id``),
         aggregate ``_metadata``, and ``schema_manifest.json``.
 
         Examples::
 
             dl-repair-catalog-metadata /data/lake --survey ultraVISTA_DR6 --check-only
-            dl-repair-catalog-metadata /data/lake --survey ultraVISTA_DR6 --migrate-join-column
             dl-repair-catalog-metadata /data/lake --survey zCOSMOS_DR3 --rebuild-link-id filename
-            dl-repair-catalog-metadata /data/lake --all --migrate-join-column --spectra
+            dl-repair-catalog-metadata /data/lake --all --check-only --spectra
         """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
         configure_warning_filters()
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="catalogs")
-
-        if migrate_join_column and rebuild_link_id:
-            raise click.ClickException(
-                "Use either --migrate-join-column or --rebuild-link-id, not both."
-            )
 
         if repair_all and surveys:
             raise click.ClickException("Use either --survey or --all, not both.")
@@ -467,58 +387,57 @@ try:
 
         if check_only:
             failed = False
-            for name in names:
-                chk = check_catalog_join_column(lake / "catalogs" / name, name)
+            checks = check_lake_join_columns(
+                lake, names,
+                include_spectra=check_spectra,
+                include_cutouts=check_cutouts,
+            )
+            for chk in checks:
                 click.echo(
-                    f"{name} [catalog]: mode={chk.source_id_mode!r} "
-                    f"join_col={chk.source_id_column!r} native={chk.native_id_column!r} "
-                    f"tiles={chk.tiles_checked} missing={chk.tiles_missing_join} "
-                    f"legacy_only={chk.tiles_legacy_only}"
+                    f"{chk.survey} [{chk.modality}]: join_col={chk.link_id_column!r} "
+                    f"tiles={chk.tiles_checked} missing={chk.tiles_missing_join}"
                 )
                 if chk.sample_columns:
                     click.echo(f"  sample columns: {chk.sample_columns[:15]}")
                 if not chk.ok:
                     failed = True
                     click.echo(f"  → {chk.error}", err=True)
+            for name in names:
                 try:
-                    resolved = resolve_source_id_column(lake / "catalogs" / name)
-                    click.echo(f"  resolve_source_id_column → {resolved!r}")
+                    resolved = resolve_link_id_column(lake / "catalogs" / name)
+                    click.echo(f"{name} [catalog]: resolve_link_id_column → {resolved!r}")
                 except KeyError as exc:
                     failed = True
-                    click.echo(f"  resolve failed: {exc}", err=True)
+                    click.echo(f"{name} [catalog]: resolve failed: {exc}", err=True)
             if failed:
                 raise SystemExit(1)
-            click.echo("All checked catalogs have _source_id on every tile.")
+            click.echo("All checked tiles have _source_id.")
             return
 
         results = repair_catalogs_under_lake(
             lake,
             names,
             norder=norder,
-            migrate_join_column=migrate_join_column,
             rebuild_link_id=rebuild_link_id,
         )
-        n_ok = 0
-        n_fail = 0
+        n_ok = n_fail = 0
         for res in results:
             if not res.ok:
                 n_fail += 1
                 click.echo(f"{res.survey}: FAILED — {res.error}", err=True)
                 continue
             n_ok += 1
-            sid_before = res.source_id_column_before or "—"
-            sid_after = res.source_id_column_after or "—"
-            mode_before = res.source_id_mode_before or "—"
-            mode_after = res.source_id_mode_after or "—"
+            sid_before = res.link_id_column_before or "—"
+            sid_after = res.link_id_column_after or "—"
+            mode_before = res.link_id_mode_before or "—"
+            mode_after = res.link_id_mode_after or "—"
             changed = sid_before != sid_after or mode_before != mode_after
             suffix = ""
             if changed:
                 suffix = (
-                    f" (source_id_column {sid_before!r} → {sid_after!r}; "
-                    f"source_id_mode {mode_before!r} → {mode_after!r})"
+                    f" (link_id_column {sid_before!r} → {sid_after!r}; "
+                    f"link_id_mode {mode_before!r} → {mode_after!r})"
                 )
-            if res.parquet_tiles_renamed:
-                suffix += f"; {res.parquet_tiles_renamed} Parquet tile(s) migrated"
             if res.parquet_tiles_rebuilt:
                 suffix += f"; {res.parquet_tiles_rebuilt} Parquet tile(s) link-id rebuilt"
             rows = res.total_rows
@@ -529,15 +448,6 @@ try:
                     f"  → run dl-rebuild-catalog-indices --survey {res.survey} "
                     f"--kind spectrum (and dl-validate-catalog-spectra-link)"
                 )
-
-        if migrate_join_column and (migrate_spectra or migrate_cutouts):
-            for name in names:
-                if migrate_spectra:
-                    r, o, m = migrate_zarr_survey_join_columns(lake / "spectra" / name)
-                    click.echo(f"{name} [spectra zarr]: renamed={r} ok={o} missing={m}")
-                if migrate_cutouts:
-                    r, o, m = migrate_zarr_survey_join_columns(lake / "cutouts" / name)
-                    click.echo(f"{name} [cutouts zarr]: renamed={r} ok={o} missing={m}")
 
         if n_fail:
             raise SystemExit(1)

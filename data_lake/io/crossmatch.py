@@ -154,23 +154,17 @@ def resolve_crossmatch_settings(
     ra_col_b: str | None = None,
     dec_col_b: str | None = None,
     norder_b: int | None = None,
-    ra_col: str | None = None,
-    dec_col: str | None = None,
-    norder: int | None = None,
 ) -> CrossmatchSettings:
-    """Resolve per-survey RA/Dec columns and HEALPix order from catalog_info.json.
-
-    Legacy ``ra_col`` / ``dec_col`` / ``norder`` apply to survey A only.
-    """
+    """Resolve per-survey RA/Dec columns and HEALPix order from catalog_info.json."""
     root = Path(lake_root)
     ra_a, dec_a, order_a = _sky_columns_from_catalog_info(root / "catalogs" / survey_a)
     ra_b, dec_b, order_b = _sky_columns_from_catalog_info(root / "catalogs" / survey_b)
 
     settings = CrossmatchSettings(
         survey_a=CrossmatchSurveySettings(
-            ra_col=ra_col_a or ra_col or ra_a,
-            dec_col=dec_col_a or dec_col or dec_a,
-            norder=norder_a if norder_a is not None else (norder if norder is not None else order_a),
+            ra_col=ra_col_a or ra_a,
+            dec_col=dec_col_a or dec_a,
+            norder=norder_a if norder_a is not None else order_a,
         ),
         survey_b=CrossmatchSurveySettings(
             ra_col=ra_col_b or ra_b,
@@ -204,18 +198,18 @@ def resolve_crossmatch_sky_columns(
     survey_a: str,
     survey_b: str,
     *,
-    ra_col: str | None = None,
-    dec_col: str | None = None,
-    norder: int | None = None,
+    ra_col_a: str | None = None,
+    dec_col_a: str | None = None,
+    norder_a: int | None = None,
 ) -> tuple[str, str, int]:
-    """Legacy helper returning survey-A settings only."""
+    """Return survey-A sky columns and HEALPix order for cross-match."""
     s = resolve_crossmatch_settings(
         lake_root,
         survey_a,
         survey_b,
-        ra_col=ra_col,
-        dec_col=dec_col,
-        norder=norder,
+        ra_col_a=ra_col_a,
+        dec_col_a=dec_col_a,
+        norder_a=norder_a,
     )
     return s.survey_a.ra_col, s.survey_a.dec_col, s.survey_a.norder
 
@@ -442,7 +436,7 @@ def _crossmatch_one_tile(
     id_col_b = (
         acc_b.resolve_id_column_for_tile(b_pixels[0])
         if b_pixels
-        else acc_b.source_id_column
+        else acc_b.link_id_column
     )
     cols_b = [id_col_b, ra_col_b, dec_col_b]
     ra_min, ra_max, dec_min, dec_max = _source_bbox_deg(ra_a, dec_a, radius_deg)
@@ -655,9 +649,6 @@ def build_crossmatch(
     survey_a: str,
     survey_b: str,
     radius_arcsec: float = 1.0,
-    norder: int | None = None,
-    ra_col: str | None = None,
-    dec_col: str | None = None,
     overwrite: bool = False,
     *,
     norder_a: int | None = None,
@@ -690,10 +681,6 @@ def build_crossmatch(
         pixel is used to assign the output row to a Parquet partition).
     radius_arcsec:
         Maximum matching radius in arcseconds.
-    norder:
-        HEALPix order for survey A (legacy alias for ``norder_a``).
-    ra_col / dec_col:
-        Sky columns for survey A (legacy aliases for ``ra_col_a`` / ``dec_col_a``).
     norder_a / norder_b:
         Per-survey HEALPix order (default: each catalog's ``catalog_info.json``).
     ra_col_a / dec_col_a / ra_col_b / dec_col_b:
@@ -727,13 +714,10 @@ def build_crossmatch(
         survey_b,
         ra_col_a=ra_col_a,
         dec_col_a=dec_col_a,
-        norder_a=norder_a if norder_a is not None else norder,
+        norder_a=norder_a,
         ra_col_b=ra_col_b,
         dec_col_b=dec_col_b,
         norder_b=norder_b,
-        ra_col=ra_col,
-        dec_col=dec_col,
-        norder=norder,
     )
     norder_a = settings.survey_a.norder
     norder_b = settings.survey_b.norder
@@ -823,9 +807,9 @@ def build_crossmatch(
             log.info(
                 "ID columns: %s (%r) × %s (%r)",
                 survey_a,
-                acc_a.source_id_column,
+                acc_a.link_id_column,
                 survey_b,
-                acc_b.source_id_column,
+                acc_b.link_id_column,
             )
             for npix_a in iterator:
                 n_rows = _crossmatch_one_tile(

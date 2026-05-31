@@ -158,7 +158,7 @@ def inspect_spplate_plugmap(hdul) -> dict[str, Any]:
     if audit["specobjid_like"]:
         audit["notes"].append(
             "Column(s) matching specObjID name pattern found — verify against CAS "
-            "before using as --source-id-col."
+            "before using as --link-id-col."
         )
     else:
         audit["notes"].append(
@@ -476,7 +476,7 @@ def format_debug_report(
     help="specObjID packing for plate synthesis.",
 )
 @click.option(
-    "--source-id-col",
+    "--link-id-col",
     default=None,
     help="Catalog/sidecar ID column after plate/mjd/fiber join (same as dl-ingest-spectra).",
 )
@@ -493,7 +493,7 @@ def cli(
     no_catalog: bool,
     no_plate: bool,
     specobj_id_layout: str,
-    source_id_col: str | None,
+    link_id_col: str | None,
     sample: int,
     as_json: bool,
     verbose: bool,
@@ -522,7 +522,7 @@ def cli(
         try_from_catalog=catalog_root is not None,
         try_from_sidecar=specobj_lookup is not None,
         specobj_id_layout=specobj_id_layout.lower(),  # type: ignore[arg-type]
-        catalog_id_col=source_id_col,
+        catalog_id_col=link_id_col,
     )
 
     if as_json:

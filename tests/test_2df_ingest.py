@@ -486,7 +486,7 @@ class TestIngest2df:
             source_id_to_index=index_map,
             kind="spectrum",
             norder=5,
-            source_id_col=None,
+            link_id_col=None,
         )
 
         # Re-read catalog tile
@@ -550,7 +550,7 @@ class TestIngest2df:
             source_id_to_index=index_map,
             kind="spectrum",
             norder=5,
-            source_id_col=None,
+            link_id_col=None,
         )
 
         refreshed = pq.read_table(cat_file)

@@ -304,9 +304,9 @@ class TestFormatDetection:
             survey_name="csv_gz_survey",
             ra_col="RAdeg",
             dec_col="DEdeg",
-            source_id_col="WISEA",
+            link_id_col="WISEA",
             norder=5,
-            overwrite=True,
+            tile_mode="overwrite",
         )
         tiles = list((lake / "catalogs" / "csv_gz_survey").rglob("Npix=*.parquet"))
         assert tiles
@@ -320,7 +320,7 @@ class TestFormatDetection:
 
 
 class TestCastObjectIdColumn:
-    def test_vector_source_id_col_rejected(self, tmp_path: Path) -> None:
+    def test_vector_link_id_col_rejected(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_parquet import ensure_catalog_source_ids
 
         tbl = pa.table({
@@ -361,15 +361,15 @@ class TestIngestCatalogEndToEnd:
             survey_name="syn_j",
             ra_col="RA",
             dec_col="DEC",
-            source_id_col="NAME",
-            overwrite=True,
+            link_id_col="NAME",
+            tile_mode="overwrite",
             streaming=False,
         )
 
         info = json.loads(
             (lake_root / "catalogs" / "syn_j" / "catalog_info.json").read_text()
         )
-        assert info["source_id_mode"] == "label:NAME"
+        assert info["link_id_mode"] == "label:NAME"
 
         _, merged = _read_merged_catalog(lake_root, "syn_j")
         assert pa.types.is_string(merged.schema.field("NAME").type) or pa.types.is_large_string(
@@ -398,8 +398,8 @@ class TestIngestCatalogEndToEnd:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
-            overwrite=True,
+            link_id_col="TARGETID",
+            tile_mode="overwrite",
             streaming=False,
         )
 
@@ -424,8 +424,8 @@ class TestIngestCatalogEndToEnd:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
-            overwrite=True,
+            link_id_col="TARGETID",
+            tile_mode="overwrite",
             streaming=True,
         )
 
@@ -448,8 +448,8 @@ class TestIngestCatalogEndToEnd:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
-            overwrite=True,
+            link_id_col="TARGETID",
+            tile_mode="overwrite",
         )
 
         # Find all written parquet tiles, read them back
@@ -502,14 +502,14 @@ class TestStreamingIngest:
         ingest_catalog(
             source_path=fits_path, output_root=mem_root, survey_name="syn",
             ra_col="TARGET_RA", dec_col="TARGET_DEC", norder=5,
-            source_id_col="TARGETID", overwrite=True, streaming=False,
+            link_id_col="TARGETID", tile_mode="overwrite", streaming=False,
         )
 
         stream_root = tmp_path / "stream"
         ingest_catalog(
             source_path=fits_path, output_root=stream_root, survey_name="syn",
             ra_col="TARGET_RA", dec_col="TARGET_DEC", norder=5,
-            source_id_col="TARGETID", overwrite=True, streaming=True,
+            link_id_col="TARGETID", tile_mode="overwrite", streaming=True,
         )
 
         # Same tile set
@@ -575,7 +575,7 @@ class TestStreamingIngest:
             )
 
     def test_streaming_with_auto_generated_source_id(self, tmp_path: Path):
-        """When source_id_col is None, streaming should auto-generate sequential IDs."""
+        """When link_id_col is None, streaming should auto-generate sequential IDs."""
         from data_lake.ingest.fits_to_parquet import ingest_catalog
 
         # Build a minimal table without an explicit ID column
@@ -591,7 +591,7 @@ class TestStreamingIngest:
         ingest_catalog(
             source_path=fits_path, output_root=lake_root, survey_name="noid",
             ra_col="RA", dec_col="DEC", norder=5,
-            source_id_col=None, overwrite=True, streaming=True,
+            link_id_col=None, tile_mode="overwrite", streaming=True,
         )
 
         merged = self._read_merged(lake_root, "noid")
@@ -624,7 +624,7 @@ class TestParquetTileIntegrity:
             incoming,
             tile_mode="append",
             on_duplicate_id="skip",
-            source_id_col="TARGETID",
+            link_id_col="TARGETID",
             parquet_options=CatalogParquetOptions(),
         )
         assert meta is not None
@@ -674,7 +674,7 @@ class TestNumericTypeNormalization:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
+            link_id_col="TARGETID",
         )
         ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
         ingest_catalog(source_path=fits_b, tile_mode="append", **common)
@@ -734,7 +734,7 @@ class TestTileMode:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
+            link_id_col="TARGETID",
         )
         ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
         ingest_catalog(
@@ -775,7 +775,7 @@ class TestTileMode:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
+            link_id_col="TARGETID",
         )
         ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
         with pytest.raises(ValueError, match="Duplicate object ID"):
@@ -800,13 +800,12 @@ class TestTileMode:
             ra_col="RA",
             dec_col="DEC",
             norder=5,
-            source_id_col="NAME",
-            tile_mode="append",
+            link_id_col="NAME",
             on_duplicate_id="skip",
         )
-        ingest_catalog(source_path=fits_path, overwrite=True, **common)
+        ingest_catalog(source_path=fits_path, tile_mode="overwrite", **common)
         _, first = _read_merged_catalog(lake, "reingest")
-        ingest_catalog(source_path=fits_path, **common)
+        ingest_catalog(source_path=fits_path, tile_mode="append", **common)
         _, second = _read_merged_catalog(lake, "reingest")
         assert second.num_rows == first.num_rows
         np.testing.assert_array_equal(
@@ -828,7 +827,7 @@ class TestTileMode:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
+            link_id_col="TARGETID",
         )
         ingest_catalog(source_path=fits_a, tile_mode="overwrite", **common)
         ingest_catalog(
@@ -866,7 +865,7 @@ class TestTileMode:
             ra_col="TARGET_RA",
             dec_col="TARGET_DEC",
             norder=5,
-            source_id_col="TARGETID",
+            link_id_col="TARGETID",
         )
         ingest_catalog(source_path=tmp_path / "a.fits", tile_mode="overwrite", **common)
         ingest_catalog(source_path=tmp_path / "b.fits", tile_mode="append", **common)

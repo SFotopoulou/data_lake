@@ -92,8 +92,8 @@ def _make_lake(tmp_path: Path, npix: int = 42) -> Path:
         npix=npix,
     )
     (cat_root / "catalog_info.json").write_text(
-        '{"hats_order": 5, "source_id_mode": "sequential", '
-        '"source_id_column": "_source_id", "ra_column": "ra", "dec_column": "dec"}'
+        '{"hats_order": 5, "link_id_mode": "sequential", '
+        '"link_id_column": "_source_id", "ra_column": "ra", "dec_column": "dec"}'
     )
     return lake
 

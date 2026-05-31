@@ -40,7 +40,7 @@ def _write_catalog_tile(
     ra_col: str = "ra",
     dec_col: str = "dec",
     id_col: str = LAKE_JOIN_ID_COLUMN,
-    source_id_mode: str | None = None,
+    link_id_mode: str | None = None,
 ) -> None:
     tile_dir = lake / "catalogs" / survey / healpix_dir(norder, npix)
     tile_dir.mkdir(parents=True, exist_ok=True)
@@ -59,15 +59,15 @@ def _write_catalog_tile(
         pa.table(cols),
         tile_dir / f"Npix={npix}.parquet",
     )
-    mode = source_id_mode or (
+    mode = link_id_mode or (
         f"column:{id_col}" if id_col != LAKE_JOIN_ID_COLUMN else "sequential"
     )
     info = {
         "hats_order": norder,
         "ra_column": ra_col,
         "dec_column": dec_col,
-        "source_id_mode": mode,
-        "source_id_column": LAKE_JOIN_ID_COLUMN,
+        "link_id_mode": mode,
+        "link_id_column": LAKE_JOIN_ID_COLUMN,
         "total_rows": len(source_ids),
         "total_columns": len(cols),
     }
@@ -106,7 +106,7 @@ class TestCrossmatchHelpers:
         assert settings.survey_a.norder == 5
         assert settings.survey_b.norder == 6
 
-    def test_legacy_resolve_sky_columns(self, tmp_path: Path) -> None:
+    def test_resolve_sky_columns(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         _write_catalog_tile(lake, "A", norder=5, npix=1, source_ids=[1], ra=[0.0], dec=[0.0])
         _write_catalog_tile(lake, "B", norder=5, npix=1, source_ids=[2], ra=[0.0], dec=[0.0])
@@ -407,13 +407,13 @@ class TestCrossmatchNativeIdColumn:
             lake, "SURVEY_A", norder=norder, npix=npix,
             source_ids=[1001], ra=[ra], dec=[dec],
             id_col="id",
-            source_id_mode="sequential",
+            link_id_mode="sequential",
         )
         _write_catalog_tile(
             lake, "SURVEY_B", norder=norder, npix=npix,
             source_ids=[2001], ra=[ra + 0.0001], dec=[dec + 0.0001],
             id_col="id",
-            source_id_mode="column:id",
+            link_id_mode="column:id",
         )
 
         result = build_crossmatch(

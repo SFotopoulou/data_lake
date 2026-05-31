@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import zarr
 
-from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, LEGACY_JOIN_ID_COLUMN
+from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
 
 
 def zarr_join_array(root: zarr.Group) -> zarr.Array:
-    """Return the per-tile int64 join array (current or legacy name)."""
+    """Return the per-tile int64 join array (``_source_id``)."""
     if LAKE_JOIN_ID_COLUMN in root:
         return root[LAKE_JOIN_ID_COLUMN]
-    if LEGACY_JOIN_ID_COLUMN in root:
-        return root[LEGACY_JOIN_ID_COLUMN]
     raise KeyError(
-        f"Zarr tile has no join array {LAKE_JOIN_ID_COLUMN!r} or "
-        f"{LEGACY_JOIN_ID_COLUMN!r}; keys: {list(root.keys())}"
+        f"Zarr tile has no join array {LAKE_JOIN_ID_COLUMN!r}; keys: {list(root.keys())}"
     )
 
 
