@@ -109,8 +109,15 @@ def _patch_catalog_parquet_file(
     *,
     sid_col: str,
     index_col: str,
+    reset_unmatched: bool = False,
 ) -> bool:
-    """Patch one catalog Parquet tile; return True if the file was rewritten."""
+    """Patch one catalog Parquet tile; return True if the file was rewritten.
+
+    When *reset_unmatched* is True (full Zarr-tile rebuild), rows whose
+    ``sid_col`` value is absent from *source_id_to_index* get
+    ``index_col=-1``.  Without this, stale indices from an older, larger Zarr
+  tile survive and fail ``dl-validate-catalog-spectra-link``.
+    """
     table = pq.ParquetFile(str(tile_file)).read()
     if sid_col not in table.schema.names:
         log.warning(
@@ -132,7 +139,7 @@ def _patch_catalog_parquet_file(
             tile_ids.append(normalize_object_id(x))
     source_id_set = set(source_id_to_index.keys())
     matches = [sid for sid in tile_ids if sid is not None and sid in source_id_set]
-    if not matches:
+    if not matches and not reset_unmatched:
         return False
 
     if index_col in table.schema.names:
@@ -150,6 +157,11 @@ def _patch_catalog_parquet_file(
     for sid in matches:
         for row_i in id_to_row[sid]:
             idx_arr[row_i] = source_id_to_index[sid]
+
+    if reset_unmatched:
+        for row_i, sid in enumerate(tile_ids):
+            if sid is None or sid not in source_id_set:
+                idx_arr[row_i] = -1
 
     if index_col in table.schema.names:
         col_pos = table.schema.get_field_index(index_col)
@@ -252,9 +264,10 @@ def update_index_column_from_zarr_tiles(
             partial_map,
             sid_col=sid_col,
             index_col=index_col,
+            reset_unmatched=True,
         ):
             n_modified += 1
-        else:
+        elif partial_map:
             log.warning(
                 "Zarr %s: catalog tile %s has no matching %s values "
                 "(%d Zarr row(s); id_col=%r)",
@@ -477,8 +490,10 @@ try:
         """Rebuild _spectrum_index / _cutout_index in catalog tiles from existing Zarr data.
 
         Scans the Zarr tiles already on disk for SURVEY and patches the matching
-        Parquet catalog tiles — no FITS re-ingestion required.  Use this to repair
-        a deployment where spectra or cutouts were ingested without catalog patching.
+        Parquet catalog tiles — no FITS re-ingestion required.  Rows with no
+        spectrum in the current Zarr tile get ``index=-1`` (stale indices cleared).
+        Use this to repair a deployment where spectra or cutouts were ingested
+        without catalog patching, or after Zarr tiles were replaced.
         """
         import logging
         logging.basicConfig(level=logging.INFO)

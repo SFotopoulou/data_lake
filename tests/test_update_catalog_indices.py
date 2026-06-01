@@ -469,6 +469,64 @@ class TestUpdateIndexFromZarrTiles:
         tbl = pq.ParquetFile(alt).read()
         assert tbl.column("_spectrum_index").to_pylist() == [0]
 
+    def test_rebuild_clears_stale_indices_not_in_zarr(self, tmp_path: Path) -> None:
+        """Stale _spectrum_index values must be reset when ID is absent from Zarr."""
+        from data_lake.ingest.fits_to_parquet import (
+            LAKE_JOIN_ID_COLUMN,
+            assign_healpix,
+            healpix_dir,
+            _ZSTD_LEVEL,
+        )
+        from data_lake.ingest.update_catalog_indices import (
+            update_index_column_from_zarr_tiles,
+        )
+
+        norder = 5
+        ra = [50.0, 50.0, 50.0]
+        dec = [20.0, 20.0, 20.0]
+        npix = int(assign_healpix(np.array(ra), np.array(dec), norder)[0])
+        in_zarr = 5_000_001
+        only_catalog = 5_000_099
+        ghost = 5_000_088
+
+        cols = {
+            LAKE_JOIN_ID_COLUMN: pa.array([in_zarr, only_catalog, ghost], type=pa.int64()),
+            "ra": pa.array(ra, type=pa.float64()),
+            "dec": pa.array(dec, type=pa.float64()),
+            f"_healpix_norder{norder}": pa.array([npix] * 3, type=pa.int64()),
+            "_spectrum_index": pa.array([21_011, 76_10, -1], type=pa.int64()),
+        }
+        survey = "stale_clear"
+        tile_dir = tmp_path / "catalogs" / survey / healpix_dir(norder, npix)
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table(cols),
+            str(tile_dir / f"Npix={npix}.parquet"),
+            compression="zstd",
+            compression_level=_ZSTD_LEVEL,
+        )
+        (tmp_path / "catalogs" / survey / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": norder,
+                "link_id_column": LAKE_JOIN_ID_COLUMN,
+                "link_id_mode": "sequential",
+                "ra_column": "ra",
+                "dec_column": "dec",
+            })
+        )
+        _write_mini_spectra_zarr(tmp_path, survey, [in_zarr], ra[:1], dec[:1], norder=norder)
+
+        n_modified = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name=survey,
+            kind="spectrum",
+        )
+        assert n_modified == 1
+        idx = pq.ParquetFile(tile_dir / f"Npix={npix}.parquet").read().column(
+            "_spectrum_index"
+        ).to_pylist()
+        assert idx == [0, -1, -1]
+
     def test_rebuild_warns_missing_catalog_tile(self, tmp_path: Path, caplog) -> None:
         import logging
 

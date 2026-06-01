@@ -1376,6 +1376,10 @@ dl-rebuild-catalog-indices --survey zCOSMOS_DR3 --kind spectrum
 dl-validate-catalog-spectra-link --survey zCOSMOS_DR3
 ```
 
+Rebuild sets ``_spectrum_index`` from each Zarr tile's ``_source_id`` array and
+clears the index to ``-1`` for catalog rows with no matching spectrum in that tile
+(fixes ``out of range`` / ``wrong id`` after Zarr was replaced or shrunk).
+
 Use ``--strict`` to treat orphan Zarr rows and unpatched catalog warnings as errors.
 Override partitioning only when needed: ``--norder 1`` (must match catalog ``hats_order``).
 
