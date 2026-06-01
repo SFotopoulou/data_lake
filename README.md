@@ -7,6 +7,25 @@ A local-first data lake for multi-survey astronomy catalogs, galaxy image cutout
 - **1-D spectra** (SDSS/BOSS, DESI, generic): stored as sharded Zarr v3 stacks alongside cutouts — flux, IVAR, mask, shared or per-source wavelength, per-source scalar metadata.
 - FITS is kept as the **ingest/export** format for observatory interoperability; it is not used as internal storage.
 
+## Contents
+
+- [Quick-start](#quick-start) — install, create a deployment, smoke test
+- [CLI quick reference](#cli-quick-reference) — every `dl-*` command in one table
+- [Ingest a survey catalog](#ingest-a-survey-catalog) — link IDs, HEALPix order, streaming
+- [Ingest cutouts](#ingest-cutouts) — FITS stamps → Zarr tiles
+- [Ingest spectra](#ingest-spectra) — DESI, SDSS/BOSS, 2dF, 6dF, GAMA, VIPERS, VUDS, VVDS, WiggleZ, OzDES, VANDELS
+  - [1-D spectrum readers reference](#1-d-spectrum-readers-reference)
+  - [Catalog vs spectrum CLI flags](#catalog-vs-spectrum-cli-flags)
+- [Batch and file-list ingest](#sequential-file-list-ingest-catalogs-cutouts-spectra) — from-list, parallel batch, checkpoints
+- [Validate and repair](#validate-parquet--zarr-survey-directories)
+- [Extract a subset](#extract-a-curated-subset-into-one-flat-zarr)
+- [Lake inventory and associations](#lake-inventory-and-master-association-tables) — registry, crossmatch, STILTS
+- [Schema registry](#schema-registry-column-discovery) — `dl-describe-survey`, manifests
+- [Lake registry](#lake-registry-and-master-metadata-p1) — `dl-describe-lake`
+- [Repository layout](#repository-layout) · [Data layout on disk](#data-layout-on-disk)
+- [Example notebooks](#example-notebooks) · [Key design decisions](#key-design-decisions)
+- [`lake_config.toml` reference](#lake_configtoml-reference) · [Dependencies](#dependencies)
+
 ## Quick-start
 
 Use [`uv`](https://docs.astral.sh/uv/) for all Python environments in this repo.
@@ -103,6 +122,13 @@ You can have multiple deployments side by side (e.g. `prod`, `staging`,
 | **Analyst** | `uv pip install data-lake` (or `uv sync` in a clone) | Shared deployment config | **Not used** | Read-only mount |
 | **Ingest operator** | Same package | Same or writable deployment | **Required** for `dl-ingest-*` | Read-write |
 
+**Key environment variables:**
+
+| Variable | Who sets it | Purpose |
+|----------|-------------|---------|
+| `DATA_LAKE_CONFIG` | Everyone | Path to `lake_config.toml`; read by all `dl-*` commands |
+| `LAKE_INGEST_TOKEN` | Operators | Plaintext ingest token; never commit to git |
+
 Installing the package only provides scripts and the Python API. It does **not**
 grant ingest rights. Anyone with shell access can still call ingest CLIs, but
 production lakes should rely on **filesystem permissions** (analysts cannot write
@@ -154,6 +180,75 @@ export DATA_LAKE_CONFIG=/path/to/mylake/lake_config.toml
 ```
 
 Read-only tools never check the ingest token.
+
+## CLI quick reference
+
+Every `dl-*` command in one table. Pass `--help` to any command for full flag docs.
+
+**Deploy**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-init` | Scaffold a new deployment (`lake_config.toml`, dirs, `.gitignore`) |
+| `dl-set-ingest-token` | Rotate the ingest token hash on an existing deployment |
+
+**Catalog ingest**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet |
+| `dl-ingest-catalog-batch` | Parallel decode, single-thread writer (large file lists) |
+| `dl-ingest-catalog-from-list` | Sequential catalog file-list ingest |
+| `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |
+| `dl-repair-catalog-metadata` | Repair/rebuild link IDs, `--check-only`, `--rebuild-link-id` |
+| `dl-recommend-catalog-norder` | Sample a catalog to suggest a good `--norder` |
+
+**Spectra ingest**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-ingest-spectra` | Single spectrum FITS → Zarr (all supported formats) |
+| `dl-ingest-spectra-batch` | Multi-process DESI coadd batch |
+| `dl-ingest-spectra-from-list` | Sequential spectrum file-list ingest |
+| `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles |
+
+**Cutout ingest**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-ingest-cutouts` | Single cutout FITS → Zarr |
+| `dl-ingest-cutouts-from-list` | Sequential cutout file-list ingest |
+| `dl-generate-cutout-fits` | Generate per-object stamp FITS from band images + catalog |
+
+**Validate and repair**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-validate-catalog-ingest` | Check Parquet tiles for required columns and schema |
+| `dl-validate-spectra-ingest` | Check Zarr spectrum tiles |
+| `dl-validate-cutout-ingest` | Check Zarr cutout tiles |
+| `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement |
+
+**Export and extract**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-extract-spectra-subset` | Export a curated ID list → flat Zarr / Parquet / HDF5 / FITS |
+| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS |
+| `dl-extract-spplate-catalog` | Build a specObj-style catalog from spPlate files |
+| `dl-pack-tile` | Package one HEALPix tile as a `.tar` for sharing |
+
+**Discovery and inventory**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--refresh` |
+| `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
+| `dl-describe-master` | Show master association columns mapped to catalog schemas |
+| `dl-refresh-lake-registry` | Scan lake and write `shared/registry/surveys.parquet` |
+| `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
+| `dl-crossmatch` | Positional catalog↔catalog match at lake scale |
+| `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |
 
 ### Ingest a survey catalog
 
@@ -339,7 +434,21 @@ column is always ``link_id_column: "_source_id"``. When you pass
 | Vector ID column | SDSS ``OBJID`` shape ``(5,)`` | **Error** — use scalar ``objid`` | — |
 | Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | ``NAME`` kept; ``_source_id`` = stable hash | ``label:NAME`` |
 | Composite labels | ``targetname`` + ``NAME_V`` + ``TITLE_V`` (6dF) | Columns kept; ``_source_id`` = hash of ``target\|name_v\|title_v`` | ``composite:targetname,NAME_V,TITLE_V`` |
+| Composite with header (2dF) | ``SPFILE`` + ``FIBRE`` per extension | Columns kept; ``_source_id`` = hash of ``spfile\|fibre`` | ``composite:SPFILE,FIBRE`` |
 | (none) | — | ``_source_id`` 0…N−1 only | ``sequential`` |
+
+**Incomplete composite IDs:** If a catalog row is missing one or more parts of a composite or label link key (e.g. the `SPFILE` column is blank for some rows), use ``--allow-incomplete-link-id``. Affected rows keep all science columns but ``_source_id`` is set to ``null`` and ``_spectrum_index`` stays ``-1``. Without the flag the ingest aborts on the first missing part.
+
+```bash
+# Ingest 2dF catalog where some rows have no SPFILE
+dl-ingest-catalog 2dF_cat.fits --survey 2DFGRS_DR3 \
+  --link-id-col SPFILE,FIBRE --allow-incomplete-link-id
+
+# Same flag is available on batch / repair commands
+dl-ingest-catalog-batch --allow-incomplete-link-id ...
+dl-repair-catalog-metadata /lake --survey 2DFGRS_DR3 \
+  --rebuild-link-id SPFILE,FIBRE --allow-incomplete-link-id
+```
 
 **Whitespace:** leading and trailing spaces are stripped before parsing or
 hashing (common for fixed-width FITS strings). Internal spaces are preserved.
@@ -368,8 +477,6 @@ For surveys where the join key spans multiple catalog columns (6dF ``targetname`
 ``_source_id`` is the stable hash of ``targetname|NAME_V|TITLE_V`` (same string
 built from FITS ``TARGET`` and ``NAME_V`` on the VR header plus ``TITLE_V`` on
 the paired V extension).
-
-```
 
 **Reassign catalog link column** (recompute ``_source_id`` from another column without FITS re-ingest; catalog Parquet only):
 
@@ -509,14 +616,36 @@ dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
   --link-id-col SPECOBJID
 ```
 
+#### 1-D spectrum readers reference
+
+Quick index of all supported `--fmt` values, the **catalog** ingest flag required to match them, and how each reader derives the spectrum link ID. Do **not** pass `--link-id-col` on `dl-ingest-spectra` for readers listed as "header" or "filename" — the reader resolves the ID internally.
+
+| `--fmt` | Catalog `--link-id-col` | Spectrum link source | Example / note |
+|---------|------------------------|----------------------|----------------|
+| `desi` | `TARGETID` (or default) | Fibermap `TARGETID` | Auto-detected from DESI coadd layout |
+| `sdss_boss` | `SPECOBJID` | `SPALL` HDU header | `spec-PLATE-MJD-FIBER.fits` |
+| `sdss_spplate` | via sidecar / plate header | `FIBERID` → specObjID | `spPlate-PLATE-MJD.fits`; see spPlate section |
+| `generic` | `--link-id-col` or auto | Header keyword chain | Any 1-D FITS with spectral WCS |
+| `2df` | `SPFILE,FIBRE` (+ `--allow-incomplete-link-id` if some rows have no filename) | Header `SPFILE` \| `FIBRE` per SPECTRUM HDU | `data/389442.fits` |
+| `6df` | `targetname,NAME_V,TITLE_V` | Header `TARGET`, `NAME_V`, `TITLE_V` per VR HDU | `data/g2302140-251235.fits` |
+| `gama` | `SPECID` | Primary header `SPECID` | `data/G23_Y7_015_265.fit` |
+| `ozdes` | filename column | Basename (stem) | `OzDES_*.fits` |
+| `vandels` | filename column | Basename | `sc_*.fits` (PRIMARY + NOISE) |
+| `vipers` | filename column | Basename | `VIPERS_*.fits` |
+| `vuds` | filename column | Basename | `sc_*.fits` with `LAM CESAM VO` header |
+| `vvds` | filename column | Basename | `sc_*.fits` without VUDS header |
+| `wigglez` | filename column | Basename (full, e.g. `wig225415.fits`) | `wig*.fits`; stem alone will not match |
+
+Auto-detection runs before `--fmt` is needed: try `dl-ingest-spectra FILE --survey NAME` first.
+
 #### Catalog vs spectrum CLI flags
 
 ``--link-id-col``, ``--ra-col``, and ``--dec-col`` on **catalog** ingest define
 how native columns map to ``_source_id`` and sky position in Parquet.  Format-specific
-spectrum readers (2dF, 6dF, OzDES, VANDELS, WiggleZ, zCOSMOS, VIPERS, VUDS, VVDS)
-resolve object IDs and coordinates **internally** (most use the spectrum **filename**
-for ``_source_id``; 2dF/6dF use header keys documented in their sections) — you do
-**not** repeat those flags on ``dl-ingest-spectra`` for those formats.
+spectrum readers (OzDES, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) resolve object IDs
+**from the spectrum filename**; 2dF and 6dF read link keys **from FITS extension
+headers** — you do **not** pass those flags on ``dl-ingest-spectra`` for any of
+these formats.
 
 For SDSS/BOSS, DESI coadds, generic 1-D FITS, and spPlate, pass ``--link-id-col``
 (and sky columns when headers differ from defaults) so the reader matches your
@@ -527,7 +656,8 @@ on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
 | Stage | ``--link-id-col`` | ``--ra-col`` / ``--dec-col`` |
 |-------|---------------------|------------------------------|
 | Catalog ingest | Required for production (native column → ``_source_id``) | Survey sky columns in degrees |
-| Spectrum ingest (2df, 6df, OzDES, VIPERS, VUDS, VVDS, …) | **Not used** — reader picks link key (often filename) | **Not used** — reader picks FITS sky keys |
+| Spectrum ingest (2df, 6df) | **Not used** — reader reads header keys (`SPFILE`/`FIBRE`, `TARGET`/`NAME_V`/`TITLE_V`) | **Not used** — reader reads `OBSRA`/`OBSDEC` from header |
+| Spectrum ingest (OzDES, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) | **Not used** — reader hashes the filename | **Not used** — reader reads sky from header |
 | Spectrum ingest (SDSS, DESI, generic, spPlate) | Header keyword / fibermap column | FITS header keywords |
 | Catalog patch after spectrum ingest | **Not used** — joins on ``_source_id`` | — |
 
@@ -759,27 +889,29 @@ sbatch scripts/slurm_ingest_2df_spectra.sh
 
 ```bash
 # Count spectra in Zarr vs files processed
-dl-describe-lake --config "$DATA_LAKE_CONFIG" --survey 2DFGRS_DR3
+dl-describe-survey 2DFGRS_DR3 --modality spectra
 
-# Spot-check one spectrum (use SPFILE label from catalog)
+# Spot-check one spectrum (use SPFILE|FIBRE composite label from catalog)
 python - <<'PY'
 from data_lake.io.spectra import SpectrumAccessor
-from data_lake.ingest.fits_to_parquet import normalize_object_id
+from data_lake.ingest.fits_to_parquet import composite_link_label, normalize_object_id
 acc = SpectrumAccessor('/path/to/lake', '2DFGRS_DR3')
-sp = acc.get_spectrum(normalize_object_id('sgp805_001203_2z.fits'))
+sp = acc.get_spectrum(normalize_object_id(composite_link_label('sgp805_001203_2z.fits', 132)))
 print('flux shape:', sp.flux.shape, 'max_ivar:', sp.ivar.max())
 PY
 
-# Verify catalog linkage (SPFILE → _spectrum_index)
+# Verify catalog linkage (SPFILE|FIBRE → _spectrum_index)
 python - <<'PY'
 import pyarrow.parquet as pq, pathlib
 tiles = list(pathlib.Path('/path/to/lake/catalogs/2DFGRS_DR3').rglob('*.parquet'))
 for t in tiles[:3]:
-    tbl = pq.read_table(t, columns=['serial', 'SPFILE', '_spectrum_index'])
+    tbl = pq.read_table(t, columns=['serial', 'SPFILE', 'FIBRE', '_spectrum_index'])
     unlinked = sum(1 for i in tbl['_spectrum_index'].to_pylist() if i < 0)
     print(t.name, 'rows:', len(tbl), 'unlinked:', unlinked)
 PY
 ```
+
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags) · [Validate linkage](#verify-catalog--spectra-linkage)
 
 #### 6dFGS spectra ingest (all VR extensions)
 
@@ -852,6 +984,8 @@ sbatch scripts/slurm_ingest_6df_spectra.sh
 
 Re-submit the same command to resume from checkpoint after timeout/preemption.
 
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags) · [Validate linkage](#verify-catalog--spectra-linkage)
+
 #### GAMA 1-D spectra ingest (stacked PRIMARY)
 
 GAMA AAOMEGA-2dF spectra are stored as a **2-D PRIMARY image** ``(n_row, n_pix)``
@@ -892,6 +1026,8 @@ dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --fmt ozdes
 dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2
 ```
 
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
+
 #### VANDELS spectra ingest (stacked only)
 
 VANDELS multi-extension FITS files store the stacked 1-D spectrum in PRIMARY with a
@@ -911,6 +1047,8 @@ dl-ingest-spectra sc_UDS313141_P3M1Q4_008_1.fits --survey VANDELS --fmt vandels
 # Auto-detect works for sc_*.fits with PRIMARY + NOISE layout
 dl-ingest-spectra sc_UDS313141_P3M1Q4_008_1.fits --survey VANDELS
 ```
+
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
 
 #### VIPERS spectra ingest
 
@@ -932,6 +1070,8 @@ dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS --fmt vipers
 # Auto-detect works for VIPERS_*.fits with the spectral table layout
 dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS
 ```
+
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
 
 #### VUDS spectra ingest
 
@@ -956,6 +1096,8 @@ dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS
 dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS
 ```
 
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
+
 #### VVDS spectra ingest
 
 VVDS 1-D spectra use a PRIMARY flux array (1-D or ``(1, n_pix)``) with spectral WCS.
@@ -977,6 +1119,8 @@ dl-ingest-spectra sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits --survey VVD
 # Auto-detect works for sc_*.fits without VUDS metadata
 dl-ingest-spectra sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits --survey VVDS
 ```
+
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
 
 #### WiggleZ spectra ingest
 
@@ -1007,6 +1151,8 @@ dl-ingest-spectra-from-list wig_files.txt \
   --checkpoint /path/to/lake/ingest_state/wig/checkpoint.json \
   --failures-log /path/to/lake/ingest_state/wig/failures.jsonl
 ```
+
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
 
 #### Parallel batch ingest (many coadd files)
 
@@ -1092,10 +1238,15 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | Command | Flag | Values | Notes |
 |---------|------|--------|--------|
 | `dl-ingest-catalog` | `--on-duplicate-id` | `skip`, `error`, `last` | Only when `--tile-mode append` (Parquet rows) |
+| `dl-ingest-catalog` | `--allow-incomplete-link-id` | flag | Null `_source_id` for rows with missing composite/label parts; row kept, `_spectrum_index` = -1 |
+| `dl-ingest-catalog` | `--tile-mode` | `append`, `replace` | Default `append`; `replace` overwrites existing tile |
+| `dl-ingest-catalog` | `--streaming` | flag | FITS-only; bounded RAM; not available on batch path |
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
 | `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
+| `dl-ingest-catalog-batch` | `--allow-incomplete-link-id` | flag | Same semantics as single-file command |
 | `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
 | `dl-repair-catalog-metadata` | `--rebuild-link-id` | column name | Recompute catalog ``_source_id`` from column (catalog only); then run ``dl-rebuild-catalog-indices`` |
+| `dl-repair-catalog-metadata` | `--allow-incomplete-link-id` | flag | Allow null `_source_id` when rebuilding link IDs |
 | `dl-repair-catalog-metadata` | — | — | Repair ``catalog_info.json``; ``--check-only``; ``--rebuild-link-id`` |
 | `dl-ingest-cutouts` | `--on-duplicate` | `skip`, `error`, `append` | Default **`skip`**; per `source_id` in each `Npix=*.zarr` |
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
@@ -1411,9 +1562,25 @@ data_lake/
     to_spectrum_fits.py  Zarr spectrum → 1-D FITS + BINTABLE export
     spectra_subset.py    Curated source-id subset → single flat Zarr group
 notebooks/
-  01_duckdb_catalog_query.ipynb … 07_cutout_ingest.ipynb   # see “Example notebooks” below
+  01_catalog_ingest.ipynb        02_spectrum_workflow.ipynb
+  03_cutout_ingest.ipynb         04_ingestion_report.ipynb
+  11_duckdb_catalog_query.ipynb  12_visualization.ipynb
+  13_pytorch_training_loop.ipynb # see "Example notebooks" below
 examples/
   cross_survey_lsst_desi_euclid/   # synthetic lake + DuckDB join (master + modalities)
+data/                               # committed FITS fixtures for tests and smoke runs
+  389442.fits                       # 2dFGRS spectrum (2 SPECTRUM extensions; SPFILE+FIBRE link)
+  154714.fits / 161216.fits         # additional 2dFGRS spectra
+  g2302140-251235.fits              # 6dFGS target file (VR extensions; TARGET+NAME_V+TITLE_V)
+  g1437140-385507.fits / g2259418-254505.fits  # additional 6dFGS files
+  G23_Y7_015_265.fit                # GAMA spectrum (SPECID header key)
+  OzDES-DR2_00001.fits              # OzDES spectrum (filename link)
+  sc_*.fits                         # VIPERS / VUDS / VVDS / VANDELS spectra (filename link)
+  VIPERS_406064719.fits             # VIPERS spectrum
+  wig225415.fits                    # WiggleZ spectrum (filename link — full name incl. ext)
+  spPlate-*.fits                    # SDSS/BOSS spPlate fixtures (2 plates, different n_pix)
+  zCOSMOS_BRIGHT_DR3_*.fits         # zCOSMOS spectrum (filename link)
+  sdss-specobjid.txt                # specObjID sidecar for spPlate tests
 ```
 
 ## Data layout on disk
@@ -1493,15 +1660,12 @@ with a formal `catalogs/<survey>/` ingest), or a dedicated tree under
 
 ### Building an inventory of “what is in the lake”
 
-Use the same tools as production queries:
+Recommended steps (fastest to slowest):
 
-1. **List surveys** — directories under `catalogs/`, `cutouts/`, `spectra/`
-   (each name is the survey identifier you passed to ingest).
-2. **Row counts / columns** — `duckdb` / `polars` over
-   `read_parquet('.../catalogs/<survey>/**/*.parquet')`, or read each survey’s
-   `catalog_info.json` (`total_rows`, `total_columns`, `hats_order`, …).
-3. **Notebook** — `notebooks/05_ingestion_report.ipynb` walks a deployment tree
-   and summarises what exists.
+1. **Registry summary** — `dl-refresh-lake-registry` then `dl-describe-lake --count-total` gives a survey × modality table with per-modality and grand-total row counts in seconds, without rescanning any tile.
+2. **Survey column manifest** — `dl-describe-survey <name>` for column names, dtypes, and roles.
+3. **Deployment tree notebook** — `notebooks/04_ingestion_report.ipynb` walks the full deployment and plots per-survey statistics.
+4. **Ad-hoc SQL** — `duckdb` / `polars` over `read_parquet('.../catalogs/<survey>/**/*.parquet')` or each survey’s `catalog_info.json` when you need custom filters.
 
 There is no requirement to materialise a single wide table of the whole lake;
 often a **small association Parquet** plus **on-demand joins** to native
@@ -1631,9 +1795,13 @@ The master file should stay ID-centric; science columns come from per-survey cat
 dl-refresh-lake-registry              # write shared/registry/surveys.parquet
 dl-describe-lake                      # print survey × modality summary
 dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout)
-dl-describe-lake --count-total        # append sum of registry total_rows
-dl-describe-lake --refresh            # rebuild registry from disk, then print
+dl-describe-lake --count-total        # footer: per-modality totals + grand total (registry sums)
+dl-describe-lake --modality catalog --count-total
+dl-describe-lake --json --count-total # JSON entries + summary object
+dl-describe-lake --refresh            # rebuild registry from disk first, then print
 ```
+
+**`--count-total` does not rescan tiles.** Counts are read from the registry (`surveys.parquet`), which stores row counts recorded at ingest time. If you have ingested new data since the last `dl-refresh-lake-registry`, run `dl-describe-lake --refresh --count-total` to get up-to-date numbers.
 
 For **spectra**, ``total_rows`` in the registry is the sum of ``source_id`` lengths
 across all ``Npix=*.zarr`` tiles (same count as the ingestion report notebook’s
@@ -1828,10 +1996,8 @@ See `notebooks/` for worked examples:
 1. **`01_catalog_ingest.ipynb`** — FITS → HEALPix Parquet ingest, validation, and `CatalogAccessor` queries (self-contained temp lake or your paths)
 2. **`02_spectrum_workflow.ipynb`** — Ingest spectra, query, transform, subset export (catalog `Z`), ML loop, FITS export + round-trip
 3. **`03_cutout_ingest.ipynb`** — FITS stamps → Zarr cutout stacks, validation, `CutoutAccessor`, optional `_cutout_index` catalog patch
-4. **`04_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`)
-5. **`11_duckdb_catalog_query.ipynb`** — SQL over Parquet catalogs; §9 master table + ID-list joins
-
-Use **`dl-describe-survey <name>`** (or the manifest JSON) to choose columns before building joins.
+4. **`04_ingestion_report.ipynb`** — Summarise what is on disk under a deployment (`lake_config.toml`); pairs with `dl-describe-lake --count-total`
+5. **`11_duckdb_catalog_query.ipynb`** — SQL over Parquet catalogs; §9 master table + ID-list joins. Use `dl-describe-survey <name>` to choose columns before building joins.
 6. **`12_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
 7. **`13_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
 
@@ -1848,6 +2014,48 @@ Use **`dl-describe-survey <name>`** (or the manifest JSON) to choose columns bef
 | Spectrum mask | uint8 (default) / uint16 | 8 bits covers SDSS/DESI defaults; bump if >8 flag bits needed |
 | Sharing unit | Per-tile .tar (catalog + cutouts + spectra) | Matches partition granularity; already compressed inside |
 | ML dataloader | CutoutDataset / SpectrumDataset (map) or Tile* (iterable) | Map-style for random sampling; tile-iterable for full-epoch streaming |
+
+## Which command for this file?
+
+```
+Do you have a 1-D spectrum FITS file?
+  → dl-ingest-spectra FILE --survey NAME        # try auto-detect first
+  → dl-ingest-spectra FILE --survey NAME --fmt <name>   # if detection fails
+  → dl-ingest-spectra-from-list file_list.txt --survey NAME  # many files, sequential
+  → dl-ingest-spectra-batch --survey NAME --file-list coadds.txt  # DESI parallel batch
+
+Do you have a catalog table? (FITS, CSV, Parquet, VOTable)
+  → dl-ingest-catalog cat.fits --survey NAME --ra-col RA --dec-col DEC --link-id-col ID
+  → dl-ingest-catalog-from-list list.txt --survey NAME ...   # file list
+  → dl-ingest-catalog-batch list.txt --survey NAME ...       # parallel decode
+
+Do you have image cutout stamps?
+  → dl-ingest-cutouts stamps.fits --survey NAME --ra-col RA --dec-col DEC
+
+After spectra or cutouts are ingested, patch catalog indices:
+  → dl-rebuild-catalog-indices --survey NAME --kind spectrum
+  → dl-validate-catalog-spectra-link --survey NAME
+
+Check what is in the lake:
+  → dl-describe-lake --count-total
+  → dl-describe-survey NAME
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| `_spectrum_index` all -1 after ingest | `_source_id` mismatch between catalog and spectra (different link key) | Check `--link-id-col` on catalog vs spectrum format; run `dl-validate-catalog-spectra-link --survey NAME` |
+| `_spectrum_index` all -1 after repair | Spectra not ingested yet, or `dl-rebuild-catalog-indices` not run | Run `dl-rebuild-catalog-indices --survey NAME --kind spectrum` |
+| Registry row counts stale | Registry not refreshed since last ingest | `dl-describe-lake --refresh --count-total` |
+| Batch job killed mid-run, catalog tiles exist but no manifest | `dl-finalize-catalog` not run | `dl-finalize-catalog --survey NAME` then `dl-refresh-lake-registry` |
+| OOM on catalog batch | `n_workers × largest file` exceeds RAM | Lower `--n-workers`; use `--columns` on wide surveys |
+| `BrokenProcessPool` on catalog batch | Worker OOM | Same — reduce workers; see parallel batch note in README |
+| `composite_link_label` ID does not match catalog | Partial parts — e.g. only `SPFILE` present, `FIBRE` absent | Add `--allow-incomplete-link-id` to ingest/repair; those rows get null `_source_id` |
+| `dl-describe-lake` shows no entries | Registry file missing | `dl-refresh-lake-registry` first |
+| spPlate `_spectrum_index` mismatch | Wrong specObjID layout (DR7 vs DR8+) | Set `--specobj-id-layout auto\|dr7\|dr8plus`; see spPlate section |
+
+For catalog–spectrum linkage issues, see also the [Catalog vs spectrum CLI flags](#catalog-vs-spectrum-cli-flags) and [1-D spectrum readers reference](#1-d-spectrum-readers-reference) sections. For duplicate/resume logic, see [Duplicate / resume flags by command](#duplicate--resume-flags-by-command).
 
 ## `lake_config.toml` reference
 
