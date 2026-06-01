@@ -56,7 +56,7 @@ class TestVipersIngest:
             records, wcs = _read_vipers_spectrum(hdul, p)
 
         r = records[0]
-        assert r.source_id == normalize_object_id(406064719)
+        assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (64,)
         assert r.wavelength.shape == (64,)
         assert r.ivar[2] > 0
@@ -81,7 +81,7 @@ class TestVipersIngest:
         with fits.open(p, memmap=True) as hdul:
             records, _ = _read_vipers_spectrum(hdul, p)
         r = records[0]
-        assert r.source_id == normalize_object_id(406064719)
+        assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (557,)
         assert set(np.unique(r.mask).tolist()) == {0, 2, 3}
         assert (r.ivar > 0).all()

@@ -54,7 +54,7 @@ class TestVvdsIngest:
             records, wcs = _read_vvds_spectrum(hdul, p)
 
         r = records[0]
-        assert r.source_id == normalize_object_id(30078)
+        assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (128,)
         assert (r.ivar == 1.0).all()
         assert r.mask.sum() == 0
@@ -88,5 +88,5 @@ class TestVvdsIngest:
         with fits.open(p, memmap=True) as hdul:
             records, _ = _read_vvds_spectrum(hdul, p)
         r = records[0]
-        assert r.source_id == normalize_object_id(30078)
+        assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (557,)

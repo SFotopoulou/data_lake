@@ -1562,8 +1562,8 @@ def _read_vipers_spectrum(
     Read a VIPERS 1-D spectrum from a row-per-pixel binary table.
 
     Columns ``WAVES``, ``FLUXES``, ``NOISE``, and ``MASK`` are stacked into 1-D
-    arrays.  ``MASK`` values are stored as ingested (no remapping).  ``source_id``
-    comes from the ``ID`` header keyword by default.
+    arrays.      ``MASK`` values are stored as ingested (no remapping).  ``source_id`` is
+    ``normalize_object_id(path.name)`` for catalog filename linkage.
     """
     _, thdu = _find_vipers_table_hdu(hdul)
     rows = thdu.data
@@ -1586,7 +1586,7 @@ def _read_vipers_spectrum(
 
     header = thdu.header
     phdr = hdul[0].header
-    source_id = object_id_from_fits_header(header, "ID", hdu_index=0)
+    source_id = _wig_source_id_from_path(source_path)
     ra = float(header.get("RA", phdr.get("RA", 0.0)))
     dec = float(header.get("DEC", phdr.get("DEC", 0.0)))
 
@@ -1646,9 +1646,10 @@ def _read_vuds_spectrum(
     """
     Read a VUDS 1-D spectrum from PRIMARY (flux + spectral WCS).
 
-    ``source_id`` comes from ``LAM CESAM VO IDENT`` by default.  Sky position
-    and redshift use ``LAM CESAM VO ALPHA`` / ``DELTA`` / ``Z``.  No uncertainty
-    or mask extensions are expected (IVAR defaults to 1, mask to 0).
+    ``source_id`` is ``normalize_object_id(path.name)`` for catalog filename
+    linkage.  Sky position and redshift use ``LAM CESAM VO ALPHA`` / ``DELTA`` /
+    ``Z``.  No uncertainty or mask extensions are expected (IVAR defaults to 1,
+    mask to 0).
     """
     if not _is_vuds_stacked_layout(hdul):
         summary = _summarize_fits_hdus(hdul)
@@ -1662,17 +1663,7 @@ def _read_vuds_spectrum(
     flux = np.asarray(flux_hdu.data, dtype=np.float32)
     n_pix = int(flux.shape[0])
 
-    sid_key = _VUDS_ID_KEY
-    if sid_key not in header:
-        source_id = object_id_from_fits_header(header, sid_key, hdu_index=0)
-    else:
-        from data_lake.ingest.fits_to_parquet import normalize_object_id
-
-        raw_id = header[sid_key]
-        if isinstance(raw_id, (float, np.floating)) and np.isfinite(raw_id) and raw_id == int(raw_id):
-            source_id = normalize_object_id(int(raw_id))
-        else:
-            source_id = normalize_object_id(raw_id)
+    source_id = _wig_source_id_from_path(source_path)
     ra = float(header.get(_VUDS_RA_KEY, header.get("RA", 0.0)))
     dec = float(header.get(_VUDS_DEC_KEY, header.get("DEC", 0.0)))
     wavelength = _wavelength_from_wcs(header, n_pix)
@@ -1696,18 +1687,6 @@ def _read_vuds_spectrum(
         wavelength=wavelength,
         meta=meta,
     )], wcs_attrs
-
-
-def _vvds_source_id_from_path(path: Path) -> int:
-    """``source_id`` from ``sc_<ID>_...`` filename stem (matches catalog ``ID`` column)."""
-    from data_lake.ingest.fits_to_parquet import normalize_object_id
-
-    match = re.match(r"sc_(\d+)", path.stem, re.IGNORECASE)
-    if not match:
-        raise ValueError(
-            f"VVDS filename missing sc_<ID>_ prefix (expected catalog ID in name): {path.name}"
-        )
-    return normalize_object_id(match.group(1))
 
 
 def _flatten_vvds_primary_flux(data: np.ndarray) -> np.ndarray:
@@ -1751,8 +1730,9 @@ def _read_vvds_spectrum(
     """
     Read a VVDS 1-D spectrum from PRIMARY (flux + spectral WCS).
 
-    ``source_id`` is parsed from the filename ``sc_<ID>_...`` prefix.  Sky position
-    uses ``RA`` / ``DEC``.  No uncertainty or mask extensions are expected.
+    ``source_id`` is ``normalize_object_id(path.name)`` for catalog filename
+    linkage.  Sky position uses ``RA`` / ``DEC``.  No uncertainty or mask
+    extensions are expected.
     """
     if not _is_vvds_stacked_layout(hdul):
         summary = _summarize_fits_hdus(hdul)
@@ -1765,7 +1745,7 @@ def _read_vvds_spectrum(
     header = flux_hdu.header
     flux = _flatten_vvds_primary_flux(flux_hdu.data)
     n_pix = int(flux.shape[0])
-    source_id = _vvds_source_id_from_path(source_path)
+    source_id = _wig_source_id_from_path(source_path)
     ra = float(header.get("RA", 0.0))
     dec = float(header.get("DEC", 0.0))
     wavelength = _wavelength_from_wcs(header, n_pix)
@@ -1854,6 +1834,18 @@ def _is_2df_stamp_only_hdul(hdul: fits.HDUList) -> bool:
 
 
 _2DF_DEFAULT_SOURCE_ID_COL = "SPFILE"
+_2DF_FIBRE_HEADER_KEYS = ("FIBRE", "FIBER", "FIBERID")
+
+
+def _2df_header_text(shdr: fits.Header, phdr: fits.Header, *keys: str) -> str:
+    """Return the first non-empty FITS keyword value from spectrum or primary header."""
+    for key in keys:
+        for hdr in (shdr, phdr):
+            if key in hdr:
+                val = hdr[key]
+                if val not in ("", None):
+                    return str(val).strip()
+    return ""
 
 
 def _2df_filename_stem(source_path: Path) -> str:
@@ -1906,15 +1898,24 @@ def _2df_link_label_from_header(
 ) -> tuple[str, bool]:
     """Resolve the catalog link label from a 2dF spectrum HDU header.
 
-    Returns ``(label, used_fallback)`` where *used_fallback* is True when the
-    filename stem was used because ``SPFILE`` was absent from headers.
+    Uses ``SPFILE`` and ``FIBRE`` (or ``FIBER`` / ``FIBERID``) from the spectrum
+    extension, joined as ``spfile|fibre`` via :func:`composite_link_label` — the
+    same rule as catalog ingest with ``--link-id-col SPFILE,FIBRE``.
+
+    Returns ``(label, used_fallback)`` where *used_fallback* is True when
+    neither keyword is present (filename stem used).
     """
-    key = _2DF_DEFAULT_SOURCE_ID_COL
-    for hdr in (shdr, phdr):
-        if key in hdr:
-            label = str(hdr[key]).strip()
-            if label:
-                return label, False
+    from data_lake.ingest.fits_to_parquet import composite_link_label
+
+    spfile = _2df_header_text(shdr, phdr, _2DF_DEFAULT_SOURCE_ID_COL)
+    fibre = _2df_header_text(shdr, phdr, *_2DF_FIBRE_HEADER_KEYS)
+    parts: list[object] = []
+    if spfile:
+        parts.append(spfile)
+    if fibre:
+        parts.append(fibre)
+    if parts:
+        return composite_link_label(*parts), False
     return _2df_filename_stem(source_path), True
 
 
@@ -1953,9 +1954,9 @@ def _read_2df_spectrum(
       ``Z``, ``SNR``, ``OBSRA``/``OBSDEC``; spectral WCS in extension header
       (``CRVAL1``, ``CRPIX1``, ``CDELT1``).
 
-    Source ID defaults to ``normalize_object_id(SPFILE)`` from each extension
-    header (catalog link column).  When ``SPFILE`` is absent, falls back to the
-    file basename stem with a warning.
+    Source ID is ``normalize_object_id(SPFILE|FIBRE)`` from each SPECTRUM extension
+    header (match catalog ``--link-id-col SPFILE,FIBRE``).  When both keywords are
+    absent, falls back to the file basename stem with a warning.
     """
     from data_lake.ingest.fits_to_parquet import normalize_object_id
 
@@ -1985,7 +1986,7 @@ def _read_2df_spectrum(
         if source_id in seen_ids:
             raise ValueError(
                 f"duplicate 2dF source_id in {source_path.name}: "
-                f"SPFILE={link_label!r} and {seen_ids[source_id]!r} "
+                f"link={link_label!r} and {seen_ids[source_id]!r} "
                 f"both map to the same _source_id"
             )
         seen_ids[source_id] = link_label
@@ -2024,8 +2025,8 @@ def _read_2df_spectrum(
 
     if used_stem_fallback:
         log.warning(
-            "2dF: %s missing SPFILE in spectrum header(s); using filename stem %r "
-            "as link key (catalog --link-id-col SPFILE at catalog ingest)",
+            "2dF: %s missing SPFILE/FIBRE in spectrum header(s); using filename stem %r "
+            "as link key (catalog --link-id-col SPFILE,FIBRE at catalog ingest)",
             source_path.name,
             _2df_filename_stem(source_path),
         )

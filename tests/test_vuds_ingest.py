@@ -42,7 +42,7 @@ class TestVudsIngest:
             records, wcs = _read_vuds_spectrum(hdul, p)
 
         r = records[0]
-        assert r.source_id == normalize_object_id(5101243705)
+        assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (64,)
         assert (r.ivar == 1.0).all()
         assert r.mask.sum() == 0
@@ -52,10 +52,8 @@ class TestVudsIngest:
         assert wcs["n_pix"] == 64
 
     @pytest.mark.skipif(
-        not Path(
-            "/stage/incoming/VUDS/final/1D/sc_5101243705_F51P006_join_A_10_1_atm_clean.fits"
-        ).is_file(),
-        reason="VUDS example FITS not available",
+        not Path("data/sc_5101243705_F51P006_join_A_10_1_atm_clean.fits").is_file(),
+        reason="VUDS example FITS not in data/",
     )
     def test_example_file(self) -> None:
         from data_lake.ingest.fits_to_parquet import normalize_object_id
@@ -64,13 +62,11 @@ class TestVudsIngest:
             _read_vuds_spectrum,
         )
 
-        p = Path(
-            "/stage/incoming/VUDS/final/1D/sc_5101243705_F51P006_join_A_10_1_atm_clean.fits"
-        )
+        p = Path("data/sc_5101243705_F51P006_join_A_10_1_atm_clean.fits")
         assert _detect_format_from_path(p) == "vuds"
         with fits.open(p, memmap=True) as hdul:
             records, _ = _read_vuds_spectrum(hdul, p)
         r = records[0]
-        assert r.source_id == normalize_object_id(5101243705)
+        assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (1117,)
         assert r.meta["z"] == pytest.approx(1.0962)

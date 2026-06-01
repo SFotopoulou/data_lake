@@ -15,6 +15,15 @@ from astropy.io import fits
 # FITS fixture helpers
 # ---------------------------------------------------------------------------
 
+def _expected_2df_source_id(spfile: str, fibre: int | str | None = None) -> int:
+    from data_lake.ingest.fits_to_parquet import composite_link_label, normalize_object_id
+
+    parts: list[object] = [spfile]
+    if fibre is not None and str(fibre).strip():
+        parts.append(fibre)
+    return normalize_object_id(composite_link_label(*parts))
+
+
 def _write_2df_spectrum(
     path: Path,
     *,
@@ -24,6 +33,7 @@ def _write_2df_spectrum(
     n_pix: int = 1024,
     z: float = 0.042,
     spfile: str | None = None,
+    fibre: int = 180,
 ) -> str:
     """Write a minimal 2dFGRS-style FITS file. Returns the SPFILE label used."""
     if spfile is None:
@@ -50,6 +60,7 @@ def _write_2df_spectrum(
     spec_hdu.header["QUALITY"] = 5
     spec_hdu.header["ABEMMA"] = 2
     spec_hdu.header["SPFILE"] = spfile
+    spec_hdu.header["FIBRE"] = fibre
     spec_hdu.header["OBSRA"] = ra
     spec_hdu.header["OBSDEC"] = dec
     spec_hdu.header["SNR"] = 12.0
@@ -93,6 +104,7 @@ def _write_2df_multi_spectrum(
         spec_hdu.header["ABEMMA"] = 2
         spfile = str(obs["spfile"])
         spec_hdu.header["SPFILE"] = spfile
+        spec_hdu.header["FIBRE"] = int(obs.get("fibre", 132))
         spec_hdu.header["OBSRA"] = ra
         spec_hdu.header["OBSDEC"] = dec
         spec_hdu.header["SNR"] = float(obs.get("snr", 8.0))
@@ -247,18 +259,16 @@ class TestRead2dfSpectrum:
         assert rec.meta["z"] == pytest.approx(0.042, abs=1e-4)
         assert wcs["n_pix"] == 1024
 
-    def test_source_id_from_spfile(self, tmp_path: Path) -> None:
+    def test_source_id_from_spfile_and_fibre(self, tmp_path: Path) -> None:
         from astropy.io import fits as afits
-        from data_lake.ingest.fits_to_parquet import normalize_object_id
         from data_lake.ingest.fits_to_spectra_zarr import _read_2df_spectrum
 
         p = tmp_path / "154714.fits"
-        spfile = _write_2df_spectrum(p, spfile="sgp153_010123_1z.fits")
+        spfile = _write_2df_spectrum(p, spfile="sgp153_010123_1z.fits", fibre=180)
         with afits.open(str(p), memmap=True) as hdul:
             records, _ = _read_2df_spectrum(hdul, p)
 
-        expected_id = normalize_object_id(spfile)
-        assert records[0].source_id == expected_id
+        assert records[0].source_id == _expected_2df_source_id(spfile, 180)
 
     def test_filename_stem_fallback_without_spfile(self, tmp_path: Path) -> None:
         from astropy.io import fits as afits
@@ -269,6 +279,7 @@ class TestRead2dfSpectrum:
         _write_2df_spectrum(p)
         with fits.open(p, mode="update") as hdul:
             del hdul[1].header["SPFILE"]
+            del hdul[1].header["FIBRE"]
             hdul.flush()
 
         with afits.open(str(p), memmap=True) as hdul:
@@ -297,14 +308,17 @@ class TestRead2dfSpectrum:
 
         assert len(records) == 2
         ids = {r.source_id for r in records}
-        assert ids == {normalize_object_id(s) for s in spfiles}
+        assert ids == {
+            _expected_2df_source_id("sgp805_001203_2z.fits", 132),
+            _expected_2df_source_id("sgp805_011009_2z.fits", 132),
+        }
         assert records[0].meta["z"] == pytest.approx(0.120724, abs=1e-5)
         assert records[1].meta["z"] == pytest.approx(0.119153, abs=1e-5)
         assert records[0].meta["snr"] == pytest.approx(7.0)
         assert records[1].meta["snr"] == pytest.approx(13.9)
         assert not np.allclose(records[0].wavelength, records[1].wavelength)
 
-    def test_duplicate_spfile_in_one_file_raises(self, tmp_path: Path) -> None:
+    def test_duplicate_spfile_and_fibre_in_one_file_raises(self, tmp_path: Path) -> None:
         from astropy.io import fits as afits
         from data_lake.ingest.fits_to_spectra_zarr import _read_2df_spectrum
 
@@ -315,8 +329,8 @@ class TestRead2dfSpectrum:
             ra=1.0,
             dec=-1.0,
             observations=[
-                {"spfile": "same_obs.fits", "z": 0.1},
-                {"spfile": "same_obs.fits", "z": 0.2},
+                {"spfile": "same_obs.fits", "fibre": 42, "z": 0.1},
+                {"spfile": "same_obs.fits", "fibre": 42, "z": 0.2},
             ],
         )
         with afits.open(str(p), memmap=True) as hdul:
@@ -384,7 +398,7 @@ class TestIngest2df:
             on_duplicate_source_id="skip",
         )
 
-        expected_id = normalize_object_id(spfile)
+        expected_id = _expected_2df_source_id(spfile, 180)
         assert expected_id in index_map
 
         acc = SpectrumAccessor(lake, "2DFG_DR3")
@@ -407,7 +421,7 @@ class TestIngest2df:
             # No explicit fmt — relies on auto-detection
             norder=5,
         )
-        expected_id = normalize_object_id(spfile)
+        expected_id = _expected_2df_source_id(spfile, 180)
         assert expected_id in index_map
 
     def test_duplicate_skipped(self, tmp_path: Path) -> None:
@@ -427,7 +441,7 @@ class TestIngest2df:
         )
 
         acc = SpectrumAccessor(lake, "2DFG_DR3")
-        sid = normalize_object_id(spfile)
+        sid = _expected_2df_source_id(spfile, 180)
         # Tile should have exactly one row for this source
         import zarr
         import glob as _glob
@@ -440,19 +454,20 @@ class TestIngest2df:
 
     def test_spectrum_index_updated_in_catalog(self, tmp_path: Path) -> None:
         """After ingest, _spectrum_index must be patched in the Parquet catalog."""
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, normalize_object_id
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
         from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
 
         seqnum = 777777
         ra, dec = 5.0, -5.0
         spfile = "sgp777_010123_1z.fits"
+        fibre = 180
         p = tmp_path / f"{seqnum}.fits"
-        _write_2df_spectrum(p, seqnum=seqnum, ra=ra, dec=dec, spfile=spfile)
+        _write_2df_spectrum(p, seqnum=seqnum, ra=ra, dec=dec, spfile=spfile, fibre=fibre)
 
         lake = tmp_path / "lake"
 
         # Build a catalog tile first with _spectrum_index = -1
-        sid = normalize_object_id(spfile)
+        sid = _expected_2df_source_id(spfile, fibre)
         cat_dir = lake / "catalogs" / "2DFG_DR3" / "Norder=5" / "Dir=0"
         cat_dir.mkdir(parents=True, exist_ok=True)
         import pyarrow as pa, pyarrow.parquet as pq, healpy as hp
@@ -466,6 +481,7 @@ class TestIngest2df:
                 "dec": pa.array([dec]),
                 "serial": pa.array([seqnum], type=pa.int64()),
                 "SPFILE": pa.array([spfile]),
+                "FIBRE": pa.array([fibre], type=pa.int32()),
                 "_healpix_norder5": pa.array([npix_val], type=pa.int64()),
                 "_spectrum_index": pa.array([-1], type=pa.int64()),
             }),
@@ -496,7 +512,7 @@ class TestIngest2df:
 
     def test_multi_hdu_catalog_linkage(self, tmp_path: Path) -> None:
         """Two catalog rows with same serial but different SPFILE both link."""
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, normalize_object_id
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
         from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
         from data_lake.ingest.update_catalog_indices import update_index_column
 
@@ -506,6 +522,7 @@ class TestIngest2df:
             "sgp805_001203_2z.fits",
             "sgp805_011009_2z.fits",
         ]
+        fibre = 132
         p = tmp_path / f"{seqnum}.fits"
         _write_2df_multi_spectrum(
             p,
@@ -513,8 +530,8 @@ class TestIngest2df:
             ra=ra,
             dec=dec,
             observations=[
-                {"spfile": spfiles[0], "z": 0.120724, "crval1": 5849.6},
-                {"spfile": spfiles[1], "z": 0.119153, "crval1": 5826.3},
+                {"spfile": spfiles[0], "fibre": fibre, "z": 0.120724, "crval1": 5849.6},
+                {"spfile": spfiles[1], "fibre": fibre, "z": 0.119153, "crval1": 5826.3},
             ],
         )
 
@@ -525,7 +542,7 @@ class TestIngest2df:
         cat_dir = lake / "catalogs" / "2DFG_DR3" / "Norder=5" / "Dir=0"
         cat_dir.mkdir(parents=True, exist_ok=True)
         cat_file = cat_dir / f"Npix={npix_val}.parquet"
-        sids = [normalize_object_id(s) for s in spfiles]
+        sids = [_expected_2df_source_id(s, fibre) for s in spfiles]
         pq.write_table(
             pa.table({
                 LAKE_JOIN_ID_COLUMN: pa.array(sids, type=pa.int64()),
@@ -533,6 +550,7 @@ class TestIngest2df:
                 "dec": pa.array([dec, dec]),
                 "serial": pa.array([seqnum, seqnum], type=pa.int64()),
                 "SPFILE": pa.array(spfiles),
+                "FIBRE": pa.array([fibre, fibre], type=pa.int32()),
                 "_healpix_norder5": pa.array([npix_val, npix_val], type=pa.int64()),
                 "_spectrum_index": pa.array([-1, -1], type=pa.int64()),
             }),
@@ -571,7 +589,7 @@ class TestIngest2df:
             p, lake, "2DFG_DR3", fmt="2df", norder=5,
         )
         expected = {
-            normalize_object_id("sgp805_001203_2z.fits"),
-            normalize_object_id("sgp805_011009_2z.fits"),
+            _expected_2df_source_id("sgp805_001203_2z.fits", 132),
+            _expected_2df_source_id("sgp805_011009_2z.fits", 132),
         }
         assert set(index_map) == expected

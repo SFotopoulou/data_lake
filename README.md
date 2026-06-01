@@ -514,8 +514,9 @@ dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
 ``--link-id-col``, ``--ra-col``, and ``--dec-col`` on **catalog** ingest define
 how native columns map to ``_source_id`` and sky position in Parquet.  Format-specific
 spectrum readers (2dF, 6dF, OzDES, VANDELS, WiggleZ, zCOSMOS, VIPERS, VUDS, VVDS)
-resolve object IDs and coordinates **internally** from FITS headers or filenames —
-you do **not** repeat those flags on ``dl-ingest-spectra`` for those formats.
+resolve object IDs and coordinates **internally** (most use the spectrum **filename**
+for ``_source_id``; 2dF/6dF use header keys documented in their sections) — you do
+**not** repeat those flags on ``dl-ingest-spectra`` for those formats.
 
 For SDSS/BOSS, DESI coadds, generic 1-D FITS, and spPlate, pass ``--link-id-col``
 (and sky columns when headers differ from defaults) so the reader matches your
@@ -526,7 +527,7 @@ on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
 | Stage | ``--link-id-col`` | ``--ra-col`` / ``--dec-col`` |
 |-------|---------------------|------------------------------|
 | Catalog ingest | Required for production (native column → ``_source_id``) | Survey sky columns in degrees |
-| Spectrum ingest (2df, 6df, OzDES, …) | **Not used** — reader picks FITS link key | **Not used** — reader picks FITS sky keys |
+| Spectrum ingest (2df, 6df, OzDES, VIPERS, VUDS, VVDS, …) | **Not used** — reader picks link key (often filename) | **Not used** — reader picks FITS sky keys |
 | Spectrum ingest (SDSS, DESI, generic, spPlate) | Header keyword / fibermap column | FITS header keywords |
 | Catalog patch after spectrum ingest | **Not used** — joins on ``_source_id`` | — |
 
@@ -660,15 +661,16 @@ carries object metadata (``SEQNUM`` = catalog ``serial``, ``NAME``, ``RA``,
 ``SNR``, ``OBSRA``, ``OBSDEC``).  Wavelength is reconstructed from
 ``CRVAL1 / CRPIX1 / CDELT1`` in each extension.
 
-**Link key:** use ``SPFILE`` (unique per observation) for ``_source_id``, not
-``serial``.  Many catalog rows share the same ``serial`` (multiple observations
-of one target).  Keep ``serial`` as the science ID; ingest the catalog with
-``--link-id-col SPFILE`` so ``_source_id = hash(SPFILE)`` on both sides.
+**Link key:** use composite ``SPFILE|FIBRE`` from each SPECTRUM extension header
+(unique per observation), not ``serial``.  Many catalog rows share the same
+``serial`` (multiple observations of one target).  Keep ``serial`` as the science
+ID; ingest the catalog with ``--link-id-col SPFILE,FIBRE`` so ``_source_id`` matches
+spectrum ingest on both sides (e.g. ``sgp805_001203_2z.fits|132``).
 
 ```bash
-# Catalog: serial kept; _source_id built from SPFILE
+# Catalog: serial kept; _source_id built from SPFILE,FIBRE composite
 dl-ingest-catalog 2dfgrs_catalog.fits --survey 2DFGRS_DR3 \
-  --link-id-col SPFILE --ra-col RA --dec-col DEC
+  --link-id-col SPFILE,FIBRE --ra-col RA --dec-col DEC
 
 # Single file (smoke test) — one Zarr row per SPECTRUM HDU
 dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 --fmt 2df
@@ -692,7 +694,7 @@ Multi-observation files (e.g. ``389442.fits`` with two SPECTRUM HDUs) auto-use
 If the catalog was previously linked on ``serial``:
 
 ```bash
-dl-repair-catalog-metadata /path/to/lake --survey 2DFGRS_DR3 --rebuild-link-id SPFILE
+dl-repair-catalog-metadata /path/to/lake --survey 2DFGRS_DR3 --rebuild-link-id SPFILE,FIBRE
 dl-rebuild-catalog-indices --survey 2DFGRS_DR3 --kind spectrum
 dl-validate-catalog-spectra-link --survey 2DFGRS_DR3 --strict
 ```
@@ -910,12 +912,14 @@ VIPERS 1-D spectra are stored as a row-per-pixel binary table with columns
 ``WAVES``, ``FLUXES``, ``NOISE``, and ``MASK``.  ``MASK`` values are stored as
 ingested (no remapping).  Redshift is read from ``REDSHIFT``.
 
-**Catalog linkage:** ingest the catalog with ``--link-id-col ID``; spectrum ingest
-reads the same ``ID`` keyword from the table header (e.g. ``406064719``).
+**Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
+that stores the spectrum **filename** (e.g. ``VIPERS_406064719.fits``).  Spectrum
+ingest derives ``_source_id`` from the FITS basename.  The ``ID`` table header
+remains a science column in the catalog.
 
 ```bash
 dl-ingest-catalog vipers_catalog.fits --survey VIPERS \
-  --link-id-col ID --ra-col RA --dec-col DEC
+  --link-id-col spectrum_filename --ra-col RA --dec-col DEC
 
 dl-ingest-spectra VIPERS_406064719.fits --survey VIPERS --fmt vipers
 
@@ -930,12 +934,14 @@ Object metadata uses ``LAM CESAM VO IDENT``, ``LAM CESAM VO ALPHA`` / ``DELTA``,
 and ``LAM CESAM VO Z``.  No uncertainty or mask extensions are expected (IVAR=1,
 mask=0).
 
-**Catalog linkage:** ingest the catalog with ``--link-id-col ID``; spectrum
-ingest reads ``LAM CESAM VO IDENT`` from the FITS header.
+**Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
+that stores the spectrum **filename** (e.g.
+``sc_5101243705_F51P006_join_A_10_1_atm_clean.fits``).  ``LAM CESAM VO IDENT`` in
+the FITS header is used for format detection only.
 
 ```bash
 dl-ingest-catalog vuds_catalog.fits --survey VUDS \
-  --link-id-col ID --ra-col RA --dec-col DEC
+  --link-id-col spectrum_filename --ra-col RA --dec-col DEC
 
 dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS \
   --fmt vuds
@@ -950,14 +956,14 @@ VVDS 1-D spectra use a PRIMARY flux array (1-D or ``(1, n_pix)``) with spectral 
 Sky coordinates are in ``RA`` / ``DEC``.  No uncertainty or mask extensions are
 expected (IVAR=1, mask=0).
 
-**Catalog linkage:** ingest the catalog with ``--link-id-col ID``; spectrum ingest
-derives ``source_id`` from the numeric segment in the filename prefix
-``sc_<ID>_...`` (e.g. ``sc_000030078_...`` → ``30078``).  Files with VUDS
+**Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
+that stores the spectrum **filename** (e.g.
+``sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits``).  Files with VUDS
 ``LAM CESAM VO IDENT`` metadata are routed to the ``vuds`` reader instead.
 
 ```bash
 dl-ingest-catalog vvds_catalog.fits --survey VVDS \
-  --link-id-col ID --ra-col RA --dec-col DEC
+  --link-id-col spectrum_filename --ra-col RA --dec-col DEC
 
 dl-ingest-spectra sc_000030078_CDFS005_vmM1_red_30_1_atm_clean.fits --survey VVDS \
   --fmt vvds
