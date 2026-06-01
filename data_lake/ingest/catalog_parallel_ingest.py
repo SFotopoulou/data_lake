@@ -473,6 +473,11 @@ try:
         require_ingest_permission,
         require_output_root,
     )
+    from data_lake.ingest.catalog_cli_options import (
+        allow_incomplete_link_id_option,
+        batch_tile_mode_option,
+        resolve_catalog_tile_mode,
+    )
     from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file
 
     @click.command("dl-ingest-catalog-batch")
@@ -485,18 +490,8 @@ try:
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int)
     @click.option("--link-id-col", default=None)
-    @click.option(
-        "--allow-incomplete-link-id",
-        is_flag=True,
-        help="Leave _source_id null when any composite/string link part is missing.",
-    )
-    @click.option(
-        "--tile-mode",
-        type=click.Choice(["skip", "overwrite", "append"], case_sensitive=False),
-        default="append",
-        show_default=True,
-        help="Use append for multi-file ingest (recommended).",
-    )
+    @allow_incomplete_link_id_option
+    @batch_tile_mode_option
     @click.option(
         "--on-duplicate-id",
         type=click.Choice(["skip", "error", "last"], case_sensitive=False),
@@ -520,7 +515,7 @@ try:
         "--max-in-flight",
         default=None,
         type=int,
-        help="Max decoded files buffered (default: n_workers + 2).",
+        help="Max decoded files buffered (default: n_workers).",
     )
     @click.option(
         "--checkpoint",
@@ -580,7 +575,7 @@ try:
             link_id_col=link_id_col,
             allow_incomplete_link_id=allow_incomplete_link_id,
             columns=col_list,
-            tile_mode=tile_mode.lower(),  # type: ignore[arg-type]
+            tile_mode=resolve_catalog_tile_mode(tile_mode, parallel=True),  # type: ignore[arg-type]
             on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
             compact=compact,
             checkpoint_path=checkpoint or default_ck,

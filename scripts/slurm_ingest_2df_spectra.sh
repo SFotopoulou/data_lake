@@ -11,6 +11,7 @@
 #   SURVEY            — survey name written into the lake (default: 2DFGRS_DR3)
 #   NORDER            — HEALPix order (default: 5)
 #   WAVELENGTH_MODE   — shared or per_source (default: shared; 2dF has a fixed grid)
+#   N_WORKERS         — parallel decode workers (default: 1 = sequential)
 #
 # How to submit:
 #   mkdir -p logs
@@ -60,6 +61,7 @@ REPO="${DATA_LAKE_REPO:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 SURVEY="${SURVEY:-2DFGRS_DR3}"
 NORDER="${NORDER:-5}"
 WAVELENGTH_MODE="${WAVELENGTH_MODE:-shared}"
+N_WORKERS="${N_WORKERS:-1}"
 
 # Checkpoint and failure log live next to the lake config so they persist
 # across job submissions.
@@ -80,6 +82,7 @@ echo "Survey         : ${SURVEY}"
 echo "File list      : ${FILE_LIST}"
 echo "Norder         : ${NORDER}"
 echo "Wavelength mode: ${WAVELENGTH_MODE}"
+echo "N workers      : ${N_WORKERS}"
 echo "Checkpoint     : ${CHECKPOINT}"
 echo "Failures log   : ${FAILURES_LOG}"
 echo "========================================================="
@@ -89,19 +92,25 @@ TOTAL=$(wc -l < "${FILE_LIST}" || echo "?")
 echo "Total files in list: ${TOTAL}"
 
 # ---- Main ingest -----------------------------------------------------------
-dl-ingest-spectra-from-list \
-    "${FILE_LIST}" \
-    --config "${DATA_LAKE_CONFIG}" \
-    --survey "${SURVEY}" \
-    --fmt 2df \
-    --norder "${NORDER}" \
-    --wavelength-mode "${WAVELENGTH_MODE}" \
-    --on-duplicate skip \
-    --on-length-mismatch pad \
-    --checkpoint "${CHECKPOINT}" \
-    --failures-log "${FAILURES_LOG}" \
-    --update-catalog \
+INGEST_ARGS=(
+    "${FILE_LIST}"
+    --config "${DATA_LAKE_CONFIG}"
+    --survey "${SURVEY}"
+    --fmt 2df
+    --norder "${NORDER}"
+    --wavelength-mode "${WAVELENGTH_MODE}"
+    --n-workers "${N_WORKERS}"
+    --on-duplicate skip
+    --on-length-mismatch pad
+    --checkpoint "${CHECKPOINT}"
+    --failures-log "${FAILURES_LOG}"
+    --update-catalog
     --verbose
+)
+if [[ "${N_WORKERS}" -gt 1 ]]; then
+    INGEST_ARGS+=(--max-in-flight "${N_WORKERS}")
+fi
+dl-ingest-spectra-from-list "${INGEST_ARGS[@]}"
 
 INGEST_EXIT=$?
 

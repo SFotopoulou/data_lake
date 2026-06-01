@@ -2494,6 +2494,502 @@ def _filter_spectrum_tile_duplicates(
 
 
 # ---------------------------------------------------------------------------
+# Parallel decode (file-list workers)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SpectrumDecodeConfig:
+    """Picklable arguments for parallel spectrum file decode workers."""
+
+    survey_name: str
+    output_root: str
+    norder: int
+    fmt: str | None
+    ra_col: str
+    dec_col: str
+    link_id_col: str | None
+    wavelength_mode: str
+    on_length_mismatch: str
+    mask_dtype: str
+    specobj_lookup: str | None = None
+    specobj_lookup_from_catalog: bool = False
+    specobj_lookup_survey: str | None = None
+    specobj_lookup_from_plate: bool = False
+    specobj_id_layout: str = "auto"
+    with_resolution: bool = False
+
+
+def _effective_spectrum_ingest_modes(
+    detected_fmt: str,
+    records: list[SpectrumRecord],
+    source_path: Path,
+    wavelength_mode: str,
+    on_length_mismatch: str,
+) -> tuple[str, str]:
+    """Return (wavelength_mode_effective, length_policy) for one FITS file."""
+    wavelength_mode_effective = wavelength_mode
+    length_policy = on_length_mismatch
+    if detected_fmt in ("sdss_boss", "sdss_spplate"):
+        if wavelength_mode == "shared":
+            log.info(
+                "SDSS (%s): using wavelength_mode='per_source' "
+                "(per-object or per-plate loglam; tile storage pads to common n_pix).",
+                detected_fmt,
+            )
+        wavelength_mode_effective = "per_source"
+        if length_policy == "error":
+            length_policy = "pad"
+    elif detected_fmt == "2df" and (
+        len(records) > 1 or _2df_spectra_wcs_differs(records)
+    ):
+        if wavelength_mode == "shared":
+            log.info(
+                "2dF: using wavelength_mode='per_source' "
+                "(multiple SPECTRUM HDUs or differing WCS in %s).",
+                source_path.name,
+            )
+        wavelength_mode_effective = "per_source"
+    elif detected_fmt == "6df" and (
+        len(records) > 1 or _6df_spectra_wcs_differs(records)
+    ):
+        if wavelength_mode == "shared":
+            log.info(
+                "6dF: using wavelength_mode='per_source' "
+                "(multiple VR HDUs or differing WCS in %s).",
+                source_path.name,
+            )
+        wavelength_mode_effective = "per_source"
+    return wavelength_mode_effective, length_policy
+
+
+def _load_spectrum_records_from_path(
+    source_path: Path,
+    *,
+    output_root: Path,
+    survey_name: str,
+    ra_col: str,
+    dec_col: str,
+    link_id_col: str | None,
+    fmt: str | None,
+    with_resolution: bool,
+    specobj_lookup: Path | str | None,
+    specobj_lookup_from_catalog: bool,
+    specobj_lookup_survey: str | None,
+    specobj_lookup_from_plate: bool,
+    specobj_id_layout: str,
+) -> tuple[
+    str,
+    list[SpectrumRecord],
+    dict,
+    list[np.ndarray] | None,
+    np.ndarray | None,
+]:
+    """Read spectra from one FITS file (format dispatch only; no Zarr writes)."""
+    detected_fmt = fmt or _detect_format_from_path(source_path)
+    res_diags: list[np.ndarray] | None = None
+    res_offsets: np.ndarray | None = None
+
+    if detected_fmt == "desi_coadd":
+        records, wcs_attrs, res_diags, res_offsets = _read_desi_with_desispec(
+            source_path,
+            with_resolution=with_resolution,
+            link_id_col=link_id_col,
+        )
+    else:
+        if with_resolution:
+            raise ValueError(
+                "--with-resolution is only supported for DESI coadd files. "
+                f"Detected format: {detected_fmt!r}"
+            )
+        with fits.open(str(source_path), memmap=True) as hdul:
+            if detected_fmt == "sdss_boss":
+                records, wcs_attrs = _read_sdss_boss(
+                    hdul,
+                    link_id_col=link_id_col,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
+            elif detected_fmt == "sdss_spplate":
+                n_lookup_modes = sum(
+                    bool(x)
+                    for x in (
+                        specobj_lookup,
+                        specobj_lookup_from_catalog,
+                        specobj_lookup_from_plate,
+                    )
+                )
+                if n_lookup_modes > 1:
+                    raise ValueError(
+                        "Pass only one of specobj_lookup=, specobj_lookup_from_catalog=True, "
+                        "or specobj_lookup_from_plate=True"
+                    )
+                if n_lookup_modes == 0:
+                    raise ValueError(
+                        "sdss_spplate ingest requires specobj_lookup= (sidecar Parquet/CSV), "
+                        "specobj_lookup_from_catalog=True (lake catalogs/<survey>/), or "
+                        "specobj_lookup_from_plate=True (synthesize specObjID from header)."
+                    )
+                from data_lake.ingest.sdss_specobj_lookup import (
+                    build_fiber_to_specobjid_map,
+                    spplate_plate_mjd_from_hdul,
+                )
+
+                plate, mjd = spplate_plate_mjd_from_hdul(hdul, source_path)
+                fiber_map = build_fiber_to_specobjid_map(
+                    survey_name,
+                    plate,
+                    mjd,
+                    lookup_path=specobj_lookup,
+                    catalog_root=output_root if specobj_lookup_from_catalog else None,
+                    lookup_survey=specobj_lookup_survey,
+                    spplate_hdul=hdul,
+                    lookup_from_plate=specobj_lookup_from_plate,
+                    specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
+                    catalog_id_col=link_id_col,
+                )
+                records, wcs_attrs = _read_sdss_spplate(
+                    hdul,
+                    path=source_path,
+                    fiber_to_specobjid=fiber_map,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
+            elif detected_fmt == "2df":
+                records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
+            elif detected_fmt == "6df":
+                records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
+            elif detected_fmt == "wig":
+                records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
+            elif detected_fmt == "gama":
+                records, wcs_attrs = _read_gama_spectrum(
+                    hdul,
+                    source_path,
+                    link_id_col=link_id_col or "SPECID",
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
+            elif detected_fmt == "ozdes":
+                records, wcs_attrs = _read_ozdes_spectrum(hdul, source_path)
+            elif detected_fmt == "zcosmos":
+                records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
+            elif detected_fmt == "vandels":
+                records, wcs_attrs = _read_vandels_spectrum(hdul, source_path)
+            elif detected_fmt == "vipers":
+                records, wcs_attrs = _read_vipers_spectrum(hdul, source_path)
+            elif detected_fmt == "vuds":
+                records, wcs_attrs = _read_vuds_spectrum(hdul, source_path)
+            elif detected_fmt == "vvds":
+                records, wcs_attrs = _read_vvds_spectrum(hdul, source_path)
+            else:
+                records, wcs_attrs = _read_generic_1d(
+                    hdul,
+                    link_id_col=link_id_col,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
+
+    return detected_fmt, records, wcs_attrs, res_diags, res_offsets
+
+
+def _spectrum_records_to_tile_batches(
+    records: list[SpectrumRecord],
+    *,
+    norder: int,
+    wavelength_mode_effective: str,
+) -> tuple[list, np.ndarray | None, int]:
+    """Group records by HEALPix tile into :class:`TileBatch` payloads."""
+    from data_lake.ingest.desi_parallel_ingest import TileBatch
+
+    n = len(records)
+    ras = np.fromiter((r.ra for r in records), dtype=np.float64, count=n)
+    decs = np.fromiter((r.dec for r in records), dtype=np.float64, count=n)
+    npix_arr = assign_healpix(ras, decs, norder)
+
+    sort_idx = np.argsort(npix_arr, kind="stable")
+    npix_sorted = npix_arr[sort_idx]
+
+    flux_stack = np.stack([records[i].flux for i in sort_idx]).astype(np.float32, copy=False)
+    ivar_stack = np.stack([records[i].ivar for i in sort_idx]).astype(np.float32, copy=False)
+    mask_stack = np.stack([records[i].mask for i in sort_idx]).astype(np.uint8, copy=False)
+    sids = np.fromiter(
+        (records[i].source_id for i in sort_idx), dtype=np.int64, count=n,
+    )
+
+    shared_wavelength: np.ndarray | None = None
+    if wavelength_mode_effective == "shared" and records:
+        w0 = records[sort_idx[0]].wavelength
+        if w0 is not None:
+            shared_wavelength = np.asarray(w0, dtype=np.float64).copy()
+
+    unique_pix, group_starts = np.unique(npix_sorted, return_index=True)
+    group_starts = np.append(group_starts, n)
+
+    batches: list[TileBatch] = []
+    for g, pix in enumerate(unique_pix):
+        s, e = int(group_starts[g]), int(group_starts[g + 1])
+        wave_rows = None
+        if wavelength_mode_effective == "per_source":
+            wave_rows = np.stack([
+                records[sort_idx[i]].wavelength.astype(np.float32)
+                if records[sort_idx[i]].wavelength is not None
+                else np.zeros(records[sort_idx[i]].flux.shape[0], dtype=np.float32)
+                for i in range(s, e)
+            ])
+        meta_bytes = b"".join(
+            _meta_to_bytes(records[sort_idx[i]].meta) for i in range(s, e)
+        )
+        batches.append(TileBatch(
+            npix=int(pix),
+            flux=flux_stack[s:e],
+            ivar=ivar_stack[s:e],
+            mask=mask_stack[s:e],
+            source_ids=sids[s:e],
+            meta_bytes=meta_bytes,
+            wavelength_rows=wave_rows,
+        ))
+
+    n_pix = max(len(r.flux) for r in records) if records else 0
+    return batches, shared_wavelength, n_pix
+
+
+def decode_spectrum_file_to_worker_result(
+    path_str: str,
+    config: SpectrumDecodeConfig,
+) -> object:
+    """Decode one spectrum FITS file into per-tile batches (worker process)."""
+    from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
+    from data_lake.ingest.desi_parallel_ingest import WorkerResult
+
+    apply_parallel_worker_logging_after_heavy_imports()
+    t0 = time.perf_counter()
+    source_path = Path(path_str)
+    output_root = Path(config.output_root)
+
+    detected_fmt, records, wcs_attrs, res_diags, res_offsets = _load_spectrum_records_from_path(
+        source_path,
+        output_root=output_root,
+        survey_name=config.survey_name,
+        ra_col=config.ra_col,
+        dec_col=config.dec_col,
+        link_id_col=config.link_id_col,
+        fmt=config.fmt,
+        with_resolution=config.with_resolution,
+        specobj_lookup=config.specobj_lookup,
+        specobj_lookup_from_catalog=config.specobj_lookup_from_catalog,
+        specobj_lookup_survey=config.specobj_lookup_survey,
+        specobj_lookup_from_plate=config.specobj_lookup_from_plate,
+        specobj_id_layout=config.specobj_id_layout,
+    )
+
+    if not records:
+        return WorkerResult(path=path_str, ok=True, elapsed_s=time.perf_counter() - t0)
+
+    wavelength_mode_effective, _length_policy = _effective_spectrum_ingest_modes(
+        detected_fmt,
+        records,
+        source_path,
+        config.wavelength_mode,
+        config.on_length_mismatch,
+    )
+
+    batches, shared_wavelength, n_pix = _spectrum_records_to_tile_batches(
+        records,
+        norder=config.norder,
+        wavelength_mode_effective=wavelength_mode_effective,
+    )
+
+    return WorkerResult(
+        path=path_str,
+        ok=True,
+        batches=batches,
+        wavelength=shared_wavelength,
+        wcs_attrs=wcs_attrs,
+        n_pix=n_pix,
+        n_spectra=len(records),
+        elapsed_s=time.perf_counter() - t0,
+    )
+
+
+def decode_spectrum_file_safe(path_str: str, config: SpectrumDecodeConfig) -> object:
+    """Picklable wrapper: never raises, returns a failure-marked result instead."""
+    import traceback
+
+    from data_lake.ingest.desi_parallel_ingest import WorkerResult
+
+    try:
+        return decode_spectrum_file_to_worker_result(path_str, config)
+    except Exception as exc:
+        return WorkerResult(
+            path=path_str,
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+            tb=traceback.format_exc(),
+        )
+
+
+def write_spectrum_tile_groups(
+    *,
+    output_root: Path,
+    survey_name: str,
+    norder: int,
+    source_path: Path,
+    tile_groups: dict[int, list[SpectrumRecord]],
+    n_pix: int,
+    wavelength_mode_effective: str,
+    length_policy: str,
+    mask_dtype: np.dtype,
+    wcs_attrs: dict,
+    on_duplicate_source_id: Literal["append", "error", "skip"],
+    res_diags: list[np.ndarray] | None = None,
+    res_offsets: np.ndarray | None = None,
+) -> dict[int, int]:
+    """Append grouped spectrum records to HEALPix Zarr tiles (sequential writer)."""
+    index_map: dict[int, int] = {}
+    n_diag = int(res_diags[0].shape[0]) if res_diags is not None else None
+    sid_to_res_idx: dict[int, int] = {}
+    if res_diags is not None:
+        flat: list[SpectrumRecord] = []
+        for pix in sorted(tile_groups):
+            flat.extend(tile_groups[pix])
+        sid_to_res_idx = {rec.source_id: i for i, rec in enumerate(flat)}
+
+    for npix, tile_records in tile_groups.items():
+        tile_dir = output_root / "spectra" / survey_name / healpix_dir(norder, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        tile_path = tile_dir / f"Npix={npix}.zarr"
+
+        batch_max_pix = max(len(r.flux) for r in tile_records)
+        tile_exists = tile_path.exists() and (tile_path / "zarr.json").exists()
+        create_n_pix = batch_max_pix if not tile_exists else max(n_pix, batch_max_pix)
+
+        root = _open_or_create_spectrum_tile(
+            tile_path,
+            create_n_pix,
+            wavelength_mode_effective,
+            mask_dtype,
+            wcs_attrs,
+            n_diag=n_diag,
+            resolution_offsets=res_offsets,
+        )
+        tile_n_pix = int(root["flux"].shape[1])
+        if root["flux"].ndim != 2:
+            raise ValueError(
+                f"Corrupt spectrum tile {tile_path}: flux array must be 2-D, "
+                f"got shape {root['flux'].shape}"
+            )
+        tile_wavelength_mode = str(
+            root.attrs.get("wavelength_mode", wavelength_mode_effective)
+        )
+
+        if tile_exists and length_policy == "pad" and batch_max_pix > tile_n_pix:
+            root = widen_spectrum_tile(
+                tile_path,
+                batch_max_pix,
+                wavelength_mode=tile_wavelength_mode,
+                mask_dtype=mask_dtype,
+                wcs_attrs=wcs_attrs,
+                n_diag=n_diag,
+                resolution_offsets=res_offsets,
+            )
+            tile_n_pix = int(root["flux"].shape[1])
+            tile_wavelength_mode = str(
+                root.attrs.get("wavelength_mode", wavelength_mode_effective)
+            )
+
+        n_existing = int(zarr_join_array(root).shape[0])
+        existing: set[int] = set()
+        if n_existing > 0:
+            existing = set(np.asarray(zarr_join_array(root)[:]).tolist())
+
+        tile_records = _filter_spectrum_tile_duplicates(
+            tile_records, existing, on_duplicate_source_id,
+        )
+        if not tile_records:
+            continue
+
+        mismatched = [r for r in tile_records if len(r.flux) != tile_n_pix]
+        if mismatched:
+            if length_policy == "error":
+                lengths = sorted({len(r.flux) for r in tile_records})
+                raise ValueError(
+                    f"Spectrum pixel lengths {lengths} disagree with tile "
+                    f"Npix={npix} n_pix={tile_n_pix} in {source_path.name}. "
+                    f"Use --on-length-mismatch pad or truncate."
+                )
+            log.info(
+                "Aligning %d spectrum(s) to n_pix=%d for tile Npix=%s (%s)",
+                len(mismatched),
+                tile_n_pix,
+                npix,
+                length_policy,
+            )
+            tile_records = _fix_length(tile_records, tile_n_pix, length_policy)
+
+        start_idx = root["flux"].shape[0]
+        n_rows = len(tile_records)
+        batch_flux = _ensure_batch_rows_2d(
+            np.stack([r.flux for r in tile_records])
+        ).astype(np.float32)
+        batch_ivar = _ensure_batch_rows_2d(
+            np.stack([r.ivar for r in tile_records])
+        ).astype(np.float32)
+        batch_mask = _ensure_batch_rows_2d(
+            np.stack([r.mask for r in tile_records])
+        ).astype(mask_dtype)
+        batch_ids = _ensure_batch_ids(
+            np.array([r.source_id for r in tile_records], dtype=np.int64)
+        )
+        batch_meta = _ensure_batch_meta(
+            np.frombuffer(
+                b"".join(_meta_to_bytes(r.meta) for r in tile_records),
+                dtype="|V" + str(_META_DTYPE.itemsize),
+            ),
+            n_rows,
+        )
+
+        root["flux"].append(batch_flux)
+        root["ivar"].append(batch_ivar)
+        root["mask"].append(batch_mask)
+        zarr_join_array(root).append(batch_ids)
+        root["meta"].append(batch_meta)
+
+        if tile_wavelength_mode == "per_source":
+            batch_wave = _ensure_batch_rows_2d(np.stack([
+                r.wavelength.astype(np.float32)
+                if r.wavelength is not None
+                else np.zeros(tile_n_pix, dtype=np.float32)
+                for r in tile_records
+            ]))
+            root["wavelength"].append(batch_wave)
+        elif start_idx == 0 and tile_records[0].wavelength is not None:
+            shared_wave = tile_records[0].wavelength.astype(np.float64)
+            if len(shared_wave) != tile_n_pix:
+                if length_policy == "error":
+                    raise ValueError(
+                        f"Shared wavelength length {len(shared_wave)} != tile "
+                        f"n_pix {tile_n_pix}"
+                    )
+                shared_wave = (
+                    shared_wave[:tile_n_pix]
+                    if len(shared_wave) > tile_n_pix
+                    else np.pad(shared_wave, (0, tile_n_pix - len(shared_wave)))
+                )
+            root["wavelength"][:] = shared_wave
+
+        if res_diags is not None:
+            batch_res = np.stack([
+                res_diags[sid_to_res_idx[r.source_id]] for r in tile_records
+            ]).astype(np.float32)
+            root["resolution"].append(batch_res)
+
+        for local_i, rec in enumerate(tile_records):
+            index_map[rec.source_id] = start_idx + local_i
+
+    return index_map
+
+
+# ---------------------------------------------------------------------------
 # Core ingest
 # ---------------------------------------------------------------------------
 
@@ -2598,150 +3094,33 @@ def ingest_spectra_from_fits(
             "resolution matrix is defined relative to a fixed wavelength grid."
         )
 
-    index_map: dict[int, int] = {}
-
-    # --- Format detection and reading ---
-    detected_fmt = fmt or _detect_format_from_path(source_path)
-
-    res_diags: list[np.ndarray] | None = None
-    res_offsets: np.ndarray | None = None
-
-    if detected_fmt == "desi_coadd":
-        records, wcs_attrs, res_diags, res_offsets = _read_desi_with_desispec(
-            source_path,
-            with_resolution=with_resolution,
-            link_id_col=link_id_col,
-        )
-    else:
-        if with_resolution:
-            raise ValueError(
-                "--with-resolution is only supported for DESI coadd files. "
-                f"Detected format: {detected_fmt!r}"
-            )
-        with fits.open(str(source_path), memmap=True) as hdul:
-            if detected_fmt == "sdss_boss":
-                records, wcs_attrs = _read_sdss_boss(
-                    hdul,
-                    link_id_col=link_id_col,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
-            elif detected_fmt == "sdss_spplate":
-                n_lookup_modes = sum(
-                    bool(x)
-                    for x in (
-                        specobj_lookup,
-                        specobj_lookup_from_catalog,
-                        specobj_lookup_from_plate,
-                    )
-                )
-                if n_lookup_modes > 1:
-                    raise ValueError(
-                        "Pass only one of specobj_lookup=, specobj_lookup_from_catalog=True, "
-                        "or specobj_lookup_from_plate=True"
-                    )
-                if n_lookup_modes == 0:
-                    raise ValueError(
-                        "sdss_spplate ingest requires specobj_lookup= (sidecar Parquet/CSV), "
-                        "specobj_lookup_from_catalog=True (lake catalogs/<survey>/), or "
-                        "specobj_lookup_from_plate=True (synthesize specObjID from header)."
-                    )
-                from data_lake.ingest.sdss_specobj_lookup import (
-                    build_fiber_to_specobjid_map,
-                    spplate_plate_mjd_from_hdul,
-                )
-
-                plate, mjd = spplate_plate_mjd_from_hdul(hdul, source_path)
-                fiber_map = build_fiber_to_specobjid_map(
-                    survey_name,
-                    plate,
-                    mjd,
-                    lookup_path=specobj_lookup,
-                    catalog_root=output_root if specobj_lookup_from_catalog else None,
-                    lookup_survey=specobj_lookup_survey,
-                    spplate_hdul=hdul,
-                    lookup_from_plate=specobj_lookup_from_plate,
-                    specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
-                    catalog_id_col=link_id_col,
-                )
-                records, wcs_attrs = _read_sdss_spplate(
-                    hdul,
-                    path=source_path,
-                    fiber_to_specobjid=fiber_map,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
-            elif detected_fmt == "2df":
-                records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
-            elif detected_fmt == "6df":
-                records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
-            elif detected_fmt == "wig":
-                records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
-            elif detected_fmt == "gama":
-                records, wcs_attrs = _read_gama_spectrum(
-                    hdul,
-                    source_path,
-                    link_id_col=link_id_col or "SPECID",
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
-            elif detected_fmt == "ozdes":
-                records, wcs_attrs = _read_ozdes_spectrum(hdul, source_path)
-            elif detected_fmt == "zcosmos":
-                records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
-            elif detected_fmt == "vandels":
-                records, wcs_attrs = _read_vandels_spectrum(hdul, source_path)
-            elif detected_fmt == "vipers":
-                records, wcs_attrs = _read_vipers_spectrum(hdul, source_path)
-            elif detected_fmt == "vuds":
-                records, wcs_attrs = _read_vuds_spectrum(hdul, source_path)
-            elif detected_fmt == "vvds":
-                records, wcs_attrs = _read_vvds_spectrum(hdul, source_path)
-            else:
-                records, wcs_attrs = _read_generic_1d(
-                    hdul,
-                    link_id_col=link_id_col,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
+    detected_fmt, records, wcs_attrs, res_diags, res_offsets = _load_spectrum_records_from_path(
+        source_path,
+        output_root=output_root,
+        survey_name=survey_name,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        link_id_col=link_id_col,
+        fmt=fmt,
+        with_resolution=with_resolution,
+        specobj_lookup=specobj_lookup,
+        specobj_lookup_from_catalog=specobj_lookup_from_catalog,
+        specobj_lookup_survey=specobj_lookup_survey,
+        specobj_lookup_from_plate=specobj_lookup_from_plate,
+        specobj_id_layout=specobj_id_layout,
+    )
 
     if not records:
         log.warning("No spectra extracted from %s", source_path.name)
-        return index_map
+        return {}
 
-    # SDSS/BOSS spec files: per-object loglam grids and pixel counts differ slightly.
-    wavelength_mode_effective = wavelength_mode
-    length_policy = on_length_mismatch
-    if detected_fmt in ("sdss_boss", "sdss_spplate"):
-        if wavelength_mode == "shared":
-            log.info(
-                "SDSS (%s): using wavelength_mode='per_source' "
-                "(per-object or per-plate loglam; tile storage pads to common n_pix).",
-                detected_fmt,
-            )
-        wavelength_mode_effective = "per_source"
-        if length_policy == "error":
-            length_policy = "pad"
-    elif detected_fmt == "2df" and (
-        len(records) > 1 or _2df_spectra_wcs_differs(records)
-    ):
-        if wavelength_mode == "shared":
-            log.info(
-                "2dF: using wavelength_mode='per_source' "
-                "(multiple SPECTRUM HDUs or differing WCS in %s).",
-                source_path.name,
-            )
-        wavelength_mode_effective = "per_source"
-    elif detected_fmt == "6df" and (
-        len(records) > 1 or _6df_spectra_wcs_differs(records)
-    ):
-        if wavelength_mode == "shared":
-            log.info(
-                "6dF: using wavelength_mode='per_source' "
-                "(multiple VR HDUs or differing WCS in %s).",
-                source_path.name,
-            )
-        wavelength_mode_effective = "per_source"
+    wavelength_mode_effective, length_policy = _effective_spectrum_ingest_modes(
+        detected_fmt,
+        records,
+        source_path,
+        wavelength_mode,
+        on_length_mismatch,
+    )
 
     n_pix = max(len(r.flux) for r in records)
     if n_pix_expected is not None and n_pix != n_pix_expected:
@@ -2755,160 +3134,29 @@ def ingest_spectra_from_fits(
         records = _fix_length(records, n_pix_expected, length_policy)
         n_pix = n_pix_expected
 
-    # Derive resolution dimensions once (same for all sources in a file)
-    n_diag = int(res_diags[0].shape[0]) if res_diags is not None else None
-
-    # Build a source_id → res_index mapping for the records list so we can
-    # index into res_diags using the per-tile record positions.
-    sid_to_res_idx: dict[int, int] = (
-        {rec.source_id: i for i, rec in enumerate(records)}
-        if res_diags is not None else {}
-    )
-
-    # Group records by HEALPix tile
     tile_groups: dict[int, list[SpectrumRecord]] = {}
     for rec in records:
         pix = int(assign_healpix(np.array([rec.ra]), np.array([rec.dec]), norder)[0])
         tile_groups.setdefault(pix, []).append(rec)
 
-    for npix, tile_records in tile_groups.items():
-        tile_dir = output_root / "spectra" / survey_name / healpix_dir(norder, npix)
-        tile_dir.mkdir(parents=True, exist_ok=True)
-        tile_path = tile_dir / f"Npix={npix}.zarr"
-
-        batch_max_pix = max(len(r.flux) for r in tile_records)
-        tile_exists = tile_path.exists() and (tile_path / "zarr.json").exists()
-        create_n_pix = batch_max_pix if not tile_exists else max(n_pix, batch_max_pix)
-
-        root = _open_or_create_spectrum_tile(
-            tile_path,
-            create_n_pix,
-            wavelength_mode_effective,
-            mask_dtype,
-            wcs_attrs,
-            n_diag=n_diag,
-            resolution_offsets=res_offsets,
-        )
-        tile_n_pix = int(root["flux"].shape[1])
-        if root["flux"].ndim != 2:
-            raise ValueError(
-                f"Corrupt spectrum tile {tile_path}: flux array must be 2-D, "
-                f"got shape {root['flux'].shape}"
-            )
-        tile_wavelength_mode = str(
-            root.attrs.get("wavelength_mode", wavelength_mode_effective)
-        )
-
-        # Dynamic tile widening: when incoming batch has longer spectra than the
-        # existing tile, widen (pad existing rows) rather than truncate new spectra.
-        if tile_exists and length_policy == "pad" and batch_max_pix > tile_n_pix:
-            root = widen_spectrum_tile(
-                tile_path,
-                batch_max_pix,
-                wavelength_mode=tile_wavelength_mode,
-                mask_dtype=mask_dtype,
-                wcs_attrs=wcs_attrs,
-                n_diag=n_diag,
-                resolution_offsets=res_offsets,
-            )
-            tile_n_pix = int(root["flux"].shape[1])
-            tile_wavelength_mode = str(
-                root.attrs.get("wavelength_mode", wavelength_mode_effective)
-            )
-
-        n_existing = int(zarr_join_array(root).shape[0])
-        existing: set[int] = set()
-        if n_existing > 0:
-            existing = set(np.asarray(zarr_join_array(root)[:]).tolist())
-
-        tile_records = _filter_spectrum_tile_duplicates(
-            tile_records, existing, on_duplicate_source_id,
-        )
-        if not tile_records:
-            continue
-
-        mismatched = [r for r in tile_records if len(r.flux) != tile_n_pix]
-        if mismatched:
-            if length_policy == "error":
-                lengths = sorted({len(r.flux) for r in tile_records})
-                raise ValueError(
-                    f"Spectrum pixel lengths {lengths} disagree with tile "
-                    f"Npix={npix} n_pix={tile_n_pix} in {source_path.name}. "
-                    f"Use --on-length-mismatch pad or truncate."
-                )
-            log.info(
-                "Aligning %d spectrum(s) to n_pix=%d for tile Npix=%s (%s; "
-                "pad=extend short/truncate long)",
-                len(mismatched),
-                tile_n_pix,
-                npix,
-                length_policy,
-            )
-            tile_records = _fix_length(tile_records, tile_n_pix, length_policy)
-
-        start_idx = root["flux"].shape[0]
-
-        n_rows = len(tile_records)
-        batch_flux = _ensure_batch_rows_2d(
-            np.stack([r.flux for r in tile_records])
-        ).astype(np.float32)
-        batch_ivar = _ensure_batch_rows_2d(
-            np.stack([r.ivar for r in tile_records])
-        ).astype(np.float32)
-        batch_mask = _ensure_batch_rows_2d(
-            np.stack([r.mask for r in tile_records])
-        ).astype(mask_dtype)
-        batch_ids = _ensure_batch_ids(
-            np.array([r.source_id for r in tile_records], dtype=np.int64)
-        )
-        batch_meta = _ensure_batch_meta(
-            np.frombuffer(
-                b"".join(_meta_to_bytes(r.meta) for r in tile_records),
-                dtype="|V" + str(_META_DTYPE.itemsize),
-            ),
-            n_rows,
-        )
-
-        root["flux"].append(batch_flux)
-        root["ivar"].append(batch_ivar)
-        root["mask"].append(batch_mask)
-        zarr_join_array(root).append(batch_ids)
-        root["meta"].append(batch_meta)
-
-        if tile_wavelength_mode == "per_source":
-            batch_wave = _ensure_batch_rows_2d(np.stack([
-                r.wavelength.astype(np.float32)
-                if r.wavelength is not None
-                else np.zeros(tile_n_pix, dtype=np.float32)
-                for r in tile_records
-            ]))
-            root["wavelength"].append(batch_wave)
-        elif start_idx == 0 and tile_records[0].wavelength is not None:
-            # Write shared wavelength once (first time the tile is created)
-            shared_wave = tile_records[0].wavelength.astype(np.float64)
-            if len(shared_wave) != tile_n_pix:
-                if length_policy == "error":
-                    raise ValueError(
-                        f"Shared wavelength length {len(shared_wave)} != tile "
-                        f"n_pix {tile_n_pix}"
-                    )
-                shared_wave = (
-                    shared_wave[:tile_n_pix]
-                    if len(shared_wave) > tile_n_pix
-                    else np.pad(shared_wave, (0, tile_n_pix - len(shared_wave)))
-                )
-            root["wavelength"][:] = shared_wave
-
-        if res_diags is not None:
-            batch_res = np.stack([
-                res_diags[sid_to_res_idx[r.source_id]] for r in tile_records
-            ]).astype(np.float32)
-            root["resolution"].append(batch_res)
-
-        for local_i, rec in enumerate(tile_records):
-            index_map[rec.source_id] = start_idx + local_i
+    index_map = write_spectrum_tile_groups(
+        output_root=output_root,
+        survey_name=survey_name,
+        norder=norder,
+        source_path=source_path,
+        tile_groups=tile_groups,
+        n_pix=n_pix,
+        wavelength_mode_effective=wavelength_mode_effective,
+        length_policy=length_policy,
+        mask_dtype=mask_dtype,
+        wcs_attrs=wcs_attrs,
+        on_duplicate_source_id=on_duplicate_source_id,
+        res_diags=res_diags,
+        res_offsets=res_offsets,
+    )
 
     has_resolution = res_diags is not None
+    n_diag = int(res_diags[0].shape[0]) if res_diags is not None else None
     _write_spectrum_info(
         output_root / "spectra" / survey_name,
         survey_name, norder, n_pix,
@@ -2925,6 +3173,148 @@ def ingest_spectra_from_fits(
         " (with resolution)" if has_resolution else "",
     )
     return index_map
+
+
+def append_tile_batch_to_zarr(
+    tile_path: Path,
+    root: Any,
+    batch: object,
+    *,
+    file_n_pix: int,
+    wavelength_mode_effective: str,
+    length_policy: str,
+    mask_dtype: np.dtype,
+    wcs_attrs: dict,
+    on_duplicate: Literal["append", "error", "skip"],
+    shared_wavelength: np.ndarray | None,
+    existing_ids: set[int] | None,
+    n_diag: int | None = None,
+    res_offsets: np.ndarray | None = None,
+) -> int:
+    """Append one :class:`TileBatch` to an open tile group; return rows appended."""
+    from data_lake.ingest.desi_parallel_ingest import TileBatch
+    from data_lake.ingest.duplicate_policy import zarr_row_keep_mask
+
+    if not isinstance(batch, TileBatch):
+        raise TypeError(f"expected TileBatch, got {type(batch)!r}")
+
+    batch_max_pix = int(batch.flux.shape[1]) if batch.flux.size else file_n_pix
+    tile_n_pix = int(root["flux"].shape[1])
+    tile_exists = int(root["flux"].shape[0]) > 0 or (tile_path / "zarr.json").exists()
+    tile_wavelength_mode = str(
+        root.attrs.get("wavelength_mode", wavelength_mode_effective)
+    )
+
+    if tile_exists and length_policy == "pad" and batch_max_pix > tile_n_pix:
+        root = widen_spectrum_tile(
+            tile_path,
+            batch_max_pix,
+            wavelength_mode=tile_wavelength_mode,
+            mask_dtype=mask_dtype,
+            wcs_attrs=wcs_attrs,
+            n_diag=n_diag,
+            resolution_offsets=res_offsets,
+        )
+        tile_n_pix = int(root["flux"].shape[1])
+        tile_wavelength_mode = str(
+            root.attrs.get("wavelength_mode", wavelength_mode_effective)
+        )
+
+    existing_for_filter: set[int] | np.ndarray
+    if existing_ids is None:
+        existing_for_filter = np.array([], dtype=np.int64)
+    else:
+        existing_for_filter = existing_ids
+
+    keep = zarr_row_keep_mask(batch.source_ids, existing_for_filter, on_duplicate)
+    if not keep.any():
+        return 0
+    if not keep.all():
+        idx = np.nonzero(keep)[0]
+        itemsize = _META_DTYPE.itemsize
+        meta_parts = [
+            batch.meta_bytes[int(i) * itemsize : int(i) * itemsize + itemsize]
+            for i in idx.tolist()
+        ]
+        batch = TileBatch(
+            npix=batch.npix,
+            flux=batch.flux[idx],
+            ivar=batch.ivar[idx],
+            mask=batch.mask[idx],
+            source_ids=batch.source_ids[idx],
+            meta_bytes=b"".join(meta_parts),
+            wavelength_rows=(
+                batch.wavelength_rows[idx] if batch.wavelength_rows is not None else None
+            ),
+        )
+
+    if batch_max_pix != tile_n_pix:
+        if length_policy == "error":
+            raise ValueError(
+                f"Spectrum pixel length {batch_max_pix} disagrees with tile "
+                f"n_pix={tile_n_pix} in {tile_path.name}. "
+                f"Use --on-length-mismatch pad or truncate."
+            )
+        # pad/truncate batch arrays to tile_n_pix
+        def _align_2d(arr: np.ndarray) -> np.ndarray:
+            n, w = arr.shape
+            if w == tile_n_pix:
+                return arr
+            out = np.empty((n, tile_n_pix), dtype=arr.dtype)
+            if w > tile_n_pix:
+                out[:] = arr[:, :tile_n_pix]
+            else:
+                if arr.dtype == np.float32 and np.issubdtype(arr.dtype, np.floating):
+                    fill = np.nan
+                else:
+                    fill = 0
+                out[:] = fill
+                out[:, :w] = arr
+            return out
+
+        batch = TileBatch(
+            npix=batch.npix,
+            flux=_align_2d(batch.flux.astype(np.float32)),
+            ivar=_align_2d(batch.ivar.astype(np.float32)),
+            mask=_align_2d(batch.mask.astype(mask_dtype)),
+            source_ids=batch.source_ids,
+            meta_bytes=batch.meta_bytes,
+            wavelength_rows=(
+                _align_2d(batch.wavelength_rows.astype(np.float32))
+                if batch.wavelength_rows is not None
+                else None
+            ),
+        )
+
+    start_idx = int(root["flux"].shape[0])
+    n_rows = int(batch.source_ids.size)
+    meta_arr = np.frombuffer(
+        batch.meta_bytes,
+        dtype="|V" + str(_META_DTYPE.itemsize),
+    )
+    root["flux"].append(batch.flux)
+    root["ivar"].append(batch.ivar)
+    root["mask"].append(batch.mask)
+    zarr_join_array(root).append(batch.source_ids)
+    root["meta"].append(meta_arr)
+
+    if tile_wavelength_mode == "per_source" and batch.wavelength_rows is not None:
+        root["wavelength"].append(batch.wavelength_rows)
+    elif start_idx == 0 and shared_wavelength is not None:
+        shared_wave = shared_wavelength.astype(np.float64)
+        if len(shared_wave) != tile_n_pix:
+            if length_policy == "error":
+                raise ValueError(
+                    f"Shared wavelength length {len(shared_wave)} != tile n_pix {tile_n_pix}"
+                )
+            shared_wave = (
+                shared_wave[:tile_n_pix]
+                if len(shared_wave) > tile_n_pix
+                else np.pad(shared_wave, (0, tile_n_pix - len(shared_wave)))
+            )
+        root["wavelength"][:] = shared_wave
+
+    return n_rows
 
 
 def _fix_length(

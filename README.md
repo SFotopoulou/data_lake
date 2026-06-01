@@ -198,7 +198,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 |---------|---------|
 | `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet |
 | `dl-ingest-catalog-batch` | Parallel decode, single-thread writer (large file lists) |
-| `dl-ingest-catalog-from-list` | Sequential catalog file-list ingest |
+| `dl-ingest-catalog-from-list` | Sequential (default) or parallel catalog file-list ingest |
 | `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |
 | `dl-repair-catalog-metadata` | Repair/rebuild link IDs, `--check-only`, `--rebuild-link-id` |
 | `dl-recommend-catalog-norder` | Sample a catalog to suggest a good `--norder` |
@@ -209,7 +209,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 |---------|---------|
 | `dl-ingest-spectra` | Single spectrum FITS → Zarr (all supported formats) |
 | `dl-ingest-spectra-batch-desi-coadds` | Multi-process DESI coadd batch |
-| `dl-ingest-spectra-from-list` | Sequential spectrum file-list ingest |
+| `dl-ingest-spectra-from-list` | Spectrum file-list ingest (sequential default; `--n-workers > 1` for parallel decode) |
 | `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles |
 
 **Cutout ingest**
@@ -814,7 +814,7 @@ dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 --fmt 2df
 # Auto-detection also works (SPECTRUM HDU + SEQNUM/BJSEL triggers 2df format)
 dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3
 
-# File list (sequential, with checkpoint for restarts)
+# File list (sequential default, with checkpoint for restarts)
 dl-ingest-spectra-from-list 2df_files.txt \
   --survey 2DFGRS_DR3 \
   --fmt 2df \
@@ -822,7 +822,15 @@ dl-ingest-spectra-from-list 2df_files.txt \
   --on-length-mismatch pad \
   --checkpoint /path/to/lake/ingest_state/2df/checkpoint.json \
   --failures-log /path/to/lake/ingest_state/2df/failures.jsonl
+
+# Parallel decode (2dF, 6dF, GAMA, …) — same checkpoint format as catalog-from-list
+dl-ingest-spectra-from-list 2df_files.txt \
+  --survey 2DFGRS_DR3 --fmt 2df --n-workers 8 \
+  --on-duplicate skip --on-length-mismatch pad
 ```
+
+For **DESI coadd** file lists use ``dl-ingest-spectra-batch-desi-coadds`` (not
+``--n-workers`` on from-list).
 
 Multi-observation files (e.g. ``389442.fits`` with two SPECTRUM HDUs) auto-use
 ``wavelength_mode='per_source'`` when extensions have different WCS grids.
@@ -852,8 +860,9 @@ export SURVEY=2DFGRS_DR3
 sbatch scripts/slurm_ingest_2df_spectra.sh
 ```
 
-The script:
-- runs `dl-ingest-spectra-from-list` with checkpoint + failure log,
+The script runs `dl-ingest-spectra-from-list` (sequential; add `--n-workers` in
+the script or invoke the CLI directly for parallel decode on large 2dF lists),
+with checkpoint + failure log,
 - calls `dl-finalize-catalog` and `dl-validate-spectra-ingest` on completion.
 
 **Restarting after preemption or timeout** — re-submit the same `sbatch`
@@ -1242,8 +1251,11 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-catalog` | `--tile-mode` | `append`, `replace` | Default `append`; `replace` overwrites existing tile |
 | `dl-ingest-catalog` | `--streaming` | flag | FITS-only; bounded RAM; not available on batch path |
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
+| `dl-ingest-catalog-from-list` | `--allow-incomplete-link-id` | flag | Same semantics as single-file command; forwarded to parallel path when `--n-workers > 1` |
+| `dl-ingest-catalog-from-list` | `--tile-mode` | `skip`, `overwrite`, `append` | Sequential default `skip`; parallel default `append` (when omitted with `--n-workers > 1`) |
 | `dl-ingest-catalog-batch` | `--on-duplicate-id` | same | Parallel decode; default `--tile-mode append`; writes manifest at finalize |
 | `dl-ingest-catalog-batch` | `--allow-incomplete-link-id` | flag | Same semantics as single-file command |
+| `dl-ingest-catalog-batch` | `--tile-mode` | `skip`, `overwrite`, `append` | Default `append` (recommended for multi-file ingest) |
 | `dl-finalize-catalog` | — | — | Rebuild ``catalog_info.json``, ``_metadata``, ``schema_manifest.json`` from tiles |
 | `dl-repair-catalog-metadata` | `--rebuild-link-id` | column name | Recompute catalog ``_source_id`` from column (catalog only); then run ``dl-rebuild-catalog-indices`` |
 | `dl-repair-catalog-metadata` | `--allow-incomplete-link-id` | flag | Allow null `_source_id` when rebuilding link IDs |
@@ -1252,6 +1264,8 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Also ``--on-length-mismatch``, ``--wavelength-mode`` |
+| `dl-ingest-spectra-from-list` | `--n-workers` | `1` (default) | `>1` parallel decode + single Zarr writer (not for ``desi_coadd``) |
+| `dl-ingest-spectra-from-list` | `--max-in-flight` | — | Buffered decodes when ``--n-workers > 1`` (default: ``n_workers``) |
 | `dl-ingest-spectra-batch-desi-coadds` | `--on-duplicate` | same | DESI parallel batch; default **`skip`** |
 
 Cutout/spectrum ingest defaults to **`--on-duplicate skip`** so file-list and batch re-runs
@@ -1270,8 +1284,7 @@ dl-ingest-catalog-batch gaia_files.txt --survey GAIA_DR3_source \
   --tile-mode append --on-duplicate-id skip --n-workers 8
 ```
 
-Same flags on `dl-ingest-catalog-from-list` when `--n-workers > 1` (default `1` =
-sequential). **`--streaming` is not supported** on the parallel path.
+`dl-ingest-catalog-from-list` with `--n-workers > 1` uses the same parallel engine and accepts the same flags as `dl-ingest-catalog-batch` (including `--allow-incomplete-link-id` and `--tile-mode`). The sequential path (`--n-workers 1`, the default) additionally supports `--streaming`. When `--tile-mode` is omitted, the parallel path defaults to `append` and the sequential path defaults to `skip`.
 
 Each batch exit (including when every file is already in the checkpoint) runs
 **finalize**: ``catalog_info.json``, Parquet ``_metadata``, and
@@ -1545,7 +1558,8 @@ data_lake/
     fits_to_parquet.py        FITS/VOTable → HATS-partitioned Parquet
     fits_to_zarr.py           FITS cutouts → Zarr v3 sharded stacks
     fits_to_spectra_zarr.py   FITS 1-D spectra → Zarr v3 sharded stacks
-    desi_parallel_ingest.py   Multi-process batch ingest of many DESI coadd files
+    desi_parallel_ingest.py   Multi-process DESI coadd batch ingest
+    spectra_parallel_ingest.py  Parallel file-list spectrum ingest (non-DESI)
     update_catalog_indices.py Patch _cutout_index / _spectrum_index in Parquet tiles; dl-rebuild-catalog-indices backfill CLI
   io/
     catalog.py           DuckDB-backed Parquet accessor
@@ -2021,8 +2035,8 @@ See `notebooks/` for worked examples:
 Do you have a 1-D spectrum FITS file?
   → dl-ingest-spectra FILE --survey NAME        # try auto-detect first
   → dl-ingest-spectra FILE --survey NAME --fmt <name>   # if detection fails
-  → dl-ingest-spectra-from-list file_list.txt --survey NAME  # many files, sequential
-  → dl-ingest-spectra-batch-desi-coadds --survey NAME --file-list coadds.txt  # DESI parallel batch
+  → dl-ingest-spectra-from-list file_list.txt --survey NAME  # many files (add --n-workers N for parallel)
+  → dl-ingest-spectra-batch-desi-coadds --survey NAME --file-list coadds.txt  # DESI coadds only
 
 Do you have a catalog table? (FITS, CSV, Parquet, VOTable)
   → dl-ingest-catalog cat.fits --survey NAME --ra-col RA --dec-col DEC --link-id-col ID

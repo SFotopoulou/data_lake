@@ -121,6 +121,7 @@ class TileBatch:
     mask: np.ndarray      # (n, N_pix) uint8
     source_ids: np.ndarray  # (n,)      int64
     meta_bytes: bytes     # concatenated _META_DTYPE rows for n sources
+    wavelength_rows: np.ndarray | None = None  # (n, N_pix) float32 per-source mode
 
 
 @dataclass
