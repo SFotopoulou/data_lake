@@ -31,6 +31,30 @@ def _thread_executor(n_workers: int) -> ThreadPoolExecutor:
 
 
 class TestDecodeSpectrumFile:
+    def test_6df_multi_vr_same_tile_decodes_with_pad(self) -> None:
+        """6dF files with two VR HDUs of different n_pix on the same sky must stack."""
+        fits_path = _repo_data("g1512153-393712.fits")
+        cfg = SpectrumDecodeConfig(
+            survey_name="SIXDF_DR3",
+            output_root="/tmp",
+            norder=1,
+            fmt="6df",
+            ra_col="ra",
+            dec_col="dec",
+            link_id_col=None,
+            wavelength_mode="per_source",
+            on_length_mismatch="pad",
+            mask_dtype="uint8",
+        )
+        res = decode_spectrum_file_to_worker_result(str(fits_path), cfg)
+        assert res.ok, res.error
+        assert res.n_spectra == 2
+        assert len(res.batches) == 1
+        batch = res.batches[0]
+        assert batch.flux.shape == (2, 2899)
+        assert batch.wavelength_rows is not None
+        assert batch.wavelength_rows.shape == (2, 2899)
+
     def test_2df_fixture_yields_tile_batches(self) -> None:
         fits_path = _repo_data("389442.fits")
         cfg = SpectrumDecodeConfig(
@@ -104,6 +128,37 @@ class TestParallelSpectrumIngest:
             root = zarr.open_group(zarr.storage.LocalStore(str(zpath)), mode="r")
             total_zarr_rows += int(root["flux"].shape[0])
         assert total_zarr_rows == 2
+
+    def test_6df_multi_vr_same_tile_parallel_ingest(self, tmp_path: Path) -> None:
+        fits_path = _repo_data("g1512153-393712.fits")
+        list_file = tmp_path / "files.txt"
+        list_file.write_text(str(fits_path.resolve()) + "\n")
+
+        lake = tmp_path / "lake"
+        cfg = SpectrumDecodeConfig(
+            survey_name="SIXDF_DR3",
+            output_root=str(lake),
+            norder=1,
+            fmt="6df",
+            ra_col="ra",
+            dec_col="dec",
+            link_id_col=None,
+            wavelength_mode="per_source",
+            on_length_mismatch="pad",
+            mask_dtype="uint8",
+        )
+        result = ingest_spectra_files_parallel(
+            paths_from_file_list_file(list_file),
+            output_root=lake,
+            survey_name="SIXDF_DR3",
+            n_workers=2,
+            decode_config=cfg,
+            checkpoint_path=tmp_path / "ckpt.json",
+            show_progress=False,
+            executor_factory=_thread_executor,
+        )
+        assert result["n_files_failed"] == 0
+        assert result["n_spectra"] == 2
 
     def test_checkpoint_resume_skips_completed(self, tmp_path: Path) -> None:
         fits_path = _repo_data("389442.fits")

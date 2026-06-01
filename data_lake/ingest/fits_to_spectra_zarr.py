@@ -2692,11 +2692,31 @@ def _load_spectrum_records_from_path(
     return detected_fmt, records, wcs_attrs, res_diags, res_offsets
 
 
+def _align_records_for_batch_stack(
+    group_records: list[SpectrumRecord],
+    *,
+    npix: int,
+    length_policy: str,
+) -> list[SpectrumRecord]:
+    """Make *group_records* stackable when they share a HEALPix tile but differ in length."""
+    lengths = {len(r.flux) for r in group_records}
+    if len(lengths) <= 1:
+        return group_records
+    if length_policy == "error":
+        raise ValueError(
+            f"Spectrum pixel lengths {sorted(lengths)} in one file share "
+            f"HEALPix Npix={npix}; use --on-length-mismatch pad or truncate."
+        )
+    target = max(lengths) if length_policy == "pad" else min(lengths)
+    return _fix_length(group_records, target, length_policy)
+
+
 def _spectrum_records_to_tile_batches(
     records: list[SpectrumRecord],
     *,
     norder: int,
     wavelength_mode_effective: str,
+    length_policy: str = "error",
 ) -> tuple[list, np.ndarray | None, int]:
     """Group records by HEALPix tile into :class:`TileBatch` payloads."""
     from data_lake.ingest.desi_parallel_ingest import TileBatch
@@ -2708,13 +2728,6 @@ def _spectrum_records_to_tile_batches(
 
     sort_idx = np.argsort(npix_arr, kind="stable")
     npix_sorted = npix_arr[sort_idx]
-
-    flux_stack = np.stack([records[i].flux for i in sort_idx]).astype(np.float32, copy=False)
-    ivar_stack = np.stack([records[i].ivar for i in sort_idx]).astype(np.float32, copy=False)
-    mask_stack = np.stack([records[i].mask for i in sort_idx]).astype(np.uint8, copy=False)
-    sids = np.fromiter(
-        (records[i].source_id for i in sort_idx), dtype=np.int64, count=n,
-    )
 
     shared_wavelength: np.ndarray | None = None
     if wavelength_mode_effective == "shared" and records:
@@ -2728,23 +2741,35 @@ def _spectrum_records_to_tile_batches(
     batches: list[TileBatch] = []
     for g, pix in enumerate(unique_pix):
         s, e = int(group_starts[g]), int(group_starts[g + 1])
+        group_records = [
+            records[sort_idx[i]] for i in range(s, e)
+        ]
+        group_records = _align_records_for_batch_stack(
+            group_records,
+            npix=int(pix),
+            length_policy=length_policy,
+        )
+        flux = np.stack([r.flux for r in group_records]).astype(np.float32, copy=False)
+        ivar = np.stack([r.ivar for r in group_records]).astype(np.float32, copy=False)
+        mask = np.stack([r.mask for r in group_records]).astype(np.uint8, copy=False)
+        sids = np.fromiter(
+            (r.source_id for r in group_records), dtype=np.int64, count=len(group_records),
+        )
         wave_rows = None
         if wavelength_mode_effective == "per_source":
             wave_rows = np.stack([
-                records[sort_idx[i]].wavelength.astype(np.float32)
-                if records[sort_idx[i]].wavelength is not None
-                else np.zeros(records[sort_idx[i]].flux.shape[0], dtype=np.float32)
-                for i in range(s, e)
+                r.wavelength.astype(np.float32)
+                if r.wavelength is not None
+                else np.zeros(r.flux.shape[0], dtype=np.float32)
+                for r in group_records
             ])
-        meta_bytes = b"".join(
-            _meta_to_bytes(records[sort_idx[i]].meta) for i in range(s, e)
-        )
+        meta_bytes = b"".join(_meta_to_bytes(r.meta) for r in group_records)
         batches.append(TileBatch(
             npix=int(pix),
-            flux=flux_stack[s:e],
-            ivar=ivar_stack[s:e],
-            mask=mask_stack[s:e],
-            source_ids=sids[s:e],
+            flux=flux,
+            ivar=ivar,
+            mask=mask,
+            source_ids=sids,
             meta_bytes=meta_bytes,
             wavelength_rows=wave_rows,
         ))
@@ -2785,7 +2810,7 @@ def decode_spectrum_file_to_worker_result(
     if not records:
         return WorkerResult(path=path_str, ok=True, elapsed_s=time.perf_counter() - t0)
 
-    wavelength_mode_effective, _length_policy = _effective_spectrum_ingest_modes(
+    wavelength_mode_effective, length_policy = _effective_spectrum_ingest_modes(
         detected_fmt,
         records,
         source_path,
@@ -2797,6 +2822,7 @@ def decode_spectrum_file_to_worker_result(
         records,
         norder=config.norder,
         wavelength_mode_effective=wavelength_mode_effective,
+        length_policy=length_policy,
     )
 
     return WorkerResult(
