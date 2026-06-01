@@ -228,6 +228,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-validate-spectra-ingest` | Check Zarr spectrum tiles (`--survey` or `--all`) |
 | `dl-validate-cutout-ingest` | Check Zarr cutout tiles (`--survey` or `--all`) |
 | `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`) |
+| `dl-widen-spectrum-tiles` | Pad narrower `Npix=*.zarr` tiles to survey `n_pix` in `spectrum_info.json` (`--survey` or `--all`) |
 
 **Export and extract**
 
@@ -702,6 +703,15 @@ is logged at INFO level: ``Widening spectrum tile Npix=N.zarr: n_pix OLD → NEW
 Incoming spectra **shorter** than the current tile are still right-padded by
 ``_fix_length`` as before.  Using ``--on-length-mismatch truncate`` disables
 widening and truncates longer spectra instead.
+
+Tiles that were filled **before** a longer ``n_pix`` appeared in the survey never
+get widened until a longer spectrum lands in that HEALPix tile.  To pad every
+narrow tile to the ``spectrum_info.json`` width (e.g. after OzDES ingest):
+
+```bash
+dl-widen-spectrum-tiles --survey OzDES_DR2
+dl-widen-spectrum-tiles --all --dry-run   # list tiles that would change
+```
 
 ```bash
 # Quick ingest without a specObj sidecar (DR8+/BOSS: primary header RUN2D only;
