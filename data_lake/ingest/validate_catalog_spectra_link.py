@@ -40,6 +40,8 @@ class LinkValidationStats:
     n_unpatched_catalog: int = 0
     n_missing_catalog_tile: int = 0
     n_empty_zarr: int = 0
+    n_null_source_id: int = 0
+    n_null_source_id_linked: int = 0
 
 
 @dataclass
@@ -83,7 +85,11 @@ def _read_catalog_tile_columns(tile_path: Path, columns: list[str]) -> dict[str,
         col = table.column(name).combine_chunks()
         if pa.types.is_dictionary(col.type):
             col = pc.cast(col, col.type.value_type)
-        out[name] = np.asarray(col.to_numpy(zero_copy_only=False))
+        # Integer columns with nulls: to_numpy() yields float64 NaN and breaks ID coercion.
+        if pa.types.is_integer(col.type) and col.null_count > 0:
+            out[name] = np.array(col.to_pylist(), dtype=object)
+        else:
+            out[name] = np.asarray(col.to_numpy(zero_copy_only=False))
     return out
 
 
@@ -118,6 +124,18 @@ def _resolve_norder(
 
 def _catalog_tile_path(catalog_root: Path, norder: int, npix: int) -> Path:
     return catalog_root / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
+
+
+def _optional_catalog_sid(value: object) -> int | None:
+    """Return normalized int64 ID, or None for null / missing link parts."""
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    try:
+        return int(normalize_object_id(value))
+    except (ValueError, TypeError):
+        return None
 
 
 def validate_tile_link(
@@ -177,10 +195,9 @@ def validate_tile_link(
         rep.errors.append(f"{catalog_tile}: {exc}")
         return
 
-    cat_sids = np.array(
-        [normalize_object_id(int(x)) for x in cols[sid_col].tolist()],
-        dtype=np.int64,
-    )
+    sid_raw = cols[sid_col]
+    sid_iter = sid_raw.tolist() if isinstance(sid_raw, np.ndarray) else list(sid_raw)
+    cat_sids: list[int | None] = [_optional_catalog_sid(x) for x in sid_iter]
     cat_hp = np.asarray(cols[hp_col], dtype=np.int64)
     cat_idx = np.asarray(cols[index_col], dtype=np.int64)
 
@@ -194,7 +211,15 @@ def validate_tile_link(
 
     for row_i in linked_rows.tolist():
         idx = int(cat_idx[row_i])
-        sid = int(cat_sids[row_i])
+        sid_opt = cat_sids[row_i]
+        if sid_opt is None:
+            stats.n_null_source_id_linked += 1
+            rep.errors.append(
+                f"{catalog_tile.name} row {row_i}: {index_col}={idx} but "
+                f"{sid_col} is null (cannot verify Zarr linkage)"
+            )
+            continue
+        sid = sid_opt
         hp = int(cat_hp[row_i])
 
         if hp != npix:
@@ -221,10 +246,13 @@ def validate_tile_link(
         else:
             stats.n_linked += 1
 
-    # Catalog rows keyed by _source_id for reverse lookup.
+    # Catalog rows keyed by _source_id for reverse lookup (skip null IDs).
     rows_by_sid: dict[int, list[tuple[int, int]]] = {}
-    for row_i, sid in enumerate(cat_sids.tolist()):
-        rows_by_sid.setdefault(int(sid), []).append((row_i, int(cat_idx[row_i])))
+    for row_i, sid_opt in enumerate(cat_sids):
+        if sid_opt is None:
+            stats.n_null_source_id += 1
+            continue
+        rows_by_sid.setdefault(sid_opt, []).append((row_i, int(cat_idx[row_i])))
 
     for j, sid_raw in enumerate(zarr_ids.tolist()):
         sid = int(normalize_object_id(int(sid_raw)))
@@ -396,7 +424,9 @@ try:
             f"stale index: {st.n_stale_index}  wrong id: {st.n_wrong_id}  "
             f"wrong healpix: {st.n_wrong_healpix}  orphan zarr: {st.n_orphan_zarr}  "
             f"unpatched catalog: {st.n_unpatched_catalog}  "
-            f"missing catalog tile: {st.n_missing_catalog_tile}"
+            f"missing catalog tile: {st.n_missing_catalog_tile}  "
+            f"null source_id: {st.n_null_source_id}  "
+            f"null source_id linked: {st.n_null_source_id_linked}"
         )
 
         if st.n_unpatched_catalog > 0:

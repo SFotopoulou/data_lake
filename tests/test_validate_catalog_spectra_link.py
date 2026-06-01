@@ -61,7 +61,7 @@ def _write_min_zarr(
 def _write_catalog_tile(
     cat_path: Path,
     *,
-    source_ids: list[int],
+    source_ids: list[int | None],
     spectrum_indices: list[int],
     npix: int,
 ) -> None:
@@ -155,6 +155,41 @@ class TestValidateCatalogSpectraLink:
         rep = run_validation(lake, SURVEY, sample=1)
         assert rep.ok(strict=True)
         assert rep.stats.n_linked == 1
+
+    def test_null_source_id_unlinked_rows_ok(self, tmp_path: Path) -> None:
+        """Rows with null _source_id (--allow-incomplete-link-id) must not crash validation."""
+        lake = _make_lake(tmp_path)
+        npix = 42
+        cat_path = (
+            lake / "catalogs" / SURVEY / healpix_dir(NORDER, npix) / f"Npix={npix}.parquet"
+        )
+        _write_catalog_tile(
+            cat_path,
+            source_ids=[101, None, 102],
+            spectrum_indices=[0, -1, 1],
+            npix=npix,
+        )
+        rep = run_validation(lake, SURVEY)
+        assert rep.ok(strict=True)
+        assert rep.stats.n_linked == 2
+        assert rep.stats.n_null_source_id == 1
+        assert rep.stats.n_null_source_id_linked == 0
+
+    def test_null_source_id_with_linked_index_is_error(self, tmp_path: Path) -> None:
+        lake = _make_lake(tmp_path)
+        npix = 42
+        cat_path = (
+            lake / "catalogs" / SURVEY / healpix_dir(NORDER, npix) / f"Npix={npix}.parquet"
+        )
+        _write_catalog_tile(
+            cat_path,
+            source_ids=[101, None],
+            spectrum_indices=[0, 0],
+            npix=npix,
+        )
+        rep = run_validation(lake, SURVEY)
+        assert not rep.ok(strict=False)
+        assert rep.stats.n_null_source_id_linked >= 1
 
     def test_cli_unpatched_emits_rebuild_hint(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
