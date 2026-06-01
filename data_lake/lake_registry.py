@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 
 from data_lake.schema_registry import (
     MANIFEST_FILENAME,
+    MODALITY_CATALOG,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
     format_manifest_table,
@@ -440,6 +441,20 @@ def load_lake_registry(lake_root: Path | str) -> pa.Table:
     return pq.read_table(str(path))
 
 
+def filter_lake_registry_table(
+    table: pa.Table,
+    modality: str | None,
+) -> pa.Table:
+    """Return registry rows for one modality (``catalog``, ``spectra``, ``cutout``)."""
+    if modality is None:
+        return table
+    if "modality" not in table.schema.names:
+        return table.slice(0, 0)
+    import pyarrow.compute as pc
+
+    return table.filter(pc.equal(table.column("modality"), modality))
+
+
 def format_lake_registry_table(table: pa.Table) -> str:
     import polars as pl
 
@@ -547,18 +562,25 @@ try:
         is_flag=True,
         help="Rebuild shared/registry/surveys.parquet before printing.",
     )
+    @click.option(
+        "--modality",
+        default=None,
+        type=click.Choice([MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT]),
+        help="Show only catalog, spectra, or cutout rows (default: all).",
+    )
     @click.option("--json", "as_json", is_flag=True, help="Emit registry as JSON.")
     def cli_describe_lake(
         output_root: Path | None,
         config_path: Path | None,
         refresh: bool,
+        modality: str | None,
         as_json: bool,
     ) -> None:
         """List surveys and modalities on disk (registry index)."""
         lake_root = _resolve_lake_root(output_root, config_path)
         if refresh or not registry_path(lake_root).is_file():
             refresh_lake_registry(lake_root)
-        table = load_lake_registry(lake_root)
+        table = filter_lake_registry_table(load_lake_registry(lake_root), modality)
         if as_json:
             click.echo(table.to_pandas().to_json(orient="records", indent=2))
         else:

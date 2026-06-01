@@ -1630,6 +1630,7 @@ The master file should stay ID-centric; science columns come from per-survey cat
 ```bash
 dl-refresh-lake-registry              # write shared/registry/surveys.parquet
 dl-describe-lake                      # print survey × modality summary
+dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout)
 dl-describe-lake --refresh            # rebuild then print
 ```
 

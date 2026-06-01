@@ -19,6 +19,7 @@ from data_lake.ingest.fits_to_spectra_zarr import _meta_to_bytes
 from data_lake.lake_registry import (
     REGISTRY_FILENAME,
     build_lake_registry_table,
+    filter_lake_registry_table,
     guess_master_meta,
     load_lake_registry,
     load_master_meta,
@@ -27,6 +28,7 @@ from data_lake.lake_registry import (
     registry_path,
     write_master_meta,
 )
+from data_lake.schema_registry import MODALITY_CATALOG, MODALITY_SPECTRA
 
 
 def _ingest_mini_catalog(
@@ -166,6 +168,39 @@ def test_registry_spectra_total_rows(tmp_path: Path) -> None:
     ]
     assert len(spec_rows) == 1
     assert spec_rows[0]["total_rows"] == 2
+
+
+def test_filter_lake_registry_by_modality(tmp_path: Path) -> None:
+    _ingest_mini_catalog(tmp_path, "SURV_A")
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+    table = load_lake_registry(lake)
+
+    cat_only = filter_lake_registry_table(table, MODALITY_CATALOG)
+    assert cat_only.num_rows >= 1
+    assert all(m == MODALITY_CATALOG for m in cat_only.column("modality").to_pylist())
+
+    spec_only = filter_lake_registry_table(table, MODALITY_SPECTRA)
+    assert spec_only.num_rows == 0
+
+
+def test_describe_lake_modality_cli(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from data_lake.lake_registry import cli_describe_lake
+
+    _ingest_mini_catalog(tmp_path, "SURV_CLI")
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+
+    assert cli_describe_lake is not None
+    result = CliRunner().invoke(
+        cli_describe_lake,
+        [str(lake), "--modality", MODALITY_CATALOG],
+    )
+    assert result.exit_code == 0
+    assert "SURV_CLI" in result.output
+    assert "catalog" in result.output
 
 
 def test_describe_lake_version_flag() -> None:
