@@ -224,9 +224,9 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 
 | Command | Purpose |
 |---------|---------|
-| `dl-validate-catalog-ingest` | Check Parquet tiles for required columns and schema |
-| `dl-validate-spectra-ingest` | Check Zarr spectrum tiles |
-| `dl-validate-cutout-ingest` | Check Zarr cutout tiles |
+| `dl-validate-catalog-ingest` | Check Parquet tiles for required columns and schema (`--survey` or `--all`) |
+| `dl-validate-spectra-ingest` | Check Zarr spectrum tiles (`--survey` or `--all`) |
+| `dl-validate-cutout-ingest` | Check Zarr cutout tiles (`--survey` or `--all`) |
 | `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`) |
 
 **Export and extract**
@@ -1343,6 +1343,9 @@ Checkpoints default to ``catalogs/<survey>/.ingest_checkpoint.json`` or
 dl-validate-catalog-ingest --survey des_dr2
 dl-validate-cutout-ingest --survey des_dr2
 dl-validate-spectra-ingest --survey desi_edr
+# Or validate every discovered survey in that modality:
+dl-validate-spectra-ingest --all
+dl-validate-catalog-spectra-link --all
 ```
 
 These accept ``--file-list``, ``--checkpoint``, ``--inflight``, ``--max-tiles``, and ``--strict`` (same semantics as the spectrum validator).

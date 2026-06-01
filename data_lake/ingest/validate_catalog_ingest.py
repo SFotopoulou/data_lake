@@ -133,11 +133,19 @@ try:
         load_optional_config,
         require_output_root,
     )
+    from .validate_cli import (
+        discover_catalog_ingest_surveys,
+        echo_multi_survey_footer,
+        echo_survey_banner,
+        print_ingest_validation_messages,
+        resolve_validation_survey_names,
+        validation_survey_options,
+    )
 
     @click.command("dl-validate-catalog-ingest")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
-    @click.option("--survey", "survey_name", required=True, help="Survey under catalogs/.")
+    @validation_survey_options
     @click.option(
         "--file-list",
         type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -159,38 +167,53 @@ try:
     def cli(
         output_root: Path | None,
         config_path: Path | None,
-        survey_name: str,
+        surveys: tuple[str, ...],
+        validate_all: bool,
         file_list: Path | None,
         checkpoint: Path | None,
         inflight: Path | None,
         max_tiles: int | None,
         strict: bool,
     ) -> None:
-        """Validate catalog Parquet layout and ingest sidecars for one survey."""
+        """Validate catalog Parquet layout and ingest sidecars."""
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="catalogs")
 
-        rep = run_validation(
-            lake,
-            survey_name,
-            file_list=file_list,
-            checkpoint_path=checkpoint,
-            inflight_path=inflight,
-            max_tiles=max_tiles,
+        names = resolve_validation_survey_names(
+            surveys=surveys,
+            validate_all=validate_all,
+            discovered=discover_catalog_ingest_surveys(lake),
+            empty_message="No catalog surveys found under catalogs/.",
         )
-        for msg in rep.errors:
-            click.echo(f"ERROR:   {msg}", err=True)
-        for msg in rep.warnings:
-            click.echo(f"WARNING: {msg}", err=True)
-        survey_root = lake / "catalogs" / survey_name
-        n_tiles = len(list(_iter_catalog_tiles(survey_root)))
-        if rep.ok(strict=strict):
-            click.echo(
-                f"OK: survey {survey_name!r} under {survey_root} ({n_tiles} tile(s))."
+
+        all_ok = True
+        for i, survey_name in enumerate(names):
+            echo_survey_banner(i, survey_name, total=len(names))
+
+            rep = run_validation(
+                lake,
+                survey_name,
+                file_list=file_list,
+                checkpoint_path=checkpoint,
+                inflight_path=inflight,
+                max_tiles=max_tiles,
             )
-            sys.exit(0)
-        click.echo("Validation failed.", err=True)
-        sys.exit(1)
+            survey_root = lake / "catalogs" / survey_name
+            n_tiles = len(list(_iter_catalog_tiles(survey_root)))
+            if print_ingest_validation_messages(rep, strict=strict):
+                click.echo(
+                    f"OK: survey {survey_name!r} under {survey_root} ({n_tiles} tile(s))."
+                )
+            else:
+                click.echo(f"Validation failed for {survey_name!r}.", err=True)
+                all_ok = False
+
+        echo_multi_survey_footer(
+            all_ok=all_ok,
+            n_surveys=len(names),
+            ok_message=f"OK: catalog ingest for all {len(names)} survey(s).",
+        )
+        sys.exit(0 if all_ok else 1)
 
 except ImportError:
     cli = None  # type: ignore[assignment]

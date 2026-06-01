@@ -358,15 +358,9 @@ def run_validation(
 
 def discover_surveys_for_spectra_link_validation(lake_root: Path | str) -> list[str]:
     """Survey names that have both a catalog tree and a spectrum store."""
-    from data_lake.lake_registry import iter_catalog_surveys, iter_modality_surveys
+    from data_lake.ingest.validate_cli import discover_catalog_spectra_link_surveys
 
-    lake_root = Path(lake_root)
-    catalog_names = {name for name, _ in iter_catalog_surveys(lake_root / "catalogs")}
-    spectra_names = {
-        name
-        for name, _ in iter_modality_surveys(lake_root / "spectra", "spectrum_info.json")
-    }
-    return sorted(catalog_names & spectra_names)
+    return discover_catalog_spectra_link_surveys(lake_root)
 
 
 def _report_validation(
@@ -416,22 +410,18 @@ try:
     import click
 
     from ..cli_utils import config_option, load_optional_config, require_output_root
+    from .validate_cli import (
+        discover_catalog_spectra_link_surveys,
+        echo_multi_survey_footer,
+        echo_survey_banner,
+        resolve_validation_survey_names,
+        validation_survey_options,
+    )
 
     @click.command("dl-validate-catalog-spectra-link")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
-    @click.option(
-        "--survey",
-        "surveys",
-        multiple=True,
-        help="Survey name(s). Repeat for multiple surveys.",
-    )
-    @click.option(
-        "--all",
-        "validate_all",
-        is_flag=True,
-        help="Validate every survey with both catalogs/ and spectra/ trees.",
-    )
+    @validation_survey_options
     @click.option("--norder", type=int, default=None, help="HEALPix order (default: info JSON).")
     @click.option(
         "--link-id-col",
@@ -472,26 +462,18 @@ try:
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="spectra")
 
-        if validate_all and surveys:
-            raise click.ClickException("Use either --survey or --all, not both.")
-        if validate_all:
-            names = discover_surveys_for_spectra_link_validation(lake)
-        elif surveys:
-            names = list(surveys)
-        else:
-            raise click.ClickException("Provide --survey NAME (repeatable) or --all.")
-
-        if not names:
-            raise click.ClickException(
+        names = resolve_validation_survey_names(
+            surveys=surveys,
+            validate_all=validate_all,
+            discovered=discover_catalog_spectra_link_surveys(lake),
+            empty_message=(
                 "No surveys with both catalogs/ and spectra/ found under the lake root."
-            )
+            ),
+        )
 
         all_ok = True
         for i, survey_name in enumerate(names):
-            if len(names) > 1:
-                if i > 0:
-                    click.echo()
-                click.echo(f"=== {survey_name} ===")
+            echo_survey_banner(i, survey_name, total=len(names))
 
             rep = run_validation(
                 lake,
@@ -505,15 +487,11 @@ try:
             if not _report_validation(rep, survey_name, strict=strict):
                 all_ok = False
 
-        if len(names) > 1:
-            click.echo()
-            if all_ok:
-                click.echo(f"OK: catalog ↔ spectra link for all {len(names)} survey(s).")
-            else:
-                click.echo(
-                    f"Link validation failed for one or more of {len(names)} survey(s).",
-                    err=True,
-                )
+        echo_multi_survey_footer(
+            all_ok=all_ok,
+            n_surveys=len(names),
+            ok_message=f"OK: catalog ↔ spectra link for all {len(names)} survey(s).",
+        )
 
         sys.exit(0 if all_ok else 1)
 
