@@ -110,16 +110,30 @@ def check_catalog_join_column(catalog_root: Path | str, survey: str) -> JoinColu
 def rebuild_catalog_link_ids(
     catalog_root: Path | str,
     link_col: str,
+    *,
+    allow_incomplete_link_id: bool | None = None,
 ) -> tuple[int, str]:
     """Recompute ``_source_id`` from *link_col* on every catalog tile.
 
     Returns ``(n_rebuilt, link_id_mode)``.
     """
     catalog_root = Path(catalog_root)
+    if allow_incomplete_link_id is None:
+        info_path = catalog_root / "catalog_info.json"
+        allow_incomplete_link_id = False
+        if info_path.is_file():
+            with open(info_path) as fh:
+                allow_incomplete_link_id = bool(
+                    json.load(fh).get("allow_incomplete_link_id", False),
+                )
     rebuilt = 0
     mode = "sequential"
     for path in _iter_valid_parquet_tiles(catalog_root):
-        _, mode = rebuild_parquet_tile_link_id(path, link_col)
+        _, mode = rebuild_parquet_tile_link_id(
+            path,
+            link_col,
+            allow_incomplete_link_id=bool(allow_incomplete_link_id),
+        )
         rebuilt += 1
     return rebuilt, mode
 
@@ -132,6 +146,7 @@ def repair_catalog_metadata(
     ra_col: str | None = None,
     dec_col: str | None = None,
     rebuild_link_id: str | None = None,
+    allow_incomplete_link_id: bool | None = None,
 ) -> RepairCatalogMetadataResult:
     """Rebuild metadata sidecars for one ingested catalog from its Parquet tiles."""
     catalog_root = Path(catalog_root)
@@ -145,7 +160,9 @@ def repair_catalog_metadata(
     try:
         if rebuild_link_id:
             n_rebuilt, rebuilt_mode = rebuild_catalog_link_ids(
-                catalog_root, rebuild_link_id,
+                catalog_root,
+                rebuild_link_id,
+                allow_incomplete_link_id=allow_incomplete_link_id,
             )
         ok = finalize_catalog_survey(
             catalog_root,
@@ -154,6 +171,7 @@ def repair_catalog_metadata(
             ra_col=ra,
             dec_col=dec,
             link_id_mode=rebuilt_mode,
+            allow_incomplete_link_id=allow_incomplete_link_id,
         )
     except Exception as exc:
         log.exception("Repair failed for %s", survey_name)
@@ -196,6 +214,7 @@ def repair_catalogs_under_lake(
     *,
     norder: int | None = None,
     rebuild_link_id: str | None = None,
+    allow_incomplete_link_id: bool | None = None,
 ) -> list[RepairCatalogMetadataResult]:
     """Repair metadata for each named survey under ``<lake_root>/catalogs/``."""
     lake_root = Path(lake_root)
@@ -219,6 +238,7 @@ def repair_catalogs_under_lake(
                 name,
                 norder=norder,
                 rebuild_link_id=rebuild_link_id,
+                allow_incomplete_link_id=allow_incomplete_link_id,
             )
         )
     return results
@@ -342,6 +362,13 @@ try:
             "Resets _spectrum_index and _cutout_index; run dl-rebuild-catalog-indices afterward."
         ),
     )
+    @click.option(
+        "--allow-incomplete-link-id",
+        is_flag=True,
+        default=None,
+        help="With --rebuild-link-id: null _source_id when link parts missing "
+        "(default: read catalog_info.json).",
+    )
     @click.option("--spectra", "check_spectra", is_flag=True, help="With --check-only, include spectra Zarr tiles.")
     @click.option("--cutouts", "check_cutouts", is_flag=True, help="With --check-only, include cutout Zarr tiles.")
     @click.option("-v", "--verbose", is_flag=True)
@@ -353,6 +380,7 @@ try:
         norder: int | None,
         check_only: bool,
         rebuild_link_id: str | None,
+        allow_incomplete_link_id: bool | None,
         check_spectra: bool,
         check_cutouts: bool,
         verbose: bool,
@@ -419,6 +447,7 @@ try:
             names,
             norder=norder,
             rebuild_link_id=rebuild_link_id,
+            allow_incomplete_link_id=allow_incomplete_link_id,
         )
         n_ok = n_fail = 0
         for res in results:

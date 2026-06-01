@@ -667,10 +667,16 @@ carries object metadata (``SEQNUM`` = catalog ``serial``, ``NAME``, ``RA``,
 ID; ingest the catalog with ``--link-id-col SPFILE,FIBRE`` so ``_source_id`` matches
 spectrum ingest on both sides (e.g. ``sgp805_001203_2z.fits|132``).
 
+When the catalog has rows with no spectrum filename (blank ``SPFILE``), use
+``--allow-incomplete-link-id`` so those rows stay in Parquet with null
+``_source_id`` (unlinked; ``_spectrum_index`` stays ``-1``) instead of building
+a partial ``FIBRE``-only key that will not match spectra.
+
 ```bash
 # Catalog: serial kept; _source_id built from SPFILE,FIBRE composite
 dl-ingest-catalog 2dfgrs_catalog.fits --survey 2DFGRS_DR3 \
-  --link-id-col SPFILE,FIBRE --ra-col RA --dec-col DEC
+  --link-id-col SPFILE,FIBRE --ra-col RA --dec-col DEC \
+  --allow-incomplete-link-id
 
 # Single file (smoke test) — one Zarr row per SPECTRUM HDU
 dl-ingest-spectra 389442.fits --survey 2DFGRS_DR3 --fmt 2df

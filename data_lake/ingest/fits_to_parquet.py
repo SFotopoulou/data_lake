@@ -129,6 +129,19 @@ def _object_id_text(value: object) -> str:
     return str(value).strip()
 
 
+def _object_id_text_optional(value: object) -> str | None:
+    """Like :func:`_object_id_text` but returns ``None`` for null/blank/non-finite values."""
+    if value is None:
+        return None
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        return None
+    try:
+        text = _object_id_text(value)
+    except ValueError:
+        return None
+    return text if text else None
+
+
 def _text_is_integer_object_id(text: str) -> bool:
     return bool(text) and text.lstrip("+-").isdigit()
 
@@ -329,9 +342,56 @@ def composite_link_label(*parts: object, sep: str = "|") -> str:
     return sep.join(values)
 
 
+def composite_link_label_optional(
+    *parts: object,
+    require_all_parts: bool,
+    sep: str = "|",
+) -> str | None:
+    """Build a composite link label, or ``None`` when parts are incomplete.
+
+    When *require_all_parts* is True, every part must be non-empty; otherwise
+    returns ``None``.  When False, uses the same partial-join rule as
+    :func:`composite_link_label` (empty parts dropped).
+    """
+    if require_all_parts:
+        texts = [_object_id_text_optional(p) for p in parts]
+        if any(t is None for t in texts):
+            return None
+        return sep.join(texts)  # type: ignore[arg-type]
+
+    values = [t for p in parts if (t := _object_id_text_optional(p))]
+    if not values:
+        return None
+    return sep.join(values)
+
+
+def _stable_join_hashes(labels: Sequence[str | None]) -> pa.Array:
+    """Map link labels to nullable int64 ``_source_id`` hashes."""
+    out: list[int | None] = []
+    for text in labels:
+        if text is None:
+            out.append(None)
+        else:
+            out.append(stable_object_id_from_string(text))
+    return pa.array(out, type=pa.int64())
+
+
 def parse_link_id_column_spec(link_id_col: str) -> list[str]:
     """Split a catalog ``--link-id-col`` spec into one or more column names."""
     return [part.strip() for part in link_id_col.split(",") if part.strip()]
+
+
+def _link_id_columns_present(link_id_col: str | None, schema_names: list[str]) -> bool:
+    """True when every column in a link-id spec exists in *schema_names*."""
+    if not link_id_col:
+        return False
+    if "," in link_id_col:
+        try:
+            resolve_link_id_column_names(link_id_col, schema_names)
+            return True
+        except ValueError:
+            return False
+    return match_schema_column(link_id_col, schema_names) is not None
 
 
 def resolve_link_id_column_names(
@@ -439,6 +499,8 @@ def _sync_lake_join_id_from_native(table: pa.Table, native_col: str) -> pa.Table
 def ensure_catalog_source_ids(
     table: pa.Table,
     link_id_col: str | None,
+    *,
+    allow_incomplete_link_id: bool = False,
 ) -> tuple[pa.Table, str]:
     """Ensure the table has int64 object IDs for Zarr/spectrum joins.
 
@@ -449,6 +511,10 @@ def ensure_catalog_source_ids(
     * ``column:COL`` — native integer column *COL* (cast to int64 in place) plus ``_source_id``
     * ``label:COL`` — human-readable labels stay in *COL*; ``_source_id`` is a
       stable hash of each label (for cross-store matching)
+
+    When *allow_incomplete_link_id* is True and ``--link-id-col`` is composite or
+    a string label column, rows with any missing/blank link part get null
+    ``_source_id`` (row stays in Parquet; spectrum ingest will not link them).
     """
     if link_id_col:
         matched = match_schema_column(link_id_col, table.schema.names)
@@ -457,14 +523,26 @@ def ensure_catalog_source_ids(
 
     if link_id_col and "," in link_id_col:
         col_names = resolve_link_id_column_names(link_id_col, table.schema.names)
-        labels = [
-            composite_link_label(*row)
-            for row in zip(*(table.column(name).to_pylist() for name in col_names))
-        ]
-        hashes = pa.array(
-            [stable_object_id_from_string(text) for text in labels],
-            type=pa.int64(),
-        )
+        row_iter = zip(*(table.column(name).to_pylist() for name in col_names))
+        if allow_incomplete_link_id:
+            labels = [
+                composite_link_label_optional(
+                    *row, require_all_parts=True,
+                )
+                for row in row_iter
+            ]
+            n_unlinked = sum(1 for text in labels if text is None)
+            if n_unlinked:
+                log.warning(
+                    "Composite link-id: %d / %d row(s) missing a link part in %r; "
+                    "_source_id left null (use --allow-incomplete-link-id).",
+                    n_unlinked,
+                    len(labels),
+                    col_names,
+                )
+        else:
+            labels = [composite_link_label(*row) for row in row_iter]
+        hashes = _stable_join_hashes(labels)
         table = _set_lake_join_id_column(table, hashes)
         spec = ",".join(col_names)
         log.info(
@@ -559,8 +637,19 @@ def ensure_catalog_source_ids(
         table = _sync_lake_join_id_from_native(table, link_id_col)
         return table, f"column:{link_id_col}"
 
-    labels = [_object_id_text(v) for v in col.to_pylist()]
-    sample = labels[0] if labels else ""
+    if allow_incomplete_link_id:
+        labels = [_object_id_text_optional(v) for v in col.to_pylist()]
+        n_unlinked = sum(1 for text in labels if text is None)
+        if n_unlinked:
+            log.warning(
+                "Label link-id column %r: %d / %d row(s) blank; _source_id left null.",
+                link_id_col,
+                n_unlinked,
+                len(labels),
+            )
+    else:
+        labels = [_object_id_text(v) for v in col.to_pylist()]
+    sample = next((t for t in labels if t), "")
     log.warning(
         "Object-ID column %r has non-integer labels (e.g. %r). Keeping it "
         "unchanged and adding int64 column _source_id (stable hash) for "
@@ -575,10 +664,7 @@ def ensure_catalog_source_ids(
             f"Column {link_id_col!r} cannot hold non-integer labels; use "
             "--link-id-col with your survey name column (e.g. NAME or SOURCE_ID)."
         )
-    hashes = pa.array(
-        [stable_object_id_from_string(text) for text in labels],
-        type=pa.int64(),
-    )
+    hashes = _stable_join_hashes(labels)
     table = _set_lake_join_id_column(table, hashes)
     return table, f"label:{link_id_col}"
 
@@ -672,6 +758,7 @@ def rebuild_parquet_tile_link_id(
     *,
     catalog_parquet_options: CatalogParquetOptions | None = None,
     reset_indices: bool = True,
+    allow_incomplete_link_id: bool = False,
 ) -> tuple[str, str]:
     """Recompute ``_source_id`` from *link_col* on one catalog tile.
 
@@ -682,7 +769,9 @@ def rebuild_parquet_tile_link_id(
     tile_path = Path(tile_path)
     table = read_parquet_tile(tile_path)
     if "," in link_col:
-        table, mode = ensure_catalog_source_ids(table, link_col)
+        table, mode = ensure_catalog_source_ids(
+            table, link_col, allow_incomplete_link_id=allow_incomplete_link_id,
+        )
     else:
         matched = match_schema_column(link_col, table.schema.names)
         if matched is None:
@@ -690,7 +779,11 @@ def rebuild_parquet_tile_link_id(
                 f"Link column {link_col!r} not in tile {tile_path.name}; "
                 f"columns: {sorted(table.schema.names)[:25]}"
             )
-        table, mode = ensure_catalog_source_ids(table, matched)
+        table, mode = ensure_catalog_source_ids(
+            table,
+            matched,
+            allow_incomplete_link_id=allow_incomplete_link_id,
+        )
     if reset_indices:
         n = len(table)
         minus_one = pa.array(np.full(n, -1, dtype=np.int64), type=pa.int64())
@@ -1426,14 +1519,19 @@ def _id_column_for_dedup(table: pa.Table, link_id_col: str | None) -> str | None
 
 
 def _object_ids_from_column(table: pa.Table, col: str) -> set[int]:
-    return {normalize_object_id(v) for v in table.column(col).to_pylist()}
+    out: set[int] = set()
+    for v in table.column(col).to_pylist():
+        if v is None:
+            continue
+        out.add(normalize_object_id(v))
+    return out
 
 
 def _filter_table_exclude_ids(table: pa.Table, col: str, exclude: set[int]) -> pa.Table:
     if not exclude:
         return table
     keep = [
-        normalize_object_id(v) not in exclude
+        v is None or normalize_object_id(v) not in exclude
         for v in table.column(col).to_pylist()
     ]
     return table.filter(pa.array(keep, type=pa.bool_()))
@@ -1578,6 +1676,7 @@ def finalize_catalog_survey(
     link_id_mode: str | None = None,
     streaming: bool = False,
     fallback_n_cols: int = 0,
+    allow_incomplete_link_id: bool | None = None,
 ) -> bool:
     """Refresh ``catalog_info.json``, ``_metadata``, and ``schema_manifest.json`` from tiles.
 
@@ -1590,6 +1689,7 @@ def finalize_catalog_survey(
     sid = link_id_mode if link_id_mode is not None else "sequential"
     hats_order = norder
     stream = streaming
+    allow_incomplete = allow_incomplete_link_id
     info_path = catalog_root / "catalog_info.json"
     if info_path.is_file():
         with open(info_path) as fh:
@@ -1600,6 +1700,8 @@ def finalize_catalog_survey(
             sid = info.get("link_id_mode", sid)
         hats_order = int(info.get("hats_order", hats_order))
         stream = bool(info.get("ingest_streaming", stream))
+        if allow_incomplete is None:
+            allow_incomplete = bool(info.get("allow_incomplete_link_id", False))
 
     if not _iter_valid_parquet_tiles(catalog_root):
         return False
@@ -1613,6 +1715,7 @@ def finalize_catalog_survey(
         link_id_mode=sid,
         streaming=stream,
         fallback_n_cols=fallback_n_cols,
+        allow_incomplete_link_id=allow_incomplete,
     )
     return True
 
@@ -1627,6 +1730,7 @@ def _finalize_catalog_writes(
     link_id_mode: str,
     streaming: bool,
     fallback_n_cols: int,
+    allow_incomplete_link_id: bool | None = None,
 ) -> None:
     """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles."""
     catalog_root.mkdir(parents=True, exist_ok=True)
@@ -1679,6 +1783,11 @@ def _finalize_catalog_writes(
             info["native_id_column"] = native_col
         elif "native_id_column" in info:
             del info["native_id_column"]
+        if allow_incomplete_link_id is not None:
+            if allow_incomplete_link_id:
+                info["allow_incomplete_link_id"] = True
+            else:
+                info.pop("allow_incomplete_link_id", None)
         with open(info_path, "w") as fh:
             json.dump(info, fh, indent=2)
     else:
@@ -1694,6 +1803,7 @@ def _finalize_catalog_writes(
             link_id_column=join_col,
             native_id_column=native_col,
             streaming=streaming,
+            allow_incomplete_link_id=bool(allow_incomplete_link_id),
         )
 
     if tile_paths:
@@ -1764,6 +1874,7 @@ def ingest_catalog(
     columns: Sequence[str] | None = None,
     parquet_options: CatalogParquetOptions | None = None,
     compact: bool = False,
+    allow_incomplete_link_id: bool = False,
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -1811,6 +1922,10 @@ def ingest_catalog(
     compact:
         Preset for smaller files: ZSTD level 9, no column statistics, no
         dictionary encoding, narrow string type per tile.
+    allow_incomplete_link_id:
+        When True, composite or string ``--link-id-col`` rows with any missing
+        link part keep null ``_source_id`` (catalog row retained, not linked to
+        spectra).  Recorded in ``catalog_info.json`` for rebuild/repair.
     """
     source_path = Path(source_path)
     output_root = Path(output_root)
@@ -1837,13 +1952,16 @@ def ingest_catalog(
             on_duplicate_id=on_duplicate_id,
             columns=columns,
             parquet_options=pq_opts,
+            allow_incomplete_link_id=allow_incomplete_link_id,
         )
         return
 
     table = _read_source_table(source_path)
     log.info("Loaded %d rows × %d columns", len(table), len(table.schema))
 
-    table, sid_mode = ensure_catalog_source_ids(table, link_id_col)
+    table, sid_mode = ensure_catalog_source_ids(
+        table, link_id_col, allow_incomplete_link_id=allow_incomplete_link_id,
+    )
 
     table = _add_healpix_columns(table, ra_col, dec_col, norder)
     table = _filter_table_columns(
@@ -1900,6 +2018,7 @@ def ingest_catalog(
         link_id_mode=sid_mode,
         streaming=False,
         fallback_n_cols=len(table.schema),
+        allow_incomplete_link_id=allow_incomplete_link_id,
     )
     log.info("Catalog written to %s", catalog_root)
 
@@ -1934,6 +2053,7 @@ def decode_catalog_file_to_batches(
     norder: int,
     link_id_col: str | None = None,
     columns: Sequence[str] | None = None,
+    allow_incomplete_link_id: bool = False,
 ) -> tuple[list[tuple[int, pa.Table]], str, int]:
     """Read one catalog file and partition rows by HEALPix tile (in-memory).
 
@@ -1942,7 +2062,9 @@ def decode_catalog_file_to_batches(
     """
     source_path = Path(source_path)
     table = _read_source_table(source_path)
-    table, sid_mode = ensure_catalog_source_ids(table, link_id_col)
+    table, sid_mode = ensure_catalog_source_ids(
+        table, link_id_col, allow_incomplete_link_id=allow_incomplete_link_id,
+    )
     table = _add_healpix_columns(table, ra_col, dec_col, norder)
     table = _filter_table_columns(
         table,
@@ -1969,6 +2091,7 @@ def _ingest_catalog_streaming(
     on_duplicate_id: DuplicateIdMode = "skip",
     columns: Sequence[str] | None = None,
     parquet_options: CatalogParquetOptions | None = None,
+    allow_incomplete_link_id: bool = False,
 ) -> None:
     """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
     the full catalog as a PyArrow Table in RAM.
@@ -2037,10 +2160,8 @@ def _ingest_catalog_streaming(
         ra = np.ascontiguousarray(np.asarray(data[ra_col], dtype=np.float64))
         dec = np.ascontiguousarray(np.asarray(data[dec_col], dtype=np.float64))
 
-        if link_id_col and link_id_col in col_names:
-            sid_in_fits = True
-        else:
-            sid_in_fits = False
+        sid_in_fits = _link_id_columns_present(link_id_col, col_names)
+        if not sid_in_fits:
             sids = np.arange(n_rows, dtype=np.int64)
 
         npix_arr = assign_healpix(ra, dec, norder)
@@ -2081,7 +2202,9 @@ def _ingest_catalog_streaming(
                 )
             else:
                 tile_table, tile_sid_mode = ensure_catalog_source_ids(
-                    tile_table, link_id_col,
+                    tile_table,
+                    link_id_col,
+                    allow_incomplete_link_id=allow_incomplete_link_id,
                 )
                 if sid_mode is None:
                     sid_mode = tile_sid_mode
@@ -2140,6 +2263,7 @@ def _ingest_catalog_streaming(
                 link_id_mode=sid_mode,
                 streaming=True,
                 fallback_n_cols=len(tile_schema),
+                allow_incomplete_link_id=allow_incomplete_link_id,
             )
         log.info("Catalog written to %s", catalog_root)
 
@@ -2170,6 +2294,7 @@ def _write_catalog_info(
     link_id_column: str | None = None,
     native_id_column: str | None = None,
     streaming: bool,
+    allow_incomplete_link_id: bool = False,
 ) -> None:
     join_col = link_id_column or LAKE_JOIN_ID_COLUMN
     info = {
@@ -2189,6 +2314,8 @@ def _write_catalog_info(
     }
     if native_id_column:
         info["native_id_column"] = native_id_column
+    if allow_incomplete_link_id:
+        info["allow_incomplete_link_id"] = True
     with open(catalog_root / "catalog_info.json", "w") as fh:
         json.dump(info, fh, indent=2)
 
@@ -2208,6 +2335,7 @@ def ingest_catalog_batch(
     link_id_col: str | None = None,
     tile_mode: TileMode | None = None,
     on_duplicate_id: DuplicateIdMode = "skip",
+    allow_incomplete_link_id: bool = False,
 ) -> None:
     """Ingest multiple source files into the same survey catalog.
 
@@ -2226,6 +2354,7 @@ def ingest_catalog_batch(
             link_id_col=link_id_col,
             tile_mode=tile_mode,
             on_duplicate_id=on_duplicate_id,
+            allow_incomplete_link_id=allow_incomplete_link_id,
         )
 
 
@@ -2257,6 +2386,12 @@ try:
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
     @click.option("--link-id-col", default=None)
+    @click.option(
+        "--allow-incomplete-link-id",
+        is_flag=True,
+        help="For composite or string --link-id-col: leave _source_id null when "
+        "any link part is missing (row stays in catalog, unlinked to spectra).",
+    )
     @click.option(
         "--tile-mode",
         type=click.Choice(["skip", "overwrite", "append"], case_sensitive=False),
@@ -2306,6 +2441,7 @@ try:
         dec_col: str,
         norder: int | None,
         link_id_col: str | None,
+        allow_incomplete_link_id: bool,
         tile_mode: str | None,
         on_duplicate_id: str,
         streaming: bool,
@@ -2340,6 +2476,7 @@ try:
             norder=pick(norder,
                         cfg.partitioning.hats_order if cfg else None, 5),
             link_id_col=link_id_col,
+            allow_incomplete_link_id=allow_incomplete_link_id,
             tile_mode=tile_mode.lower() if tile_mode else None,  # type: ignore[arg-type]
             on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
             streaming=streaming,

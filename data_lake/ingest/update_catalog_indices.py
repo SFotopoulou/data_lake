@@ -124,9 +124,14 @@ def _patch_catalog_parquet_file(
         sid_col, table.schema.field(sid_col).type, context="catalog",
     )
 
-    tile_ids = [normalize_object_id(x) for x in table.column(sid_col).to_pylist()]
+    tile_ids: list[int | None] = []
+    for x in table.column(sid_col).to_pylist():
+        if x is None:
+            tile_ids.append(None)
+        else:
+            tile_ids.append(normalize_object_id(x))
     source_id_set = set(source_id_to_index.keys())
-    matches = [sid for sid in tile_ids if sid in source_id_set]
+    matches = [sid for sid in tile_ids if sid is not None and sid in source_id_set]
     if not matches:
         return False
 
@@ -138,6 +143,8 @@ def _patch_catalog_parquet_file(
 
     id_to_row: dict[int, list[int]] = {}
     for row_i, sid in enumerate(tile_ids):
+        if sid is None:
+            continue
         id_to_row.setdefault(sid, []).append(row_i)
 
     for sid in matches:

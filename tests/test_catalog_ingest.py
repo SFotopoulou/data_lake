@@ -881,6 +881,49 @@ class TestTileMode:
         assert info["total_rows"] == 4
 
 
+class TestAllowIncompleteLinkId:
+    def test_composite_null_when_part_missing(self) -> None:
+        from data_lake.ingest.fits_to_parquet import (
+            LAKE_JOIN_ID_COLUMN,
+            composite_link_label,
+            ensure_catalog_source_ids,
+            stable_object_id_from_string,
+        )
+
+        table = pa.table({
+            "SPFILE": pa.array(["a.fits", "", "c.fits"]),
+            "FIBRE": pa.array([1, 2, 3]),
+        })
+        out, mode = ensure_catalog_source_ids(
+            table, "SPFILE,FIBRE", allow_incomplete_link_id=True,
+        )
+        assert mode == "composite:SPFILE,FIBRE"
+        sids = out[LAKE_JOIN_ID_COLUMN].to_pylist()
+        assert sids[0] == stable_object_id_from_string(
+            composite_link_label("a.fits", 1),
+        )
+        assert sids[1] is None
+        assert sids[2] == stable_object_id_from_string(
+            composite_link_label("c.fits", 3),
+        )
+
+    def test_composite_partial_join_without_flag(self) -> None:
+        from data_lake.ingest.fits_to_parquet import (
+            LAKE_JOIN_ID_COLUMN,
+            composite_link_label,
+            ensure_catalog_source_ids,
+            stable_object_id_from_string,
+        )
+
+        table = pa.table({
+            "SPFILE": pa.array(["a.fits", "", "c.fits"]),
+            "FIBRE": pa.array([1, 2, 3]),
+        })
+        out, _ = ensure_catalog_source_ids(table, "SPFILE,FIBRE")
+        sids = out[LAKE_JOIN_ID_COLUMN].to_pylist()
+        assert sids[1] == stable_object_id_from_string(composite_link_label(2))
+
+
 class TestPackedVectorFits:
     """GALEX photoobjall: one FITS row, each column a vector of sources."""
 

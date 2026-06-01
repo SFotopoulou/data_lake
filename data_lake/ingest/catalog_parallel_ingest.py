@@ -49,6 +49,7 @@ class CatalogDecodeConfig:
     ra_col: str
     dec_col: str
     link_id_col: str | None
+    allow_incomplete_link_id: bool
     columns: tuple[str, ...] | None
 
 
@@ -96,6 +97,7 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
         dec_col=config.dec_col,
         norder=config.norder,
         link_id_col=config.link_id_col,
+        allow_incomplete_link_id=config.allow_incomplete_link_id,
         columns=cols,
     )
     # Do not pickle pa.Table across processes (ALLWISE/Gaia-scale tables OOM the
@@ -155,6 +157,7 @@ def ingest_catalogs_parallel(
     dec_col: str = "dec",
     norder: int = 5,
     link_id_col: str | None = None,
+    allow_incomplete_link_id: bool = False,
     columns: Sequence[str] | None = None,
     tile_mode: TileMode | None = None,
     on_duplicate_id: DuplicateIdMode = "skip",
@@ -198,6 +201,7 @@ def ingest_catalogs_parallel(
         ra_col=ra_col,
         dec_col=dec_col,
         link_id_col=link_id_col,
+        allow_incomplete_link_id=allow_incomplete_link_id,
         columns=tuple(columns) if columns else None,
     )
     decoder = decoder or _decode_one_catalog_safe
@@ -430,6 +434,7 @@ def ingest_catalogs_parallel(
         link_id_mode=sid_mode,
         streaming=False,
         fallback_n_cols=fallback_n_cols,
+        allow_incomplete_link_id=allow_incomplete_link_id,
     )
 
     elapsed = time.perf_counter() - t_start
@@ -480,6 +485,11 @@ try:
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int)
     @click.option("--link-id-col", default=None)
+    @click.option(
+        "--allow-incomplete-link-id",
+        is_flag=True,
+        help="Leave _source_id null when any composite/string link part is missing.",
+    )
     @click.option(
         "--tile-mode",
         type=click.Choice(["skip", "overwrite", "append"], case_sensitive=False),
@@ -535,6 +545,7 @@ try:
         dec_col: str,
         norder: int | None,
         link_id_col: str | None,
+        allow_incomplete_link_id: bool,
         tile_mode: str,
         on_duplicate_id: str,
         columns: str | None,
@@ -567,6 +578,7 @@ try:
             dec_col=dec_col,
             norder=n,
             link_id_col=link_id_col,
+            allow_incomplete_link_id=allow_incomplete_link_id,
             columns=col_list,
             tile_mode=tile_mode.lower(),  # type: ignore[arg-type]
             on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
