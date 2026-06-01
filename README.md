@@ -1631,7 +1631,8 @@ The master file should stay ID-centric; science columns come from per-survey cat
 dl-refresh-lake-registry              # write shared/registry/surveys.parquet
 dl-describe-lake                      # print survey × modality summary
 dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout)
-dl-describe-lake --refresh            # rebuild then print
+dl-describe-lake --count-total        # append sum of registry total_rows
+dl-describe-lake --refresh            # rebuild registry from disk, then print
 ```
 
 For **spectra**, ``total_rows`` in the registry is the sum of ``source_id`` lengths

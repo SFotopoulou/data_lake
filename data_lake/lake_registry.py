@@ -455,7 +455,69 @@ def filter_lake_registry_table(
     return table.filter(pc.equal(table.column("modality"), modality))
 
 
-def format_lake_registry_table(table: pa.Table) -> str:
+_REGISTRY_MODALITY_ORDER = (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT)
+
+
+def summarize_registry_row_counts(table: pa.Table) -> dict[str, Any]:
+    """Sum ``total_rows`` from registry rows (no on-disk rescan)."""
+    grand_total = 0
+    by_modality: dict[str, int] = {}
+    surveys_by_modality: dict[str, int] = {}
+    unknown_by_modality: dict[str, int] = {}
+    for row in table.to_pylist():
+        modality = str(row.get("modality") or "?")
+        surveys_by_modality[modality] = surveys_by_modality.get(modality, 0) + 1
+        total = row.get("total_rows")
+        if total is None:
+            unknown_by_modality[modality] = unknown_by_modality.get(modality, 0) + 1
+            continue
+        n = int(total)
+        grand_total += n
+        by_modality[modality] = by_modality.get(modality, 0) + n
+    return {
+        "grand_total": grand_total,
+        "by_modality": by_modality,
+        "surveys_by_modality": surveys_by_modality,
+        "unknown_by_modality": unknown_by_modality,
+        "surveys_listed": int(table.num_rows),
+        "surveys_unknown_rows": sum(unknown_by_modality.values()),
+    }
+
+
+def format_registry_count_footer(summary: dict[str, Any]) -> str:
+    """Footer lines for ``--count-total`` (registry sums only)."""
+    lines: list[str] = ["By modality:"]
+    by_mod = summary.get("by_modality") or {}
+    surveys_by_mod = summary.get("surveys_by_modality") or {}
+    unknown_by_mod = summary.get("unknown_by_modality") or {}
+    modalities_seen = set(surveys_by_mod) | set(by_mod)
+    ordered = [m for m in _REGISTRY_MODALITY_ORDER if m in modalities_seen]
+    ordered.extend(sorted(modalities_seen - set(ordered)))
+
+    for mod in ordered:
+        n_rows = by_mod.get(mod, 0)
+        n_surveys = surveys_by_mod.get(mod, 0)
+        n_unknown = unknown_by_mod.get(mod, 0)
+        detail = f"{n_surveys} survey{'s' if n_surveys != 1 else ''}"
+        if n_unknown:
+            detail += f"; {n_unknown} without row count"
+        lines.append(f"  {mod:<10} {n_rows:>14,} rows  ({detail})")
+
+    unknown = int(summary.get("surveys_unknown_rows", 0))
+    listed = int(summary.get("surveys_listed", 0))
+    suffix = f" ({listed} entries"
+    if unknown:
+        suffix += f"; {unknown} without row count in registry"
+    suffix += ")"
+    lines.append(f"Total: {int(summary.get('grand_total', 0)):,} rows{suffix}")
+    return "\n".join(lines)
+
+
+def format_lake_registry_table(
+    table: pa.Table,
+    *,
+    count_total: bool = False,
+) -> str:
     import polars as pl
 
     df = pl.from_arrow(table).sort(["modality", "survey"])
@@ -474,6 +536,9 @@ def format_lake_registry_table(table: pa.Table) -> str:
             f"{row['survey']:<24} {row['modality']:<10} {hats_s:>4} {cols_s:>6} {rows_s:>14}  "
             f"{str(row.get('link_id_column') or '—'):<16} {manifest}"
         )
+    if count_total:
+        lines.append("-" * 90)
+        lines.append(format_registry_count_footer(summarize_registry_row_counts(table)))
     return "\n".join(lines)
 
 
@@ -568,12 +633,18 @@ try:
         type=click.Choice([MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT]),
         help="Show only catalog, spectra, or cutout rows (default: all).",
     )
+    @click.option(
+        "--count-total",
+        is_flag=True,
+        help="Append grand total of registry total_rows (sum only; use --refresh to rescan).",
+    )
     @click.option("--json", "as_json", is_flag=True, help="Emit registry as JSON.")
     def cli_describe_lake(
         output_root: Path | None,
         config_path: Path | None,
         refresh: bool,
         modality: str | None,
+        count_total: bool,
         as_json: bool,
     ) -> None:
         """List surveys and modalities on disk (registry index)."""
@@ -581,10 +652,20 @@ try:
         if refresh or not registry_path(lake_root).is_file():
             refresh_lake_registry(lake_root)
         table = filter_lake_registry_table(load_lake_registry(lake_root), modality)
+        summary = summarize_registry_row_counts(table) if count_total else None
         if as_json:
-            click.echo(table.to_pandas().to_json(orient="records", indent=2))
+            if count_total:
+                payload = {
+                    "entries": table.to_pylist(),
+                    "summary": summary,
+                }
+                click.echo(json.dumps(payload, indent=2))
+            else:
+                click.echo(table.to_pandas().to_json(orient="records", indent=2))
         else:
-            click.echo(format_lake_registry_table(table))
+            click.echo(
+                format_lake_registry_table(table, count_total=count_total),
+            )
 
     @click.command("dl-describe-master")
     @click.argument("master_parquet", type=click.Path(exists=True, path_type=Path))

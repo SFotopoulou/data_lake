@@ -20,12 +20,14 @@ from data_lake.lake_registry import (
     REGISTRY_FILENAME,
     build_lake_registry_table,
     filter_lake_registry_table,
+    format_lake_registry_table,
     guess_master_meta,
     load_lake_registry,
     load_master_meta,
     master_meta_path,
     refresh_lake_registry,
     registry_path,
+    summarize_registry_row_counts,
     write_master_meta,
 )
 from data_lake.schema_registry import MODALITY_CATALOG, MODALITY_SPECTRA
@@ -182,6 +184,41 @@ def test_filter_lake_registry_by_modality(tmp_path: Path) -> None:
 
     spec_only = filter_lake_registry_table(table, MODALITY_SPECTRA)
     assert spec_only.num_rows == 0
+
+
+def test_summarize_registry_row_counts(tmp_path: Path) -> None:
+    _ingest_mini_catalog(tmp_path, "SURV_A")
+    _ingest_mini_catalog(tmp_path, "SURV_B", id_offset=100)
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+    table = load_lake_registry(lake)
+
+    summary = summarize_registry_row_counts(table)
+    assert summary["grand_total"] == 12
+    assert summary["surveys_listed"] == 2
+    assert summary["by_modality"][MODALITY_CATALOG] == 12
+
+    text = format_lake_registry_table(table, count_total=True)
+    assert "By modality:" in text
+    assert f"  {MODALITY_CATALOG}" in text
+    assert "Total: 12 rows" in text
+
+
+def test_describe_lake_count_total_cli(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from data_lake.lake_registry import cli_describe_lake
+
+    _ingest_mini_catalog(tmp_path, "SURV_SUM")
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+
+    assert cli_describe_lake is not None
+    result = CliRunner().invoke(cli_describe_lake, [str(lake), "--count-total"])
+    assert result.exit_code == 0
+    assert "By modality:" in result.output
+    assert "catalog" in result.output
+    assert "Total: 6 rows" in result.output
 
 
 def test_describe_lake_modality_cli(tmp_path: Path) -> None:
