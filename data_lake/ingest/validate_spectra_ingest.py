@@ -4,6 +4,10 @@ Validate spectrum Zarr tiles and ingest sidecar files under ``spectra/<survey>/`
 Checks ``spectrum_info.json``, optional checkpoint / inflight / file-list
 coverage, and per-tile array shape consistency (flux / ivar / mask /
 source_id / meta, and wavelength for shared mode).
+
+``spectrum_info.json`` ``n_pix`` is the survey-wide maximum pixel width.
+Individual tiles may be narrower until ingest widens them on append; those
+tiles emit a warning (an error with ``--strict``).
 """
 
 from __future__ import annotations
@@ -86,7 +90,7 @@ def validate_tile(tile_path: Path, info: dict[str, Any], rep: ValidationReport) 
         rep.errors.append(f"Not a Zarr v3 directory (no zarr.json): {tile_path}")
         return
 
-    n_pix = int(info["n_pix"])
+    survey_n_pix = int(info["n_pix"])
     wave_mode = str(info.get("wavelength_mode", "shared"))
 
     try:
@@ -109,11 +113,18 @@ def validate_tile(tile_path: Path, info: dict[str, Any], rep: ValidationReport) 
         rep.errors.append(f"{tile_path}: flux must be 2-D, got shape {flux.shape}")
         return
     n_row = int(flux.shape[0])
-    if int(flux.shape[1]) != n_pix:
+    tile_n_pix = int(flux.shape[1])
+    if tile_n_pix > survey_n_pix:
         rep.errors.append(
-            f"{tile_path}: flux shape {flux.shape} (expected (*, {n_pix}))"
+            f"{tile_path}: flux shape {flux.shape} exceeds survey n_pix {survey_n_pix} "
+            f"in spectrum_info.json (stale or corrupt metadata)"
         )
         return
+    if tile_n_pix < survey_n_pix:
+        rep.warnings.append(
+            f"{tile_path}: flux width {tile_n_pix} < survey n_pix {survey_n_pix} "
+            f"(tile not widened; ingest widens on append or re-ingest with pad)"
+        )
 
     for name in _ROW_ARRAYS:
         arr = root[name]
@@ -122,9 +133,10 @@ def validate_tile(tile_path: Path, info: dict[str, Any], rep: ValidationReport) 
                 f"{tile_path}: {name} row count {arr.shape[0]} != flux rows {n_row}"
             )
         if name in ("flux", "ivar", "mask") and len(arr.shape) == 2:
-            if int(arr.shape[1]) != n_pix:
+            if int(arr.shape[1]) != tile_n_pix:
                 rep.errors.append(
-                    f"{tile_path}: {name} second dim {arr.shape[1]} != n_pix {n_pix}"
+                    f"{tile_path}: {name} second dim {arr.shape[1]} != tile n_pix "
+                    f"{tile_n_pix}"
                 )
 
     if wave_mode == "shared":
@@ -132,15 +144,29 @@ def validate_tile(tile_path: Path, info: dict[str, Any], rep: ValidationReport) 
             rep.errors.append(f"{tile_path}: missing wavelength (shared mode)")
         else:
             w = root["wavelength"]
-            if tuple(w.shape) != (n_pix,):
+            if tuple(w.shape) != (tile_n_pix,):
                 rep.errors.append(
-                    f"{tile_path}: wavelength shape {w.shape} (expected ({n_pix},))"
+                    f"{tile_path}: wavelength shape {w.shape} "
+                    f"(expected ({tile_n_pix},) for this tile)"
+                )
+    elif wave_mode == "per_source" and "wavelength" in root:
+        w = root["wavelength"]
+        if len(w.shape) == 2 and int(w.shape[0]) == n_row:
+            if int(w.shape[1]) != tile_n_pix:
+                rep.errors.append(
+                    f"{tile_path}: wavelength shape {w.shape} "
+                    f"(expected ({n_row}, {tile_n_pix}))"
                 )
     if info.get("has_resolution") and "resolution" in root:
         res = root["resolution"]
         if int(res.shape[0]) != n_row:
             rep.errors.append(
                 f"{tile_path}: resolution row count {res.shape[0]} != flux {n_row}"
+            )
+        if len(res.shape) == 3 and int(res.shape[2]) != tile_n_pix:
+            rep.errors.append(
+                f"{tile_path}: resolution pixel dim {res.shape[2]} != tile n_pix "
+                f"{tile_n_pix}"
             )
 
     from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN

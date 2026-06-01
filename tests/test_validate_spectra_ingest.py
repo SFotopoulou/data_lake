@@ -91,6 +91,57 @@ def test_run_validation_ok_after_minimal_ingest(tmp_path: Path, two_fake_coadds)
     assert rep.ok(strict=True), (rep.errors, rep.warnings)
 
 
+def test_narrower_tile_than_survey_n_pix_warns(tmp_path: Path) -> None:
+    """Tiles narrower than spectrum_info n_pix are valid (pre-widen ingest state)."""
+    from data_lake.ingest.fits_to_spectra_zarr import (
+        _META_DTYPE,
+        _open_or_create_spectrum_tile,
+    )
+    from data_lake.ingest.zarr_ids import zarr_join_array
+
+    lake = tmp_path / "lake"
+    survey = "oz_like"
+    survey_root = lake / "spectra" / survey
+    survey_root.mkdir(parents=True)
+    tile_n = 8
+    survey_n = 10
+    import json
+
+    (survey_root / "spectrum_info.json").write_text(
+        json.dumps({
+            "n_pix": survey_n,
+            "hats_order": 5,
+            "wavelength_mode": "shared",
+            "wcs": {},
+        })
+    )
+    zpath = survey_root / "Norder=5" / "Dir=0" / "Npix=34.zarr"
+    zpath.parent.mkdir(parents=True)
+    wcs_attrs = {
+        "ctype": "WAVE",
+        "crval": 3600.0,
+        "cdelt": 1.0,
+        "crpix": 1.0,
+        "unit": "Angstrom",
+        "air_or_vacuum": "vacuum",
+        "n_pix": tile_n,
+    }
+    root = _open_or_create_spectrum_tile(
+        zpath, tile_n, "shared", np.dtype(np.uint8), wcs_attrs,
+    )
+    root["flux"].append(np.zeros((2, tile_n), dtype=np.float32))
+    root["ivar"].append(np.zeros((2, tile_n), dtype=np.float32))
+    root["mask"].append(np.zeros((2, tile_n), dtype=np.uint8))
+    zarr_join_array(root).append(np.array([101, 102], dtype=np.int64))
+    root["meta"].append(np.zeros(2, dtype="|V" + str(_META_DTYPE.itemsize)))
+    root["wavelength"][:] = np.linspace(3600.0, 3600.0 + tile_n - 1, tile_n)
+
+    rep = run_validation(lake, survey)
+    assert rep.ok(strict=False), rep.errors
+    assert any("flux width 8 < survey n_pix 10" in w for w in rep.warnings)
+    assert not rep.ok(strict=True)
+
+
 def test_strict_fails_on_stale_inflight(tmp_path: Path, two_fake_coadds) -> None:
     lake = tmp_path / "lake"
     survey_root = lake / "spectra" / "syn"
