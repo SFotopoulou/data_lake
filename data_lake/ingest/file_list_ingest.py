@@ -452,6 +452,7 @@ try:
                 "desi_coadd",
                 "generic",
                 "2df",
+                "gama",
                 "6df",
                 "wig",
                 "ozdes",

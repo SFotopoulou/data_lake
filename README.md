@@ -844,6 +844,25 @@ sbatch scripts/slurm_ingest_6df_spectra.sh
 
 Re-submit the same command to resume from checkpoint after timeout/preemption.
 
+#### GAMA 1-D spectra ingest (stacked PRIMARY)
+
+GAMA AAOMEGA-2dF spectra are stored as a **2-D PRIMARY image** ``(n_row, n_pix)``
+with row labels in ``ROW1``…``ROW5`` (e.g. ``Spectrum``, ``Error``, sky rows).
+Only the calibrated flux row and 1-σ error row are ingested (``ivar = 1/σ²``).
+
+**Link key:** ``SPECID`` in the primary header (HDU 0), e.g. ``G23_Y7_015_265``.
+Use the same column at catalog ingest so ``_source_id`` matches on both sides.
+
+```bash
+dl-ingest-catalog gama_targets.fits --survey GAMA_DR4 \
+  --link-id-col SPECID --ra-col RA --dec-col DEC
+
+dl-ingest-spectra G23_Y7_015_265.fit --survey GAMA_DR4 --fmt gama
+
+# Auto-detect when ORIGIN=GAMA or ROW1=Spectrum (e.g. G23_* basenames)
+dl-ingest-spectra G23_Y7_015_265.fit --survey GAMA_DR4 --link-id-col SPECID
+```
+
 #### OzDES spectra ingest (stacked only)
 
 OzDES target FITS files store the **stacked** spectrum in the first three HDUs:

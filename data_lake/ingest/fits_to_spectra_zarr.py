@@ -13,6 +13,8 @@ Supported input formats
   the B/R/Z arms onto a single monotonic BRZ wavelength grid.
   Requires ``pip install 'data-lake[desi]'`` (``desispec>=0.62``).
 * **6dFGS**     multi-extension target FITS – ingests every combined VR spectrum extension.
+* **GAMA**      stacked AAOMEGA-2dF PRIMARY image ``(n_row, n_pix)`` with ``ROW1=Spectrum``,
+  ``ROW2=Error`` (1-σ), optional sky rows; ``SPECID`` in the primary header.
 * **Generic**   spectral WCS FITS – 1-D or multi-spectra image HDU with CTYPE1=WAVE*.
 
 DESI note
@@ -1211,6 +1213,121 @@ def _read_ozdes_spectrum(
     return [record], wcs_attrs
 
 
+def _gama_row_labels(header: fits.Header, n_rows: int) -> dict[str, int]:
+    """Map normalised row labels (e.g. ``spectrum``) to 0-based row indices."""
+    labels: dict[str, int] = {}
+    for i in range(1, max(n_rows, 1) + 5):
+        key = f"ROW{i}"
+        if key not in header:
+            continue
+        labels[str(header[key]).strip().lower()] = i - 1
+    return labels
+
+
+def _is_gama_stacked_layout(hdul: fits.HDUList) -> bool:
+    """True when PRIMARY is a GAMA-style stacked spectrum image (rows × pixels)."""
+    if not hdul or hdul[0].data is None:
+        return False
+    arr = np.asarray(hdul[0].data)
+    if arr.ndim != 2 or arr.shape[0] >= arr.shape[1] or arr.shape[0] < 2:
+        return False
+    header = hdul[0].header
+    row1 = str(header.get("ROW1", "")).strip().upper()
+    if row1 == "SPECTRUM":
+        return True
+    origin = str(header.get("ORIGIN", "")).strip().upper()
+    ctype1 = str(header.get("CTYPE1", "")).strip().upper()
+    return (
+        origin == "GAMA"
+        and "SPECID" in header
+        and ctype1.startswith("WAVE")
+    )
+
+
+def _is_gama_hdul(hdul: fits.HDUList, path: Path) -> bool:
+    """Return True if the file looks like a GAMA stacked 1-D spectrum FITS."""
+    if not _is_gama_stacked_layout(hdul):
+        return False
+    if path.stem.upper().startswith(("G23_", "GAMA")):
+        return True
+    return str(hdul[0].header.get("ORIGIN", "")).strip().upper() == "GAMA"
+
+
+def _read_gama_spectrum(
+    hdul: fits.HDUList,
+    source_path: Path,
+    *,
+    link_id_col: str = "SPECID",
+    ra_col: str = "RA",
+    dec_col: str = "DEC",
+) -> tuple[list[SpectrumRecord], dict]:
+    """
+    Read a GAMA stacked 1-D spectrum from the PRIMARY image.
+
+    Expected layout: 2-D array ``(n_row, n_pix)`` with ``ROW1=Spectrum``,
+    ``ROW2=Error`` (1-σ noise), and optional calibration/sky rows.  Wavelength
+    comes from the primary spectral WCS.  ``source_id`` defaults to
+    ``normalize_object_id(SPECID)`` from the primary header.
+    """
+    if not _is_gama_stacked_layout(hdul):
+        summary = _summarize_fits_hdus(hdul)
+        raise ValueError(
+            "GAMA stacked layout not found (expected PRIMARY (n_row, n_pix) with "
+            f"ROW1=Spectrum and SPECID). Found: {summary}"
+        )
+
+    hdu = hdul[0]
+    header = hdu.header
+    arr = np.asarray(hdu.data, dtype=np.float64)
+    n_rows, n_pix = int(arr.shape[0]), int(arr.shape[1])
+    if n_pix <= 0:
+        raise ValueError(f"GAMA spectrum has zero pixels in {source_path.name}")
+
+    row_labels = _gama_row_labels(header, n_rows)
+    flux_row = row_labels.get("spectrum", 0)
+    if flux_row < 0 or flux_row >= n_rows:
+        raise ValueError(f"GAMA flux row index {flux_row} out of range for shape {arr.shape}")
+
+    flux = arr[flux_row].astype(np.float32)
+    error_row = row_labels.get("error")
+    if error_row is not None and 0 <= error_row < n_rows:
+        sigma = arr[error_row]
+        valid = np.isfinite(sigma) & (sigma > 0.0)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            ivar64 = np.where(valid, 1.0 / (sigma * sigma), 0.0)
+        ivar = np.clip(ivar64, 0.0, np.finfo(np.float32).max).astype(np.float32)
+    else:
+        ivar = np.ones(n_pix, dtype=np.float32)
+
+    mask = ((~np.isfinite(flux)) | (ivar <= 0.0)).astype(np.uint8)
+
+    source_id = object_id_from_fits_header(header, link_id_col, hdu_index=0)
+    ra, dec = sky_from_fits_header(header, ra_col, dec_col)
+    wavelength = _wavelength_from_wcs(header, n_pix)
+    wcs_attrs = _wcs_attrs_from_header(header, n_pix)
+
+    sn_val = header.get("SN", header.get("SNR", 0.0))
+    meta: dict[str, Any] = {
+        "z": float(header.get("Z", 0.0)),
+        "z_err": float(header.get("Z_ERR", 0.0)),
+        "snr": float(sn_val) if sn_val not in ("", None) else 0.0,
+        "exptime": float(header.get("T_EXP", header.get("EXPTIME", 0.0))),
+        "R": float(header.get("SPEC_RES", 1000.0)),
+        "instr": str(header.get("INSTRUME", "GAMA"))[:16],
+    }
+    record = SpectrumRecord(
+        source_id=source_id,
+        ra=ra,
+        dec=dec,
+        flux=flux,
+        ivar=ivar,
+        mask=mask,
+        wavelength=wavelength,
+        meta=meta,
+    )
+    return [record], wcs_attrs
+
+
 def _is_zcosmos_container_hdu(hdu: fits.hdu.base.ExtensionHDU | fits.PrimaryHDU) -> bool:
     """True when an HDU is a zCOSMOS spectral container binary table."""
     if not isinstance(hdu, fits.BinTableHDU):
@@ -2342,6 +2459,8 @@ def _detect_format_from_path(path: Path) -> str:
             return "sdss_spplate"
         if _is_2df_hdul(hdul):
             return "2df"
+        if _is_gama_hdul(hdul, path):
+            return "gama"
         if _is_vipers_hdul(hdul, path):
             return "vipers"
         if _is_vuds_hdul(hdul, path):
@@ -2437,7 +2556,7 @@ def ingest_spectra_from_fits(
         Storage dtype for the mask array (``uint8`` or ``uint16``).
     fmt:
         Force format detection: ``"sdss_boss"``, ``"sdss_spplate"``, ``"desi_coadd"``,
-        ``"2df"``, ``"6df"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"vipers"``, ``"vuds"``, ``"vvds"``, ``"generic"``.
+        ``"2df"``, ``"6df"``, ``"gama"``, ``"wig"``, ``"ozdes"``, ``"zcosmos"``, ``"vandels"``, ``"vipers"``, ``"vuds"``, ``"vvds"``, ``"generic"``.
         Auto-detected from HDU names if ``None``.
     specobj_lookup:
         Parquet/CSV sidecar with ``survey``, ``PLATE``, ``MJD``, ``FIBERID``,
@@ -2557,6 +2676,14 @@ def ingest_spectra_from_fits(
                 records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
             elif detected_fmt == "wig":
                 records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
+            elif detected_fmt == "gama":
+                records, wcs_attrs = _read_gama_spectrum(
+                    hdul,
+                    source_path,
+                    link_id_col=link_id_col or "SPECID",
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
             elif detected_fmt == "ozdes":
                 records, wcs_attrs = _read_ozdes_spectrum(hdul, source_path)
             elif detected_fmt == "zcosmos":
@@ -2994,6 +3121,7 @@ try:
                           "generic",
                           "2df",
                           "6df",
+                          "gama",
                           "wig",
                           "ozdes",
                           "zcosmos",
