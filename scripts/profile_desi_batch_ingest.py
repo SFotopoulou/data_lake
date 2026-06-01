@@ -29,7 +29,7 @@ Inspect a saved profile::
 
 Live job (install py-spy: pip install py-spy)::
 
-    PARENT=$(pgrep -f 'dl-ingest-spectra-batch' | head -1)
+    PARENT=$(pgrep -f 'dl-ingest-spectra-batch-desi-coadds' | head -1)
     py-spy top --pid "$PARENT" --subprocesses
     py-spy record -o ingest.svg --pid "$PARENT" --subprocesses --duration 120
 

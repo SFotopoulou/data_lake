@@ -168,7 +168,7 @@ dl-set-ingest-token --ingest-token 'new-secret'
 
 ```bash
 export LAKE_INGEST_TOKEN='your-secret'   # prefer env over --ingest-token (ps visibility)
-dl-ingest-spectra-batch --survey DESI_DR1 --file-list coadds.txt --n-workers 8
+dl-ingest-spectra-batch-desi-coadds --survey DESI_DR1 --file-list coadds.txt --n-workers 8
 ```
 
 **Analysts** point at the shared config and use read APIs only — no token, no
@@ -208,7 +208,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | Command | Purpose |
 |---------|---------|
 | `dl-ingest-spectra` | Single spectrum FITS → Zarr (all supported formats) |
-| `dl-ingest-spectra-batch` | Multi-process DESI coadd batch |
+| `dl-ingest-spectra-batch-desi-coadds` | Multi-process DESI coadd batch |
 | `dl-ingest-spectra-from-list` | Sequential spectrum file-list ingest |
 | `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles |
 
@@ -1168,7 +1168,7 @@ store — that's the only multi-file pattern that is **safe** here, since
 
 ```bash
 # By directory + glob
-dl-ingest-spectra-batch \
+dl-ingest-spectra-batch-desi-coadds \
     --survey desi_dr1 \
     --coadd-root /data/desi/coadds \
     --coadd-glob 'coadd-*.fits' \
@@ -1176,7 +1176,7 @@ dl-ingest-spectra-batch \
 
 # Or by explicit file list (one path per line)
 ls /data/desi/coadds/coadd-*.fits > coadds.txt
-dl-ingest-spectra-batch \
+dl-ingest-spectra-batch-desi-coadds \
     --survey desi_dr1 \
     --file-list coadds.txt \
     --n-workers 16
@@ -1252,7 +1252,7 @@ manual rebuild after ingest use `dl-rebuild-catalog-indices`.
 | `dl-ingest-cutouts-from-list` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra` | `--on-duplicate` | same | same |
 | `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Also ``--on-length-mismatch``, ``--wavelength-mode`` |
-| `dl-ingest-spectra-batch` | `--on-duplicate` | same | DESI parallel batch; default **`skip`** |
+| `dl-ingest-spectra-batch-desi-coadds` | `--on-duplicate` | same | DESI parallel batch; default **`skip`** |
 
 Cutout/spectrum ingest defaults to **`--on-duplicate skip`** so file-list and batch re-runs
 are idempotent. Use **`append`** only when you intentionally want duplicate Zarr rows.
@@ -1301,7 +1301,7 @@ dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \
   --band-names r,i,z --on-duplicate skip
 
 ls coadds.txt  # one DESI coadd path per line
-dl-ingest-spectra-batch --survey desi_dr1 --file-list coadds.txt --n-workers 16 \
+dl-ingest-spectra-batch-desi-coadds --survey desi_dr1 --file-list coadds.txt --n-workers 16 \
   --on-duplicate skip
 
 # Generic / SDSS spectra (sequential, not parallel DESI batch):
@@ -2022,7 +2022,7 @@ Do you have a 1-D spectrum FITS file?
   → dl-ingest-spectra FILE --survey NAME        # try auto-detect first
   → dl-ingest-spectra FILE --survey NAME --fmt <name>   # if detection fails
   → dl-ingest-spectra-from-list file_list.txt --survey NAME  # many files, sequential
-  → dl-ingest-spectra-batch --survey NAME --file-list coadds.txt  # DESI parallel batch
+  → dl-ingest-spectra-batch-desi-coadds --survey NAME --file-list coadds.txt  # DESI parallel batch
 
 Do you have a catalog table? (FITS, CSV, Parquet, VOTable)
   → dl-ingest-catalog cat.fits --survey NAME --ra-col RA --dec-col DEC --link-id-col ID

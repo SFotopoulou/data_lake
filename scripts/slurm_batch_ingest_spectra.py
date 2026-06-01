@@ -1,5 +1,5 @@
 #!/bin/bash
-# Example Slurm wrapper for dl-ingest-spectra-batch.
+# Example Slurm wrapper for dl-ingest-spectra-batch-desi-coadds.
 #
 # Required (export before sbatch, or pass via sbatch --export):
 #   DATA_LAKE_CONFIG  — path to lake_config.toml
@@ -42,7 +42,7 @@ mkdir -p "${REPO}/logs"
 source "${REPO}/.venv/bin/activate"
 
 # n_workers <= cpus-per-task (leave headroom for writer + OS)
-exec dl-ingest-spectra-batch \
+exec dl-ingest-spectra-batch-desi-coadds \
   --config "$DATA_LAKE_CONFIG" \
   --survey "$SURVEY" \
   --file-list "$COADD_LIST" \

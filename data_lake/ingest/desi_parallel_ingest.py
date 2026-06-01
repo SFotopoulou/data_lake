@@ -36,6 +36,9 @@ Anti-patterns that do *not* work
 * ``parallel dl-ingest-spectra ...`` (multiple processes appending to the
   same tile zarr concurrently) – ``LocalStore`` has no cross-process locks
   and shards will silently corrupt.
+* Running ``dl-ingest-spectra-batch-desi-coadds`` on non-DESI formats — it
+  calls ``desispec.io.read_spectra`` exclusively; use
+  ``dl-ingest-spectra-from-list --fmt <name>`` for 2dF, 6dF, GAMA, etc.
 * ``ThreadPoolExecutor`` – ``read_spectra`` is mostly Python; expect ~1.5×.
 """
 
@@ -929,7 +932,7 @@ try:
         require_output_root,
     )
 
-    @click.command("dl-ingest-spectra-batch")
+    @click.command("dl-ingest-spectra-batch-desi-coadds")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
     @ingest_token_option

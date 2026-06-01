@@ -1,7 +1,7 @@
 """
 Checkpointed ingest from a text file list (one path per line).
 
-Complements ``dl-ingest-spectra-batch`` (DESI parallel) with a **sequential**
+Complements ``dl-ingest-spectra-batch-desi-coadds`` (DESI parallel) with a **sequential**
 pattern suitable for catalog FITS and cutout FITS batches: one process,
 optional tqdm progress, JSON checkpoint under the survey directory, optional
 JSONL failure log.
