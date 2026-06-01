@@ -356,6 +356,62 @@ def run_validation(
     return rep
 
 
+def discover_surveys_for_spectra_link_validation(lake_root: Path | str) -> list[str]:
+    """Survey names that have both a catalog tree and a spectrum store."""
+    from data_lake.lake_registry import iter_catalog_surveys, iter_modality_surveys
+
+    lake_root = Path(lake_root)
+    catalog_names = {name for name, _ in iter_catalog_surveys(lake_root / "catalogs")}
+    spectra_names = {
+        name
+        for name, _ in iter_modality_surveys(lake_root / "spectra", "spectrum_info.json")
+    }
+    return sorted(catalog_names & spectra_names)
+
+
+def _report_validation(
+    rep: LinkValidationReport,
+    survey_name: str,
+    *,
+    strict: bool,
+) -> bool:
+    """Print one survey's report; return whether validation passed."""
+    st = rep.stats
+    for msg in rep.errors:
+        click.echo(f"ERROR:   {msg}", err=True)
+    for msg in rep.warnings:
+        click.echo(f"WARNING: {msg}", err=True)
+
+    click.echo(
+        f"Tiles checked: {st.n_tiles_checked}  linked rows verified: {st.n_linked}  "
+        f"stale index: {st.n_stale_index}  wrong id: {st.n_wrong_id}  "
+        f"wrong healpix: {st.n_wrong_healpix}  orphan zarr: {st.n_orphan_zarr}  "
+        f"unpatched catalog: {st.n_unpatched_catalog}  "
+        f"missing catalog tile: {st.n_missing_catalog_tile}  "
+        f"null source_id: {st.n_null_source_id}  "
+        f"null source_id linked: {st.n_null_source_id_linked}"
+    )
+
+    if st.n_unpatched_catalog > 0:
+        click.echo(
+            f"Hint: run dl-rebuild-catalog-indices --survey {survey_name!r} "
+            f"--kind spectrum (uses hats_order from catalog_info.json unless --norder is set)"
+        )
+
+    if rep.ok(strict=strict):
+        if rep.warnings and not strict:
+            click.echo(
+                f"OK (with {len(rep.warnings)} warning(s)): "
+                f"catalog ↔ spectra link for {survey_name!r}."
+            )
+        else:
+            click.echo(f"OK: catalog ↔ spectra link for {survey_name!r}.")
+        return True
+
+    click.echo(f"Link validation failed for {survey_name!r}.", err=True)
+    return False
+
+
 try:
     import click
 
@@ -364,7 +420,18 @@ try:
     @click.command("dl-validate-catalog-spectra-link")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
-    @click.option("--survey", "survey_name", required=True, help="Survey name.")
+    @click.option(
+        "--survey",
+        "surveys",
+        multiple=True,
+        help="Survey name(s). Repeat for multiple surveys.",
+    )
+    @click.option(
+        "--all",
+        "validate_all",
+        is_flag=True,
+        help="Validate every survey with both catalogs/ and spectra/ trees.",
+    )
     @click.option("--norder", type=int, default=None, help="HEALPix order (default: info JSON).")
     @click.option(
         "--link-id-col",
@@ -392,7 +459,8 @@ try:
     def cli(
         output_root: Path | None,
         config_path: Path | None,
-        survey_name: str,
+        surveys: tuple[str, ...],
+        validate_all: bool,
         norder: int | None,
         link_id_col: str | None,
         max_tiles: int | None,
@@ -404,48 +472,50 @@ try:
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="spectra")
 
-        rep = run_validation(
-            lake,
-            survey_name,
-            norder=norder,
-            link_id_col=link_id_col,
-            max_tiles=max_tiles,
-            sample=sample,
-            seed=seed,
-        )
-        st = rep.stats
-        for msg in rep.errors:
-            click.echo(f"ERROR:   {msg}", err=True)
-        for msg in rep.warnings:
-            click.echo(f"WARNING: {msg}", err=True)
+        if validate_all and surveys:
+            raise click.ClickException("Use either --survey or --all, not both.")
+        if validate_all:
+            names = discover_surveys_for_spectra_link_validation(lake)
+        elif surveys:
+            names = list(surveys)
+        else:
+            raise click.ClickException("Provide --survey NAME (repeatable) or --all.")
 
-        click.echo(
-            f"Tiles checked: {st.n_tiles_checked}  linked rows verified: {st.n_linked}  "
-            f"stale index: {st.n_stale_index}  wrong id: {st.n_wrong_id}  "
-            f"wrong healpix: {st.n_wrong_healpix}  orphan zarr: {st.n_orphan_zarr}  "
-            f"unpatched catalog: {st.n_unpatched_catalog}  "
-            f"missing catalog tile: {st.n_missing_catalog_tile}  "
-            f"null source_id: {st.n_null_source_id}  "
-            f"null source_id linked: {st.n_null_source_id_linked}"
-        )
-
-        if st.n_unpatched_catalog > 0:
-            click.echo(
-                f"Hint: run dl-rebuild-catalog-indices --survey {survey_name!r} "
-                f"--kind spectrum (uses hats_order from catalog_info.json unless --norder is set)"
+        if not names:
+            raise click.ClickException(
+                "No surveys with both catalogs/ and spectra/ found under the lake root."
             )
 
-        if rep.ok(strict=strict):
-            if rep.warnings and not strict:
-                click.echo(
-                    f"OK (with {len(rep.warnings)} warning(s)): "
-                    f"catalog ↔ spectra link for {survey_name!r}."
-                )
+        all_ok = True
+        for i, survey_name in enumerate(names):
+            if len(names) > 1:
+                if i > 0:
+                    click.echo()
+                click.echo(f"=== {survey_name} ===")
+
+            rep = run_validation(
+                lake,
+                survey_name,
+                norder=norder,
+                link_id_col=link_id_col,
+                max_tiles=max_tiles,
+                sample=sample,
+                seed=seed,
+            )
+            if not _report_validation(rep, survey_name, strict=strict):
+                all_ok = False
+
+        if len(names) > 1:
+            click.echo()
+            if all_ok:
+                click.echo(f"OK: catalog ↔ spectra link for all {len(names)} survey(s).")
             else:
-                click.echo(f"OK: catalog ↔ spectra link for {survey_name!r}.")
-            sys.exit(0)
-        click.echo("Link validation failed.", err=True)
-        sys.exit(1)
+                click.echo(
+                    f"Link validation failed for one or more of {len(names)} survey(s).",
+                    err=True,
+                )
+
+        sys.exit(0 if all_ok else 1)
 
 except ImportError:
     cli = None  # type: ignore[assignment]

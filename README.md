@@ -227,7 +227,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-validate-catalog-ingest` | Check Parquet tiles for required columns and schema |
 | `dl-validate-spectra-ingest` | Check Zarr spectrum tiles |
 | `dl-validate-cutout-ingest` | Check Zarr cutout tiles |
-| `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement |
+| `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`) |
 
 **Export and extract**
 
@@ -1362,6 +1362,9 @@ dl-validate-catalog-spectra-link --survey zCOSMOS_DR3
 
 # Quick smoke: first tile only, sample 100 linked rows per tile
 dl-validate-catalog-spectra-link --survey zCOSMOS_DR3 --max-tiles 1 --sample 100
+
+# Every survey with both catalogs/ and spectra/ trees
+dl-validate-catalog-spectra-link --all
 ```
 
 If step 2 reports **unpatched catalog** (``_spectrum_index=-1`` but Zarr row exists)

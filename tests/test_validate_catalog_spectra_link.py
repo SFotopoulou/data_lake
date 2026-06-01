@@ -10,7 +10,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, healpix_dir
-from data_lake.ingest.validate_catalog_spectra_link import run_validation
+from data_lake.ingest.validate_catalog_spectra_link import (
+    discover_surveys_for_spectra_link_validation,
+    run_validation,
+)
 
 
 NORDER = 5
@@ -190,6 +193,30 @@ class TestValidateCatalogSpectraLink:
         rep = run_validation(lake, SURVEY)
         assert not rep.ok(strict=False)
         assert rep.stats.n_null_source_id_linked >= 1
+
+    def test_discover_surveys_requires_both_modalities(self, tmp_path: Path) -> None:
+        lake = _make_lake(tmp_path)
+        assert discover_surveys_for_spectra_link_validation(lake) == [SURVEY]
+
+        (lake / "catalogs" / "CAT_ONLY").mkdir(parents=True)
+        (lake / "catalogs" / "CAT_ONLY" / "catalog_info.json").write_text(
+            '{"hats_order": 5}'
+        )
+        assert "CAT_ONLY" not in discover_surveys_for_spectra_link_validation(lake)
+
+    def test_cli_all_validates_every_paired_survey(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.ingest.validate_catalog_spectra_link import cli
+
+        if cli is None:
+            pytest.skip("click not available")
+
+        lake = _make_lake(tmp_path)
+        result = CliRunner().invoke(cli, ["--all", str(lake)])
+        assert result.exit_code == 0
+        assert "OK:" in result.output
+        assert SURVEY in result.output
 
     def test_cli_unpatched_emits_rebuild_hint(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
