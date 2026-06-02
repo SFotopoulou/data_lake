@@ -434,7 +434,7 @@ column is always ``link_id_column: "_source_id"``. When you pass
 | Decimal string column | ``"39627658462934656"`` in FITS ASCII | Parsed native + ``_source_id`` | ``column:TARGETID`` |
 | Vector ID column | SDSS ``OBJID`` shape ``(5,)`` | **Error** — use scalar ``objid`` | — |
 | Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | ``NAME`` kept; ``_source_id`` = stable hash | ``label:NAME`` |
-| Composite labels | ``targetname`` + ``obsid_v`` + ``TITLE_V`` (6dF) | Columns kept; ``_source_id`` = hash of ``target\|obsid_v\|title_v`` | ``composite:targetname,obsid_v,TITLE_V`` |
+| Composite labels | ``targetname`` + ``obsid_v`` + ``obsid_r`` (6dF) | Columns kept; ``_source_id`` = hash of ``target\|obsid_v\|obsid_r`` | ``composite:targetname,obsid_v,obsid_r`` |
 | Composite with header (2dF) | ``SPFILE`` + ``FIBRE`` per extension | Columns kept; ``_source_id`` = hash of ``spfile\|fibre`` | ``composite:SPFILE,FIBRE`` |
 | (none) | — | ``_source_id`` 0…N−1 only | ``sequential`` |
 
@@ -473,11 +473,11 @@ If no ``--link-id-col`` is given, ingest tries common column names
 (``TARGETID``, ``SOURCE_ID``, …) or generates sequential ``_source_id`` values.
 
 For surveys where the join key spans multiple catalog columns (6dF ``targetname`` +
-``obsid_v`` + ``TITLE_V``), pass a comma-separated spec:
-``--link-id-col targetname,obsid_v,TITLE_V``.  All columns are preserved;
-``_source_id`` is the stable hash of ``targetname|obsid_v|TITLE_V`` (same string
-built from FITS ``TARGET`` and ``OBSID_V`` on the VR header plus ``TITLE_V`` on
-the paired V extension).
+``obsid_v`` + ``obsid_r``), pass a comma-separated spec:
+``--link-id-col targetname,obsid_v,obsid_r``.  All columns are preserved;
+``_source_id`` is the stable hash of ``targetname|obsid_v|obsid_r`` (same string
+built from spectrum filename stem + FITS ``OBSID_V`` on the V header and
+``OBSID_R`` on the R header).
 
 **Reassign catalog link column** (recompute ``_source_id`` from another column without FITS re-ingest; catalog Parquet only):
 
@@ -628,7 +628,7 @@ Quick index of all supported `--fmt` values, the **catalog** ingest flag require
 | `sdss_spplate` | via sidecar / plate header | `FIBERID` → specObjID | `spPlate-PLATE-MJD.fits`; see spPlate section |
 | `generic` | `--link-id-col` or auto | Header keyword chain | Any 1-D FITS with spectral WCS |
 | `2df` | `SPFILE,FIBRE` (+ `--allow-incomplete-link-id` if some rows have no filename) | Header `SPFILE` \| `FIBRE` per SPECTRUM HDU | `data/389442.fits` |
-| `6df` | `targetname,obsid_v,TITLE_V` | Header `TARGET`, `OBSID_V`, `TITLE_V` per VR HDU | `data/g2302140-251235.fits` |
+| `6df` | `targetname,obsid_v,obsid_r` | Filename stem + V header `OBSID_V` + R header `OBSID_R` per V/R/VR triple | `data/g2302140-251235.fits` |
 | `gama` | `SPECID` | Primary header `SPECID` | `data/G23_Y7_015_265.fit` |
 | `ozdes` | filename column | Basename (stem) | `OzDES_*.fits` |
 | `vandels` | filename column | Basename | `sc_*.fits` (PRIMARY + NOISE) |
@@ -657,7 +657,7 @@ on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
 | Stage | ``--link-id-col`` | ``--ra-col`` / ``--dec-col`` |
 |-------|---------------------|------------------------------|
 | Catalog ingest | Required for production (native column → ``_source_id``) | Survey sky columns in degrees |
-| Spectrum ingest (2df, 6df) | **Not used** — reader reads header keys (`SPFILE`/`FIBRE`, `TARGET`/`OBSID_V`/`TITLE_V`) | **Not used** — reader reads `OBSRA`/`OBSDEC` from header |
+| Spectrum ingest (2df, 6df) | **Not used** — reader resolves IDs internally (`SPFILE`/`FIBRE`; filename stem + `OBSID_V`/`OBSID_R`) | **Not used** — reader reads `OBSRA`/`OBSDEC` from header |
 | Spectrum ingest (OzDES, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) | **Not used** — reader hashes the filename | **Not used** — reader reads sky from header |
 | Spectrum ingest (SDSS, DESI, generic, spPlate) | Header keyword / fibermap column | FITS header keywords |
 | Catalog patch after spectrum ingest | **Not used** — joins on ``_source_id`` | — |
@@ -941,29 +941,27 @@ immediately preceding V extension for the link key.  VR rows:
 ``[flux, variance, sky, wavelength?]``. If the 4th row (explicit wavelength)
 exists it is preferred; otherwise wavelength is reconstructed from WCS header
 keywords.  Some targets have multiple VR versions in one file (same
-``targetname`` and ``obsid_v``, disambiguated by ``TITLE_V`` on the paired V
-extension).
+filename stem target, disambiguated by paired ``OBSID_V``/``OBSID_R``).
 
-**Link key:** ``TARGET`` and ``OBSID_V`` from the VR header plus ``TITLE_V`` from
-the paired V header → ``target|obsid_v|title_v`` (e.g.
-``g2302140-251235|N-00023|2m2308m2500p1c1``).  Ingest the catalog with a
+**Link key:** filename stem (target) plus ``OBSID_V`` from the paired V header
+and ``OBSID_R`` from the paired R header → ``target|obsid_v|obsid_r`` (e.g.
+``g2302140-251235|UK-SCHM.20011021.121407|UK-SCHM.20011021.104720``).  Ingest the catalog with a
 **composite** source column so ``_source_id`` matches on both sides:
 
 ```bash
 dl-ingest-catalog 6df_catalog.fits --survey SIXDF_DR3 \
-  --link-id-col targetname,obsid_v,TITLE_V --ra-col ra --dec-col dec
+  --link-id-col targetname,obsid_v,obsid_r --ra-col ra --dec-col dec
 ```
 
 Spectrum ingest resolves the same composite label from FITS headers internally
-(no sidecar lookup like SDSS spPlate).  When ``OBSID_V`` is absent, ``TARGET`` and
-``TITLE_V`` are still used when present.  When ``TARGET`` is missing, the filename
-stem is used as a fallback.
+(no sidecar lookup like SDSS spPlate). ``targetname`` must match the spectrum
+filename stem.
 
 To recompute catalog IDs for this key shape:
 
 ```bash
 dl-repair-catalog-metadata --survey SIXDF_DR3 \
-  --rebuild-link-id targetname,obsid_v,TITLE_V
+  --rebuild-link-id targetname,obsid_v,obsid_r
 dl-rebuild-catalog-indices --survey SIXDF_DR3 --kind spectrum
 ```
 
@@ -1605,7 +1603,7 @@ examples/
 data/                               # committed FITS fixtures for tests and smoke runs
   389442.fits                       # 2dFGRS spectrum (2 SPECTRUM extensions; SPFILE+FIBRE link)
   154714.fits / 161216.fits         # additional 2dFGRS spectra
-  g2302140-251235.fits              # 6dFGS target file (VR extensions; TARGET+OBSID_V+TITLE_V)
+  g2302140-251235.fits              # 6dFGS target file (VR extensions; stem+OBSID_V+OBSID_R)
   g1437140-385507.fits / g2259418-254505.fits  # additional 6dFGS files
   G23_Y7_015_265.fit                # GAMA spectrum (SPECID header key)
   OzDES-DR2_00001.fits              # OzDES spectrum (filename link)
