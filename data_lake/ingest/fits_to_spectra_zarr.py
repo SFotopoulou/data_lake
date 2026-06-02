@@ -1920,9 +1920,15 @@ def _2df_link_label_from_header(
 
 
 def _2df_sky_from_headers(shdr: fits.Header, phdr: fits.Header) -> tuple[float, float]:
-    """Per-observation sky position, falling back to PRIMARY ``RA``/``DEC``."""
-    ra = shdr.get("OBSRA", phdr.get("RA", 0.0))
-    dec = shdr.get("OBSDEC", phdr.get("DEC", 0.0))
+    """Per-observation sky position with 2dF J2000-first fallback chain.
+
+    Priority:
+    1) Spectrum header ``SRRA``/``SRDEC`` (preferred J2000 fields)
+    2) Spectrum header ``OBSRA``/``OBSDEC``
+    3) PRIMARY header ``RA``/``DEC``
+    """
+    ra = shdr.get("SRRA", shdr.get("OBSRA", phdr.get("RA", 0.0)))
+    dec = shdr.get("SRDEC", shdr.get("OBSDEC", phdr.get("DEC", 0.0)))
     return float(ra), float(dec)
 
 
