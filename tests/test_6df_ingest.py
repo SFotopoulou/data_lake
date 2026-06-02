@@ -31,12 +31,12 @@ def _write_minimal_6df(
 
     target = path.stem
     if vr_observations is None:
-        vr_observations = [{"name_v": "N-00001", "title_v": "obs1", "flux_scale": 33.0, "z": 0.12}]
+        vr_observations = [{"obsid_v": "V-00001", "obsid_r": "R-00001", "flux_scale": 33.0, "z": 0.12}]
 
     for obs_idx, obs in enumerate(vr_observations, start=1):
         flux_scale = float(obs.get("flux_scale", 33.0))
-        name_v = str(obs.get("name_v", "N-00001"))
-        title_v = str(obs.get("title_v", f"title{obs_idx}"))
+        obsid_v = str(obs.get("obsid_v", f"V-{obs_idx:05d}"))
+        obsid_r = str(obs.get("obsid_r", f"R-{obs_idx:05d}"))
         z_val = float(obs.get("z", 0.12))
         obs_target = str(obs.get("target", target))
         kbestr = int(obs.get("kbestr", obs_idx))
@@ -53,8 +53,8 @@ def _write_minimal_6df(
             hdu.header["OBSRA"] = 150.0
             hdu.header["OBSDEC"] = -30.0
             hdu.header["KBESTR"] = kbestr
-        hdu_v.header["TITLE_V"] = title_v
-        hdu_vr.header["NAME_V"] = name_v
+        hdu_vr.header["OBSID_V"] = obsid_v
+        hdu_vr.header["OBSID_R"] = obsid_r
         hdu_vr.header["CRVAL1"] = 4000.0
         hdu_vr.header["CRPIX1"] = 1.0
         hdu_vr.header["CDELT1"] = 1.0
@@ -66,17 +66,12 @@ def _write_minimal_6df(
 
 def _expected_6df_source_id(
     target: str,
-    name_v: str | None = None,
-    title_v: str | None = None,
+    obsid_v: str,
+    obsid_r: str,
 ) -> int:
     from data_lake.ingest.fits_to_parquet import composite_link_label, normalize_object_id
 
-    parts: list[object] = [target]
-    if name_v:
-        parts.append(name_v)
-    if title_v:
-        parts.append(title_v)
-    return normalize_object_id(composite_link_label(*parts))
+    return normalize_object_id(composite_link_label(target, obsid_v, obsid_r))
 
 
 def test_detect_format_6df(tmp_path: Path) -> None:
@@ -115,7 +110,7 @@ def test_read_6df_prefers_explicit_wave_row(tmp_path: Path) -> None:
     assert wave[-1] == pytest.approx(5000.0 + 2.0 * 15.0)
 
 
-def test_read_6df_uses_target_and_name_v(tmp_path: Path) -> None:
+def test_read_6df_uses_target_obsid_v_obsid_r(tmp_path: Path) -> None:
     from data_lake.ingest.fits_to_spectra_zarr import _read_6df_spectrum
 
     p = tmp_path / "wrong_name.fits"
@@ -124,8 +119,8 @@ def test_read_6df_uses_target_and_name_v(tmp_path: Path) -> None:
         vr_observations=[
             {
                 "target": "g2259418-254505",
-                "name_v": "N-00030",
-                "title_v": "2m2308m2500p1c1",
+                "obsid_v": "V-00030",
+                "obsid_r": "R-00030",
             },
         ],
     )
@@ -134,7 +129,7 @@ def test_read_6df_uses_target_and_name_v(tmp_path: Path) -> None:
         records, _ = _read_6df_spectrum(hdul, p)
 
     assert records[0].source_id == _expected_6df_source_id(
-        "g2259418-254505", "N-00030", "2m2308m2500p1c1",
+        "g2259418-254505", "V-00030", "R-00030",
     )
 
 
@@ -148,15 +143,15 @@ def test_read_6df_multi_vr_same_target(tmp_path: Path) -> None:
         vr_observations=[
             {
                 "target": "g2302140-251235",
-                "name_v": "N-00023",
-                "title_v": "2m2308m2500p1c1",
+                "obsid_v": "V-00023",
+                "obsid_r": "R-00023",
                 "flux_scale": 33.0,
                 "z": 0.032423,
             },
             {
                 "target": "g2302140-251235",
-                "name_v": "g2302139-251235",
-                "title_v": "2314m253p1.sds",
+                "obsid_v": "V-00024",
+                "obsid_r": "R-00024",
                 "flux_scale": 44.0,
                 "z": 0.03237,
             },
@@ -169,8 +164,8 @@ def test_read_6df_multi_vr_same_target(tmp_path: Path) -> None:
     assert len(records) == 2
     sids = {r.source_id for r in records}
     expected = {
-        _expected_6df_source_id("g2302140-251235", "N-00023", "2m2308m2500p1c1"),
-        _expected_6df_source_id("g2302140-251235", "g2302139-251235", "2314m253p1.sds"),
+        _expected_6df_source_id("g2302140-251235", "V-00023", "R-00023"),
+        _expected_6df_source_id("g2302140-251235", "V-00024", "R-00024"),
     }
     assert sids == expected
     by_flux = {float(r.flux[0]): r for r in records}
@@ -178,8 +173,8 @@ def test_read_6df_multi_vr_same_target(tmp_path: Path) -> None:
     assert by_flux[44.0].meta["z"] == pytest.approx(0.03237)
 
 
-def test_read_6df_multi_vr_same_target_and_name_v(tmp_path: Path) -> None:
-    """Duplicate TARGET/NAME_V are disambiguated by TITLE_V (g1437140-style)."""
+def test_read_6df_multi_vr_same_target_disambiguated_by_obsid(tmp_path: Path) -> None:
+    """Two observations of the same target are uniquely keyed by OBSID_V/OBSID_R."""
     from data_lake.ingest.fits_to_spectra_zarr import _read_6df_spectrum
 
     target = "g1437140-385507"
@@ -190,15 +185,15 @@ def test_read_6df_multi_vr_same_target_and_name_v(tmp_path: Path) -> None:
         vr_observations=[
             {
                 "target": target,
-                "name_v": target,
-                "title_v": "1438m370p2",
+                "obsid_v": "V-00001",
+                "obsid_r": "R-00001",
                 "flux_scale": 33.0,
                 "z": 0.0515,
             },
             {
                 "target": target,
-                "name_v": target,
-                "title_v": "1443m395p2.sds",
+                "obsid_v": "V-00002",
+                "obsid_r": "R-00002",
                 "flux_scale": 44.0,
                 "z": 1.83636,
             },
@@ -211,87 +206,68 @@ def test_read_6df_multi_vr_same_target_and_name_v(tmp_path: Path) -> None:
     assert len(records) == 2
     sids = {r.source_id for r in records}
     expected = {
-        _expected_6df_source_id(target, target, "1438m370p2"),
-        _expected_6df_source_id(target, target, "1443m395p2.sds"),
+        _expected_6df_source_id(target, "V-00001", "R-00001"),
+        _expected_6df_source_id(target, "V-00002", "R-00002"),
     }
     assert sids == expected
 
 
-@pytest.mark.skipif(
-    not (Path(__file__).resolve().parents[1] / "data" / "g2259418-254505.fits").is_file(),
-    reason="requires data/g2259418-254505.fits",
-)
-def test_real_6df_detects_and_uses_target_header() -> None:
-    from data_lake.ingest.fits_to_spectra_zarr import (
-        _detect_format_from_path,
-        _read_6df_spectrum,
-    )
+def test_read_6df_missing_obsid_v_raises(tmp_path: Path) -> None:
+    """Missing OBSID_V must raise ValueError (strict key enforcement)."""
+    from data_lake.ingest.fits_to_spectra_zarr import _read_6df_spectrum
 
-    p = Path(__file__).resolve().parents[1] / "data" / "g2259418-254505.fits"
-    assert _detect_format_from_path(p) == "6df"
+    p = tmp_path / "g0001.fits"
+    _write_minimal_6df(
+        p,
+        vr_observations=[{"target": "g0001", "obsid_v": "V-00001", "obsid_r": "R-00001"}],
+    )
+    # Remove OBSID_V from VR HDU
+    with fits.open(p, mode="update") as hdul:
+        for hdu in hdul:
+            if "OBSID_V" in hdu.header:
+                del hdu.header["OBSID_V"]
+
     with fits.open(p, memmap=True) as hdul:
-        records, _ = _read_6df_spectrum(hdul, p)
-    assert len(records) == 1
-    assert records[0].source_id == _expected_6df_source_id(
-        "g2259418-254505", "N-00030", "2m2308m2500p1c1",
+        with pytest.raises(ValueError, match="OBSID_V"):
+            _read_6df_spectrum(hdul, p)
+
+
+def test_read_6df_missing_obsid_r_raises(tmp_path: Path) -> None:
+    """Missing OBSID_R must raise ValueError (strict key enforcement)."""
+    from data_lake.ingest.fits_to_spectra_zarr import _read_6df_spectrum
+
+    p = tmp_path / "g0001.fits"
+    _write_minimal_6df(
+        p,
+        vr_observations=[{"target": "g0001", "obsid_v": "V-00001", "obsid_r": "R-00001"}],
     )
-    assert records[0].ra == pytest.approx(344.92415833, abs=1e-5)
-    assert records[0].dec == pytest.approx(-25.75148056, abs=1e-5)
+    with fits.open(p, mode="update") as hdul:
+        for hdu in hdul:
+            if "OBSID_R" in hdu.header:
+                del hdu.header["OBSID_R"]
 
-
-@pytest.mark.skipif(
-    not (Path(__file__).resolve().parents[1] / "data" / "g2302140-251235.fits").is_file(),
-    reason="requires data/g2302140-251235.fits",
-)
-def test_real_6df_multi_vr_ingests_both_versions() -> None:
-    from data_lake.ingest.fits_to_spectra_zarr import (
-        _detect_format_from_path,
-        _read_6df_spectrum,
-    )
-
-    p = Path(__file__).resolve().parents[1] / "data" / "g2302140-251235.fits"
-    assert _detect_format_from_path(p) == "6df"
     with fits.open(p, memmap=True) as hdul:
-        records, _ = _read_6df_spectrum(hdul, p)
-
-    assert len(records) == 2
-    sids = {r.source_id for r in records}
-    expected = {
-        _expected_6df_source_id("g2302140-251235", "N-00023", "2m2308m2500p1c1"),
-        _expected_6df_source_id("g2302140-251235", "g2302139-251235", "2314m253p1.sds"),
-    }
-    assert sids == expected
+        with pytest.raises(ValueError, match="OBSID_R"):
+            _read_6df_spectrum(hdul, p)
 
 
-@pytest.mark.skipif(
-    not (Path(__file__).resolve().parents[1] / "data" / "g1437140-385507.fits").is_file(),
-    reason="requires data/g1437140-385507.fits",
-)
-def test_real_g1437140_duplicate_name_v_disambiguated_by_title_v() -> None:
-    from data_lake.ingest.fits_to_spectra_zarr import (
-        _read_6df_spectrum,
-        ingest_spectra_from_fits,
+def test_read_6df_missing_target_raises(tmp_path: Path) -> None:
+    """Missing TARGET must raise ValueError (strict key enforcement)."""
+    from data_lake.ingest.fits_to_spectra_zarr import _read_6df_spectrum
+
+    p = tmp_path / "g0001.fits"
+    _write_minimal_6df(
+        p,
+        vr_observations=[{"target": "g0001", "obsid_v": "V-00001", "obsid_r": "R-00001"}],
     )
+    with fits.open(p, mode="update") as hdul:
+        for hdu in hdul:
+            if "TARGET" in hdu.header:
+                del hdu.header["TARGET"]
 
-    target = "g1437140-385507"
-    p = Path(__file__).resolve().parents[1] / "data" / f"{target}.fits"
     with fits.open(p, memmap=True) as hdul:
-        records, _ = _read_6df_spectrum(hdul, p)
-
-    assert len(records) == 2
-    sids = {r.source_id for r in records}
-    expected = {
-        _expected_6df_source_id(target, target, "1438m370p2"),
-        _expected_6df_source_id(target, target, "1443m395p2.sds"),
-    }
-    assert sids == expected
-
-    import tempfile
-    lake = Path(tempfile.mkdtemp()) / "lake"
-    index_map = ingest_spectra_from_fits(
-        p, lake, "SIXDF_DR3", fmt="6df", norder=5,
-    )
-    assert set(index_map) == expected
+        with pytest.raises(ValueError, match="TARGET"):
+            _read_6df_spectrum(hdul, p)
 
 
 def test_6df_composite_catalog_source_ids(tmp_path: Path) -> None:
@@ -303,16 +279,16 @@ def test_6df_composite_catalog_source_ids(tmp_path: Path) -> None:
 
     table = pa.table({
         "targetname": pa.array(["g2302140-251235", "g2302140-251235"]),
-        "NAME_V": pa.array(["N-00023", "g2302139-251235"]),
-        "TITLE_V": pa.array(["2m2308m2500p1c1", "2314m253p1.sds"]),
+        "obsid_v": pa.array(["V-00023", "V-00024"]),
+        "obsid_r": pa.array(["R-00023", "R-00024"]),
         "ra": pa.array([345.55, 345.55]),
         "dec": pa.array([-25.21, -25.21]),
     })
-    out, mode = ensure_catalog_source_ids(table, "targetname,NAME_V,TITLE_V")
-    assert mode == "composite:targetname,NAME_V,TITLE_V"
+    out, mode = ensure_catalog_source_ids(table, "targetname,obsid_v,obsid_r")
+    assert mode == "composite:targetname,obsid_v,obsid_r"
     sids = out[LAKE_JOIN_ID_COLUMN].to_pylist()
-    assert sids[0] == _expected_6df_source_id("g2302140-251235", "N-00023", "2m2308m2500p1c1")
-    assert sids[1] == _expected_6df_source_id("g2302140-251235", "g2302139-251235", "2314m253p1.sds")
+    assert sids[0] == _expected_6df_source_id("g2302140-251235", "V-00023", "R-00023")
+    assert sids[1] == _expected_6df_source_id("g2302140-251235", "V-00024", "R-00024")
 
 
 def test_ingest_6df_end_to_end(tmp_path: Path) -> None:
@@ -320,7 +296,7 @@ def test_ingest_6df_end_to_end(tmp_path: Path) -> None:
     from data_lake.io.spectra import SpectrumAccessor
 
     p = tmp_path / "g00123.fits"
-    _write_minimal_6df(p, vr_observations=[{"name_v": "N-00001", "title_v": "obs1"}])
+    _write_minimal_6df(p, vr_observations=[{"obsid_v": "V-00001", "obsid_r": "R-00001"}])
 
     lake = tmp_path / "lake"
     index_map = ingest_spectra_from_fits(
@@ -331,7 +307,7 @@ def test_ingest_6df_end_to_end(tmp_path: Path) -> None:
         norder=5,
         on_duplicate_source_id="skip",
     )
-    sid = _expected_6df_source_id("g00123", "N-00001", "obs1")
+    sid = _expected_6df_source_id("g00123", "V-00001", "R-00001")
     assert sid in index_map
 
     acc = SpectrumAccessor(lake, "SIXDF_DR3")

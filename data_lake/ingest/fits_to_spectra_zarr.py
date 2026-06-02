@@ -12,7 +12,7 @@ Supported input formats
   ``desispec.coaddition.coadd_cameras`` for IVAR-weighted camera combination of
   the B/R/Z arms onto a single monotonic BRZ wavelength grid.
   Requires ``pip install 'data-lake[desi]'`` (``desispec>=0.62``).
-* **6dFGS**     multi-extension target FITS – ingests every combined VR spectrum extension.
+* **6dFGS**     multi-extension target FITS – ingests every combined VR spectrum extension (link: TARGET|OBSID_V|OBSID_R).
 * **GAMA**      stacked AAOMEGA-2dF PRIMARY image ``(n_row, n_pix)`` with ``ROW1=Spectrum``,
   ``ROW2=Error`` (1-σ), optional sky rows; ``SPECID`` in the primary header.
 * **Generic**   spectral WCS FITS – 1-D or multi-spectra image HDU with CTYPE1=WAVE*.
@@ -2138,34 +2138,31 @@ def _6df_link_label_from_triple(
 ) -> tuple[str, bool]:
     """Resolve the catalog link label for a paired 6dFGS V/VR spectrum block.
 
-    Uses ``TARGET`` and ``NAME_V`` from the VR header and ``TITLE_V`` from the
-    paired V header: ``target|name_v|title_v``.  Returns ``(label, used_fallback)``
-    where *used_fallback* is True when the filename stem was used because
-    ``TARGET`` was absent.
+    Builds ``target|obsid_v|obsid_r`` from the VR extension headers
+    (``TARGET``, ``OBSID_V``, ``OBSID_R``), matching catalog ingest with
+    ``--link-id-col targetname,obsid_v,obsid_r``.
+
+    Raises ``ValueError`` when any of the three required header keys is absent
+    or blank on both the VR and PRIMARY headers.
+
+    Returns ``(label, used_fallback)`` where *used_fallback* is always False
+    (kept for API compatibility; fallback to filename stem is no longer supported).
     """
     from data_lake.ingest.fits_to_parquet import composite_link_label
 
     target = _6df_header_text(vr_hdr, phdr, "TARGET", "TARGETNAME")
-    name_v = _6df_header_text(vr_hdr, phdr, "NAME_V")
-    title_v = _6df_header_text_single(v_hdr, "TITLE_V")
+    obsid_v = _6df_header_text(vr_hdr, phdr, "OBSID_V")
+    obsid_r = _6df_header_text(vr_hdr, phdr, "OBSID_R")
 
-    parts: list[str] = []
-    if target:
-        parts.append(target)
-    if name_v:
-        parts.append(name_v)
-    if title_v:
-        parts.append(title_v)
-    elif target or name_v:
-        log.warning(
-            "6dF: %s VR block missing TITLE_V on paired V header; link key omits "
-            "title segment (catalog --link-id-col targetname,NAME_V,TITLE_V)",
-            source_path.name,
+    missing = [k for k, v in [("TARGET", target), ("OBSID_V", obsid_v), ("OBSID_R", obsid_r)] if not v]
+    if missing:
+        raise ValueError(
+            f"6dF: {source_path.name} VR HDU is missing required header key(s) "
+            f"{missing!r}; cannot build link label "
+            f"(catalog --link-id-col targetname,obsid_v,obsid_r)"
         )
 
-    if parts:
-        return composite_link_label(*parts), target is None
-    return source_path.stem, True
+    return composite_link_label(target, obsid_v, obsid_r), False
 
 
 def _looks_like_sky_degrees(ra: float, dec: float) -> bool:
@@ -2329,17 +2326,9 @@ def _read_6df_vr_record(
         )
 
     ra, dec = _6df_sky_from_headers(vhdr, phdr)
-    link_label, used_fallback = _6df_link_label_from_triple(
+    link_label, _ = _6df_link_label_from_triple(
         v_hdr, vhdr, phdr, source_path,
     )
-    if used_fallback:
-        log.warning(
-            "6dF: %s VR HDU %r missing TARGET; using filename stem %r as link key "
-            "(catalog --link-id-col targetname,NAME_V,TITLE_V)",
-            source_path.name,
-            vr_hdu.name,
-            source_path.stem,
-        )
     source_id = normalize_object_id(link_label)
     data = np.asarray(vr_hdu.data, dtype=np.float64)
     if data.ndim != 2:
@@ -2401,10 +2390,12 @@ def _read_6df_spectrum(
     """Read a 6dFGS FITS file, ingesting every combined VR extension.
 
     Each ``(SPECTRUM V, SPECTRUM R, SPECTRUM VR)`` block yields one spectrum
-    row from the VR HDU.  ``source_id`` is built from VR ``TARGET`` and
-    ``NAME_V`` plus ``TITLE_V`` on the paired V extension
-    (``target|name_v|title_v``), matching catalog ingest with
-    ``--link-id-col targetname,NAME_V,TITLE_V``.
+    row from the VR HDU.  ``source_id`` is built from VR ``TARGET``,
+    ``OBSID_V``, and ``OBSID_R`` (``target|obsid_v|obsid_r``), matching
+    catalog ingest with ``--link-id-col targetname,obsid_v,obsid_r``.
+
+    Raises ``ValueError`` when a VR HDU is missing any of the three required
+    header keys.
 
     Sky coordinates are taken from each VR extension's ``OBSRA``/``OBSDEC``
     (degrees), with fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or
