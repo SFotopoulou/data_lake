@@ -12,7 +12,7 @@ Supported input formats
   ``desispec.coaddition.coadd_cameras`` for IVAR-weighted camera combination of
   the B/R/Z arms onto a single monotonic BRZ wavelength grid.
   Requires ``pip install 'data-lake[desi]'`` (``desispec>=0.62``).
-* **6dFGS**     multi-extension target FITS – ingests every combined VR spectrum extension (link: TARGET|OBSID_V|OBSID_R).
+* **6dFGS**     multi-extension target FITS – ingests every combined VR spectrum extension.
 * **GAMA**      stacked AAOMEGA-2dF PRIMARY image ``(n_row, n_pix)`` with ``ROW1=Spectrum``,
   ``ROW2=Error`` (1-σ), optional sky rows; ``SPECID`` in the primary header.
 * **Generic**   spectral WCS FITS – 1-D or multi-spectra image HDU with CTYPE1=WAVE*.
@@ -2132,37 +2132,40 @@ def _6df_warn_triple_header_mismatch(
 
 def _6df_link_label_from_triple(
     v_hdr: fits.Header,
+    r_hdr: fits.Header,
     vr_hdr: fits.Header,
     phdr: fits.Header,
     source_path: Path,
 ) -> tuple[str, bool]:
     """Resolve the catalog link label for a paired 6dFGS V/VR spectrum block.
 
-    Builds ``target|obsid_v|obsid_r`` from the VR extension headers
-    (``TARGET``, ``OBSID_V``, ``OBSID_R``), matching catalog ingest with
-    ``--link-id-col targetname,obsid_v,obsid_r``.
-
-    Raises ``ValueError`` when any of the three required header keys is absent
-    or blank on both the VR and PRIMARY headers.
-
-    Returns ``(label, used_fallback)`` where *used_fallback* is always False
-    (kept for API compatibility; fallback to filename stem is no longer supported).
+    Uses filename stem as ``TARGET`` plus per-observation IDs from paired V/R headers:
+    ``target|obsid_v|obsid_r``. Returns ``(label, used_fallback)`` where
+    *used_fallback* is always False for normal triples.
     """
     from data_lake.ingest.fits_to_parquet import composite_link_label
 
-    target = _6df_header_text(vr_hdr, phdr, "TARGET", "TARGETNAME")
-    obsid_v = _6df_header_text(vr_hdr, phdr, "OBSID_V")
-    obsid_r = _6df_header_text(vr_hdr, phdr, "OBSID_R")
+    target = source_path.stem
+    obsid_v = _6df_header_text_single(v_hdr, "OBSID_V")
+    obsid_r = _6df_header_text_single(r_hdr, "OBSID_R")
 
-    missing = [k for k, v in [("TARGET", target), ("OBSID_V", obsid_v), ("OBSID_R", obsid_r)] if not v]
-    if missing:
-        raise ValueError(
-            f"6dF: {source_path.name} VR HDU is missing required header key(s) "
-            f"{missing!r}; cannot build link label "
-            f"(catalog --link-id-col targetname,obsid_v,obsid_r)"
+    parts: list[str] = []
+    if target:
+        parts.append(target)
+    if obsid_v:
+        parts.append(obsid_v)
+    if obsid_r:
+        parts.append(obsid_r)
+    elif target or obsid_v:
+        log.warning(
+            "6dF: %s VR block missing OBSID_R on paired R header; link key omits "
+            "R segment (catalog --link-id-col targetname,obsid_v,obsid_r)",
+            source_path.name,
         )
 
-    return composite_link_label(target, obsid_v, obsid_r), False
+    if parts:
+        return composite_link_label(*parts), False
+    return source_path.stem, True
 
 
 def _looks_like_sky_degrees(ra: float, dec: float) -> bool:
@@ -2305,6 +2308,7 @@ def _6df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
 
 def _read_6df_vr_record(
     v_hdu: fits.ImageHDU,
+    r_hdu: fits.ImageHDU,
     vr_hdu: fits.ImageHDU,
     phdr: fits.Header,
     source_path: Path,
@@ -2315,6 +2319,7 @@ def _read_6df_vr_record(
     from data_lake.ingest.fits_to_parquet import normalize_object_id
 
     v_hdr = v_hdu.header
+    r_hdr = r_hdu.header
     vhdr = vr_hdu.header
     if triple_indices is not None:
         _6df_warn_triple_header_mismatch(
@@ -2327,7 +2332,7 @@ def _read_6df_vr_record(
 
     ra, dec = _6df_sky_from_headers(vhdr, phdr)
     link_label, _ = _6df_link_label_from_triple(
-        v_hdr, vhdr, phdr, source_path,
+        v_hdr, r_hdr, vhdr, phdr, source_path,
     )
     source_id = normalize_object_id(link_label)
     data = np.asarray(vr_hdu.data, dtype=np.float64)
@@ -2390,12 +2395,10 @@ def _read_6df_spectrum(
     """Read a 6dFGS FITS file, ingesting every combined VR extension.
 
     Each ``(SPECTRUM V, SPECTRUM R, SPECTRUM VR)`` block yields one spectrum
-    row from the VR HDU.  ``source_id`` is built from VR ``TARGET``,
-    ``OBSID_V``, and ``OBSID_R`` (``target|obsid_v|obsid_r``), matching
-    catalog ingest with ``--link-id-col targetname,obsid_v,obsid_r``.
-
-    Raises ``ValueError`` when a VR HDU is missing any of the three required
-    header keys.
+    row from the VR HDU.  ``source_id`` is built from filename stem (TARGET) and
+    ``OBSID_V``/``OBSID_R`` on paired V/R extensions
+    (``target|obsid_v|obsid_r``), matching catalog ingest with
+    ``--link-id-col targetname,obsid_v,obsid_r``.
 
     Sky coordinates are taken from each VR extension's ``OBSRA``/``OBSDEC``
     (degrees), with fallbacks to ``RA``/``DEC``, PRIMARY image WCS, or
@@ -2407,9 +2410,9 @@ def _read_6df_spectrum(
     wcs_attrs: dict = {}
     seen_ids: dict[int, str] = {}
 
-    for v_hdu, _, vr_hdu, indices in triples:
+    for v_hdu, r_hdu, vr_hdu, indices in triples:
         rec = _read_6df_vr_record(
-            v_hdu, vr_hdu, phdr, source_path, triple_indices=indices,
+            v_hdu, r_hdu, vr_hdu, phdr, source_path, triple_indices=indices,
         )
         if rec.source_id in seen_ids:
             raise ValueError(
