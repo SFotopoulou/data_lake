@@ -98,6 +98,7 @@ from data_lake.ingest.fits_to_parquet import (
     is_valid_sky_position,
     object_id_from_fits_header,
     sky_from_fits_header,
+    sky_from_header_chain,
 )
 from data_lake.ingest.zarr_ids import create_zarr_join_array, zarr_join_array
 
@@ -137,12 +138,17 @@ _DEFAULT_MASK_DTYPE = np.uint8
 # Canonical metadata lives in the Parquet catalog; this mirrors only the most
 # commonly needed scalars so the tile is self-contained for offline use.
 _META_DTYPE = np.dtype([
-    ("z",        np.float32),   # spectroscopic redshift
-    ("z_err",    np.float32),   # redshift error
-    ("snr",      np.float32),   # median S/N per pixel
-    ("exptime",  np.float32),   # total exposure time [s]
-    ("R",        np.float32),   # spectral resolution R = λ/Δλ (representative)
-    ("instr",    "S16"),        # instrument identifier (ASCII, <=16 chars)
+    ("z",           np.float32),   # spectroscopic redshift
+    ("z_err",       np.float32),   # redshift error
+    ("snr",         np.float32),   # median S/N per pixel
+    ("exptime",     np.float32),   # total exposure time [s]
+    ("R",           np.float32),   # spectral resolution R = λ/Δλ (representative)
+    ("instr",       "S16"),        # instrument identifier (ASCII, <=16 chars)
+    ("ra_key",      "S32"),        # header keyword or column used for RA
+    ("dec_key",     "S32"),        # header keyword or column used for Dec
+    ("ra",          np.float32),   # sky RA [deg] at ingest
+    ("dec",         np.float32),   # sky Dec [deg] at ingest
+    ("source_file", "S128"),       # basename of the 1-D FITS file
 ])
 
 # Bit-flag definitions stored in spectrum_info.json
@@ -447,13 +453,68 @@ def _fits_bintable_column(
     )
 
 
+def _fits_bintable_column_name(data, *candidates: str) -> str:
+    """Return the actual column name used from a FITS BINTABLE recarray."""
+    names = data.dtype.names
+    if not names:
+        raise KeyError("FITS BINTABLE has no named columns")
+    by_lower = {n.lower(): n for n in names}
+    for cand in candidates:
+        key = by_lower.get(cand.lower())
+        if key is not None:
+            return key
+    raise KeyError(
+        f"None of {candidates!r} in FITS BINTABLE; available: {list(names)}"
+    )
+
+
 def _fits_header_keyword(header, name: str) -> object | None:
     """Return a primary-header keyword value (case-insensitive), or None."""
-    target = name.upper()
-    for key in header.keys():
-        if key and str(key).upper() == target:
-            return header[key]
-    return None
+    from data_lake.ingest.fits_to_parquet import fits_header_keyword
+
+    return fits_header_keyword(header, name)
+
+
+def _spectrum_sky_meta(
+    source_path: Path | str,
+    ra: float,
+    dec: float,
+    ra_key: str,
+    dec_key: str,
+    base_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build per-spectrum meta dict including sky provenance and source FITS name."""
+    meta = dict(base_meta or {})
+    meta["ra_key"] = str(ra_key)[:32]
+    meta["dec_key"] = str(dec_key)[:32]
+    meta["ra"] = float(ra)
+    meta["dec"] = float(dec)
+    meta["source_file"] = Path(source_path).name[:128]
+    return meta
+
+
+def _fibermap_sky_row(
+    row,
+    colnames: list[str],
+    pairs: tuple[tuple[str, str], ...],
+    *,
+    row_index: int,
+    context: str,
+) -> tuple[float, float, str, str]:
+    """Return RA/Dec and column names from a DESI fibermap row."""
+    colset = {c.upper() for c in colnames}
+    for ra_col, dec_col in pairs:
+        if ra_col.upper() in colset and dec_col.upper() in colset:
+            ra_key = next(c for c in colnames if c.upper() == ra_col.upper())
+            dec_key = next(c for c in colnames if c.upper() == dec_col.upper())
+            ra = float(row[ra_key])
+            dec = float(row[dec_key])
+            if is_valid_sky_position(ra, dec):
+                return ra, dec, ra_key, dec_key
+    raise KeyError(
+        f"{context}: fibermap row {row_index} missing sky columns; "
+        f"tried {pairs!r}; available: {colnames}"
+    )
 
 
 def _sdss_spall_hdu(hdul: fits.HDUList) -> fits.BinTableHDU | None:
@@ -539,6 +600,7 @@ def _read_sdss_boss(
     link_id_col: str | None = None,
     ra_col: str = "RA",
     dec_col: str = "DEC",
+    source_path: Path | None = None,
 ) -> tuple[list[SpectrumRecord], dict]:
     """
     Read an SDSS/BOSS spec-*.fits file.
@@ -566,20 +628,33 @@ def _read_sdss_boss(
 
     # Object-level header
     phdr = hdul[0].header
-    ra, dec = sky_from_fits_header(phdr, ra_col, dec_col)
-    if ra_col not in phdr and "PLUG_RA" in phdr:
-        ra = float(phdr["PLUG_RA"])
-    if dec_col not in phdr and "PLUG_DEC" in phdr:
-        dec = float(phdr["PLUG_DEC"])
+    ctx = str(source_path or "SDSS BOSS")
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        phdr,
+        pairs=(
+            (ra_col, dec_col),
+            ("PLUG_RA", "PLUG_DEC"),
+            ("RA_TARG", "DEC_TARG"),
+            ("TARGET_RA", "TARGET_DEC"),
+        ),
+        context=ctx,
+    )
     source_id = _sdss_source_id(hdul, link_id_col)
-    meta = {
-        "z":       float(phdr.get("Z", 0.0)),
-        "z_err":   float(phdr.get("Z_ERR", 0.0)),
-        "snr":     float(phdr.get("SN_MEDIAN_ALL", 0.0)),
-        "exptime": float(phdr.get("EXPTIME", 0.0)),
-        "R":       float(phdr.get("SPEC_RES", 2000.0)),
-        "instr":   "SDSS",
-    }
+    meta = _spectrum_sky_meta(
+        source_path or Path("unknown.fits"),
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(phdr.get("Z", 0.0)),
+            "z_err": float(phdr.get("Z_ERR", 0.0)),
+            "snr": float(phdr.get("SN_MEDIAN_ALL", 0.0)),
+            "exptime": float(phdr.get("EXPTIME", 0.0)),
+            "R": float(phdr.get("SPEC_RES", 2000.0)),
+            "instr": "SDSS",
+        },
+    )
 
     wcs_attrs = {
         "ctype": "WAVE-LOG",
@@ -736,8 +811,10 @@ def _read_sdss_spplate(
 
     fdata = ftable.data
     fiber_col = _fits_bintable_column(fdata, "fiberid", "FIBERID")
-    ra_arr = _fits_bintable_column(fdata, ra_col.lower(), ra_col, "RA")
-    dec_arr = _fits_bintable_column(fdata, dec_col.lower(), dec_col, "DEC")
+    ra_key = _fits_bintable_column_name(fdata, ra_col.lower(), ra_col, "RA")
+    dec_key = _fits_bintable_column_name(fdata, dec_col.lower(), dec_col, "DEC")
+    ra_arr = np.asarray(fdata[ra_key], dtype=np.float64)
+    dec_arr = np.asarray(fdata[dec_key], dtype=np.float64)
 
     wcs_attrs = {
         "ctype": "WAVE-LOG",
@@ -783,17 +860,24 @@ def _read_sdss_spplate(
             m = np.asarray(mask_or[row_i], dtype=np.int32)
             mask = np.clip(mask | np.clip(m, 0, 255), 0, 255).astype(np.uint8)
 
-        meta = {
-            "z": 0.0,
-            "z_err": 0.0,
-            "snr": 0.0,
-            "exptime": float(phdr.get("EXPTIME", 0.0)),
-            "R": float(phdr.get("SPEC_RES", 2000.0)),
-            "instr": "SDSS",
-            "plate": plate,
-            "mjd": mjd,
-            "fiber": fiber_id,
-        }
+        meta = _spectrum_sky_meta(
+            path or Path("unknown.fits"),
+            ra,
+            dec,
+            ra_key,
+            dec_key,
+            {
+                "z": 0.0,
+                "z_err": 0.0,
+                "snr": 0.0,
+                "exptime": float(phdr.get("EXPTIME", 0.0)),
+                "R": float(phdr.get("SPEC_RES", 2000.0)),
+                "instr": "SDSS",
+                "plate": plate,
+                "mjd": mjd,
+                "fiber": fiber_id,
+            },
+        )
         records.append(SpectrumRecord(
             source_id=source_id,
             ra=ra,
@@ -893,6 +977,12 @@ def _read_desi_with_desispec(
 
     # Fibermap column names differ between pipeline releases; try in order.
     fmap = coadded.fibermap
+    _sky_pairs = (
+        ("TARGET_RA", "TARGET_DEC"),
+        ("RA_TARGET", "DEC_TARGET"),
+        ("FIBER_RA", "FIBER_DEC"),
+    )
+
     def _fmap_col(row, *names: str, default=0.0):
         for name in names:
             if name in fmap.colnames:
@@ -902,8 +992,13 @@ def _read_desi_with_desispec(
     records: list[SpectrumRecord] = []
     for i in range(n_spec):
         row = fmap[i]
-        ra  = float(_fmap_col(row, "TARGET_RA",  "RA_TARGET",  "FIBER_RA",  default=0.0))
-        dec = float(_fmap_col(row, "TARGET_DEC", "DEC_TARGET", "FIBER_DEC", default=0.0))
+        ra, dec, ra_key, dec_key = _fibermap_sky_row(
+            row,
+            list(fmap.colnames),
+            _sky_pairs,
+            row_index=i,
+            context=str(path),
+        )
         sid_key = link_id_col or "TARGETID"
         if sid_key not in fmap.colnames:
             raise KeyError(
@@ -913,14 +1008,26 @@ def _read_desi_with_desispec(
         from data_lake.ingest.fits_to_parquet import normalize_object_id
 
         source_id = normalize_object_id(row[sid_key])
-        meta = {
-            "z":       float(_fmap_col(row, "Z",    default=0.0)),
-            "z_err":   float(_fmap_col(row, "ZERR", default=0.0)),
-            "snr":     float(np.median(flux_brz[i] * np.sqrt(np.where(ivar_brz[i] > 0, ivar_brz[i], 0)))),
-            "exptime": float(_fmap_col(row, "EXPTIME", default=0.0)),
-            "R":       3000.0,
-            "instr":   "DESI",
-        }
+        meta = _spectrum_sky_meta(
+            path,
+            ra,
+            dec,
+            ra_key,
+            dec_key,
+            {
+                "z": float(_fmap_col(row, "Z", default=0.0)),
+                "z_err": float(_fmap_col(row, "ZERR", default=0.0)),
+                "snr": float(
+                    np.median(
+                        flux_brz[i]
+                        * np.sqrt(np.where(ivar_brz[i] > 0, ivar_brz[i], 0))
+                    )
+                ),
+                "exptime": float(_fmap_col(row, "EXPTIME", default=0.0)),
+                "R": 3000.0,
+                "instr": "DESI",
+            },
+        )
         records.append(SpectrumRecord(
             source_id=source_id, ra=ra, dec=dec,
             flux=flux_brz[i], ivar=ivar_brz[i], mask=mask_brz[i],
@@ -1000,6 +1107,7 @@ def _read_generic_1d(
     link_id_col: str | None = None,
     ra_col: str = "RA",
     dec_col: str = "DEC",
+    source_path: Path | None = None,
 ) -> tuple[list[SpectrumRecord], dict]:
     """
     Read a generic 1-D FITS spectrum (spectral WCS in primary header).
@@ -1024,7 +1132,12 @@ def _read_generic_1d(
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
     base_id = object_id_from_fits_header(header, link_id_col, hdu_index=image_hdu)
-    base_ra, base_dec = sky_from_fits_header(header, ra_col, dec_col)
+    ctx = str(source_path or f"HDU {image_hdu}")
+    base_ra, base_dec, ra_key, dec_key = sky_from_header_chain(
+        header,
+        pairs=((ra_col, dec_col),),
+        context=ctx,
+    )
     ivar_2d = _load_generic_ivar_2d(
         hdul, flux_hdu_idx=image_hdu, n_spec=n_spec, n_pix=n_pix,
     )
@@ -1037,14 +1150,21 @@ def _read_generic_1d(
             ivar = ivar_2d[i]
         else:
             ivar = np.ones(n_pix, dtype=np.float32)
-        meta = {
-            "z":       float(header.get("Z", 0.0)),
-            "z_err":   float(header.get("Z_ERR", 0.0)),
-            "snr":     0.0,
-            "exptime": float(header.get("EXPTIME", 0.0)),
-            "R":       float(header.get("SPEC_RES", 1000.0)),
-            "instr":   str(header.get("INSTRUME", "UNKNOWN"))[:16],
-        }
+        meta = _spectrum_sky_meta(
+            source_path or Path("unknown.fits"),
+            ra,
+            dec,
+            ra_key,
+            dec_key,
+            {
+                "z": float(header.get("Z", 0.0)),
+                "z_err": float(header.get("Z_ERR", 0.0)),
+                "snr": 0.0,
+                "exptime": float(header.get("EXPTIME", 0.0)),
+                "R": float(header.get("SPEC_RES", 1000.0)),
+                "instr": str(header.get("INSTRUME", "UNKNOWN"))[:16],
+            },
+        )
         records.append(SpectrumRecord(
             source_id=source_id + i, ra=ra, dec=dec,
             flux=spectra_2d[i].astype(np.float32),
@@ -1110,6 +1230,7 @@ def _read_wig_spectrum(
         hdul,
         ra_col="RA_OBJ",
         dec_col="DEC_OBJ",
+        source_path=source_path,
     )
     out: list[SpectrumRecord] = []
     for rec in records:
@@ -1188,18 +1309,29 @@ def _read_ozdes_spectrum(
     mask = (bad != 0).astype(np.uint8)
 
     source_id = normalize_object_id(source_path.name)
-    ra, dec = sky_from_fits_header(header, "RA", "DEC")
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        header,
+        pairs=(("RA", "DEC"),),
+        context=str(source_path),
+    )
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
-    meta: dict[str, Any] = {
-        "z": float(header.get("Z", 0.0)),
-        "z_err": float(header.get("Z_ERR", 0.0)),
-        "snr": 0.0,
-        "exptime": float(header.get("EXPTIME", 0.0)),
-        "R": float(header.get("SPEC_RES", 1000.0)),
-        "instr": str(header.get("INSTRUME", "OzDES"))[:16],
-    }
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(header.get("Z", 0.0)),
+            "z_err": float(header.get("Z_ERR", 0.0)),
+            "snr": 0.0,
+            "exptime": float(header.get("EXPTIME", 0.0)),
+            "R": float(header.get("SPEC_RES", 1000.0)),
+            "instr": str(header.get("INSTRUME", "OzDES"))[:16],
+        },
+    )
     record = SpectrumRecord(
         source_id=source_id,
         ra=ra,
@@ -1302,19 +1434,30 @@ def _read_gama_spectrum(
     mask = ((~np.isfinite(flux)) | (ivar <= 0.0)).astype(np.uint8)
 
     source_id = object_id_from_fits_header(header, link_id_col, hdu_index=0)
-    ra, dec = sky_from_fits_header(header, ra_col, dec_col)
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        header,
+        pairs=((ra_col, dec_col),),
+        context=str(source_path),
+    )
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
     sn_val = header.get("SN", header.get("SNR", 0.0))
-    meta: dict[str, Any] = {
-        "z": float(header.get("Z", 0.0)),
-        "z_err": float(header.get("Z_ERR", 0.0)),
-        "snr": float(sn_val) if sn_val not in ("", None) else 0.0,
-        "exptime": float(header.get("T_EXP", header.get("EXPTIME", 0.0))),
-        "R": float(header.get("SPEC_RES", 1000.0)),
-        "instr": str(header.get("INSTRUME", "GAMA"))[:16],
-    }
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(header.get("Z", 0.0)),
+            "z_err": float(header.get("Z_ERR", 0.0)),
+            "snr": float(sn_val) if sn_val not in ("", None) else 0.0,
+            "exptime": float(header.get("T_EXP", header.get("EXPTIME", 0.0))),
+            "R": float(header.get("SPEC_RES", 1000.0)),
+            "instr": str(header.get("INSTRUME", "GAMA"))[:16],
+        },
+    )
     record = SpectrumRecord(
         source_id=source_id,
         ra=ra,
@@ -1404,16 +1547,27 @@ def _read_zcosmos_spectrum(
 
     phdr = hdul[0].header
     shdr = shdu.header
-    ra = float(shdr.get("RA", phdr.get("RA", 0.0)))
-    dec = float(shdr.get("DEC", phdr.get("DEC", 0.0)))
-    meta: dict[str, Any] = {
-        "z": float(shdr.get("Z", phdr.get("Z", 0.0))),
-        "z_err": float(shdr.get("Z_ERR", phdr.get("Z_ERR", 0.0))),
-        "snr": 0.0,
-        "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
-        "R": float(shdr.get("SPEC_RES", phdr.get("SPEC_RES", 1000.0))),
-        "instr": str(shdr.get("INSTRUME", phdr.get("INSTRUME", "zCOSMOS")))[:16],
-    }
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        shdr,
+        phdr,
+        pairs=(("RA", "DEC"),),
+        context=str(source_path),
+    )
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(shdr.get("Z", phdr.get("Z", 0.0))),
+            "z_err": float(shdr.get("Z_ERR", phdr.get("Z_ERR", 0.0))),
+            "snr": 0.0,
+            "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+            "R": float(shdr.get("SPEC_RES", phdr.get("SPEC_RES", 1000.0))),
+            "instr": str(shdr.get("INSTRUME", phdr.get("INSTRUME", "zCOSMOS")))[:16],
+        },
+    )
     wcs_attrs = {
         "wcs_source": "explicit",
         "n_pix": n_pix,
@@ -1499,18 +1653,31 @@ def _read_vandels_spectrum(
     finite = np.isfinite(flux) & np.isfinite(_wavelength_from_wcs(header, n_pix))
     mask = np.where(finite & valid_noise, 0, 1).astype(np.uint8)
 
-    ra = float(header.get("PND OBJRA", header.get("RA", 0.0)))
-    dec = float(header.get("PND OBJDEC", header.get("DEC", 0.0)))
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        header,
+        pairs=(
+            ("PND OBJRA", "PND OBJDEC"),
+            ("RA", "DEC"),
+        ),
+        context=str(source_path),
+    )
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
-    meta: dict[str, Any] = {
-        "z": float(header.get("PND Z", header.get("Z", 0.0))),
-        "z_err": float(header.get("PND ZERR", header.get("Z_ERR", 0.0))),
-        "snr": 0.0,
-        "exptime": float(header.get("EXPTIME", 0.0)),
-        "R": float(header.get("SPEC_RES", 1000.0)),
-        "instr": str(header.get("INSTRUME", "VIMOS"))[:16],
-    }
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(header.get("PND Z", header.get("Z", 0.0))),
+            "z_err": float(header.get("PND ZERR", header.get("Z_ERR", 0.0))),
+            "snr": 0.0,
+            "exptime": float(header.get("EXPTIME", 0.0)),
+            "R": float(header.get("SPEC_RES", 1000.0)),
+            "instr": str(header.get("INSTRUME", "VIMOS"))[:16],
+        },
+    )
     return [SpectrumRecord(
         source_id=source_id,
         ra=ra,
@@ -1587,17 +1754,28 @@ def _read_vipers_spectrum(
     header = thdu.header
     phdr = hdul[0].header
     source_id = _wig_source_id_from_path(source_path)
-    ra = float(header.get("RA", phdr.get("RA", 0.0)))
-    dec = float(header.get("DEC", phdr.get("DEC", 0.0)))
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        header,
+        phdr,
+        pairs=(("RA", "DEC"),),
+        context=str(source_path),
+    )
 
-    meta: dict[str, Any] = {
-        "z": float(header.get("REDSHIFT", header.get("Z", 0.0))),
-        "z_err": float(header.get("REDSHIFT_ERR", header.get("Z_ERR", 0.0))),
-        "snr": 0.0,
-        "exptime": float(header.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
-        "R": float(header.get("SPEC_RES", phdr.get("SPEC_RES", 1000.0))),
-        "instr": str(header.get("INSTRUME", phdr.get("INSTRUME", "VIMOS")))[:16],
-    }
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(header.get("REDSHIFT", header.get("Z", 0.0))),
+            "z_err": float(header.get("REDSHIFT_ERR", header.get("Z_ERR", 0.0))),
+            "snr": 0.0,
+            "exptime": float(header.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+            "R": float(header.get("SPEC_RES", phdr.get("SPEC_RES", 1000.0))),
+            "instr": str(header.get("INSTRUME", phdr.get("INSTRUME", "VIMOS")))[:16],
+        },
+    )
     wcs_attrs = {
         "wcs_source": "explicit",
         "n_pix": n_pix,
@@ -1618,6 +1796,8 @@ _VUDS_ID_KEY = "LAM CESAM VO IDENT"
 _VUDS_RA_KEY = "LAM CESAM VO ALPHA"
 _VUDS_DEC_KEY = "LAM CESAM VO DELTA"
 _VUDS_Z_KEY = "LAM CESAM VO Z"
+_VVDS_ESO_RA = "ESO INS REF1 OBJ RA"
+_VVDS_ESO_DEC = "ESO INS REF1 OBJ DEC"
 
 
 def _is_vuds_stacked_layout(hdul: fits.HDUList) -> bool:
@@ -1664,19 +1844,32 @@ def _read_vuds_spectrum(
     n_pix = int(flux.shape[0])
 
     source_id = _wig_source_id_from_path(source_path)
-    ra = float(header.get(_VUDS_RA_KEY, header.get("RA", 0.0)))
-    dec = float(header.get(_VUDS_DEC_KEY, header.get("DEC", 0.0)))
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        header,
+        pairs=(
+            (_VUDS_RA_KEY, _VUDS_DEC_KEY),
+            ("RA", "DEC"),
+        ),
+        context=str(source_path),
+    )
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
-    meta: dict[str, Any] = {
-        "z": float(header.get(_VUDS_Z_KEY, header.get("Z", 0.0))),
-        "z_err": float(header.get("LAM CESAM VO ZERR", header.get("Z_ERR", 0.0))),
-        "snr": 0.0,
-        "exptime": float(header.get("EXPTIME", 0.0)),
-        "R": float(header.get("SPEC_RES", 1000.0)),
-        "instr": str(header.get("INSTRUME", header.get("ESO INS ID", "VIMOS")))[:16],
-    }
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(header.get(_VUDS_Z_KEY, header.get("Z", 0.0))),
+            "z_err": float(header.get("LAM CESAM VO ZERR", header.get("Z_ERR", 0.0))),
+            "snr": 0.0,
+            "exptime": float(header.get("EXPTIME", 0.0)),
+            "R": float(header.get("SPEC_RES", 1000.0)),
+            "instr": str(header.get("INSTRUME", header.get("ESO INS ID", "VIMOS")))[:16],
+        },
+    )
     return [SpectrumRecord(
         source_id=source_id,
         ra=ra,
@@ -1731,8 +1924,8 @@ def _read_vvds_spectrum(
     Read a VVDS 1-D spectrum from PRIMARY (flux + spectral WCS).
 
     ``source_id`` is ``normalize_object_id(path.name)`` for catalog filename
-    linkage.  Sky position uses ``RA`` / ``DEC``.  No uncertainty or mask
-    extensions are expected.
+    linkage.  Sky position uses ``RA`` / ``DEC``, else ESO INS REF1 OBJ RA/DEC.
+    No uncertainty or mask extensions are expected.
     """
     if not _is_vvds_stacked_layout(hdul):
         summary = _summarize_fits_hdus(hdul)
@@ -1746,19 +1939,32 @@ def _read_vvds_spectrum(
     flux = _flatten_vvds_primary_flux(flux_hdu.data)
     n_pix = int(flux.shape[0])
     source_id = _wig_source_id_from_path(source_path)
-    ra = float(header.get("RA", 0.0))
-    dec = float(header.get("DEC", 0.0))
+    ra, dec, ra_key, dec_key = sky_from_header_chain(
+        header,
+        pairs=(
+            ("RA", "DEC"),
+            (_VVDS_ESO_RA, _VVDS_ESO_DEC),
+        ),
+        context=f"VVDS {source_path.name}",
+    )
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
-    meta: dict[str, Any] = {
-        "z": float(header.get("REDSHIFT", header.get("Z", 0.0))),
-        "z_err": float(header.get("REDSHIFT_ERR", header.get("Z_ERR", 0.0))),
-        "snr": 0.0,
-        "exptime": float(header.get("EXPTIME", 0.0)),
-        "R": float(header.get("SPEC_RES", 1000.0)),
-        "instr": str(header.get("INSTRUME", header.get("ESO INS ID", "VIMOS")))[:16],
-    }
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(header.get("REDSHIFT", header.get("Z", 0.0))),
+            "z_err": float(header.get("REDSHIFT_ERR", header.get("Z_ERR", 0.0))),
+            "snr": 0.0,
+            "exptime": float(header.get("EXPTIME", 0.0)),
+            "R": float(header.get("SPEC_RES", 1000.0)),
+            "instr": str(header.get("INSTRUME", header.get("ESO INS ID", "VIMOS")))[:16],
+        },
+    )
     return [SpectrumRecord(
         source_id=source_id,
         ra=ra,
@@ -1919,17 +2125,23 @@ def _2df_link_label_from_header(
     return _2df_filename_stem(source_path), True
 
 
-def _2df_sky_from_headers(shdr: fits.Header, phdr: fits.Header) -> tuple[float, float]:
-    """Per-observation sky position with 2dF J2000-first fallback chain.
-
-    Priority:
-    1) Spectrum header ``SRRA``/``SRDEC`` (preferred J2000 fields)
-    2) Spectrum header ``OBSRA``/``OBSDEC``
-    3) PRIMARY header ``RA``/``DEC``
-    """
-    ra = shdr.get("SRRA", shdr.get("OBSRA", phdr.get("RA", 0.0)))
-    dec = shdr.get("SRDEC", shdr.get("OBSDEC", phdr.get("DEC", 0.0)))
-    return float(ra), float(dec)
+def _2df_sky_from_headers(
+    shdr: fits.Header,
+    phdr: fits.Header,
+    *,
+    context: str,
+) -> tuple[float, float, str, str]:
+    """Per-observation sky position with 2dF J2000-first fallback chain."""
+    return sky_from_header_chain(
+        shdr,
+        phdr,
+        pairs=(
+            ("SRRA", "SRDEC"),
+            ("OBSRA", "OBSDEC"),
+            ("RA", "DEC"),
+        ),
+        context=context,
+    )
 
 
 def _2df_spectra_wcs_differs(records: list[SpectrumRecord]) -> bool:
@@ -1997,7 +2209,9 @@ def _read_2df_spectrum(
             )
         seen_ids[source_id] = link_label
 
-        ra, dec = _2df_sky_from_headers(shdr, phdr)
+        ra, dec, ra_key, dec_key = _2df_sky_from_headers(
+            shdr, phdr, context=str(source_path),
+        )
         flux, variance, n_pix = _parse_2df_spectrum_data(np.asarray(shdu.data))
         flux = flux.astype(np.float32)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -2009,14 +2223,21 @@ def _read_2df_spectrum(
             wcs_attrs = _wcs_attrs_from_header(shdr, n_pix)
 
         snr_val = shdr.get("SNR", phdr.get("SNR", 0.0))
-        meta: dict[str, Any] = {
-            "z":       float(shdr.get("Z", phdr.get("Z", 0.0))),
-            "z_err":   0.0,
-            "snr":     float(snr_val) if snr_val not in ("", None) else 0.0,
-            "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
-            "R":       float(shdr.get("SPEC_RES", 500.0)),
-            "instr":   "2dFGRS",
-        }
+        meta = _spectrum_sky_meta(
+            source_path,
+            ra,
+            dec,
+            ra_key,
+            dec_key,
+            {
+                "z": float(shdr.get("Z", phdr.get("Z", 0.0))),
+                "z_err": 0.0,
+                "snr": float(snr_val) if snr_val not in ("", None) else 0.0,
+                "exptime": float(shdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+                "R": float(shdr.get("SPEC_RES", 500.0)),
+                "instr": "2dFGRS",
+            },
+        )
 
         records.append(SpectrumRecord(
             source_id=source_id,
@@ -2200,42 +2421,40 @@ def _parse_fits_sexagesimal_sky(ra_val: object, dec_val: object) -> tuple[float,
 def _6df_sky_from_headers(
     vhdr: fits.Header,
     phdr: fits.Header,
-) -> tuple[float, float]:
-    """Resolve 6dFGS sky position in degrees for spectrum HEALPix assignment.
-
-    Production 6dF target files store per-observation coordinates as ``OBSRA`` /
-    ``OBSDEC`` (degrees) on the VR extension.  PRIMARY headers often carry
-    sexagesimal ``OBJCTRA``/``OBJCTDEC`` or image WCS ``CRVAL1``/``CRVAL2``
-    instead of numeric ``RA``/``DEC``.
-    """
-    if "OBSRA" in vhdr and "OBSDEC" in vhdr:
-        ra = float(vhdr["OBSRA"])
-        dec = float(vhdr["OBSDEC"])
-        if _looks_like_sky_degrees(ra, dec):
-            return ra, dec
-
-    for hdr in (vhdr, phdr):
-        if "RA" in hdr and "DEC" in hdr:
-            ra = float(hdr["RA"])
-            dec = float(hdr["DEC"])
-            if _looks_like_sky_degrees(ra, dec):
-                return ra, dec
-
+    *,
+    context: str,
+) -> tuple[float, float, str, str]:
+    """Resolve 6dFGS sky position in degrees for spectrum HEALPix assignment."""
+    try:
+        return sky_from_header_chain(
+            vhdr,
+            pairs=(("OBSRA", "OBSDEC"),),
+            context=context,
+        )
+    except ValueError:
+        pass
+    try:
+        return sky_from_header_chain(
+            vhdr,
+            phdr,
+            pairs=(("RA", "DEC"),),
+            context=context,
+        )
+    except ValueError:
+        pass
     if "CRVAL1" in phdr and "CRVAL2" in phdr:
         ra = float(phdr["CRVAL1"])
         dec = float(phdr["CRVAL2"])
-        if _looks_like_sky_degrees(ra, dec):
-            return ra, dec
-
+        if is_valid_sky_position(ra, dec):
+            return ra, dec, "CRVAL1", "CRVAL2"
     if "OBJCTRA" in phdr and "OBJCTDEC" in phdr:
         parsed = _parse_fits_sexagesimal_sky(phdr["OBJCTRA"], phdr["OBJCTDEC"])
         if parsed is not None:
-            return parsed
-
-    log.warning(
-        "6dF: could not resolve sky position from VR/PRIMARY headers; using (0, 0)"
+            return parsed[0], parsed[1], "OBJCTRA", "OBJCTDEC"
+    raise ValueError(
+        f"{context}: missing or invalid sky coordinates; tried OBSRA/OBSDEC, RA/DEC, "
+        "CRVAL1/CRVAL2, OBJCTRA/OBJCTDEC"
     )
-    return 0.0, 0.0
 
 
 def _is_6df_hdul(hdul: fits.HDUList) -> bool:
@@ -2336,7 +2555,9 @@ def _read_6df_vr_record(
             vr_idx=triple_indices[2],
         )
 
-    ra, dec = _6df_sky_from_headers(vhdr, phdr)
+    ra, dec, ra_key, dec_key = _6df_sky_from_headers(
+        vhdr, phdr, context=str(source_path),
+    )
     link_label, _ = _6df_link_label_from_triple(
         v_hdr, r_hdr, vhdr, phdr, source_path,
     )
@@ -2374,14 +2595,21 @@ def _read_6df_vr_record(
     else:
         wavelength = _wavelength_from_wcs(vhdr, n_pix)
 
-    meta: dict[str, Any] = {
-        "z": float(vhdr.get("Z", phdr.get("Z", 0.0))),
-        "z_err": 0.0,
-        "snr": 0.0,
-        "exptime": float(vhdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
-        "R": float(vhdr.get("SPEC_RES", 1000.0)),
-        "instr": "6dFGS",
-    }
+    meta = _spectrum_sky_meta(
+        source_path,
+        ra,
+        dec,
+        ra_key,
+        dec_key,
+        {
+            "z": float(vhdr.get("Z", phdr.get("Z", 0.0))),
+            "z_err": 0.0,
+            "snr": 0.0,
+            "exptime": float(vhdr.get("EXPTIME", phdr.get("EXPTIME", 0.0))),
+            "R": float(vhdr.get("SPEC_RES", 1000.0)),
+            "instr": "6dFGS",
+        },
+    )
     return SpectrumRecord(
         source_id=source_id,
         ra=ra,
@@ -2609,6 +2837,7 @@ def _load_spectrum_records_from_path(
                     link_id_col=link_id_col,
                     ra_col=ra_col,
                     dec_col=dec_col,
+                    source_path=source_path,
                 )
             elif detected_fmt == "sdss_spplate":
                 n_lookup_modes = sum(
@@ -3029,6 +3258,12 @@ def _meta_to_bytes(meta: dict[str, Any]) -> bytes:
     arr["R"][0]       = meta.get("R",       0.0)
     instr = str(meta.get("instr", ""))[:16].encode("ascii")
     arr["instr"][0]   = instr.ljust(16)[:16]
+    arr["ra_key"][0] = str(meta.get("ra_key", ""))[:32].encode("ascii")
+    arr["dec_key"][0] = str(meta.get("dec_key", ""))[:32].encode("ascii")
+    arr["ra"][0] = float(meta.get("ra", 0.0))
+    arr["dec"][0] = float(meta.get("dec", 0.0))
+    src = str(meta.get("source_file", ""))[:128].encode("ascii")
+    arr["source_file"][0] = src.ljust(128)[:128]
     return bytes(arr.view("|V" + str(_META_DTYPE.itemsize)))
 
 

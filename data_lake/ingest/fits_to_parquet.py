@@ -242,12 +242,61 @@ def object_id_from_fits_header(
     return int(hdu_index)
 
 
+def fits_header_keyword(header, name: str) -> object | None:
+    """Return a FITS header keyword value (case-insensitive), or None if absent."""
+    target = name.upper()
+    for key in header.keys():
+        if key and str(key).upper() == target:
+            return header[key]
+    return None
+
+
+def sky_from_header_chain(
+    *headers,
+    pairs: tuple[tuple[str, str], ...],
+    context: str = "FITS",
+) -> tuple[float, float, str, str]:
+    """Resolve (RA, Dec) in degrees from the first matching keyword pair.
+
+    Uses key *presence* only (never treats missing keys as 0,0).  Returns the
+    matched keyword names for provenance metadata.
+    """
+    for hdr in headers:
+        for ra_key, dec_key in pairs:
+            ra_raw = fits_header_keyword(hdr, ra_key)
+            dec_raw = fits_header_keyword(hdr, dec_key)
+            if ra_raw is None or dec_raw is None:
+                continue
+            ra = float(ra_raw)
+            dec = float(dec_raw)
+            if not is_valid_sky_position(ra, dec):
+                continue
+            return ra, dec, ra_key, dec_key
+    tried = ", ".join(f"{a}/{b}" for a, b in pairs)
+    raise ValueError(
+        f"{context}: missing or invalid sky coordinates; tried keyword pairs: {tried}"
+    )
+
+
 def sky_from_fits_header(
     header,
     ra_col: str,
     dec_col: str,
+    *,
+    required: bool = False,
 ) -> tuple[float, float]:
     """Return (RA, Dec) in degrees from a cutout/spectrum image header."""
+    if required:
+        ra, dec, _, _ = sky_from_header_chain(
+            header,
+            pairs=(
+                (ra_col, dec_col),
+                ("RA_TARG", "DEC_TARG"),
+                ("TARGET_RA", "TARGET_DEC"),
+            ),
+            context="FITS header",
+        )
+        return ra, dec
     ra = float(header.get(
         ra_col,
         header.get("RA_TARG", header.get("TARGET_RA", header.get("CRVAL1", 0.0))),

@@ -634,7 +634,7 @@ Quick index of all supported `--fmt` values, the **catalog** ingest flag require
 | `vandels` | filename column | Basename | Header `PND OBJRA` / `PND OBJDEC` (fallback `RA` / `DEC`) | `sc_*.fits` (PRIMARY + NOISE) |
 | `vipers` | filename column | Basename | Header `RA` / `DEC` (table/PRIMARY fallback) | `VIPERS_*.fits` |
 | `vuds` | filename column | Basename | Header `ALPHA` / `DELTA` (fallback `RA` / `DEC`) | `sc_*.fits` with `LAM CESAM VO` header |
-| `vvds` | filename column | Basename | Header `RA` / `DEC` | `sc_*.fits` without VUDS header |
+| `vvds` | filename column | Basename | Header `RA` / `DEC`, else `ESO INS REF1 OBJ RA` / `DEC`; error if missing | `sc_*.fits` without VUDS header |
 | `wigglez` | filename column | Basename (full, e.g. `wig225415.fits`) | Header `RA_OBJ` / `DEC_OBJ` | `wig*.fits`; stem alone will not match |
 
 Auto-detection runs before `--fmt` is needed: try `dl-ingest-spectra FILE --survey NAME` first.
@@ -1118,8 +1118,11 @@ dl-ingest-spectra sc_5101243705_F51P006_join_A_10_1_atm_clean.fits --survey VUDS
 #### VVDS spectra ingest
 
 VVDS 1-D spectra use a PRIMARY flux array (1-D or ``(1, n_pix)``) with spectral WCS.
-Sky coordinates are in ``RA`` / ``DEC``.  No uncertainty or mask extensions are
-expected (IVAR=1, mask=0).
+Sky coordinates are read from ``RA`` / ``DEC`` when present, otherwise from
+``ESO INS REF1 OBJ RA`` / ``ESO INS REF1 OBJ DEC`` (astropy stores hierarchical
+keywords without the ``HIERARCH`` prefix).  Missing or invalid coordinates raise
+an error (they are never defaulted to 0°, 0°).  No uncertainty or mask extensions
+are expected (IVAR=1, mask=0).
 
 **Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
 that stores the spectrum **filename** (e.g.
@@ -1645,7 +1648,7 @@ data/                               # committed FITS fixtures for tests and smok
         mask/       (N, N_pix) uint8,   sharded
         wavelength/ (N_pix,)   float64  (shared) or (N, N_pix) float32 (per-source)
         _source_id/  (N,) int64
-        meta/       (N,) structured bytes (z, z_err, snr, exptime, R, instr)
+        meta/       (N,) structured bytes (z, z_err, snr, exptime, R, instr, ra_key, dec_key, ra, dec, source_file)
       spectrum_info.json
 ```
 
@@ -1832,7 +1835,7 @@ dl-describe-lake --modality catalog --count-total
 dl-describe-lake --json               # {"entries": [...]} per survey × modality
 dl-describe-lake --json --count-total # entries + summary object
 dl-describe-lake --json --pair-surveys  # entries + catalog/spectra hats_order pairing
-dl-describe-lake --verbose            # tiles, ingest sidecars, link_id_mode, path, …
+dl-describe-lake --verbose            # tiles, ingest sidecars, meta_fields, spectrum_sky_meta, path, …
 dl-describe-lake --pair-surveys       # footer: catalog vs spectra hats_order per survey name
 dl-describe-lake --refresh            # rebuild registry from disk first, then print
 ```
@@ -1847,6 +1850,7 @@ The default table adds **sky** (`ra_column`/`dec_column`), a **detail** column (
 | Sky columns for joins / crossmatch | `ra_column`, `dec_column` | `dl-extract-catalog`, STILTS |
 | Catalog vs spectra HEALPix order | `hats_order_match`, `--pair-surveys` | `dl-validate-catalog-spectra-link` |
 | Spectrum pixel width / wavelength layout | `n_pix`, `wavelength_mode` | `spectrum_info.json` |
+| Per-spectrum Zarr meta (redshift, sky provenance, …) | `meta_fields`, `spectrum_sky_meta_fields`, `has_spectrum_sky_meta` | `dl-describe-lake` detail/`--verbose`; `dl-describe-survey NAME --modality spectra` lists `meta.*` columns with dtypes and `meta.sky` group |
 | Ingest still running? | `has_ingest_checkpoint`, `has_ingest_inflight` | survey `.ingest_*.json` sidecars |
 
 For **spectra**, ``total_rows`` in the registry is the sum of ``source_id`` lengths

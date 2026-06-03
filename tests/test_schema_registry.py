@@ -9,14 +9,17 @@ import pytest
 from astropy.table import Table
 
 from data_lake.ingest.fits_to_parquet import ingest_catalog
+from data_lake.ingest.fits_to_spectra_zarr import _META_DTYPE
 from data_lake.schema_registry import (
     MANIFEST_FILENAME,
     MODALITY_SPECTRA,
     ROLE_FLUX,
     ROLE_ID,
+    ROLE_METADATA,
     ROLE_PHOTOMETRY,
     ROLE_REDSHIFT,
     ROLE_SKY,
+    SPECTRUM_SKY_META_FIELDS,
     build_catalog_schema_manifest,
     build_spectra_schema_manifest,
     format_manifest_table,
@@ -180,6 +183,43 @@ def test_spectra_schema_manifest(tmp_path: Path) -> None:
 
     text = format_manifest_table(manifest, role=ROLE_FLUX)
     assert "flux" in text
+
+
+def test_spectra_schema_manifest_sky_meta_fields(tmp_path: Path) -> None:
+    spectra_root = tmp_path / "lake" / "spectra" / "VVDS_TEST"
+    spectra_root.mkdir(parents=True)
+    info = {
+        "survey_name": "VVDS_TEST",
+        "hats_order": 5,
+        "n_pix": 557,
+        "wavelength_mode": "shared",
+        "meta_fields": list(_META_DTYPE.names),
+        "has_resolution": False,
+    }
+    (spectra_root / "spectrum_info.json").write_text(json.dumps(info))
+
+    manifest = build_spectra_schema_manifest(spectra_root, "VVDS_TEST")
+    assert manifest["has_spectrum_sky_meta"] is True
+    assert set(manifest["spectrum_sky_meta_fields"]) == set(SPECTRUM_SKY_META_FIELDS)
+    assert "meta.sky" in manifest["column_groups"]
+
+    by_name = {c["name"]: c for c in manifest["columns"]}
+    assert by_name["meta.ra"]["role"] == ROLE_SKY
+    assert by_name["meta.ra_key"]["role"] == ROLE_METADATA
+    assert "FITS" in by_name["meta.ra_key"]["description"]
+    assert by_name["meta.ra_key"]["dtype"] == "ascii[32]"
+
+    text = format_manifest_table(manifest)
+    assert "spectrum_sky_meta" in text
+    assert "ra_key" in text
+
+    sky_text = format_manifest_table(manifest, role=ROLE_SKY)
+    assert "meta.ra" in sky_text
+    assert "meta.dec" in sky_text
+
+    meta_text = format_manifest_table(manifest, role=ROLE_METADATA)
+    assert "meta.ra_key" in meta_text
+    assert "meta.source_file" in meta_text
 
 
 def test_column_overlay_merge(tmp_path: Path) -> None:

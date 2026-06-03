@@ -43,6 +43,73 @@ MODALITY_CATALOG = "catalog"
 MODALITY_SPECTRA = "spectra"
 MODALITY_CUTOUT = "cutout"
 
+# Per-source Zarr meta scalars for FITS sky provenance (see fits_to_spectra_zarr._META_DTYPE).
+SPECTRUM_SKY_META_FIELDS: tuple[str, ...] = (
+    "ra_key",
+    "dec_key",
+    "ra",
+    "dec",
+    "source_file",
+)
+
+_SPECTRUM_META_SPECS: dict[str, dict[str, str]] = {
+    "z": {
+        "dtype": "float32",
+        "role": ROLE_REDSHIFT,
+        "description": "Spectroscopic redshift",
+    },
+    "z_err": {
+        "dtype": "float32",
+        "role": ROLE_METADATA,
+        "description": "Redshift uncertainty",
+    },
+    "snr": {
+        "dtype": "float32",
+        "role": ROLE_METADATA,
+        "description": "Median S/N per pixel",
+    },
+    "exptime": {
+        "dtype": "float32",
+        "role": ROLE_METADATA,
+        "description": "Total exposure time [s]",
+    },
+    "R": {
+        "dtype": "float32",
+        "role": ROLE_METADATA,
+        "description": "Spectral resolution R = λ/Δλ",
+    },
+    "instr": {
+        "dtype": "ascii[16]",
+        "role": ROLE_METADATA,
+        "description": "Instrument identifier",
+    },
+    "ra_key": {
+        "dtype": "ascii[32]",
+        "role": ROLE_METADATA,
+        "description": "FITS header keyword or table column used for RA [deg]",
+    },
+    "dec_key": {
+        "dtype": "ascii[32]",
+        "role": ROLE_METADATA,
+        "description": "FITS header keyword or table column used for Dec [deg]",
+    },
+    "ra": {
+        "dtype": "float32",
+        "role": ROLE_SKY,
+        "description": "Sky RA [deg] at ingest (tile routing)",
+    },
+    "dec": {
+        "dtype": "float32",
+        "role": ROLE_SKY,
+        "description": "Sky Dec [deg] at ingest (tile routing)",
+    },
+    "source_file": {
+        "dtype": "ascii[128]",
+        "role": ROLE_METADATA,
+        "description": "Basename of the 1-D FITS file for this spectrum",
+    },
+}
+
 _LAYER_DIRS: dict[str, str] = {
     MODALITY_CATALOG: "catalogs",
     MODALITY_SPECTRA: "spectra",
@@ -297,6 +364,23 @@ def _write_schema_manifest_file(survey_root: Path, manifest: dict[str, Any]) -> 
     return out_path
 
 
+def _spectrum_meta_manifest_column(field: str) -> dict[str, Any]:
+    """One Zarr ``meta`` scalar column for ``schema_manifest.json``."""
+    spec = _SPECTRUM_META_SPECS.get(
+        field,
+        {"dtype": "float32", "role": ROLE_METADATA, "description": ""},
+    )
+    col: dict[str, Any] = {
+        "name": f"meta.{field}",
+        "dtype": spec["dtype"],
+        "nullable": True,
+        "role": spec["role"],
+    }
+    if spec.get("description"):
+        col["description"] = spec["description"]
+    return col
+
+
 def build_spectra_schema_manifest(spectra_root: Path | str, survey_name: str) -> dict[str, Any]:
     """Build manifest from ``spectrum_info.json`` (Zarr array layout)."""
     spectra_root = Path(spectra_root)
@@ -334,15 +418,9 @@ def build_spectra_schema_manifest(spectra_root: Path | str, survey_name: str) ->
                 "role": ROLE_WAVELENGTH,
             }
         )
-    for field in info.get("meta_fields", []):
-        columns.append(
-            {
-                "name": f"meta.{field}",
-                "dtype": "see spectrum_info meta_fields",
-                "nullable": True,
-                "role": ROLE_METADATA,
-            }
-        )
+    meta_field_names = [str(f) for f in info.get("meta_fields", [])]
+    for field in meta_field_names:
+        columns.append(_spectrum_meta_manifest_column(field))
     if info.get("has_resolution"):
         n_diag = info.get("resolution_n_diag")
         columns.append(
@@ -368,12 +446,37 @@ def build_spectra_schema_manifest(spectra_root: Path | str, survey_name: str) ->
         "wavelength_mode": wl_mode,
         "has_resolution": bool(info.get("has_resolution")),
         "mask_bits": info.get("mask_bits"),
-        "meta_fields": info.get("meta_fields"),
+        "meta_fields": meta_field_names or None,
+        "spectrum_sky_meta_fields": (
+            [f for f in SPECTRUM_SKY_META_FIELDS if f in meta_field_names]
+            if meta_field_names
+            else None
+        ),
+        "has_spectrum_sky_meta": (
+            set(SPECTRUM_SKY_META_FIELDS) <= set(meta_field_names)
+            if meta_field_names
+            else None
+        ),
         "columns": columns,
-        "column_groups": {"meta": [c["name"] for c in columns if c["name"].startswith("meta.")]},
+        "column_groups": _spectra_column_groups(columns, meta_field_names),
         "survey_root": str(spectra_root),
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def _spectra_column_groups(
+    columns: list[dict[str, Any]],
+    meta_field_names: list[str],
+) -> dict[str, list[str]]:
+    """Group spectrum manifest columns (meta + sky provenance subgroup)."""
+    meta_cols = [c["name"] for c in columns if c["name"].startswith("meta.")]
+    groups: dict[str, list[str]] = {}
+    if meta_cols:
+        groups["meta"] = meta_cols
+    sky_cols = [f"meta.{f}" for f in SPECTRUM_SKY_META_FIELDS if f in meta_field_names]
+    if sky_cols:
+        groups["meta.sky"] = sky_cols
+    return groups
 
 
 def write_spectra_schema_manifest(spectra_root: Path | str, survey_name: str) -> Path:
@@ -513,8 +616,19 @@ def format_manifest_table(
     elif modality == MODALITY_SPECTRA:
         lines.append(
             f"n_pix: {manifest.get('n_pix')}  wavelength: {manifest.get('wavelength_mode')}  "
-            f"resolution: {manifest.get('has_resolution')}  meta: {manifest.get('meta_fields')}"
+            f"resolution: {manifest.get('has_resolution')}  "
+            f"meta_fields: {manifest.get('meta_fields')}"
         )
+        sky = manifest.get("spectrum_sky_meta_fields")
+        if sky:
+            lines.append(
+                "spectrum_sky_meta (per-source FITS provenance in Zarr meta): "
+                + ", ".join(str(f) for f in sky)
+            )
+        elif manifest.get("meta_fields") and manifest.get("has_spectrum_sky_meta") is False:
+            lines.append(
+                "spectrum_sky_meta: — (re-ingest for ra_key, dec_key, ra, dec, source_file)"
+            )
     elif modality == MODALITY_CUTOUT:
         lines.append(
             f"bands: {manifest.get('band_names')}  shape: "

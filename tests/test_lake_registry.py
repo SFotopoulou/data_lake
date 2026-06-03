@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from data_lake.ingest.desi_parallel_ingest import TileBatch, WorkerResult, ingest_spectra_parallel
 from data_lake.ingest.fits_to_parquet import ingest_catalog
-from data_lake.ingest.fits_to_spectra_zarr import _meta_to_bytes
+from data_lake.ingest.fits_to_spectra_zarr import _META_DTYPE, _meta_to_bytes
 from data_lake.lake_registry import (
     REGISTRY_FILENAME,
     build_lake_registry_table,
@@ -193,6 +193,17 @@ def test_registry_spectra_total_rows(tmp_path: Path) -> None:
     assert spec_rows[0]["wavelength_mode"] == "shared"
     assert spec_rows[0]["n_tiles"] == 2
     assert spec_rows[0]["wcs_summary"]
+    assert spec_rows[0]["meta_fields"] == list(_META_DTYPE.names)
+    assert spec_rows[0]["has_spectrum_sky_meta"] is True
+    assert set(spec_rows[0]["spectrum_sky_meta_fields"]) == {
+        "ra_key", "dec_key", "ra", "dec", "source_file",
+    }
+
+    table_text = format_lake_registry_table(load_lake_registry(lake))
+    assert "sky_meta" in table_text
+    verbose_text = format_lake_registry_table(load_lake_registry(lake), verbose=True)
+    assert "spectrum_sky_meta:" in verbose_text
+    assert "ra_key" in verbose_text
 
 
 def test_registry_hats_order_match(tmp_path: Path) -> None:

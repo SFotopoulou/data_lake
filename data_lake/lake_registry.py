@@ -22,6 +22,7 @@ from data_lake.schema_registry import (
     MODALITY_CATALOG,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
+    SPECTRUM_SKY_META_FIELDS,
     format_manifest_table,
     load_catalog_schema_manifest,
     load_schema_manifest,
@@ -237,6 +238,31 @@ def _format_sky_columns(row: dict[str, Any]) -> str:
     return "—"
 
 
+def _spectrum_sky_meta_status(row: dict[str, Any]) -> str | None:
+    """Compact label for Zarr sky provenance meta (ra_key, dec_key, ra, dec, source_file)."""
+    meta_fields = row.get("meta_fields")
+    if not meta_fields:
+        return None
+    present = {str(f) for f in meta_fields}
+    expected = set(SPECTRUM_SKY_META_FIELDS)
+    if expected <= present:
+        return "sky_meta"
+    if present & expected:
+        return "sky_meta?"
+    return None
+
+
+def _format_spectrum_meta_fields(row: dict[str, Any], *, max_len: int = 48) -> str:
+    """Comma-separated Zarr meta field names for spectra (truncated)."""
+    meta_fields = row.get("meta_fields")
+    if not meta_fields:
+        return "—"
+    text = ",".join(str(f) for f in meta_fields)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
 def _format_modality_detail(row: dict[str, Any]) -> str:
     modality = row.get("modality")
     if modality == MODALITY_CATALOG:
@@ -251,6 +277,12 @@ def _format_modality_detail(row: dict[str, Any]) -> str:
             parts.append(str(wl))
         if row.get("has_resolution"):
             parts.append("res")
+        sky_meta = _spectrum_sky_meta_status(row)
+        if sky_meta:
+            parts.append(sky_meta)
+        n_meta = row.get("n_meta_fields")
+        if n_meta is not None:
+            parts.append(f"m={n_meta}")
         return " ".join(parts) if parts else "—"
     if modality == MODALITY_CUTOUT:
         n_bands = row.get("n_bands")
@@ -510,6 +542,7 @@ def _info_registry_row(
 
     if modality == MODALITY_SPECTRA:
         meta_fields = info.get("meta_fields")
+        meta_list = [str(f) for f in meta_fields] if meta_fields else None
         row.update(
             {
                 "n_pix": info.get("n_pix"),
@@ -517,8 +550,18 @@ def _info_registry_row(
                 "has_resolution": bool(info.get("has_resolution")),
                 "resolution_n_diag": info.get("resolution_n_diag"),
                 "wcs_summary": _wcs_summary(info.get("wcs")),
-                "meta_fields": meta_fields,
-                "n_meta_fields": len(meta_fields) if meta_fields else None,
+                "meta_fields": meta_list,
+                "n_meta_fields": len(meta_list) if meta_list else None,
+                "spectrum_sky_meta_fields": (
+                    [f for f in SPECTRUM_SKY_META_FIELDS if f in meta_list]
+                    if meta_list
+                    else None
+                ),
+                "has_spectrum_sky_meta": (
+                    set(SPECTRUM_SKY_META_FIELDS) <= set(meta_list)
+                    if meta_list
+                    else None
+                ),
             }
         )
     elif modality == MODALITY_CUTOUT:
@@ -763,6 +806,18 @@ def format_lake_registry_table(
                 lines.append(f"    native_id: {row['native_id_column']}")
             if row.get("modality") == MODALITY_SPECTRA and row.get("wcs_summary"):
                 lines.append(f"    wcs: {row['wcs_summary']}")
+            if row.get("modality") == MODALITY_SPECTRA and row.get("meta_fields"):
+                lines.append(f"    meta_fields: {_format_spectrum_meta_fields(row, max_len=120)}")
+                sky = row.get("spectrum_sky_meta_fields")
+                if sky:
+                    lines.append(
+                        f"    spectrum_sky_meta: {', '.join(sky)}"
+                        " (per-source FITS sky provenance in Zarr meta)"
+                    )
+                elif row.get("has_spectrum_sky_meta") is False:
+                    lines.append(
+                        "    spectrum_sky_meta: — (re-ingest for ra_key/dec_key/ra/dec/source_file)"
+                    )
     else:
         header = (
             f"{'survey':<24} {'modality':<10} {'hats':>4} {'cols':>6} {'rows':>14}  "

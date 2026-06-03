@@ -60,6 +60,9 @@ class TestVvdsIngest:
         assert r.mask.sum() == 0
         assert r.ra == pytest.approx(53.07825)
         assert r.dec == pytest.approx(-27.77536)
+        assert r.meta["ra_key"] == "RA"
+        assert r.meta["dec_key"] == "DEC"
+        assert r.meta["source_file"] == p.name
         assert wcs["n_pix"] == 128
 
     def test_reads_1d_primary(self, tmp_path: Path) -> None:
@@ -90,3 +93,58 @@ class TestVvdsIngest:
         r = records[0]
         assert r.source_id == normalize_object_id(p.name)
         assert r.flux.shape == (557,)
+
+    def test_eso_fallback_when_ra_dec_missing(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import _read_vvds_spectrum
+
+        p = tmp_path / "sc_eso_only.fits"
+        flux = np.ones(16, dtype=np.float32)
+        primary = fits.PrimaryHDU(flux)
+        primary.header["ESO INS REF1 OBJ RA"] = 12.5
+        primary.header["ESO INS REF1 OBJ DEC"] = -5.25
+        primary.header["CRVAL1"] = 5500.0
+        primary.header["CRPIX1"] = 1.0
+        primary.header["CDELT1"] = 5.0
+        fits.HDUList([primary]).writeto(p, overwrite=True)
+
+        with fits.open(p, memmap=True) as hdul:
+            records, _ = _read_vvds_spectrum(hdul, p)
+
+        r = records[0]
+        assert r.ra == pytest.approx(12.5)
+        assert r.dec == pytest.approx(-5.25)
+        assert r.meta["ra_key"] == "ESO INS REF1 OBJ RA"
+        assert r.meta["dec_key"] == "ESO INS REF1 OBJ DEC"
+
+    def test_missing_sky_raises(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import _read_vvds_spectrum
+
+        p = tmp_path / "sc_no_sky.fits"
+        flux = np.ones(8, dtype=np.float32)
+        primary = fits.PrimaryHDU(flux)
+        primary.header["CRVAL1"] = 5500.0
+        primary.header["CRPIX1"] = 1.0
+        primary.header["CDELT1"] = 5.0
+        fits.HDUList([primary]).writeto(p, overwrite=True)
+
+        with fits.open(p, memmap=True) as hdul:
+            with pytest.raises(ValueError, match="missing or invalid sky"):
+                _read_vvds_spectrum(hdul, p)
+
+    def test_legitimate_zero_zero_with_keys(self, tmp_path: Path) -> None:
+        from data_lake.ingest.fits_to_spectra_zarr import _read_vvds_spectrum
+
+        p = tmp_path / "sc_origin.fits"
+        flux = np.ones(8, dtype=np.float32)
+        primary = fits.PrimaryHDU(flux)
+        primary.header["RA"] = 0.0
+        primary.header["DEC"] = 0.0
+        primary.header["CRVAL1"] = 5500.0
+        primary.header["CRPIX1"] = 1.0
+        primary.header["CDELT1"] = 5.0
+        fits.HDUList([primary]).writeto(p, overwrite=True)
+
+        with fits.open(p, memmap=True) as hdul:
+            records, _ = _read_vvds_spectrum(hdul, p)
+        assert records[0].ra == 0.0
+        assert records[0].dec == 0.0
