@@ -243,7 +243,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 
 | Command | Purpose |
 |---------|---------|
-| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--refresh` |
+| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--refresh`, `--verbose`, `--pair-surveys` |
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake and write `shared/registry/surveys.parquet` |
@@ -619,23 +619,23 @@ dl-ingest-spectra spec-3586-55181-0001.fits --survey sdss_dr17 \
 
 #### 1-D spectrum readers reference
 
-Quick index of all supported `--fmt` values, the **catalog** ingest flag required to match them, and how each reader derives the spectrum link ID. Do **not** pass `--link-id-col` on `dl-ingest-spectra` for readers listed as "header" or "filename" — the reader resolves the ID internally.
+Quick index of all supported `--fmt` values, the **catalog** ingest flag required to match them, how each reader derives the spectrum link ID, and which coordinates are used for HEALPix routing. Do **not** pass `--link-id-col` on `dl-ingest-spectra` for readers listed as "header" or "filename" — the reader resolves the ID internally.
 
-| `--fmt` | Catalog `--link-id-col` | Spectrum link source | Example / note |
-|---------|------------------------|----------------------|----------------|
-| `desi` | `TARGETID` (or default) | Fibermap `TARGETID` | Auto-detected from DESI coadd layout |
-| `sdss_boss` | `SPECOBJID` | `SPALL` HDU header | `spec-PLATE-MJD-FIBER.fits` |
-| `sdss_spplate` | via sidecar / plate header | `FIBERID` → specObjID | `spPlate-PLATE-MJD.fits`; see spPlate section |
-| `generic` | `--link-id-col` or auto | Header keyword chain | Any 1-D FITS with spectral WCS |
-| `2df` | `SPFILE,FIBRE` (+ `--allow-incomplete-link-id` if some rows have no filename) | Header `SPFILE` \| `FIBRE` per SPECTRUM HDU | `data/389442.fits` |
-| `6df` | `targetname,obsid_v,obsid_r` | Filename stem + V header `OBSID_V` + R header `OBSID_R` per V/R/VR triple | `data/g2302140-251235.fits` |
-| `gama` | `SPECID` | Primary header `SPECID` | `data/G23_Y7_015_265.fit` |
-| `ozdes` | filename column | Basename (stem) | `OzDES_*.fits` |
-| `vandels` | filename column | Basename | `sc_*.fits` (PRIMARY + NOISE) |
-| `vipers` | filename column | Basename | `VIPERS_*.fits` |
-| `vuds` | filename column | Basename | `sc_*.fits` with `LAM CESAM VO` header |
-| `vvds` | filename column | Basename | `sc_*.fits` without VUDS header |
-| `wigglez` | filename column | Basename (full, e.g. `wig225415.fits`) | `wig*.fits`; stem alone will not match |
+| `--fmt` | Catalog `--link-id-col` | Spectrum link source | Spectrum sky source | Example / note |
+|---------|------------------------|----------------------|---------------------|----------------|
+| `desi` | `TARGETID` (or default) | Fibermap `TARGETID` | Fibermap `TARGET_RA` / `TARGET_DEC` (fallbacks: `RA_TARGET`, `FIBER_RA`; `DEC_TARGET`, `FIBER_DEC`) | Auto-detected from DESI coadd layout |
+| `sdss_boss` | `SPECOBJID` | `SPALL` HDU header | Header `RA` / `DEC` (fallback `PLUG_RA` / `PLUG_DEC`) | `spec-PLATE-MJD-FIBER.fits` |
+| `sdss_spplate` | via sidecar / plate header | `FIBERID` → specObjID | Fiber table columns (default `RA` / `DEC`, configurable via `--ra-col/--dec-col`) | `spPlate-PLATE-MJD.fits`; see spPlate section |
+| `generic` | `--link-id-col` or auto | Header keyword chain | Header columns from `--ra-col/--dec-col` (default `RA` / `DEC`) | Any 1-D FITS with spectral WCS |
+| `2df` | `SPFILE,FIBRE` (+ `--allow-incomplete-link-id` if some rows have no filename) | Header `SPFILE` \| `FIBRE` per SPECTRUM HDU | `SRRA` / `SRDEC` (fallback `OBSRA` / `OBSDEC`, then PRIMARY `RA` / `DEC`) | `data/389442.fits` |
+| `6df` | `targetname,obsid_v,obsid_r` | Filename stem + V header `OBSID_V` + R header `OBSID_R` per V/R/VR triple | VR header `OBSRA` / `OBSDEC` (fallback header `RA` / `DEC`, PRIMARY WCS, `OBJCTRA` / `OBJCTDEC`) | `data/g2302140-251235.fits` |
+| `gama` | `SPECID` | Primary header `SPECID` | Header columns from `--ra-col/--dec-col` (default `RA` / `DEC`) | `data/G23_Y7_015_265.fit` |
+| `ozdes` | filename column | Basename (stem) | Header `RA` / `DEC` | `OzDES_*.fits` |
+| `vandels` | filename column | Basename | Header `PND OBJRA` / `PND OBJDEC` (fallback `RA` / `DEC`) | `sc_*.fits` (PRIMARY + NOISE) |
+| `vipers` | filename column | Basename | Header `RA` / `DEC` (table/PRIMARY fallback) | `VIPERS_*.fits` |
+| `vuds` | filename column | Basename | Header `ALPHA` / `DELTA` (fallback `RA` / `DEC`) | `sc_*.fits` with `LAM CESAM VO` header |
+| `vvds` | filename column | Basename | Header `RA` / `DEC` | `sc_*.fits` without VUDS header |
+| `wigglez` | filename column | Basename (full, e.g. `wig225415.fits`) | Header `RA_OBJ` / `DEC_OBJ` | `wig*.fits`; stem alone will not match |
 
 Auto-detection runs before `--fmt` is needed: try `dl-ingest-spectra FILE --survey NAME` first.
 
@@ -1829,11 +1829,25 @@ dl-describe-lake                      # print survey × modality summary
 dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout)
 dl-describe-lake --count-total        # footer: per-modality totals + grand total (registry sums)
 dl-describe-lake --modality catalog --count-total
-dl-describe-lake --json --count-total # JSON entries + summary object
+dl-describe-lake --json               # {"entries": [...]} per survey × modality
+dl-describe-lake --json --count-total # entries + summary object
+dl-describe-lake --json --pair-surveys  # entries + catalog/spectra hats_order pairing
+dl-describe-lake --verbose            # tiles, ingest sidecars, link_id_mode, path, …
+dl-describe-lake --pair-surveys       # footer: catalog vs spectra hats_order per survey name
 dl-describe-lake --refresh            # rebuild registry from disk first, then print
 ```
 
 **`--count-total` does not rescan tiles.** Counts are read from the registry (`surveys.parquet`), which stores row counts recorded at ingest time. If you have ingested new data since the last `dl-refresh-lake-registry`, run `dl-describe-lake --refresh --count-total` to get up-to-date numbers.
+
+The default table adds **sky** (`ra_column`/`dec_column`), a **detail** column (`link_id_mode` for catalogs; `n_pix` + `wavelength_mode` for spectra; band stack shape for cutouts), and **manifest** (`Y`/`·`). Full registry fields (including `link_id_mode`, `native_id_column`, `n_tiles`, ingest checkpoint flags, `hats_order_match`, `created_utc`, …) are in `shared/registry/surveys.parquet` and `--json`.
+
+| Question | Registry field | Also see |
+|----------|----------------|----------|
+| How are catalog IDs defined? | `link_id_mode`, `native_id_column` | `catalog_info.json`, `dl-describe-survey` |
+| Sky columns for joins / crossmatch | `ra_column`, `dec_column` | `dl-extract-catalog`, STILTS |
+| Catalog vs spectra HEALPix order | `hats_order_match`, `--pair-surveys` | `dl-validate-catalog-spectra-link` |
+| Spectrum pixel width / wavelength layout | `n_pix`, `wavelength_mode` | `spectrum_info.json` |
+| Ingest still running? | `has_ingest_checkpoint`, `has_ingest_inflight` | survey `.ingest_*.json` sidecars |
 
 For **spectra**, ``total_rows`` in the registry is the sum of ``source_id`` lengths
 across all ``Npix=*.zarr`` tiles (same count as the ingestion report notebook’s

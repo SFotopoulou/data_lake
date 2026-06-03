@@ -25,6 +25,7 @@ from data_lake.schema_registry import (
     format_manifest_table,
     load_catalog_schema_manifest,
     load_schema_manifest,
+    overlay_search_paths,
     write_catalog_schema_manifest,
     write_cutout_schema_manifest,
     write_spectra_schema_manifest,
@@ -150,6 +151,114 @@ def _count_zarr_sources(survey_root: Path) -> int | None:
         total += n
         n_tiles += 1
     return total if n_tiles else None
+
+
+def _count_parquet_tiles(survey_root: Path) -> int:
+    return sum(1 for _ in survey_root.rglob("Npix=*.parquet"))
+
+
+def _count_zarr_tiles(survey_root: Path) -> int:
+    return sum(1 for _ in _iter_zarr_tiles(survey_root))
+
+
+def _wcs_summary(wcs: Any) -> str | None:
+    if not isinstance(wcs, dict) or not wcs:
+        return None
+    parts: list[str] = []
+    for key in ("ctype", "unit", "air_or_vacuum"):
+        val = wcs.get(key)
+        if val:
+            parts.append(str(val))
+    return "/".join(parts) if parts else None
+
+
+def _truncate_link_id_mode(mode: str | None, *, max_len: int = 24) -> str:
+    if not mode:
+        return "—"
+    if len(mode) <= max_len:
+        return mode
+    return mode[: max_len - 1] + "…"
+
+
+def _filesystem_registry_fields(
+    lake_root: Path,
+    survey: str,
+    survey_root: Path,
+    modality: str,
+) -> dict[str, Any]:
+    if modality == MODALITY_CATALOG:
+        n_tiles = _count_parquet_tiles(survey_root)
+        has_aggregate_metadata = (survey_root / "_metadata").is_file()
+    else:
+        n_tiles = _count_zarr_tiles(survey_root)
+        has_aggregate_metadata = None
+
+    return {
+        "n_tiles": n_tiles if n_tiles else None,
+        "has_aggregate_metadata": has_aggregate_metadata,
+        "has_ingest_checkpoint": (survey_root / ".ingest_checkpoint.json").is_file(),
+        "has_ingest_inflight": (survey_root / ".ingest_inflight.json").is_file(),
+        "has_column_overlay": any(
+            p.is_file() for p in overlay_search_paths(lake_root, survey, modality)
+        ),
+    }
+
+
+def _annotate_hats_order_match(rows: list[dict[str, Any]]) -> None:
+    """Set ``hats_order_match`` on catalog/spectra rows when both layers exist."""
+    orders_by_survey: dict[str, dict[str, int | None]] = {}
+    for row in rows:
+        survey = str(row["survey"])
+        modality = str(row["modality"])
+        hats = row.get("hats_order")
+        orders_by_survey.setdefault(survey, {})[modality] = (
+            int(hats) if hats is not None else None
+        )
+
+    for row in rows:
+        modality = str(row["modality"])
+        if modality not in (MODALITY_CATALOG, MODALITY_SPECTRA):
+            row["hats_order_match"] = None
+            continue
+        orders = orders_by_survey.get(str(row["survey"]), {})
+        cat_order = orders.get(MODALITY_CATALOG)
+        spec_order = orders.get(MODALITY_SPECTRA)
+        if cat_order is None or spec_order is None:
+            row["hats_order_match"] = None
+        else:
+            row["hats_order_match"] = cat_order == spec_order
+
+
+def _format_sky_columns(row: dict[str, Any]) -> str:
+    ra = row.get("ra_column")
+    dec = row.get("dec_column")
+    if ra and dec:
+        return f"{ra}/{dec}"
+    return "—"
+
+
+def _format_modality_detail(row: dict[str, Any]) -> str:
+    modality = row.get("modality")
+    if modality == MODALITY_CATALOG:
+        return _truncate_link_id_mode(row.get("link_id_mode"))
+    if modality == MODALITY_SPECTRA:
+        parts: list[str] = []
+        n_pix = row.get("n_pix")
+        if n_pix is not None:
+            parts.append(f"n={n_pix}")
+        wl = row.get("wavelength_mode")
+        if wl:
+            parts.append(str(wl))
+        if row.get("has_resolution"):
+            parts.append("res")
+        return " ".join(parts) if parts else "—"
+    if modality == MODALITY_CUTOUT:
+        n_bands = row.get("n_bands")
+        height = row.get("height")
+        width = row.get("width")
+        if n_bands is not None and height is not None and width is not None:
+            return f"{n_bands}x{height}x{width}"
+    return "—"
 
 
 def _load_catalog_manifest_or_none(catalog_root: Path, survey: str) -> dict[str, Any] | None:
@@ -295,30 +404,35 @@ def _catalog_registry_row(
 
     manifest_rel = None
     manifest_path = survey_root / MANIFEST_FILENAME
+    manifest: dict[str, Any] = {}
     if manifest_path.is_file():
         manifest_rel = str(manifest_path.relative_to(lake_root))
-
-    source_id = ra = dec = None
-    if manifest_path.is_file():
         with open(manifest_path) as fh:
-            m = json.load(fh)
-        source_id = m.get("link_id_column")
-        ra = m.get("ra_column")
-        dec = m.get("dec_column")
+            manifest = json.load(fh)
 
-    return {
+    row: dict[str, Any] = {
         "survey": survey,
-        "modality": "catalog",
+        "modality": MODALITY_CATALOG,
         "path": str(survey_root.relative_to(lake_root)),
         "hats_order": info.get("hats_order"),
-        "link_id_column": source_id,
-        "ra_column": ra,
-        "dec_column": dec,
-        "n_columns": info.get("total_columns"),
-        "total_rows": info.get("total_rows"),
+        "link_id_column": manifest.get("link_id_column") or info.get("link_id_column"),
+        "ra_column": manifest.get("ra_column") or info.get("ra_column"),
+        "dec_column": manifest.get("dec_column") or info.get("dec_column"),
+        "link_id_mode": manifest.get("link_id_mode") or info.get("link_id_mode"),
+        "native_id_column": info.get("native_id_column"),
+        "redshift_column": manifest.get("redshift_column"),
+        "allow_incomplete_link_id": info.get("allow_incomplete_link_id"),
+        "ingest_streaming": info.get("ingest_streaming"),
+        "epoch": info.get("epoch"),
+        "schema_version": info.get("schema_version"),
+        "created_utc": info.get("created_utc"),
+        "n_columns": info.get("total_columns") or manifest.get("n_columns"),
+        "total_rows": info.get("total_rows") or manifest.get("total_rows"),
         "manifest_path": manifest_rel,
         "has_schema_manifest": manifest_path.is_file(),
     }
+    row.update(_filesystem_registry_fields(lake_root, survey, survey_root, MODALITY_CATALOG))
+    return row
 
 
 def _load_layer_manifest_or_none(
@@ -374,7 +488,7 @@ def _info_registry_row(
             raw = info.get("total_spectra", info.get("total_rows"))
             total_rows = int(raw) if raw is not None else None
 
-    return {
+    row: dict[str, Any] = {
         "survey": survey,
         "modality": modality,
         "path": str(survey_root.relative_to(lake_root)),
@@ -386,7 +500,39 @@ def _info_registry_row(
         "total_rows": total_rows,
         "manifest_path": manifest_rel or str(info_path.relative_to(lake_root)),
         "has_schema_manifest": manifest_path.is_file(),
+        "schema_version": info.get("schema_version"),
+        "created_utc": info.get("created_utc"),
+        "on_duplicate_source_id": info.get("on_duplicate_source_id"),
+        "compression": info.get("compression"),
+        "zarr_format": info.get("zarr_format"),
     }
+    row.update(_filesystem_registry_fields(lake_root, survey, survey_root, modality))
+
+    if modality == MODALITY_SPECTRA:
+        meta_fields = info.get("meta_fields")
+        row.update(
+            {
+                "n_pix": info.get("n_pix"),
+                "wavelength_mode": info.get("wavelength_mode"),
+                "has_resolution": bool(info.get("has_resolution")),
+                "resolution_n_diag": info.get("resolution_n_diag"),
+                "wcs_summary": _wcs_summary(info.get("wcs")),
+                "meta_fields": meta_fields,
+                "n_meta_fields": len(meta_fields) if meta_fields else None,
+            }
+        )
+    elif modality == MODALITY_CUTOUT:
+        row.update(
+            {
+                "n_bands": info.get("n_bands"),
+                "height": info.get("height"),
+                "width": info.get("width"),
+                "band_names": info.get("band_names"),
+                "dtype": info.get("dtype"),
+            }
+        )
+
+    return row
 
 
 def build_lake_registry_table(lake_root: Path | str) -> pa.Table:
@@ -399,14 +545,20 @@ def build_lake_registry_table(lake_root: Path | str) -> pa.Table:
         rows.append(_catalog_registry_row(lake_root, survey, root))
 
     for survey, root in iter_modality_surveys(lake_root / "spectra", "spectrum_info.json"):
-        row = _info_registry_row(lake_root, survey, root, "spectra", "spectrum_info.json")
+        row = _info_registry_row(lake_root, survey, root, MODALITY_SPECTRA, "spectrum_info.json")
         if row:
             rows.append(row)
 
     for survey, root in iter_modality_surveys(lake_root / "cutouts", "cutout_info.json"):
-        row = _info_registry_row(lake_root, survey, root, "cutout", "cutout_info.json")
+        row = _info_registry_row(lake_root, survey, root, MODALITY_CUTOUT, "cutout_info.json")
         if row:
             rows.append(row)
+
+    if rows:
+        generated = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _annotate_hats_order_match(rows)
+        for row in rows:
+            row["registry_generated_utc"] = generated
 
     if not rows:
         return pa.table(
@@ -513,32 +665,128 @@ def format_registry_count_footer(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _pairing_summary_from_table(table: pa.Table) -> list[dict[str, Any]]:
+    by_survey: dict[str, dict[str, Any]] = {}
+    for row in table.to_pylist():
+        by_survey.setdefault(str(row["survey"]), {})[str(row["modality"])] = row
+    out: list[dict[str, Any]] = []
+    for survey in sorted(by_survey):
+        layers = by_survey[survey]
+        cat = layers.get(MODALITY_CATALOG)
+        spec = layers.get(MODALITY_SPECTRA)
+        if cat is None or spec is None:
+            continue
+        out.append(
+            {
+                "survey": survey,
+                "catalog_hats_order": cat.get("hats_order"),
+                "spectra_hats_order": spec.get("hats_order"),
+                "hats_order_match": cat.get("hats_order_match"),
+            }
+        )
+    return out
+
+
+def format_registry_pair_footer(table: pa.Table) -> str:
+    """Catalog vs spectra ``hats_order`` for surveys present in both layers."""
+    by_survey: dict[str, dict[str, Any]] = {}
+    for row in table.to_pylist():
+        survey = str(row["survey"])
+        modality = str(row["modality"])
+        by_survey.setdefault(survey, {})[modality] = row
+
+    lines = ["", "Catalog + spectra pairing (hats_order):"]
+    any_pairs = False
+    for survey in sorted(by_survey):
+        layers = by_survey[survey]
+        cat = layers.get(MODALITY_CATALOG)
+        spec = layers.get(MODALITY_SPECTRA)
+        if cat is None or spec is None:
+            continue
+        any_pairs = True
+        cat_order = cat.get("hats_order")
+        spec_order = spec.get("hats_order")
+        match = cat.get("hats_order_match")
+        if match is True:
+            status = "match"
+        elif match is False:
+            status = "MISMATCH"
+        else:
+            status = "—"
+        lines.append(
+            f"  {survey:<24} catalog={cat_order}  spectra={spec_order}  ({status})"
+        )
+    if not any_pairs:
+        lines.append("  (no survey with both catalog and spectra rows)")
+    return "\n".join(lines)
+
+
 def format_lake_registry_table(
     table: pa.Table,
     *,
     count_total: bool = False,
+    verbose: bool = False,
+    pair_surveys: bool = False,
 ) -> str:
     import polars as pl
 
     df = pl.from_arrow(table).sort(["modality", "survey"])
-    lines = [
-        f"{'survey':<24} {'modality':<10} {'hats':>4} {'cols':>6} {'rows':>14}  "
-        f"{'id_col':<16} manifest",
-        "-" * 90,
-    ]
-    for row in df.iter_rows(named=True):
-        rows_s = f"{row['total_rows']:,}" if row.get("total_rows") is not None else "—"
-        cols_s = str(row["n_columns"]) if row.get("n_columns") is not None else "—"
-        hats = row.get("hats_order")
-        hats_s = str(hats) if hats is not None else "—"
-        manifest = "yes" if row.get("has_schema_manifest") else "no"
-        lines.append(
-            f"{row['survey']:<24} {row['modality']:<10} {hats_s:>4} {cols_s:>6} {rows_s:>14}  "
-            f"{str(row.get('link_id_column') or '—'):<16} {manifest}"
+    lines: list[str] = []
+
+    if verbose:
+        header = (
+            f"{'survey':<20} {'mod':<8} {'hats':>4} {'rows':>10} {'tiles':>6} "
+            f"{'sky':<18} {'detail':<22} {'id_col':<14} {'link_mode':<20} "
+            f"ckpt infl ovly man"
         )
+        lines.extend([header, "-" * len(header)])
+        for row in df.iter_rows(named=True):
+            rows_s = f"{row['total_rows']:,}" if row.get("total_rows") is not None else "—"
+            hats_s = str(row["hats_order"]) if row.get("hats_order") is not None else "—"
+            tiles_s = str(row["n_tiles"]) if row.get("n_tiles") is not None else "—"
+            ckpt = "Y" if row.get("has_ingest_checkpoint") else "."
+            infl = "Y" if row.get("has_ingest_inflight") else "."
+            ovly = "Y" if row.get("has_column_overlay") else "."
+            manifest = "Y" if row.get("has_schema_manifest") else "."
+            link_mode = _truncate_link_id_mode(row.get("link_id_mode"), max_len=18)
+            lines.append(
+                f"{row['survey']:<20} {row['modality']:<8} {hats_s:>4} {rows_s:>10} "
+                f"{tiles_s:>6} {_format_sky_columns(row):<18} "
+                f"{_format_modality_detail(row):<22} "
+                f"{str(row.get('link_id_column') or '—'):<14} {link_mode:<20} "
+                f"{ckpt:>4} {infl:>4} {ovly:>4} {manifest:>3}"
+            )
+            path = row.get("path")
+            if path:
+                lines.append(f"    path: {path}")
+            if row.get("modality") == MODALITY_CATALOG and row.get("native_id_column"):
+                lines.append(f"    native_id: {row['native_id_column']}")
+            if row.get("modality") == MODALITY_SPECTRA and row.get("wcs_summary"):
+                lines.append(f"    wcs: {row['wcs_summary']}")
+    else:
+        header = (
+            f"{'survey':<24} {'modality':<10} {'hats':>4} {'cols':>6} {'rows':>14}  "
+            f"{'sky':<16} {'detail':<18} {'id_col':<12} mf"
+        )
+        lines.extend([header, "-" * 108])
+        for row in df.iter_rows(named=True):
+            rows_s = f"{row['total_rows']:,}" if row.get("total_rows") is not None else "—"
+            cols_s = str(row["n_columns"]) if row.get("n_columns") is not None else "—"
+            hats_s = str(row["hats_order"]) if row.get("hats_order") is not None else "—"
+            manifest = "Y" if row.get("has_schema_manifest") else "."
+            lines.append(
+                f"{row['survey']:<24} {row['modality']:<10} {hats_s:>4} {cols_s:>6} "
+                f"{rows_s:>14}  {_format_sky_columns(row):<16} "
+                f"{_format_modality_detail(row):<18} "
+                f"{str(row.get('link_id_column') or '—'):<12} {manifest}"
+            )
+
     if count_total:
-        lines.append("-" * 90)
+        sep = "-" * (len(lines[0]) if lines else 90)
+        lines.append(sep)
         lines.append(format_registry_count_footer(summarize_registry_row_counts(table)))
+    if pair_surveys:
+        lines.append(format_registry_pair_footer(table))
     return "\n".join(lines)
 
 
@@ -639,6 +887,16 @@ try:
         help="Append grand total of registry total_rows (sum only; use --refresh to rescan).",
     )
     @click.option("--json", "as_json", is_flag=True, help="Emit registry as JSON.")
+    @click.option(
+        "--verbose",
+        is_flag=True,
+        help="Wide table: path, tiles, ingest sidecars, link_id_mode, WCS summary, …",
+    )
+    @click.option(
+        "--pair-surveys",
+        is_flag=True,
+        help="Footer: catalog vs spectra hats_order per survey name.",
+    )
     def cli_describe_lake(
         output_root: Path | None,
         config_path: Path | None,
@@ -646,6 +904,8 @@ try:
         modality: str | None,
         count_total: bool,
         as_json: bool,
+        verbose: bool,
+        pair_surveys: bool,
     ) -> None:
         """List surveys and modalities on disk (registry index)."""
         lake_root = _resolve_lake_root(output_root, config_path)
@@ -654,17 +914,20 @@ try:
         table = filter_lake_registry_table(load_lake_registry(lake_root), modality)
         summary = summarize_registry_row_counts(table) if count_total else None
         if as_json:
+            payload: dict[str, Any] = {"entries": table.to_pylist()}
             if count_total:
-                payload = {
-                    "entries": table.to_pylist(),
-                    "summary": summary,
-                }
-                click.echo(json.dumps(payload, indent=2))
-            else:
-                click.echo(table.to_pandas().to_json(orient="records", indent=2))
+                payload["summary"] = summary
+            if pair_surveys:
+                payload["pairing"] = _pairing_summary_from_table(table)
+            click.echo(json.dumps(payload, indent=2, default=str))
         else:
             click.echo(
-                format_lake_registry_table(table, count_total=count_total),
+                format_lake_registry_table(
+                    table,
+                    count_total=count_total,
+                    verbose=verbose,
+                    pair_surveys=pair_surveys,
+                ),
             )
 
     @click.command("dl-describe-master")

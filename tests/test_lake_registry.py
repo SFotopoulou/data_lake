@@ -21,6 +21,7 @@ from data_lake.lake_registry import (
     build_lake_registry_table,
     filter_lake_registry_table,
     format_lake_registry_table,
+    format_registry_pair_footer,
     guess_master_meta,
     load_lake_registry,
     load_master_meta,
@@ -75,6 +76,24 @@ def test_refresh_lake_registry(tmp_path: Path) -> None:
     names = set(table.column("survey").to_pylist())
     assert "SURV_A" in names
     assert "SURV_B" in names
+
+
+def test_registry_catalog_extended_fields(tmp_path: Path) -> None:
+    _ingest_mini_catalog(tmp_path, "SURV_META")
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+    row = next(
+        r for r in load_lake_registry(lake).to_pylist()
+        if r["survey"] == "SURV_META" and r["modality"] == MODALITY_CATALOG
+    )
+    assert row["link_id_mode"] == "column:TARGETID"
+    assert row["native_id_column"] == "TARGETID"
+    assert row["ra_column"] == "TARGET_RA"
+    assert row["dec_column"] == "TARGET_DEC"
+    assert row["n_tiles"] is not None and row["n_tiles"] >= 1
+    assert row["has_aggregate_metadata"] is True
+    assert row["registry_generated_utc"]
+    assert row["hats_order_match"] is None
 
 
 def test_master_meta_guess_and_write(tmp_path: Path) -> None:
@@ -170,6 +189,38 @@ def test_registry_spectra_total_rows(tmp_path: Path) -> None:
     ]
     assert len(spec_rows) == 1
     assert spec_rows[0]["total_rows"] == 2
+    assert spec_rows[0]["n_pix"] == 8
+    assert spec_rows[0]["wavelength_mode"] == "shared"
+    assert spec_rows[0]["n_tiles"] == 2
+    assert spec_rows[0]["wcs_summary"]
+
+
+def test_registry_hats_order_match(tmp_path: Path) -> None:
+    _ingest_mini_catalog(tmp_path, "PAIR_SURV")
+    lake = tmp_path / "lake"
+    paths = [tmp_path / "a.fits", tmp_path / "b.fits"]
+    for p in paths:
+        p.touch()
+    ingest_spectra_parallel(
+        file_paths=paths,
+        output_root=lake,
+        survey_name="PAIR_SURV",
+        n_workers=1,
+        norder=5,
+        checkpoint_path=tmp_path / "ckpt.json",
+        failures_log=tmp_path / "fail.jsonl",
+        show_progress=False,
+        decoder=_mini_spectrum_decoder,
+        executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+    )
+    refresh_lake_registry(lake)
+    table = load_lake_registry(lake)
+    rows = {r["modality"]: r for r in table.to_pylist() if r["survey"] == "PAIR_SURV"}
+    assert rows[MODALITY_CATALOG]["hats_order_match"] is True
+    assert rows[MODALITY_SPECTRA]["hats_order_match"] is True
+    footer = format_registry_pair_footer(table)
+    assert "PAIR_SURV" in footer
+    assert "match" in footer
 
 
 def test_filter_lake_registry_by_modality(tmp_path: Path) -> None:
@@ -238,6 +289,63 @@ def test_describe_lake_modality_cli(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "SURV_CLI" in result.output
     assert "catalog" in result.output
+
+
+def test_describe_lake_verbose_and_json_cli(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from data_lake.lake_registry import cli_describe_lake
+
+    _ingest_mini_catalog(tmp_path, "SURV_VERB")
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+
+    assert cli_describe_lake is not None
+    runner = CliRunner()
+    verbose = runner.invoke(cli_describe_lake, [str(lake), "--verbose"])
+    assert verbose.exit_code == 0
+    assert "link_mode" in verbose.output or "column:TARGETID" in verbose.output
+    assert "tiles" in verbose.output.lower() or "ckpt" in verbose.output
+
+    json_out = runner.invoke(cli_describe_lake, [str(lake), "--json"])
+    assert json_out.exit_code == 0
+    payload = json.loads(json_out.output)
+    assert "entries" in payload
+    assert payload["entries"][0]["survey"] == "SURV_VERB"
+
+
+def test_describe_lake_pair_surveys_cli(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from data_lake.lake_registry import cli_describe_lake
+
+    _ingest_mini_catalog(tmp_path, "PAIR_CLI")
+    lake = tmp_path / "lake"
+    for label in ("a", "b"):
+        (tmp_path / f"{label}.fits").touch()
+    ingest_spectra_parallel(
+        file_paths=[tmp_path / "a.fits", tmp_path / "b.fits"],
+        output_root=lake,
+        survey_name="PAIR_CLI",
+        n_workers=1,
+        norder=5,
+        checkpoint_path=tmp_path / "ckpt_pair.json",
+        failures_log=tmp_path / "fail_pair.jsonl",
+        show_progress=False,
+        decoder=_mini_spectrum_decoder,
+        executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+    )
+    refresh_lake_registry(lake)
+
+    assert cli_describe_lake is not None
+    result = CliRunner().invoke(
+        cli_describe_lake,
+        [str(lake), "--pair-surveys", "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert "pairing" in payload
+    assert any(p["survey"] == "PAIR_CLI" for p in payload["pairing"])
 
 
 def test_describe_lake_version_flag() -> None:
