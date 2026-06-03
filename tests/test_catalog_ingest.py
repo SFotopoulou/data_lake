@@ -578,11 +578,10 @@ class TestStreamingIngest:
                 streaming=True,
             )
 
-    def test_streaming_with_auto_generated_source_id(self, tmp_path: Path):
-        """When link_id_col is None, streaming should auto-generate sequential IDs."""
+    def test_streaming_requires_link_id_col(self, tmp_path: Path):
+        """Catalog ingest must have --link-id-col; no sequential auto-IDs."""
         from data_lake.ingest.fits_to_parquet import ingest_catalog
 
-        # Build a minimal table without an explicit ID column
         tbl = Table({
             "RA":  np.array([10.0, 20.0, 30.0, 40.0]),
             "DEC": np.array([1.0, 2.0, 3.0, 4.0]),
@@ -591,19 +590,41 @@ class TestStreamingIngest:
         fits_path = tmp_path / "noid.fits"
         _write_table_as_fits(tbl, fits_path)
 
-        lake_root = tmp_path / "lake"
-        ingest_catalog(
-            source_path=fits_path, output_root=lake_root, survey_name="noid",
-            ra_col="RA", dec_col="DEC", norder=5,
-            link_id_col=None, tile_mode="overwrite", streaming=True,
-        )
+        with pytest.raises(ValueError, match="--link-id-col"):
+            ingest_catalog(
+                source_path=fits_path,
+                output_root=tmp_path / "lake",
+                survey_name="noid",
+                ra_col="RA",
+                dec_col="DEC",
+                norder=5,
+                link_id_col=None,
+                tile_mode="overwrite",
+                streaming=True,
+            )
 
-        merged = self._read_merged(lake_root, "noid")
-        assert merged.num_rows == 4
-        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
+    def test_invalid_sky_coordinates_rejected(self, tmp_path: Path):
+        """Rows with NaN or pipeline sentinels must fail before HEALPix assignment."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
 
-        assert LAKE_JOIN_ID_COLUMN in merged.schema.names
-        assert set(np.asarray(merged.column(LAKE_JOIN_ID_COLUMN)).tolist()) == {0, 1, 2, 3}
+        tbl = Table({
+            "TARGETID": np.array([1, 2], dtype=np.int64),
+            "TARGET_RA": np.array([10.0, np.nan]),
+            "TARGET_DEC": np.array([1.0, 2.0]),
+        })
+        fits_path = tmp_path / "bad_sky.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        with pytest.raises(ValueError, match="invalid sky"):
+            ingest_catalog(
+                source_path=fits_path,
+                output_root=tmp_path / "lake",
+                survey_name="bad",
+                ra_col="TARGET_RA",
+                dec_col="TARGET_DEC",
+                link_id_col="TARGETID",
+                tile_mode="overwrite",
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -564,13 +564,17 @@ def ensure_catalog_source_ids(
     When *allow_incomplete_link_id* is True and ``--link-id-col`` is composite or
     a string label column, rows with any missing/blank link part get null
     ``_source_id`` (row stays in Parquet; spectrum ingest will not link them).
-    """
-    if link_id_col:
-        matched = match_schema_column(link_id_col, table.schema.names)
-        if matched is not None:
-            link_id_col = matched
 
-    if link_id_col and "," in link_id_col:
+    *link_id_col* is required; auto-inference and sequential ``_source_id`` are
+    not supported.
+    """
+    if not link_id_col:
+        raise ValueError(
+            "Catalog ingest requires --link-id-col (e.g. TARGETID, SOURCE_ID). "
+            "Pass the survey's native object ID column."
+        )
+
+    if "," in link_id_col:
         col_names = resolve_link_id_column_names(link_id_col, table.schema.names)
         row_iter = zip(*(table.column(name).to_pylist() for name in col_names))
         if allow_incomplete_link_id:
@@ -601,16 +605,14 @@ def ensure_catalog_source_ids(
         )
         return table, f"composite:{spec}"
 
-    if not link_id_col or link_id_col not in table.schema.names:
-        inferred = infer_native_id_column(table.schema.names)
-        if inferred is not None:
-            return ensure_catalog_source_ids(table, inferred)
-        if LAKE_JOIN_ID_COLUMN not in table.schema.names:
-            table = _set_lake_join_id_column(
-                table,
-                pa.array(np.arange(len(table), dtype=np.int64), type=pa.int64()),
-            )
-        return table, "sequential"
+    matched = match_schema_column(link_id_col, table.schema.names)
+    if matched is None:
+        raise KeyError(
+            f"Link-ID column {link_id_col!r} not found in catalog table. "
+            f"Available columns: {table.schema.names[:30]}"
+            f"{'…' if len(table.schema.names) > 30 else ''}"
+        )
+    link_id_col = matched
 
     sid_field = table.schema.field(link_id_col)
     col = table.column(link_id_col)
@@ -864,6 +866,24 @@ def is_valid_sky_position(ra: float, dec: float) -> bool:
     if ra <= -9000.0 or dec <= -9000.0:
         return False
     return True
+
+
+def valid_sky_position_mask(ra_deg: np.ndarray, dec_deg: np.ndarray) -> np.ndarray:
+    """Element-wise :func:`is_valid_sky_position` for RA/Dec arrays (vectorized)."""
+    ra_deg = np.asarray(ra_deg, dtype=np.float64).reshape(-1)
+    dec_deg = np.asarray(dec_deg, dtype=np.float64).reshape(-1)
+    if ra_deg.shape != dec_deg.shape:
+        raise ValueError(
+            f"RA and Dec length mismatch: {ra_deg.shape[0]} vs {dec_deg.shape[0]}"
+        )
+    return (
+        np.isfinite(ra_deg)
+        & np.isfinite(dec_deg)
+        & (dec_deg >= -90.0)
+        & (dec_deg <= 90.0)
+        & (ra_deg > -9000.0)
+        & (dec_deg > -9000.0)
+    )
 
 
 def assign_healpix(
@@ -1264,6 +1284,19 @@ def _add_healpix_columns(
 
     ra = _sky_to_float64(ra_col)
     dec = _sky_to_float64(dec_col)
+    valid = valid_sky_position_mask(ra, dec)
+    if not valid.all():
+        bad_idx = np.flatnonzero(~valid)[:5]
+        n_bad = int((~valid).sum())
+        examples = "; ".join(
+            f"row {int(i)}: {ra_col}={ra[i]!r}, {dec_col}={dec[i]!r}"
+            for i in bad_idx
+        )
+        raise ValueError(
+            f"{n_bad} catalog row(s) have invalid sky coordinates "
+            f"({ra_col!r}/{dec_col!r}; checked with is_valid_sky_position). "
+            f"Examples: {examples}"
+        )
     pix = assign_healpix(ra, dec, norder)
     col_name = f"_healpix_norder{norder}"
     table = table.append_column(col_name, pa.array(pix, type=pa.int64()))
@@ -1949,11 +1982,10 @@ def ingest_catalog(
     norder:
         HEALPix order for partitioning (default 5 → ~12k tiles of ~3.7 deg²).
     link_id_col:
-        If provided, used as the object identifier.  Integer columns are stored
-        as ``int64``.  Non-integer string labels (e.g. ``J000000.00-314627.5``)
-        are kept in that column and a ``source_id`` int64 hash column is added
-        for spectrum/cutout joins.  Decimal ASCII strings (DESI ``TARGETID``) are
-        parsed as integers.  Otherwise a sequential ``source_id`` is generated.
+        **Required.** Survey object ID column (e.g. ``TARGETID``, ``SOURCE_ID``).
+        Integer columns are stored as ``int64`` in ``_source_id``.  Non-integer
+        string labels are kept in that column and ``_source_id`` is a stable hash.
+        Decimal ASCII strings (DESI ``TARGETID``) are parsed as integers.
     tile_mode:
         How to handle an existing ``Npix=*.parquet`` tile: ``skip`` (default),
         ``overwrite`` (replace), or ``append`` (read–concat–write).
@@ -2216,9 +2248,31 @@ def _ingest_catalog_streaming(
         ra = np.ascontiguousarray(np.asarray(data[ra_col], dtype=np.float64))
         dec = np.ascontiguousarray(np.asarray(data[dec_col], dtype=np.float64))
 
-        sid_in_fits = _link_id_columns_present(link_id_col, col_names)
-        if not sid_in_fits:
-            sids = np.arange(n_rows, dtype=np.int64)
+        if not link_id_col:
+            raise ValueError(
+                "Catalog ingest requires --link-id-col (e.g. TARGETID, SOURCE_ID). "
+                "Pass the survey's native object ID column."
+            )
+        if not _link_id_columns_present(link_id_col, col_names):
+            raise KeyError(
+                f"Link-ID column {link_id_col!r} not found in FITS BINTABLE. "
+                f"Available columns: {col_names[:30]}"
+                f"{'…' if len(col_names) > 30 else ''}"
+            )
+
+        valid = valid_sky_position_mask(ra, dec)
+        if not valid.all():
+            bad_idx = np.flatnonzero(~valid)[:5]
+            n_bad = int((~valid).sum())
+            examples = "; ".join(
+                f"row {int(i)}: {ra_col}={ra[i]!r}, {dec_col}={dec[i]!r}"
+                for i in bad_idx
+            )
+            raise ValueError(
+                f"{n_bad} catalog row(s) have invalid sky coordinates "
+                f"({ra_col!r}/{dec_col!r}; checked with is_valid_sky_position). "
+                f"Examples: {examples}"
+            )
 
         npix_arr = assign_healpix(ra, dec, norder)
         sort_order = np.argsort(npix_arr, kind="stable")
@@ -2249,21 +2303,13 @@ def _ingest_catalog_streaming(
             astropy_chunk = Table(chunk, copy=False)
             tile_table = _astropy_table_to_arrow(astropy_chunk)
 
-            if not sid_in_fits:
-                if sid_mode is None:
-                    sid_mode = "sequential"
-                tile_table = _set_lake_join_id_column(
-                    tile_table,
-                    pa.array(sids[row_idx], type=pa.int64()),
-                )
-            else:
-                tile_table, tile_sid_mode = ensure_catalog_source_ids(
-                    tile_table,
-                    link_id_col,
-                    allow_incomplete_link_id=allow_incomplete_link_id,
-                )
-                if sid_mode is None:
-                    sid_mode = tile_sid_mode
+            tile_table, tile_sid_mode = ensure_catalog_source_ids(
+                tile_table,
+                link_id_col,
+                allow_incomplete_link_id=allow_incomplete_link_id,
+            )
+            if sid_mode is None:
+                sid_mode = tile_sid_mode
 
             tile_table = tile_table.append_column(
                 hp_col,
@@ -2443,7 +2489,11 @@ try:
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
-    @click.option("--link-id-col", default=None)
+    @click.option(
+        "--link-id-col",
+        required=True,
+        help="Survey object ID column (e.g. TARGETID, SOURCE_ID). Required.",
+    )
     @click.option(
         "--allow-incomplete-link-id",
         is_flag=True,

@@ -153,7 +153,11 @@ try:
     @click.option("--ra-col", default="ra", show_default=True)
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int)
-    @click.option("--link-id-col", default=None)
+    @click.option(
+        "--link-id-col",
+        required=True,
+        help="Survey object ID column (e.g. TARGETID). Required.",
+    )
     @allow_incomplete_link_id_option
     @from_list_tile_mode_option
     @click.option(

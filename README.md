@@ -438,7 +438,10 @@ column is always ``link_id_column: "_source_id"``. When you pass
 | Alphanumeric labels | ``J000000.00-314627.5`` in ``NAME`` | ``NAME`` kept; ``_source_id`` = stable hash | ``label:NAME`` |
 | Composite labels | ``targetname`` + ``obsid_v`` + ``obsid_r`` (6dF) | Columns kept; ``_source_id`` = hash of ``target\|obsid_v\|obsid_r`` | ``composite:targetname,obsid_v,obsid_r`` |
 | Composite with header (2dF) | ``SPFILE`` + ``FIBRE`` per extension | Columns kept; ``_source_id`` = hash of ``spfile\|fibre`` | ``composite:SPFILE,FIBRE`` |
-| (none) | — | ``_source_id`` 0…N−1 only | ``sequential`` |
+
+**Required:** ``--link-id-col`` must name an existing catalog column (or comma-separated composite). Auto-inference and sequential ``_source_id`` are not supported.
+
+**Sky coordinates:** every row's ``--ra-col`` / ``--dec-col`` values must pass ``is_valid_sky_position`` (finite, Dec in [-90, 90], not SDSS-style sentinels ≤ −9000). Invalid rows abort ingest before HEALPix assignment.
 
 **Incomplete composite IDs:** If a catalog row is missing one or more parts of a composite or label link key (e.g. the `SPFILE` column is blank for some rows), use ``--allow-incomplete-link-id``. Affected rows keep all science columns but ``_source_id`` is set to ``null`` and ``_spectrum_index`` stays ``-1``. Without the flag the ingest aborts on the first missing part.
 
@@ -470,9 +473,6 @@ acc.get_spectrum(sid)
 SQL on names: ``SELECT * FROM catalog WHERE NAME = 'J000000.00-314627.5'``.
 Use the **same** spelling (after strip) in cutout/spectrum FITS headers via
 ``--link-id-col NAME`` so ingest hashes match the catalog.
-
-If no ``--link-id-col`` is given, ingest tries common column names
-(``TARGETID``, ``SOURCE_ID``, …) or generates sequential ``_source_id`` values.
 
 For surveys where the join key spans multiple catalog columns (6dF ``targetname`` +
 ``obsid_v`` + ``obsid_r``), pass a comma-separated spec:
