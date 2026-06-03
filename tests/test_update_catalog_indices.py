@@ -548,7 +548,59 @@ class TestUpdateIndexFromZarrTiles:
             norder=None,
         )
         assert n_modified == 0
-        assert any("no catalog tile" in r.message for r in caplog.records)
+        # In the new ID-based model the warning message reflects that no catalog
+        # rows matched (rather than "no catalog tile at Npix=X"), because all
+        # catalog tiles are scanned regardless of Zarr Npix.
+        assert any(
+            "no catalog rows matched" in r.message or "no catalog tile" in r.message
+            for r in caplog.records
+        )
+
+
+    def test_mixed_order_patches_across_different_npix(self, tmp_path: Path) -> None:
+        """Catalog at norder=5, spectra at norder=1 — Zarr Npix differs from catalog Npix.
+
+        After rebuild, catalog rows should have _spectrum_npix set to the Zarr
+        tile pixel and _spectrum_index set to the local row index.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, healpix_dir
+        from data_lake.ingest.update_catalog_indices import (
+            update_index_column_from_zarr_tiles,
+        )
+
+        cat_order = 5
+        spec_order = 1
+        survey = "mixed_order"
+
+        ids = [9_000_001, 9_000_002]
+        ra = [50.0, 50.5]
+        dec = [20.0, 20.5]
+
+        # Build catalog tiles at norder=5.
+        _write_mini_catalog(tmp_path, survey, LAKE_JOIN_ID_COLUMN, ids, ra, dec, norder=cat_order)
+
+        # Build spectrum Zarr at norder=1 (all fall in same coarse tile).
+        _write_mini_spectra_zarr(tmp_path, survey, ids, ra, dec, norder=spec_order)
+
+        n_modified = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name=survey,
+            kind="spectrum",
+        )
+        assert n_modified > 0
+
+        tiles = sorted((tmp_path / "catalogs" / survey).rglob("Npix=*.parquet"))
+        merged = pa.concat_tables([pq.ParquetFile(str(t)).read() for t in tiles])
+        spec_idx = merged.column("_spectrum_index").to_pylist()
+        spec_npix = merged.column("_spectrum_npix").to_pylist()
+
+        assert all(v >= 0 for v in spec_idx), f"Unlinked _spectrum_index: {spec_idx}"
+        assert all(v >= 0 for v in spec_npix), f"Unset _spectrum_npix: {spec_npix}"
+        # All rows in this survey map to the same Zarr tile (coarse norder=1).
+        assert len(set(spec_npix)) == 1, "Expected all rows in one Zarr tile"
 
 
 class TestBuildIndexMapFromZarr:
@@ -573,11 +625,12 @@ class TestBuildIndexMapFromZarr:
         # 2. Write Zarr tiles (simulating a prior ingest run with no catalog patch)
         written_map = _write_mini_spectra_zarr(tmp_path, "desi_backfill", ids, ra, dec)
 
-        # 3. Reconstruct map from Zarr
+        # 3. Reconstruct map from Zarr — values are now (zarr_npix, local_index) tuples.
         recovered_map = build_index_map_from_zarr(tmp_path, "desi_backfill", kind="spectrum")
         assert set(recovered_map.keys()) == set(written_map.keys())
         for sid in written_map:
-            assert recovered_map[sid] == written_map[sid]
+            # written_map has plain local_index; recovered_map has (npix, local_index).
+            assert recovered_map[sid][1] == written_map[sid]
 
         # 4. Patch catalog using the recovered map
         n_modified = update_index_column(

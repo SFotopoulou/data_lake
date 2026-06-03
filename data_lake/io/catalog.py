@@ -411,25 +411,29 @@ class CatalogAccessor:
         kind: str = "cutout",
     ) -> tuple[int, int]:
         """
-        Return ``(healpix_npix, local_index)`` for a given source_id.
+        Return ``(modality_npix, local_index)`` for a given source_id.
+
+        When ``_spectrum_npix`` / ``_cutout_npix`` is present (new-format
+        catalog), the modality-specific pixel is returned so the caller can
+        open the correct Zarr tile regardless of HEALPix order differences.
+        In the legacy path (column absent), ``_healpix_norder{N}`` is used.
 
         Parameters
         ----------
         source_id:
             Source identifier (value of the catalog's ID column, e.g. ``TARGETID``).
         kind:
-            Which index column to return: ``"cutout"`` (default) reads
-            ``_cutout_index``; ``"spectrum"`` reads ``_spectrum_index``.
+            ``"cutout"`` or ``"spectrum"``.
 
         Raises KeyError if the source is not found.
         """
         if kind not in ("cutout", "spectrum"):
             raise ValueError(f"kind must be 'cutout' or 'spectrum', got {kind!r}")
         index_col = f"_{kind}_index"
+        npix_col = f"_{kind}_npix"
         hp_col = f"_healpix_norder{self.norder}"
         sid_col = self._link_id_column
 
-        # _spectrum_index may not exist in catalogs ingested before this change
         cols_available = self.columns
         if index_col not in cols_available:
             raise KeyError(
@@ -437,7 +441,17 @@ class CatalogAccessor:
                 f"Re-run catalog ingest or call update_index_column() first."
             )
 
-        sql = f"SELECT {hp_col}, {index_col} FROM catalog WHERE {sid_col} = {source_id} LIMIT 1"
+        # Prefer modality-specific npix when available (decoupled orders).
+        if npix_col in cols_available:
+            sql = (
+                f"SELECT {npix_col}, {index_col} FROM catalog "
+                f"WHERE {sid_col} = {source_id} LIMIT 1"
+            )
+        else:
+            sql = (
+                f"SELECT {hp_col}, {index_col} FROM catalog "
+                f"WHERE {sid_col} = {source_id} LIMIT 1"
+            )
         result = self._con.execute(sql).fetchone()
         if result is None:
             raise KeyError(f"source_id={source_id} not found in catalog")

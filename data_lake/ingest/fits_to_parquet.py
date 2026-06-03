@@ -836,12 +836,13 @@ def rebuild_parquet_tile_link_id(
     if reset_indices:
         n = len(table)
         minus_one = pa.array(np.full(n, -1, dtype=np.int64), type=pa.int64())
-        if "_spectrum_index" in table.schema.names:
-            idx = table.schema.get_field_index("_spectrum_index")
-            table = table.set_column(idx, "_spectrum_index", minus_one)
-        if "_cutout_index" in table.schema.names:
-            idx = table.schema.get_field_index("_cutout_index")
-            table = table.set_column(idx, "_cutout_index", minus_one)
+        for _reset_col in (
+            "_spectrum_index", "_spectrum_npix",
+            "_cutout_index", "_cutout_npix",
+        ):
+            if _reset_col in table.schema.names:
+                _idx = table.schema.get_field_index(_reset_col)
+                table = table.set_column(_idx, _reset_col, minus_one)
     opts = catalog_parquet_options or CatalogParquetOptions()
     pq.write_table(
         table,
@@ -1266,16 +1267,18 @@ def _add_healpix_columns(
     pix = assign_healpix(ra, dec, norder)
     col_name = f"_healpix_norder{norder}"
     table = table.append_column(col_name, pa.array(pix, type=pa.int64()))
-    # cutout_index and spectrum_index are filled by the respective ingest steps;
-    # initialise both to -1 (sentinel meaning "not yet ingested").
-    if "_cutout_index" not in table.schema.names:
-        table = table.append_column(
-            "_cutout_index", pa.array(np.full(len(table), -1, dtype=np.int64), type=pa.int64())
-        )
-    if "_spectrum_index" not in table.schema.names:
-        table = table.append_column(
-            "_spectrum_index", pa.array(np.full(len(table), -1, dtype=np.int64), type=pa.int64())
-        )
+    # cutout_index, spectrum_index, and their modality-specific Npix columns are
+    # filled by the respective ingest steps; initialise all to -1.
+    for colname in (
+        "_cutout_index",
+        "_cutout_npix",
+        "_spectrum_index",
+        "_spectrum_npix",
+    ):
+        if colname not in table.schema.names:
+            table = table.append_column(
+                colname, pa.array(np.full(len(table), -1, dtype=np.int64), type=pa.int64())
+            )
     return table
 
 
@@ -1292,7 +1295,11 @@ def _filter_table_columns(
     if not columns:
         return table
     hp_col = f"_healpix_norder{norder}"
-    required = {ra_col, dec_col, hp_col, "_cutout_index", "_spectrum_index"}
+    required = {
+        ra_col, dec_col, hp_col,
+        "_cutout_index", "_cutout_npix",
+        "_spectrum_index", "_spectrum_npix",
+    }
     if link_id_col:
         required.add(link_id_col)
     required.add(LAKE_JOIN_ID_COLUMN)
@@ -2262,14 +2269,16 @@ def _ingest_catalog_streaming(
                 hp_col,
                 pa.array(np.full(n_tile, npix, dtype=np.int64), type=pa.int64()),
             )
-            tile_table = tile_table.append_column(
+            for _col in (
                 "_cutout_index",
-                pa.array(np.full(n_tile, -1, dtype=np.int64), type=pa.int64()),
-            )
-            tile_table = tile_table.append_column(
+                "_cutout_npix",
                 "_spectrum_index",
-                pa.array(np.full(n_tile, -1, dtype=np.int64), type=pa.int64()),
-            )
+                "_spectrum_npix",
+            ):
+                tile_table = tile_table.append_column(
+                    _col,
+                    pa.array(np.full(n_tile, -1, dtype=np.int64), type=pa.int64()),
+                )
 
             tile_table = _filter_table_columns(
                 tile_table, columns, ra_col=ra_col, dec_col=dec_col,

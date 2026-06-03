@@ -3098,9 +3098,12 @@ def write_spectrum_tile_groups(
     on_duplicate_source_id: Literal["append", "error", "skip"],
     res_diags: list[np.ndarray] | None = None,
     res_offsets: np.ndarray | None = None,
-) -> dict[int, int]:
-    """Append grouped spectrum records to HEALPix Zarr tiles (sequential writer)."""
-    index_map: dict[int, int] = {}
+) -> dict[int, tuple[int, int]]:
+    """Append grouped spectrum records to HEALPix Zarr tiles (sequential writer).
+
+    Returns ``{source_id: (zarr_npix, local_index)}``.
+    """
+    index_map: dict[int, tuple[int, int]] = {}
     n_diag = int(res_diags[0].shape[0]) if res_diags is not None else None
     sid_to_res_idx: dict[int, int] = {}
     if res_diags is not None:
@@ -3239,7 +3242,7 @@ def write_spectrum_tile_groups(
             root["resolution"].append(batch_res)
 
         for local_i, rec in enumerate(tile_records):
-            index_map[rec.source_id] = start_idx + local_i
+            index_map[rec.source_id] = (npix, start_idx + local_i)
 
     return index_map
 

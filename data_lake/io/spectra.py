@@ -510,26 +510,31 @@ class SpectrumAccessor:
         if self._catalog is not None:
             try:
                 cat_cols = self._catalog.columns
-                hp_col = f"_healpix_norder{self._catalog.norder}"
                 sid_col = self._catalog.link_id_column
-                if "_spectrum_index" in cat_cols and hp_col in cat_cols:
-                    batch_size = 10_000
-                    for start in tqdm(
-                        range(0, len(requested_int), batch_size),
-                        desc="catalog lookup",
-                        disable=not show_progress,
-                        unit="batch",
-                    ):
-                        chunk = requested_int[start : start + batch_size]
-                        ids_csv = ",".join(str(int(s)) for s in chunk)
-                        sql = (
-                            f"SELECT {sid_col}, {hp_col}, _spectrum_index "
-                            f"FROM catalog WHERE {sid_col} IN ({ids_csv}) "
-                            f"AND _spectrum_index >= 0"
-                        )
-                        rows = self._catalog._con.execute(sql).fetchall()
-                        for sid, npix, lidx in rows:
-                            result[int(sid)] = (int(npix), int(lidx))
+                if "_spectrum_index" in cat_cols:
+                    # Prefer modality-specific npix column (decoupled orders).
+                    if "_spectrum_npix" in cat_cols:
+                        tile_col = "_spectrum_npix"
+                    else:
+                        tile_col = f"_healpix_norder{self._catalog.norder}"
+                    if tile_col in cat_cols:
+                        batch_size = 10_000
+                        for start in tqdm(
+                            range(0, len(requested_int), batch_size),
+                            desc="catalog lookup",
+                            disable=not show_progress,
+                            unit="batch",
+                        ):
+                            chunk = requested_int[start : start + batch_size]
+                            ids_csv = ",".join(str(int(s)) for s in chunk)
+                            sql = (
+                                f"SELECT {sid_col}, {tile_col}, _spectrum_index "
+                                f"FROM catalog WHERE {sid_col} IN ({ids_csv}) "
+                                f"AND _spectrum_index >= 0"
+                            )
+                            rows = self._catalog._con.execute(sql).fetchall()
+                            for sid, npix, lidx in rows:
+                                result[int(sid)] = (int(npix), int(lidx))
             except Exception:  # pragma: no cover - defensive
                 log.warning(
                     "Catalog fast-path failed, falling back to tile scan.",

@@ -529,7 +529,11 @@ class TestStreamingIngest:
         assert set(mem_tbl.schema.names) == set(stream_tbl.schema.names)
 
         # Required bookkeeping columns
-        for col in ("_healpix_norder5", "_cutout_index", "_spectrum_index"):
+        for col in (
+            "_healpix_norder5",
+            "_cutout_index", "_cutout_npix",
+            "_spectrum_index", "_spectrum_npix",
+        ):
             assert col in mem_tbl.schema.names
             assert col in stream_tbl.schema.names
 

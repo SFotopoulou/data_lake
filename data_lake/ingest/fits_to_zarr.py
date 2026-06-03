@@ -200,10 +200,12 @@ def ingest_cutouts_from_fits(
     link_id_col: str | None = None,
     dtype: np.dtype | type = _DEFAULT_DTYPE,
     on_duplicate_source_id: Literal["append", "error", "skip"] = "skip",
-) -> dict[int, int]:
+) -> dict[int, tuple[int, int]]:
     """
     Ingest cutout images from a FITS file (one HDU = one source or one MEF
     with multiple extensions = multiple bands per source).
+
+    Returns ``{source_id: (zarr_npix, local_index)}``.
 
     Parameters
     ----------
@@ -244,7 +246,7 @@ def ingest_cutouts_from_fits(
     output_root = Path(output_root)
     dtype = np.dtype(dtype)
 
-    index_map: dict[int, int] = {}
+    index_map: dict[int, tuple[int, int]] = {}
 
     with fits.open(str(source_path), memmap=True) as hdul:
         records = _extract_records_from_hdul(
@@ -301,7 +303,7 @@ def ingest_cutouts_from_fits(
         wcs_arr.append(batch_wcs_bytes)
 
         for local_i, rec in enumerate(tile_records):
-            index_map[rec.source_id] = start_idx + local_i
+            index_map[rec.source_id] = (npix, start_idx + local_i)
 
         # Store band names as attribute if provided
         if band_names and "band_names" not in root.attrs:

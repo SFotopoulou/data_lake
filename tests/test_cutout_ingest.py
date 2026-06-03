@@ -47,8 +47,8 @@ def test_ingest_cutouts_writes_zarr_and_passes_validation(tmp_path: Path) -> Non
         f2, tmp_path, "test_survey", ra_col="RA", dec_col="DEC",
         norder=3,
     )
-    assert m1[1001] == 0
-    assert m2[1002] == 1
+    assert m1[1001][1] == 0   # local_index
+    assert m2[1002][1] == 1   # local_index (second file appended to same tile)
 
     info = json.loads((tmp_path / "cutouts" / "test_survey" / "cutout_info.json").read_text())
     assert info["dtype"] == "float32"
@@ -100,7 +100,7 @@ def test_link_id_col_targetid(tmp_path: Path) -> None:
         link_id_col="TARGETID",
         norder=3,
     )
-    assert m[tid] == 0
+    assert m[tid][1] == 0   # local_index
 
 
 def test_link_id_col_missing_raises(tmp_path: Path) -> None:

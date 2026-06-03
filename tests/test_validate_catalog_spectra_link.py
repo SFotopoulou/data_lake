@@ -246,3 +246,62 @@ class TestValidateCatalogSpectraLink:
         assert "unpatched catalog:" in result.output
         assert "dl-rebuild-catalog-indices" in result.output
         assert "OK (with" in result.output
+
+    def test_mixed_order_with_spectrum_npix_col(self, tmp_path: Path) -> None:
+        """Catalog at norder=5, spectra at norder=1 — different Npix values.
+
+        The catalog tile uses _spectrum_npix (the new format) to record which
+        Zarr tile each row belongs to.  Validation must pass even though the
+        catalog _healpix_norder5 pixel differs from the Zarr tile Npix.
+        """
+        import json
+
+        cat_order = 5
+        spec_order = 1
+        cat_npix = 42
+        spec_npix = 0  # different from cat_npix
+
+        lake = tmp_path / "lake"
+
+        # Write spectrum Zarr tile at spec_order=1, Npix=0.
+        spec_root = lake / "spectra" / SURVEY
+        spec_root.mkdir(parents=True, exist_ok=True)
+        (spec_root / "spectrum_info.json").write_text(json.dumps({
+            "n_pix": N_PIX, "hats_order": spec_order, "wavelength_mode": "shared", "wcs": {}
+        }))
+        zarr_path = spec_root / healpix_dir(spec_order, spec_npix) / f"Npix={spec_npix}.zarr"
+        _write_min_zarr(zarr_path, source_ids=[201, 202])
+
+        # Write catalog tile at cat_order=5, with _spectrum_npix pointing to the zarr tile.
+        cat_root = lake / "catalogs" / SURVEY
+        cat_path = cat_root / healpix_dir(cat_order, cat_npix) / f"Npix={cat_npix}.parquet"
+        cat_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([201, 202], type=pa.int64()),
+                f"_healpix_norder{cat_order}": pa.array([cat_npix, cat_npix], type=pa.int64()),
+                "_spectrum_index": pa.array([0, 1], type=pa.int64()),
+                "_spectrum_npix": pa.array([spec_npix, spec_npix], type=pa.int64()),
+            }),
+            cat_path,
+        )
+        (cat_root / "catalog_info.json").write_text(json.dumps({
+            "hats_order": cat_order, "link_id_mode": "sequential",
+            "link_id_column": "_source_id", "ra_column": "ra", "dec_column": "dec",
+        }))
+
+        rep = run_validation(lake, SURVEY)
+        # strict=False because the order-mismatch warning is informational.
+        assert rep.ok(strict=False), f"errors={rep.errors} warnings={rep.warnings}"
+        assert rep.stats.n_linked == 2
+        assert rep.stats.n_orphan_zarr == 0
+        # Confirm the warning is about order difference, not a linkage error.
+        assert any("hats_order differs" in w for w in rep.warnings)
+
+    def test_legacy_mode_same_order(self, tmp_path: Path) -> None:
+        """No _spectrum_npix column — legacy path using same-Npix pairing."""
+        lake = _make_lake(tmp_path)
+        # _make_lake creates a catalog without _spectrum_npix; validation must still pass.
+        rep = run_validation(lake, SURVEY)
+        assert rep.ok(strict=True), f"errors={rep.errors} warnings={rep.warnings}"
+        assert rep.stats.n_linked == 2

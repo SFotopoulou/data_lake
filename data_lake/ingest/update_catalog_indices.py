@@ -1,10 +1,15 @@
 """
 update_catalog_indices – rewrite only the affected tile Parquet files with
-updated ``_cutout_index`` or ``_spectrum_index`` values after a Zarr ingest.
+updated ``_cutout_index`` / ``_cutout_npix`` or ``_spectrum_index`` /
+``_spectrum_npix`` values after a Zarr ingest.
 
-The ingest functions in ``fits_to_zarr`` and ``fits_to_spectra_zarr`` return a
-``{source_id: local_index}`` mapping.  Pass that mapping to
-``update_index_column`` so the relevant Parquet tiles are patched in-place.
+The ingest functions return a ``{source_id: (zarr_npix, local_index)}``
+mapping.  Pass that mapping to ``update_index_column`` so the relevant
+Parquet tiles are patched in-place.
+
+The modality-specific npix column (``_spectrum_npix``, ``_cutout_npix``)
+allows catalog and spectra/cutout layers to use **different HEALPix orders
+and different coordinates** while still joining on ``_source_id``.
 
 Only tiles that actually contain matched source_ids are rewritten – every
 other tile is left untouched, making this efficient even for large catalogs.
@@ -42,6 +47,10 @@ IndexKind = Literal["cutout", "spectrum"]
 _INDEX_COL: dict[str, str] = {
     "cutout":   "_cutout_index",
     "spectrum": "_spectrum_index",
+}
+_NPIX_COL: dict[str, str] = {
+    "cutout":   "_cutout_npix",
+    "spectrum": "_spectrum_npix",
 }
 _KIND_DIR: dict[str, str] = {"spectrum": "spectra", "cutout": "cutouts"}
 _MODALITY_INFO: dict[str, str] = {"spectrum": "spectrum_info.json", "cutout": "cutout_info.json"}
@@ -105,18 +114,23 @@ def _catalog_tile_for_npix(
 
 def _patch_catalog_parquet_file(
     tile_file: Path,
-    source_id_to_index: dict[int, int],
+    source_id_to_tile: dict[int, tuple[int, int]],
     *,
     sid_col: str,
     index_col: str,
+    npix_col: str,
     reset_unmatched: bool = False,
 ) -> bool:
     """Patch one catalog Parquet tile; return True if the file was rewritten.
 
+    ``source_id_to_tile`` maps ``source_id -> (zarr_npix, local_index)``.
+
+    Both ``index_col`` (local Zarr row) and ``npix_col`` (which Zarr tile)
+    are updated so that readers can open the correct tile at any HEALPix order.
+
     When *reset_unmatched* is True (full Zarr-tile rebuild), rows whose
-    ``sid_col`` value is absent from *source_id_to_index* get
-    ``index_col=-1``.  Without this, stale indices from an older, larger Zarr
-  tile survive and fail ``dl-validate-catalog-spectra-link``.
+    ``sid_col`` value is absent from *source_id_to_tile* get ``-1`` for both
+    columns.
     """
     table = pq.ParquetFile(str(tile_file)).read()
     if sid_col not in table.schema.names:
@@ -137,7 +151,7 @@ def _patch_catalog_parquet_file(
             tile_ids.append(None)
         else:
             tile_ids.append(normalize_object_id(x))
-    source_id_set = set(source_id_to_index.keys())
+    source_id_set = set(source_id_to_tile.keys())
     matches = [sid for sid in tile_ids if sid is not None and sid in source_id_set]
     if not matches and not reset_unmatched:
         return False
@@ -148,6 +162,12 @@ def _patch_catalog_parquet_file(
         idx_arr = np.full(len(table), -1, dtype=np.int64)
         log.debug("Adding missing column %s to %s", index_col, tile_file.name)
 
+    if npix_col in table.schema.names:
+        npix_arr = np.array(table.column(npix_col).to_pylist(), dtype=np.int64)
+    else:
+        npix_arr = np.full(len(table), -1, dtype=np.int64)
+        log.debug("Adding missing column %s to %s", npix_col, tile_file.name)
+
     id_to_row: dict[int, list[int]] = {}
     for row_i, sid in enumerate(tile_ids):
         if sid is None:
@@ -155,19 +175,23 @@ def _patch_catalog_parquet_file(
         id_to_row.setdefault(sid, []).append(row_i)
 
     for sid in matches:
+        zarr_npix, local_idx = source_id_to_tile[sid]
         for row_i in id_to_row[sid]:
-            idx_arr[row_i] = source_id_to_index[sid]
+            idx_arr[row_i] = local_idx
+            npix_arr[row_i] = zarr_npix
 
     if reset_unmatched:
         for row_i, sid in enumerate(tile_ids):
             if sid is None or sid not in source_id_set:
                 idx_arr[row_i] = -1
+                npix_arr[row_i] = -1
 
-    if index_col in table.schema.names:
-        col_pos = table.schema.get_field_index(index_col)
-        table = table.set_column(col_pos, index_col, pa.array(idx_arr, type=pa.int64()))
-    else:
-        table = table.append_column(index_col, pa.array(idx_arr, type=pa.int64()))
+    for col_name, arr in ((index_col, idx_arr), (npix_col, npix_arr)):
+        if col_name in table.schema.names:
+            col_pos = table.schema.get_field_index(col_name)
+            table = table.set_column(col_pos, col_name, pa.array(arr, type=pa.int64()))
+        else:
+            table = table.append_column(col_name, pa.array(arr, type=pa.int64()))
 
     pq.write_table(
         table,
@@ -192,12 +216,16 @@ def update_index_column_from_zarr_tiles(
     norder: int | None = None,
     link_id_col: str | None = None,
 ) -> int:
-    """Patch catalog indices one Zarr tile at a time (bounded memory).
+    """Patch catalog index + npix columns one Zarr tile at a time (bounded memory).
 
-    For large surveys (millions of spectra), building a single in-memory
-    ``{source_id: index}`` map can exhaust RAM.  This walks each
-    ``Npix=*.zarr``, patches the matching catalog Parquet tile, and discards
-    the per-tile map before opening the next Zarr group.
+    For large surveys (millions of spectra), building a single in-memory map can
+    exhaust RAM.  This walks each ``Npix=*.zarr``, builds ``{source_id: (npix,
+    local_idx)}`` for that tile, scans **all** catalog Parquet tiles for matching
+    IDs (catalog and Zarr may use different HEALPix orders), and discards the
+    per-tile map before opening the next Zarr group.
+
+    Both ``_spectrum_index`` / ``_cutout_index`` (local Zarr row) and
+    ``_spectrum_npix`` / ``_cutout_npix`` (which Zarr tile) are updated.
     """
     import zarr
 
@@ -211,21 +239,43 @@ def update_index_column_from_zarr_tiles(
         raise FileNotFoundError(f"No {kind} tiles found at {zarr_root}")
 
     index_col = _INDEX_COL[kind]
+    npix_col = _NPIX_COL[kind]
     schema_names: list[str] | None = None
-    sample_parquet = next(catalog_root.rglob("Npix=*.parquet"), None)
-    if sample_parquet is not None:
-        schema_names = pq.read_schema(str(sample_parquet)).names
+    all_parquet = sorted(catalog_root.rglob("Npix=*.parquet"))
+    if all_parquet:
+        schema_names = pq.read_schema(str(all_parquet[0])).names
     sid_col = resolve_link_id_column(
         catalog_root, schema_names=schema_names, override=link_id_col,
     )
-    resolved_norder = _resolve_catalog_norder(
-        catalog_root, zarr_root, kind=kind, override=norder,
-    )
+    resolved_cat_norder = _resolve_catalog_norder(catalog_root)
     log.info(
-        "Rebuilding %s using catalog hats_order=%d (id_col=%r)",
-        index_col, resolved_norder, sid_col,
+        "Rebuilding %s/%s using catalog hats_order=%d (id_col=%r)",
+        index_col, npix_col, resolved_cat_norder, sid_col,
     )
 
+    # Step 1: Reset index and npix columns to -1 across all catalog tiles.
+    # This ensures stale entries from a previous (now-rebuilt) ingest are cleared.
+    _sentinel = pa.array(np.full(1, -1, dtype=np.int64), type=pa.int64())  # placeholder
+    for cat_tile in all_parquet:
+        table = pq.ParquetFile(str(cat_tile)).read()
+        changed = False
+        for col in (index_col, npix_col):
+            arr = np.full(len(table), -1, dtype=np.int64)
+            if col in table.schema.names:
+                col_pos = table.schema.get_field_index(col)
+                table = table.set_column(col_pos, col, pa.array(arr, type=pa.int64()))
+            else:
+                table = table.append_column(col, pa.array(arr, type=pa.int64()))
+            changed = True
+        if changed:
+            pq.write_table(
+                table, str(cat_tile),
+                compression="zstd", compression_level=_ZSTD_LEVEL,
+                write_statistics=True, use_dictionary=True,
+            )
+
+    # Step 2: For each Zarr tile, patch matching catalog rows (no reset_unmatched,
+    # since we already reset above and different Zarr tiles may share catalog tiles).
     n_modified = 0
     tile_paths = sorted(zarr_root.rglob("Npix=*.zarr"))
     for tile_path in tile_paths:
@@ -240,40 +290,33 @@ def update_index_column_from_zarr_tiles(
             sids = np.asarray(zarr_join_array(root)[:], dtype=np.int64)
             if sids.size == 0:
                 continue
-            partial_map = {
-                normalize_object_id(int(sid)): int(i)
+            zarr_npix = _npix_from_tile_name(tile_path.name)
+            partial_map: dict[int, tuple[int, int]] = {
+                normalize_object_id(int(sid)): (zarr_npix, int(i))
                 for i, sid in enumerate(sids.tolist())
             }
         except Exception as exc:
             log.warning("Could not read Zarr tile %s: %s", tile_path.name, exc)
             continue
 
-        npix = _npix_from_tile_name(tile_path.name)
-        catalog_tile = _catalog_tile_for_npix(catalog_root, resolved_norder, npix)
-        if catalog_tile is None:
-            log.warning(
-                "Zarr %s: no catalog tile for Npix=%d at hats_order=%d under %s",
-                tile_path.name,
-                npix,
-                resolved_norder,
-                catalog_root,
-            )
-            continue
-        if _patch_catalog_parquet_file(
-            catalog_tile,
-            partial_map,
-            sid_col=sid_col,
-            index_col=index_col,
-            reset_unmatched=True,
-        ):
+        # Scan ALL catalog tiles — catalog Npix may differ from zarr_npix.
+        tile_modified = False
+        for cat_tile in all_parquet:
+            if _patch_catalog_parquet_file(
+                cat_tile,
+                partial_map,
+                sid_col=sid_col,
+                index_col=index_col,
+                npix_col=npix_col,
+                reset_unmatched=False,
+            ):
+                tile_modified = True
+        if tile_modified:
             n_modified += 1
         elif partial_map:
             log.warning(
-                "Zarr %s: catalog tile %s has no matching %s values "
-                "(%d Zarr row(s); id_col=%r)",
+                "Zarr %s: no catalog rows matched %d source IDs (id_col=%r)",
                 tile_path.name,
-                catalog_tile.name,
-                sid_col,
                 len(partial_map),
                 sid_col,
             )
@@ -290,17 +333,22 @@ def update_index_column_from_zarr_tiles(
 def update_index_column(
     lake_root: Path | str,
     survey_name: str,
-    source_id_to_index: dict[int, int],
+    source_id_to_index: dict[int, tuple[int, int]] | dict[int, int],
     kind: IndexKind = "spectrum",
     norder: int = 5,
     link_id_col: str | None = None,
 ) -> int:
     """
-    Update ``_cutout_index`` or ``_spectrum_index`` in the affected Parquet tiles.
+    Update modality index + npix columns in the affected Parquet tiles.
 
-    Reads only the tiles that contain at least one source_id from
-    ``source_id_to_index``, modifies the relevant index column, and rewrites
-    the tile file in-place with the same Zstd compression.
+    ``source_id_to_index`` is the mapping returned by
+    ``ingest_spectra_from_fits`` / ``ingest_cutouts_from_fits``.  Each value
+    is a ``(zarr_npix, local_index)`` 2-tuple; the legacy plain ``int`` form
+    (``local_index`` only) is still accepted for backward compatibility and is
+    treated as ``(catalog_Npix, local_index)`` with a deprecation warning.
+
+    Both ``_spectrum_index`` / ``_cutout_index`` (local Zarr row) and
+    ``_spectrum_npix`` / ``_cutout_npix`` (which Zarr tile) are updated.
 
     The ID column name is resolved automatically from ``catalog_info.json``:
     catalogs ingested with ``--link-id-col TARGETID`` (or any other native
@@ -313,14 +361,14 @@ def update_index_column(
     survey_name:
         Survey whose catalog tiles should be updated.
     source_id_to_index:
-        Mapping returned by ``ingest_spectra_from_fits`` / ``ingest_cutouts_from_fits``.
+        ``{source_id: (zarr_npix, local_index)}`` mapping.
     kind:
-        Which index column to update: ``"cutout"`` or ``"spectrum"``.
+        Which columns to update: ``"cutout"`` or ``"spectrum"``.
     norder:
-        HEALPix partitioning order.
+        Kept for backward compatibility; ignored when map values are tuples.
     link_id_col:
-        Force the catalog ID column (e.g. ``TARGETID``).  When omitted, resolved
-        from ``catalog_info.json`` and validated against the Parquet schema.
+        Force the catalog ID column.  When omitted, resolved from
+        ``catalog_info.json``.
 
     Returns
     -------
@@ -332,6 +380,7 @@ def update_index_column(
         raise FileNotFoundError(f"Catalog not found: {catalog_root}")
 
     index_col = _INDEX_COL[kind]
+    npix_col = _NPIX_COL[kind]
 
     # Discover affected tile files by scanning the Parquet tree
     all_parquet = list(catalog_root.rglob("Npix=*.parquet"))
@@ -345,30 +394,70 @@ def update_index_column(
         log.warning("No Parquet tiles found in %s", catalog_root)
         return 0
 
-    source_id_to_index = {
-        normalize_object_id(k): int(v) for k, v in source_id_to_index.items()
-    }
+    # Normalise keys and coerce legacy int values to (npix, local_index) tuples.
+    normalised: dict[int, tuple[int, int]] = {}
+    _legacy_warned = False
+    for k, v in source_id_to_index.items():
+        nk = normalize_object_id(k)
+        if isinstance(v, (list, tuple)):
+            normalised[nk] = (int(v[0]), int(v[1]))
+        else:
+            if not _legacy_warned:
+                log.warning(
+                    "update_index_column received plain-int index values (legacy format). "
+                    "Ingest should return (zarr_npix, local_index) tuples; "
+                    "_spectrum_npix / _cutout_npix will not be set correctly.",
+                )
+                _legacy_warned = True
+            normalised[nk] = (-1, int(v))
+
+    # First pass: patch matched tiles (adds npix_col when absent on patched tiles).
     n_modified = 0
+    patched: set[Path] = set()
     for tile_file in all_parquet:
         if _patch_catalog_parquet_file(
             tile_file,
-            source_id_to_index,
+            normalised,
             sid_col=sid_col,
             index_col=index_col,
+            npix_col=npix_col,
         ):
             n_modified += 1
+            patched.add(tile_file)
+
+    # Second pass: add npix_col=-1 to any tiles that were NOT patched but are
+    # missing the column, so all tiles share the same schema.
+    for tile_file in all_parquet:
+        if tile_file in patched:
+            continue
+        schema = pq.read_schema(str(tile_file))
+        if npix_col not in schema.names:
+            table = pq.ParquetFile(str(tile_file)).read()
+            table = table.append_column(
+                npix_col,
+                pa.array(np.full(len(table), -1, dtype=np.int64), type=pa.int64()),
+            )
+            pq.write_table(
+                table,
+                str(tile_file),
+                compression="zstd",
+                compression_level=_ZSTD_LEVEL,
+                write_statistics=True,
+                use_dictionary=True,
+            )
+            log.debug("Added placeholder %s to %s", npix_col, tile_file.name)
 
     log.info(
-        "Updated %s in %d tile file(s) for survey=%s (%d sources, id_col=%r)",
-        index_col, n_modified, survey_name, len(source_id_to_index), sid_col,
+        "Updated %s/%s in %d tile file(s) for survey=%s (%d sources, id_col=%r)",
+        index_col, npix_col, n_modified, survey_name, len(normalised), sid_col,
     )
 
-    if source_id_to_index and n_modified == 0:
+    if normalised and n_modified == 0:
         log.warning(
             "No catalog tiles were modified for survey=%r (kind=%r, %d source IDs given). "
             "Possible causes: survey name mismatch, no catalog ingested yet, "
             "or wrong source-ID column (resolved to %r from catalog_info.json).",
-            survey_name, kind, len(source_id_to_index), sid_col,
+            survey_name, kind, len(normalised), sid_col,
         )
 
     # Regenerate aggregate _metadata
@@ -386,8 +475,8 @@ def build_index_map_from_zarr(
     lake_root: Path | str,
     survey_name: str,
     kind: IndexKind = "spectrum",
-) -> dict[int, int]:
-    """Scan existing Zarr tiles and return a ``{source_id: local_index}`` map.
+) -> dict[int, tuple[int, int]]:
+    """Scan existing Zarr tiles and return ``{source_id: (zarr_npix, local_index)}``.
 
     Reads the ``source_id`` array from every tile under
     ``<lake_root>/<kind>s/<survey_name>/`` without touching FITS files, so
@@ -410,7 +499,7 @@ def build_index_map_from_zarr(
     if not zarr_root.exists():
         raise FileNotFoundError(f"No {kind} tiles found at {zarr_root}")
 
-    index_map: dict[int, int] = {}
+    index_map: dict[int, tuple[int, int]] = {}
     tile_paths = sorted(zarr_root.rglob("Npix=*.zarr"))
     if not tile_paths:
         log.warning("No Zarr tiles found under %s", zarr_root)
@@ -425,9 +514,10 @@ def build_index_map_from_zarr(
             )
             if LAKE_JOIN_ID_COLUMN not in root:
                 continue
+            zarr_npix = _npix_from_tile_name(tile_path.name)
             sids = zarr_join_array(root)[:]
             for local_i, sid in enumerate(sids.tolist()):
-                index_map[normalize_object_id(sid)] = local_i
+                index_map[normalize_object_id(sid)] = (zarr_npix, local_i)
         except Exception as exc:
             log.warning("Could not read tile %s: %s", tile_path.name, exc)
 

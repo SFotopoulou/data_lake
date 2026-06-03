@@ -154,7 +154,7 @@ def infer_column_role(
         return ROLE_REDSHIFT
     if name.startswith("_healpix"):
         return ROLE_HEALPIX
-    if name in ("_cutout_index", "_spectrum_index"):
+    if name in ("_cutout_index", "_cutout_npix", "_spectrum_index", "_spectrum_npix"):
         return ROLE_INDEX
     if upper in _CLASSIFICATION_NAMES or upper.endswith("TYPE"):
         return ROLE_CLASSIFICATION

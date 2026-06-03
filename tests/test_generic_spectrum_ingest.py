@@ -37,6 +37,8 @@ def _write_generic_flux_only(path: Path, *, n_pix: int = 32) -> None:
     primary.header["CRVAL1"] = 5000.0
     primary.header["CRPIX1"] = 1.0
     primary.header["CDELT1"] = 1.0
+    primary.header["RA"] = 15.0
+    primary.header["DEC"] = -30.0
     fits.HDUList([primary]).writeto(path, overwrite=True)
 
 
@@ -76,6 +78,8 @@ class TestReadGeneric1d:
         primary.header["CRVAL1"] = 4000.0
         primary.header["CRPIX1"] = 1.0
         primary.header["CDELT1"] = 1.0
+        primary.header["RA"] = 25.0
+        primary.header["DEC"] = -10.0
         ivar_hdu = fits.ImageHDU(ivar, name="IVAR")
         p = tmp_path / "spec_ivar.fits"
         fits.HDUList([primary, ivar_hdu]).writeto(p, overwrite=True)

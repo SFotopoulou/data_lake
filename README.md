@@ -375,11 +375,13 @@ approaching one file per object at very high order).
    all-sky tables; keep **5** for dense survey footprints (DESI, deep drills)
    and Rubin/LSST **lsdb** interoperability.
 
-3. **One order per survey** — set `--norder` (or `catalog_info.json`
-   `hats_order`) per catalog ingest. Spectra/cutouts for that survey must use the
-   **same** order. Different surveys in one lake **may** use different orders;
-   tile-aligned cross-match in this repo expects the **same** order on both sides
-   (otherwise join on sky position or via a master association table).
+3. **Independent orders per modality** — set `--norder` separately for catalog,
+   spectra, and cutouts. They no longer need to match. The catalog stores
+   `_spectrum_npix` / `_cutout_npix` (modality-specific tile pixel) alongside
+   `_healpix_norder{N}` (catalog partition key) so accessors can open the right
+   Zarr tile regardless of order differences. Linkage uses `_source_id`, not
+   positional HEALPix equality. Tile-aligned **cross-survey** join
+   (`crossmatch.py`) still requires identical catalog orders on both sides.
 
 4. **Benchmark before TB ingests** — use **`dl-recommend-catalog-norder`** (quick
    FITS scan of RA/Dec only) or ingest a subset, then check tile counts and
@@ -1655,9 +1657,13 @@ data/                               # committed FITS fixtures for tests and smok
 Each catalog row carries:
 - `_source_id` — stable int64 join key for Zarr/cross-match (sequential 0…N−1, copy of native int ID, or hash of a label column)
 - native survey ID columns (e.g. `TARGETID`, `SOURCE_ID`) when ``link_id_mode`` is ``column:…`` or ``label:…``
-- `_healpix_norder5` — HEALPix tile pixel (partitioning key)
-- `_cutout_index` — position inside the tile's Zarr cutout array (O(1) lookup)
-- `_spectrum_index` — position inside the tile's Zarr spectrum array (O(1) lookup; -1 = not ingested)
+- `_healpix_norder{N}` — HEALPix tile pixel at the **catalog** partition order (partitioning key only)
+- `_cutout_index` — local row offset inside the Zarr cutout tile identified by `_cutout_npix` (-1 = not ingested)
+- `_cutout_npix` — HEALPix pixel at the **cutout** `hats_order` that identifies the Zarr tile (-1 = not ingested)
+- `_spectrum_index` — local row offset inside the Zarr spectrum tile identified by `_spectrum_npix` (-1 = not ingested)
+- `_spectrum_npix` — HEALPix pixel at the **spectrum** `hats_order` that identifies the Zarr tile (-1 = not ingested)
+
+The catalog and spectrum/cutout layers may use **different** `hats_order` values and different sky coordinates; linkage is via `_source_id` + the modality-specific npix column.
 
 ## Lake inventory and master association tables
 

@@ -80,7 +80,7 @@ def test_generate_multiband_and_ingest(tmp_path: Path) -> None:
         norder=5,
         band_names=["r", "i", "z"],
     )
-    assert m[1001] == 0
+    assert m[1001][1] == 0   # local_index
 
 
 def test_images_file_order(tmp_path: Path) -> None:

@@ -385,7 +385,7 @@ try:
         default_ck = lake / "cutouts" / survey_name / ".ingest_checkpoint.json"
 
         # Accumulate index_map across all files so we patch the catalog once.
-        total_index_map: dict[int, int] = {}
+        total_index_map: dict[int, tuple[int, int]] = {}
 
         def one(p: Path) -> None:
             m = ingest_cutouts_from_fits(
@@ -657,7 +657,7 @@ try:
 
         from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
 
-        total_index_map: dict[int, int] = {}
+        total_index_map: dict[int, tuple[int, int]] = {}
 
         def one(p: Path) -> None:
             m = ingest_spectra_from_fits(

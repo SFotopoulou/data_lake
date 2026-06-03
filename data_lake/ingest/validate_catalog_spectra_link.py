@@ -93,12 +93,18 @@ def _read_catalog_tile_columns(tile_path: Path, columns: list[str]) -> dict[str,
     return out
 
 
-def _resolve_norder(
+def _resolve_norders(
     catalog_root: Path,
     spectra_root: Path,
     norder: int | None,
     rep: LinkValidationReport,
-) -> int | None:
+) -> tuple[int, int]:
+    """Return ``(cat_order, spec_order)``; each defaults independently.
+
+    Orders may differ when catalog and spectra were partitioned at different
+    resolutions — this is now supported via ``_spectrum_npix`` on catalog rows.
+    A warning (not an error) is emitted when orders differ.
+    """
     cat_order: int | None = norder
     spec_order: int | None = norder
 
@@ -109,17 +115,15 @@ def _resolve_norder(
     if spec_info.is_file():
         spec_order = int(_load_json(spec_info).get("hats_order", spec_order or 5))
 
-    if cat_order is None:
-        cat_order = spec_order or 5
-    if spec_order is None:
-        spec_order = cat_order
+    cat_order = cat_order or 5
+    spec_order = spec_order or 5
 
     if cat_order != spec_order:
-        rep.errors.append(
-            f"hats_order mismatch: catalog {cat_order} vs spectra {spec_order}"
+        rep.warnings.append(
+            f"hats_order differs: catalog {cat_order} vs spectra {spec_order} "
+            f"(OK when _spectrum_npix linkage is present)"
         )
-        return None
-    return cat_order
+    return cat_order, spec_order
 
 
 def _catalog_tile_path(catalog_root: Path, norder: int, npix: int) -> Path:
@@ -141,15 +145,22 @@ def _optional_catalog_sid(value: object) -> int | None:
 def validate_tile_link(
     *,
     zarr_tile: Path,
-    catalog_tile: Path | None,
-    npix: int,
-    norder: int,
+    zarr_npix: int,
+    cat_order: int,
+    cat_tiles: list[Path],
     sid_col: str,
     rep: LinkValidationReport,
+    has_npix_col: bool,
     sample: int | None = None,
     rng: random.Random | None = None,
 ) -> None:
-    """Validate one paired Zarr / catalog HEALPix tile."""
+    """Validate one Zarr tile against all catalog tiles that reference it.
+
+    When ``has_npix_col`` is True (new-format catalog), catalog rows are
+    matched via ``_spectrum_npix == zarr_npix``.  In the legacy path
+    (``has_npix_col`` is False), only the catalog tile with the same Npix
+    is checked.
+    """
     import zarr
 
     stats = rep.stats
@@ -175,108 +186,123 @@ def validate_tile_link(
         stats.n_empty_zarr += 1
         return
 
-    if catalog_tile is None or not catalog_tile.is_file():
-        stats.n_missing_catalog_tile += 1
-        rep.warnings.append(
-            f"{zarr_tile.name}: no catalog tile at expected path "
-            f"(Npix={npix}); {n_zarr} Zarr row(s) treated as orphan"
-        )
-        stats.n_orphan_zarr += n_zarr
-        return
-
-    hp_col = f"_healpix_norder{norder}"
     index_col = "_spectrum_index"
-    try:
-        cols = _read_catalog_tile_columns(
-            catalog_tile,
-            [sid_col, hp_col, index_col],
-        )
-    except KeyError as exc:
-        rep.errors.append(f"{catalog_tile}: {exc}")
-        return
+    npix_col = "_spectrum_npix"
+    hp_col = f"_healpix_norder{cat_order}"
 
-    sid_raw = cols[sid_col]
-    sid_iter = sid_raw.tolist() if isinstance(sid_raw, np.ndarray) else list(sid_raw)
-    cat_sids: list[int | None] = [_optional_catalog_sid(x) for x in sid_iter]
-    cat_hp = np.asarray(cols[hp_col], dtype=np.int64)
-    cat_idx = np.asarray(cols[index_col], dtype=np.int64)
+    # Track which Zarr row indices were correctly linked across all catalog tiles.
+    zarr_idx_linked: set[int] = set()
+    # For reverse check: which Zarr source_ids appear in any catalog tile.
+    zarr_sid_in_catalog: set[int] = set()
+    # Which Zarr source_ids appear with index=-1 (unpatched) in the catalog.
+    zarr_sid_unpatched: set[int] = set()
 
-    linked_rows = np.nonzero(cat_idx >= 0)[0]
-    if sample is not None and sample > 0 and linked_rows.size > sample:
-        pick = rng or random.Random(0)
-        linked_rows = np.array(
-            pick.sample(linked_rows.tolist(), sample),
-            dtype=np.int64,
-        )
-
-    for row_i in linked_rows.tolist():
-        idx = int(cat_idx[row_i])
-        sid_opt = cat_sids[row_i]
-        if sid_opt is None:
-            stats.n_null_source_id_linked += 1
-            rep.errors.append(
-                f"{catalog_tile.name} row {row_i}: {index_col}={idx} but "
-                f"{sid_col} is null (cannot verify Zarr linkage)"
-            )
-            continue
-        sid = sid_opt
-        hp = int(cat_hp[row_i])
-
-        if hp != npix:
-            stats.n_wrong_healpix += 1
-            rep.errors.append(
-                f"{catalog_tile.name} row {row_i}: {hp_col}={hp} != tile Npix={npix}"
-            )
-
-        if idx < 0 or idx >= n_zarr:
-            stats.n_stale_index += 1
-            rep.errors.append(
-                f"{catalog_tile.name} row {row_i}: {index_col}={idx} out of range "
-                f"(Zarr rows={n_zarr})"
-            )
-            continue
-
-        zarr_sid = int(normalize_object_id(int(zarr_ids[idx])))
-        if zarr_sid != sid:
-            stats.n_wrong_id += 1
-            rep.errors.append(
-                f"{catalog_tile.name} row {row_i}: {sid_col}={sid} but "
-                f"Zarr {index_col}={idx} has _source_id={zarr_sid}"
-            )
-        else:
-            stats.n_linked += 1
-
-    # Catalog rows keyed by _source_id for reverse lookup (skip null IDs).
-    rows_by_sid: dict[int, list[tuple[int, int]]] = {}
-    for row_i, sid_opt in enumerate(cat_sids):
-        if sid_opt is None:
-            stats.n_null_source_id += 1
-            continue
-        rows_by_sid.setdefault(sid_opt, []).append((row_i, int(cat_idx[row_i])))
-
-    for j, sid_raw in enumerate(zarr_ids.tolist()):
-        sid = int(normalize_object_id(int(sid_raw)))
-        matches = rows_by_sid.get(sid, [])
-        if not matches:
-            stats.n_orphan_zarr += 1
+    # In legacy mode (no _spectrum_npix), only check the same-Npix catalog tile.
+    if not has_npix_col:
+        candidate_tiles = [t for t in cat_tiles if f"Npix={zarr_npix}.parquet" in t.name]
+        if not candidate_tiles:
+            stats.n_missing_catalog_tile += 1
             rep.warnings.append(
-                f"{zarr_tile.name} row {j}: _source_id={sid} not in catalog tile"
+                f"{zarr_tile.name}: no catalog tile Npix={zarr_npix} "
+                f"(legacy mode, orders must match)"
             )
+            stats.n_orphan_zarr += n_zarr
+            return
+    else:
+        candidate_tiles = cat_tiles
+
+    for cat_tile in candidate_tiles:
+        if not cat_tile.is_file():
             continue
 
-        if all(idx < 0 for _, idx in matches):
+        read_cols = [sid_col, index_col, npix_col if has_npix_col else hp_col]
+        try:
+            cols = _read_catalog_tile_columns(cat_tile, read_cols)
+        except KeyError as exc:
+            rep.errors.append(f"{cat_tile}: {exc}")
+            continue
+
+        sid_raw = cols[sid_col]
+        sid_iter = sid_raw.tolist() if isinstance(sid_raw, np.ndarray) else list(sid_raw)
+        cat_sids: list[int | None] = [_optional_catalog_sid(x) for x in sid_iter]
+        cat_idx = np.asarray(cols[index_col], dtype=np.int64)
+        ref_col = npix_col if has_npix_col else hp_col
+        cat_ref = np.asarray(cols[ref_col], dtype=np.int64)
+
+        # Forward check: catalog rows claiming to link into this Zarr tile.
+        if has_npix_col:
+            candidate_rows = np.nonzero((cat_idx >= 0) & (cat_ref == zarr_npix))[0]
+        else:
+            candidate_rows = np.nonzero(cat_idx >= 0)[0]
+
+        if sample is not None and sample > 0 and candidate_rows.size > sample:
+            pick = rng or random.Random(0)
+            candidate_rows = np.array(
+                pick.sample(candidate_rows.tolist(), sample), dtype=np.int64,
+            )
+
+        for row_i in candidate_rows.tolist():
+            idx = int(cat_idx[row_i])
+            sid_opt = cat_sids[row_i]
+            if sid_opt is None:
+                stats.n_null_source_id_linked += 1
+                rep.errors.append(
+                    f"{cat_tile.name} row {row_i}: {index_col}={idx} but "
+                    f"{sid_col} is null (cannot verify Zarr linkage)"
+                )
+                continue
+            sid = sid_opt
+
+            if not has_npix_col:
+                hp = int(cat_ref[row_i])
+                if hp != zarr_npix:
+                    continue  # different healpix tile in legacy mode
+
+            if idx < 0 or idx >= n_zarr:
+                stats.n_stale_index += 1
+                rep.errors.append(
+                    f"{cat_tile.name} row {row_i}: {index_col}={idx} out of range "
+                    f"(Zarr rows={n_zarr} in Npix={zarr_npix})"
+                )
+                continue
+
+            zarr_sid = int(normalize_object_id(int(zarr_ids[idx])))
+            if zarr_sid != sid:
+                stats.n_wrong_id += 1
+                rep.errors.append(
+                    f"{cat_tile.name} row {row_i}: {sid_col}={sid} but "
+                    f"Zarr {index_col}={idx} has _source_id={zarr_sid}"
+                )
+            else:
+                stats.n_linked += 1
+                zarr_idx_linked.add(idx)
+
+        # Reverse: note catalog source_ids for orphan/unpatched detection.
+        for row_i, sid_opt in enumerate(cat_sids):
+            if sid_opt is None:
+                stats.n_null_source_id += 1
+                continue
+            zarr_sid_in_catalog.add(sid_opt)
+            if int(cat_idx[row_i]) < 0:
+                zarr_sid_unpatched.add(sid_opt)
+
+    # Reverse check: classify unlinked Zarr rows as "unpatched" or "orphan".
+    for j, sid_raw in enumerate(zarr_ids.tolist()):
+        if j in zarr_idx_linked:
+            continue
+        sid = int(normalize_object_id(int(sid_raw)))
+        if sid in zarr_sid_unpatched:
             stats.n_unpatched_catalog += 1
             rep.warnings.append(
                 f"{zarr_tile.name} row {j}: _source_id={sid} in catalog but "
                 f"{index_col}=-1 (run dl-rebuild-catalog-indices)"
             )
-            continue
-
-        if not any(idx == j for _, idx in matches):
+        elif sid not in zarr_sid_in_catalog:
             stats.n_orphan_zarr += 1
             rep.warnings.append(
-                f"{zarr_tile.name} row {j}: _source_id={sid} not linked at index {j} "
-                f"(catalog claims {index_col} in {[idx for _, idx in matches]})"
+                f"{zarr_tile.name} row {j}: _source_id={sid} not linked by any "
+                f"catalog row with {npix_col if has_npix_col else hp_col}={zarr_npix} "
+                f"(run dl-rebuild-catalog-indices)"
             )
 
 
@@ -290,7 +316,11 @@ def run_validation(
     sample: int | None = None,
     seed: int = 0,
 ) -> LinkValidationReport:
-    """Cross-check catalog ``_spectrum_index`` against spectrum Zarr tiles."""
+    """Cross-check catalog ``_spectrum_index`` / ``_spectrum_npix`` against Zarr tiles.
+
+    Catalog and spectrum may use different HEALPix orders; linkage is validated
+    via ``_spectrum_npix`` (new format) or by same-Npix pairing (legacy).
+    """
     lake_root = Path(lake_root)
     catalog_root = lake_root / "catalogs" / survey
     spectra_root = lake_root / "spectra" / survey
@@ -303,14 +333,12 @@ def run_validation(
         rep.errors.append(f"Spectrum store not found: {spectra_root}")
         return rep
 
-    order = _resolve_norder(catalog_root, spectra_root, norder, rep)
-    if order is None:
-        return rep
+    cat_order, _spec_order = _resolve_norders(catalog_root, spectra_root, norder, rep)
 
+    all_parquet = sorted(catalog_root.rglob("Npix=*.parquet"))
     schema_names: list[str] | None = None
-    sample_parquet = next(catalog_root.rglob("Npix=*.parquet"), None)
-    if sample_parquet is not None:
-        schema_names = pq.read_schema(str(sample_parquet)).names
+    if all_parquet:
+        schema_names = pq.read_schema(str(all_parquet[0])).names
     try:
         sid_col = resolve_link_id_column(
             catalog_root,
@@ -328,6 +356,8 @@ def run_validation(
         )
         return rep
 
+    has_npix_col = "_spectrum_npix" in (schema_names or [])
+
     tiles = list(_iter_spectrum_zarr_tiles(spectra_root))
     if not tiles:
         rep.warnings.append(f"No Npix=*.zarr tiles under {spectra_root}")
@@ -339,16 +369,14 @@ def run_validation(
     rng = random.Random(seed) if sample else None
     for zarr_tile in tiles:
         npix = _npix_from_tile_name(zarr_tile.name)
-        cat_tile = _catalog_tile_path(catalog_root, order, npix)
-        if not cat_tile.is_file():
-            cat_tile = next(catalog_root.rglob(f"Npix={npix}.parquet"), None)
         validate_tile_link(
             zarr_tile=zarr_tile,
-            catalog_tile=cat_tile,
-            npix=npix,
-            norder=order,
+            zarr_npix=npix,
+            cat_order=cat_order,
+            cat_tiles=all_parquet,
             sid_col=sid_col,
             rep=rep,
+            has_npix_col=has_npix_col,
             sample=sample,
             rng=rng,
         )
