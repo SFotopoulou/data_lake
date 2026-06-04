@@ -2853,30 +2853,44 @@ def _load_spectrum_records_from_path(
                         "Pass only one of specobj_lookup=, specobj_lookup_from_catalog=True, "
                         "or specobj_lookup_from_plate=True"
                     )
-                if n_lookup_modes == 0:
-                    raise ValueError(
-                        "sdss_spplate ingest requires specobj_lookup= (sidecar Parquet/CSV), "
-                        "specobj_lookup_from_catalog=True (lake catalogs/<survey>/), or "
-                        "specobj_lookup_from_plate=True (synthesize specObjID from header)."
-                    )
                 from data_lake.ingest.sdss_specobj_lookup import (
+                    build_fiber_to_source_id_from_triplet,
                     build_fiber_to_specobjid_map,
                     spplate_plate_mjd_from_hdul,
                 )
 
                 plate, mjd = spplate_plate_mjd_from_hdul(hdul, source_path)
-                fiber_map = build_fiber_to_specobjid_map(
-                    survey_name,
-                    plate,
-                    mjd,
-                    lookup_path=specobj_lookup,
-                    catalog_root=output_root if specobj_lookup_from_catalog else None,
-                    lookup_survey=specobj_lookup_survey,
-                    spplate_hdul=hdul,
-                    lookup_from_plate=specobj_lookup_from_plate,
-                    specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
-                    catalog_id_col=link_id_col,
-                )
+                if n_lookup_modes == 0:
+                    # Default: composite PLATE|MJD|FIBERID hash — no catalog scan.
+                    # Catalog must be ingested with --link-id-col PLATE,MJD,FIBERID.
+                    ftable = _spplate_fiber_table_hdu(hdul)
+                    if ftable is None:
+                        raise ValueError(
+                            "spPlate: no per-fiber BINTABLE with FIBERID column; "
+                            "cannot build triplet hash IDs."
+                        )
+                    fiber_col = _fits_bintable_column(ftable.data, "fiberid", "FIBERID")
+                    fiber_ids = [int(x) for x in fiber_col]
+                    fiber_map = build_fiber_to_source_id_from_triplet(plate, mjd, fiber_ids)
+                    log.info(
+                        "spPlate %s: composite PLATE|MJD|FIBERID hash → %d fiber IDs "
+                        "(no catalog scan; catalog must use --link-id-col PLATE,MJD,FIBERID)",
+                        source_path.name,
+                        len(fiber_map),
+                    )
+                else:
+                    fiber_map = build_fiber_to_specobjid_map(
+                        survey_name,
+                        plate,
+                        mjd,
+                        lookup_path=specobj_lookup,
+                        catalog_root=output_root if specobj_lookup_from_catalog else None,
+                        lookup_survey=specobj_lookup_survey,
+                        spplate_hdul=hdul,
+                        lookup_from_plate=specobj_lookup_from_plate,
+                        specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
+                        catalog_id_col=link_id_col,
+                    )
                 records, wcs_attrs = _read_sdss_spplate(
                     hdul,
                     path=source_path,

@@ -627,7 +627,7 @@ Quick index of all supported `--fmt` values, the **catalog** ingest flag require
 |---------|------------------------|----------------------|---------------------|----------------|
 | `desi` | `TARGETID` (or default) | Fibermap `TARGETID` | Fibermap `TARGET_RA` / `TARGET_DEC` (fallbacks: `RA_TARGET`, `FIBER_RA`; `DEC_TARGET`, `FIBER_DEC`) | Auto-detected from DESI coadd layout |
 | `sdss_boss` | `SPECOBJID` | `SPALL` HDU header | Header `RA` / `DEC` (fallback `PLUG_RA` / `PLUG_DEC`) | `spec-PLATE-MJD-FIBER.fits` |
-| `sdss_spplate` | via sidecar / plate header | `FIBERID` → specObjID | Fiber table columns (default `RA` / `DEC`, configurable via `--ra-col/--dec-col`) | `spPlate-PLATE-MJD.fits`; see spPlate section |
+| `sdss_spplate` | `PLATE,MJD,FIBERID` (default) or via sidecar / plate header | plugmap `FIBERID` → composite hash (default), or specObjID from sidecar/synthesis | Fiber table columns (default `RA` / `DEC`, configurable via `--ra-col/--dec-col`) | `spPlate-PLATE-MJD.fits`; see spPlate section |
 | `generic` | `--link-id-col` or auto | Header keyword chain | Header columns from `--ra-col/--dec-col` (default `RA` / `DEC`) | Any 1-D FITS with spectral WCS |
 | `2df` | `SPFILE,FIBRE` (+ `--allow-incomplete-link-id` if some rows have no filename) | Header `SPFILE` \| `FIBRE` per SPECTRUM HDU | `SRRA` / `SRDEC` (fallback `OBSRA` / `OBSDEC`, then PRIMARY `RA` / `DEC`) | `data/389442.fits` |
 | `6df` | `targetname,obsid_v,obsid_r` | Filename stem + V header `OBSID_V` + R header `OBSID_R` per V/R/VR triple | VR header `OBSRA` / `OBSDEC` (fallback header `RA` / `DEC`, PRIMARY WCS, `OBJCTRA` / `OBJCTDEC`) | `data/g2302140-251235.fits` |
@@ -661,7 +661,9 @@ on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
 | Catalog ingest | Required for production (native column → ``_source_id``) | Survey sky columns in degrees |
 | Spectrum ingest (2df, 6df) | **Not used** — reader resolves IDs internally (`SPFILE`/`FIBRE`; filename stem + `OBSID_V`/`OBSID_R`) | **Not used** — reader reads `OBSRA`/`OBSDEC` from header |
 | Spectrum ingest (OzDES, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) | **Not used** — reader hashes the filename | **Not used** — reader reads sky from header |
-| Spectrum ingest (SDSS, DESI, generic, spPlate) | Header keyword / fibermap column | FITS header keywords |
+| Spectrum ingest (spPlate, default) | **Not used** — reader hashes `PLATE\|MJD\|FIBERID` per fiber (catalog must use `--link-id-col PLATE,MJD,FIBERID`) | FITS plugmap `RA` / `DEC` |
+| Spectrum ingest (SDSS, DESI, generic) | Header keyword / fibermap column | FITS header keywords |
+| Spectrum ingest (spPlate, legacy modes) | `--link-id-col` used only with `--specobj-lookup-from-catalog` | FITS plugmap `RA` / `DEC` |
 | Catalog patch after spectrum ingest | **Not used** — joins on ``_source_id`` | — |
 
 #### SDSS spPlate ingest (640 or 1000 fibers per file)
@@ -671,10 +673,15 @@ BOSS: 1000 plugmap rows, typically ~500 with non-zero flux).  There is **no
 SPECOBJID** column in the FITS file.  Ingest maps each **FIBERID** to
 ``source_id`` via one of:
 
-1. **Sidecar / catalog** — join on ``(survey,) PLATE, MJD, FIBERID``; ID from
+1. **Triplet hash (default, fast)** — derives ``_source_id`` from a composite
+   BLAKE2b hash of ``PLATE|MJD|FIBERID`` per fiber.  No catalog scan; identical
+   to what catalog ingest with ``--link-id-col PLATE,MJD,FIBERID`` stores in
+   ``_source_id``.  Use this mode (no extra flags required) when your catalog was
+   ingested that way.  This is the recommended approach.
+2. **Sidecar / catalog** — join on ``(survey,) PLATE, MJD, FIBERID``; ID from
    ``source_id``, ``specobjid``, ``TARGETID``, or ``--link-id-col`` (not
    photometric ``objid`` unless you set that column explicitly)
-2. **Plate header** — synthesize CAS ``specObjID`` from plate/mjd/fiber
+3. **Plate header** — synthesize CAS ``specObjID`` from plate/mjd/fiber
    (``--specobj-lookup-from-plate``).  **DR7 and DR8+ use different 64-bit layouts**
    (see below); use ``--specobj-id-layout auto|dr7|dr8plus``.
 
@@ -716,38 +723,41 @@ dl-widen-spectrum-tiles --all --dry-run   # list tiles that would change
 ```
 
 ```bash
-# Quick ingest without a specObj sidecar (DR8+/BOSS: primary header RUN2D only;
-# VERS2D/VERSCOMB are pipeline versions, not used for specObjID)
+# Default (fast): composite PLATE|MJD|FIBERID hash — no catalog scan.
+# Catalog must be ingested with --link-id-col PLATE,MJD,FIBERID.
+dl-ingest-catalog specObj.parquet --survey SDSS_DR17 \
+  --link-id-col PLATE,MJD,FIBERID --ra-col RA --dec-col DEC
+
+dl-ingest-spectra spPlate-4002-55645.fits --survey SDSS_DR17 --fmt sdss_spplate
+
+# Many plates in parallel (no lookup flags needed)
+dl-ingest-spectra-from-list spplate_paths.txt --survey SDSS_DR17 --fmt sdss_spplate
+
+# Legacy: synthesize CAS specObjID from header (DR8+/BOSS, no catalog scan)
 dl-ingest-spectra data/spPlate-3523-55144.fits --survey boss_dr12 \
   --fmt sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr8plus
 
-# SDSS-II / DR7 plates (low bits; no RUN2D) — force DR7 packing:
+# Legacy: SDSS-II / DR7 plates (low bits; no RUN2D) — force DR7 packing:
 dl-ingest-spectra spPlate-287-52251.fits --survey sdss_dr7 \
   --fmt sdss_spplate --specobj-lookup-from-plate --specobj-id-layout dr7
 
-# Sidecar Parquet/CSV: survey, PLATE, MJD, FIBERID, plus an ID column
+# Legacy: sidecar Parquet/CSV (survey, PLATE, MJD, FIBERID, ID column)
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
-  --fmt sdss_spplate \
-  --specobj-lookup /path/to/specobj_lookup.parquet
+  --fmt sdss_spplate --specobj-lookup /path/to/specobj_lookup.parquet
 
-# BOSS spPlates with an explicit specObj table
-dl-ingest-spectra spPlate-5695-56191.fits --survey boss_dr12 \
-  --fmt sdss_spplate \
-  --specobj-lookup /path/to/boss_specobj_lookup.parquet
-
-# Lake catalog: join on plate/mjd/fiber; ID from catalog source_id or specobjid
+# Legacy: lake catalog scan — join on plate/mjd/fiber (slow for large catalogs)
 dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
   --fmt sdss_spplate --specobj-lookup-from-catalog
-
-# If the catalog used a non-default ID column at ingest time:
-dl-ingest-spectra spPlate-1960-53289.fits --survey sdss_dr17 \
-  --fmt sdss_spplate --specobj-lookup-from-catalog --link-id-col TARGETID
 ```
 
 If catalog lookup finds **0 fibers**, run the debug helper before re-ingesting:
 
 ```bash
-# Plate synthesis + lake catalog scan (typical BOSS / DR17 troubleshooting)
+# Triplet hash probe — shows sample fiber → source_id without any catalog scan.
+# Use this first to verify the IDs produced by the default mode.
+dl-debug-specobj-lookup data/spPlate-3523-55144.fits --survey SDSS_DR17 --triplet-hash
+
+# Plate synthesis + lake catalog scan (legacy BOSS / DR17 troubleshooting)
 dl-debug-specobj-lookup data/spPlate-3523-55144.fits --survey SDSS_DR17 /path/to/lake
 
 # Plate synthesis only (no catalog)
@@ -760,8 +770,11 @@ dl-debug-specobj-lookup spPlate-1960-53289.fits --survey sdss_dr17 /path/to/lake
 
 The tool reports **PLUGMAP column names** (flags ``OBJID`` as imaging ID, not
 ``specObjID``), plugmap fiber count, resolved catalog columns, row counts for
-plate/mjd, sample ``fiber → specobjid`` pairs, and overlap with the plate file.
+plate/mjd, sample ``fiber → source_id`` pairs, and overlap with the plate file.
 Exit code **1** when every mode maps zero fibers (same failure as ingest).
+
+When using `--triplet-hash`, the tool notes whether the IDs will match a catalog
+that was ingested with `--link-id-col PLATE,MJD,FIBERID`.
 
 Catalogs without plate/mjd/fiber cannot drive spPlate ingest; photo-only tables
 need ``--specobj-lookup-from-plate`` or a specObj export with spectroscopic keys.

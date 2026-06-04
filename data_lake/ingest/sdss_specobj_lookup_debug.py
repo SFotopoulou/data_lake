@@ -20,6 +20,7 @@ from astropy.io import fits
 from data_lake.cli_utils import config_option, load_optional_config, require_output_root
 from data_lake.ingest.sdss_specobj_lookup import (
     SpecObjIdLayout,
+    build_fiber_to_source_id_from_triplet,
     build_fiber_to_specobjid_from_spplate,
     build_fiber_to_specobjid_map,
     infer_specobjid_layout,
@@ -225,6 +226,7 @@ def debug_specobj_lookup(
     catalog_root: Path | str | None = None,
     lookup_path: Path | str | None = None,
     lookup_survey: str | None = None,
+    try_triplet_hash: bool = False,
     try_from_plate: bool = True,
     try_from_catalog: bool = True,
     try_from_sidecar: bool = True,
@@ -256,6 +258,22 @@ def debug_specobj_lookup(
             )
         except Exception as exc:
             report.layout_error = str(exc)
+
+        if try_triplet_hash:
+            mode = LookupModeResult(name="triplet_hash")
+            try:
+                mode.fiber_map = build_fiber_to_source_id_from_triplet(
+                    plate, mjd, plugmap or [],
+                )
+                mode.extra["label_format"] = f"{plate}|{mjd}|<fiberid>"
+                mode.extra["note"] = (
+                    "IDs match catalog only when ingested with "
+                    "--link-id-col PLATE,MJD,FIBERID"
+                )
+            except Exception as exc:
+                mode.error = str(exc)
+            mode.extra["overlap"] = _fiber_overlap(plugmap, mode.fiber_map)
+            report.modes.append(mode)
 
         if try_from_plate:
             mode = LookupModeResult(name="from_plate")
@@ -404,9 +422,15 @@ def format_debug_report(
                 sample_mjds = mjds[:12]
                 extra = f" … (+{len(mjds) - 12})" if len(mjds) > 12 else ""
                 lines.append(f"  MJDs for this plate in catalog: {sample_mjds}{extra}")
+        if mode.name == "triplet_hash":
+            if mode.extra.get("label_format"):
+                lines.append(f"  label format: {mode.extra['label_format']}")
+            if mode.extra.get("note"):
+                lines.append(f"  note: {mode.extra['note']}")
         if mode.fiber_map and sample > 0:
+            id_label = "source_id" if mode.name == "triplet_hash" else "specobjid"
             for row in _sample_pairs(mode.fiber_map, sample):
-                lines.append(f"  fiber {row['fiber']} → specobjid {row['specobjid']}")
+                lines.append(f"  fiber {row['fiber']} → {id_label} {row['specobjid']}")
 
     plate_mode = report.mode("from_plate")
     cat_mode = report.mode("catalog")
@@ -432,8 +456,8 @@ def format_debug_report(
     elif all(m.size == 0 for m in report.modes):
         lines.append(
             "RESULT: no fibers resolved — ingest would skip all spectra. "
-            "Use a catalog with plate+mjd+fiber (+ source_id or specobjid), "
-            "--specobj-lookup-from-plate, or a sidecar lookup file."
+            "Default (triplet hash) works without a catalog; for native specObjID "
+            "use --specobj-lookup-from-plate or a sidecar lookup file."
         )
     else:
         best = max(report.modes, key=lambda m: m.size)
@@ -457,6 +481,14 @@ def format_debug_report(
     "--specobj-lookup-survey",
     default=None,
     help="Survey column value when sidecar has no SURVEY column.",
+)
+@click.option(
+    "--triplet-hash",
+    is_flag=True,
+    help=(
+        "Show composite PLATE|MJD|FIBERID hash IDs (the default ingest mode). "
+        "IDs match a catalog ingested with --link-id-col PLATE,MJD,FIBERID."
+    ),
 )
 @click.option(
     "--no-catalog",
@@ -490,6 +522,7 @@ def cli(
     config_path: Path | None,
     specobj_lookup: Path | None,
     specobj_lookup_survey: str | None,
+    triplet_hash: bool,
     no_catalog: bool,
     no_plate: bool,
     specobj_id_layout: str,
@@ -506,10 +539,16 @@ def cli(
         cfg = load_optional_config(config_path)
         catalog_root = require_output_root(output_root, cfg, kind="catalogs")
 
-    if no_plate and specobj_lookup is None and catalog_root is None:
+    nothing_to_probe = (
+        not triplet_hash
+        and no_plate
+        and specobj_lookup is None
+        and catalog_root is None
+    )
+    if nothing_to_probe:
         raise click.ClickException(
-            "Nothing to probe: pass output_root (catalog), --specobj-lookup, "
-            "or allow plate synthesis (default)."
+            "Nothing to probe: pass --triplet-hash, output_root (catalog), "
+            "--specobj-lookup, or allow plate synthesis (default)."
         )
 
     report = debug_specobj_lookup(
@@ -518,6 +557,7 @@ def cli(
         catalog_root=catalog_root,
         lookup_path=specobj_lookup,
         lookup_survey=specobj_lookup_survey,
+        try_triplet_hash=triplet_hash,
         try_from_plate=not no_plate,
         try_from_catalog=catalog_root is not None,
         try_from_sidecar=specobj_lookup is not None,

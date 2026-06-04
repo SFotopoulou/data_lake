@@ -259,14 +259,73 @@ class TestSpplateIngest:
         any_sid = next(iter(n))
         assert acc.get_spectrum(any_sid).flux.shape[0] == 3854
 
-    def test_requires_lookup(self, tmp_path: Path) -> None:
+    def test_default_triplet_hash(self, tmp_path: Path) -> None:
+        """No lookup flag → composite PLATE|MJD|FIBERID hash used automatically."""
+        from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
+        from data_lake.ingest.sdss_specobj_lookup import spplate_source_id_from_triplet
+        from data_lake.io.spectra import SpectrumAccessor
+
+        plate, mjd = 4002, 55645
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=3)
+        lake = tmp_path / "lake"
+        index_map = ingest_spectra_from_fits(
+            sp, lake, "sdss_test", fmt="sdss_spplate", norder=5,
+        )
+        assert len(index_map) == 3
+        for fiber_id in (1, 2, 3):
+            expected_sid = spplate_source_id_from_triplet(plate, mjd, fiber_id)
+            assert expected_sid in index_map, f"fiber {fiber_id} → sid {expected_sid} missing"
+        acc = SpectrumAccessor(lake, "sdss_test")
+        for fiber_id in (1, 2, 3):
+            sid = spplate_source_id_from_triplet(plate, mjd, fiber_id)
+            assert acc.get_spectrum(sid) is not None
+
+    def test_triplet_hash_matches_composite_catalog(self, tmp_path: Path) -> None:
+        """source_id from triplet hash == _source_id in catalog ingested with PLATE,MJD,FIBERID."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from data_lake.ingest.fits_to_parquet import composite_link_label, normalize_object_id
+        from data_lake.ingest.sdss_specobj_lookup import (
+            build_fiber_to_source_id_from_triplet,
+            spplate_source_id_from_triplet,
+        )
+
+        plate, mjd = 4002, 55645
+        fibers = [1, 2, 3]
+
+        # Simulate what catalog composite ingest does for PLATE,MJD,FIBERID rows.
+        catalog_source_ids = [
+            normalize_object_id(composite_link_label(plate, mjd, fid)) for fid in fibers
+        ]
+
+        # Triplet helper must produce identical values.
+        triplet_map = build_fiber_to_source_id_from_triplet(plate, mjd, fibers)
+        for fid, cat_sid in zip(fibers, catalog_source_ids):
+            assert triplet_map[fid] == cat_sid, (
+                f"fiber {fid}: triplet={triplet_map[fid]} != catalog={cat_sid}"
+            )
+        # Scalar helper is consistent with the map builder.
+        for fid in fibers:
+            assert spplate_source_id_from_triplet(plate, mjd, fid) == triplet_map[fid]
+
+    def test_mutual_exclusion_of_lookup_modes(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_spectra_zarr import ingest_spectra_from_fits
 
-        sp = tmp_path / "spPlate-1-2.fits"
-        _write_minimal_spplate(sp, plate=1, mjd=2, n_fiber=1)
-        with pytest.raises(ValueError, match="specobj_lookup"):
+        plate, mjd = 1, 2
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=1)
+        lookup = tmp_path / "lookup.parquet"
+        _write_lookup(lookup, plate, mjd, "sdss_test", {1: 99})
+        with pytest.raises(ValueError, match="only one"):
             ingest_spectra_from_fits(
-                sp, tmp_path / "lake", "sdss_test", fmt="sdss_spplate",
+                sp,
+                tmp_path / "lake",
+                "sdss_test",
+                fmt="sdss_spplate",
+                specobj_lookup=lookup,
+                specobj_lookup_from_plate=True,
             )
 
 

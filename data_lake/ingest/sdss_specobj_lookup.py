@@ -1,9 +1,15 @@
 """
 sdss_specobj_lookup – resolve (survey, plate, mjd, fiber) → source_id for spPlate ingest.
 
-spPlate FITS files do not carry a spectroscopic ID; ingest joins on **PLATE, MJD,
-FIBERID** against a sidecar Parquet/CSV or lake catalog, then reads the catalog's
-ID column (``source_id``, ``specobjid``, ``TARGETID``, or ``--link-id-col``).
+spPlate FITS files do not carry a spectroscopic ID.  The **default** (fastest)
+mode uses a composite BLAKE2b hash of the ``(PLATE, MJD, FIBERID)`` triplet —
+see :func:`build_fiber_to_source_id_from_triplet`.  This matches catalog ingest
+when ``--link-id-col PLATE,MJD,FIBERID`` is used (no catalog tile scan required).
+
+Legacy modes join on **PLATE, MJD, FIBERID** against a sidecar Parquet/CSV
+(``--specobj-lookup``) or a full lake catalog scan (``--specobj-lookup-from-catalog``),
+or synthesize the CAS integer specObjID from header metadata
+(``--specobj-lookup-from-plate``).
 """
 
 from __future__ import annotations
@@ -704,6 +710,46 @@ def _fits_fiber_column(fdata: np.ndarray) -> np.ndarray:
         if key is not None:
             return np.asarray(fdata[key])
     raise KeyError(f"No FIBERID column in plugmap; columns: {list(names)}")
+
+
+def spplate_composite_link_label(plate: int, mjd: int, fiber_id: int) -> str:
+    """Return the composite label string ``'plate|mjd|fiber_id'`` for spPlate fiber rows.
+
+    This mirrors how catalog composite ingest stores ``_source_id`` when
+    ``--link-id-col PLATE,MJD,FIBERID`` is used.  Integer parts are formatted
+    via :func:`~data_lake.ingest.fits_to_parquet.composite_link_label`, which
+    calls ``str()`` on each non-empty part and joins with ``'|'``.
+    """
+    from data_lake.ingest.fits_to_parquet import composite_link_label
+
+    return composite_link_label(plate, mjd, fiber_id)
+
+
+def spplate_source_id_from_triplet(plate: int, mjd: int, fiber_id: int) -> int:
+    """Derive the int64 ``_source_id`` from ``(plate, mjd, fiber_id)`` without any I/O.
+
+    Produces the same value as catalog ingest with
+    ``--link-id-col PLATE,MJD,FIBERID`` for the same triplet.
+    """
+    return normalize_object_id(spplate_composite_link_label(plate, mjd, fiber_id))
+
+
+def build_fiber_to_source_id_from_triplet(
+    plate: int,
+    mjd: int,
+    fiber_ids: Iterable[int],
+) -> dict[int, int]:
+    """Return ``{fiber_id: source_id}`` for all fibers in *fiber_ids* (no I/O).
+
+    Consistent with catalog ingest using ``--link-id-col PLATE,MJD,FIBERID``.
+    """
+    plate_i, mjd_i = int(plate), int(mjd)
+    out: dict[int, int] = {}
+    for fid in fiber_ids:
+        fid_i = int(fid)
+        if fid_i not in out:
+            out[fid_i] = spplate_source_id_from_triplet(plate_i, mjd_i, fid_i)
+    return out
 
 
 def spplate_plate_mjd_from_hdul(hdul, path: Path | None = None) -> tuple[int, int]:
