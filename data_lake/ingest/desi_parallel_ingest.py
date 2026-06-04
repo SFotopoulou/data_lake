@@ -71,6 +71,8 @@ from data_lake.ingest.fits_to_spectra_zarr import (
     _open_or_create_spectrum_tile,
     _read_desi_with_desispec,
     _write_spectrum_info,
+    append_tile_batch_to_zarr,
+    widen_spectrum_tile,
 )
 
 log = logging.getLogger(__name__)
@@ -247,6 +249,7 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 class _OpenTile:
     """One HEALPix tile Zarr group held open by the parallel writer."""
     root: Any
+    tile_path: Path
     existing_ids: set[int] | None = None
 
 
@@ -278,6 +281,9 @@ class _TileGroupCache:
     the whole run (file descriptors + metadata).  For all-sky DESI ingest that
     can mean thousands of open stores and multi-GB of cached ``source_id`` reads
     when ``--on-duplicate skip``.
+
+    When ``length_policy`` is ``pad``, tiles are created or widened to
+    ``create_n_pix`` on each ``get()`` (see :func:`append_tile_batch_to_zarr`).
     """
 
     def __init__(
@@ -285,41 +291,74 @@ class _TileGroupCache:
         *,
         survey_root: Path,
         norder: int,
-        n_pix_known: int,
-        wcs_attrs_known: dict,
+        wcs_attrs: dict,
         mask_dtype: np.dtype,
+        wavelength_mode: str,
+        length_policy: str,
         on_duplicate: ZarrDuplicateMode,
         max_open: int,
     ) -> None:
         self._survey_root = survey_root
         self._norder = norder
-        self._n_pix_known = n_pix_known
-        self._wcs_attrs_known = wcs_attrs_known
+        self._wcs_attrs = wcs_attrs
         self._mask_dtype = mask_dtype
+        self._wavelength_mode = wavelength_mode
+        self._length_policy = length_policy
         self._track_ids = on_duplicate != "append"
         self._max_open = max_open
         self._tiles: OrderedDict[int, _OpenTile] = OrderedDict()
         self.tiles_touched: set[int] = set()
 
-    def get(self, npix: int) -> _OpenTile:
+    def _widen_if_needed(self, root: Any, tile_path: Path, create_n_pix: int) -> Any:
+        cur_w = int(root["flux"].shape[1])
+        if create_n_pix <= cur_w:
+            return root
+        if self._length_policy == "pad":
+            return widen_spectrum_tile(
+                tile_path,
+                create_n_pix,
+                wavelength_mode=str(
+                    root.attrs.get("wavelength_mode", self._wavelength_mode)
+                ),
+                mask_dtype=self._mask_dtype,
+                wcs_attrs=self._wcs_attrs,
+            )
+        raise ValueError(
+            f"Tile {tile_path.name} n_pix={cur_w} < incoming {create_n_pix}; "
+            f"use length_policy='pad'"
+        )
+
+    def get(self, npix: int, *, create_n_pix: int) -> _OpenTile:
         if npix in self._tiles:
             self._tiles.move_to_end(npix)
-            return self._tiles[npix]
+            entry = self._tiles[npix]
+            new_root = self._widen_if_needed(entry.root, entry.tile_path, create_n_pix)
+            if new_root is not entry.root:
+                entry.root = new_root
+            return entry
 
         tile_dir = self._survey_root / healpix_dir(self._norder, npix)
         tile_dir.mkdir(parents=True, exist_ok=True)
         tile_path = tile_dir / f"Npix={npix}.zarr"
-        root = _open_or_create_spectrum_tile(
-            tile_path,
-            self._n_pix_known,
-            "shared",
-            self._mask_dtype,
-            self._wcs_attrs_known,
-        )
+        tile_exists = tile_path.exists() and (tile_path / "zarr.json").exists()
+        if tile_exists:
+            import zarr
+
+            store = zarr.storage.LocalStore(str(tile_path))
+            root = zarr.open_group(store=store, mode="a", zarr_format=3)
+            root = self._widen_if_needed(root, tile_path, create_n_pix)
+        else:
+            root = _open_or_create_spectrum_tile(
+                tile_path,
+                create_n_pix,
+                self._wavelength_mode,
+                self._mask_dtype,
+                self._wcs_attrs,
+            )
         existing_ids = (
             _load_tile_source_id_set(root) if self._track_ids else None
         )
-        entry = _OpenTile(root=root, existing_ids=existing_ids)
+        entry = _OpenTile(root=root, tile_path=tile_path, existing_ids=existing_ids)
         self._tiles[npix] = entry
         self.tiles_touched.add(npix)
         self._evict_if_needed()
@@ -539,6 +578,8 @@ def ingest_spectra_parallel(
     track_index_map: bool = False,
     max_in_flight: int | None = None,
     max_open_tiles: int = 64,
+    length_policy: str = "error",
+    wavelength_mode: str = "shared",
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -596,6 +637,13 @@ def ingest_spectra_parallel(
         Use ``0`` for unlimited (not recommended on 10k+ coadd runs).  Evicted
         tiles are closed and re-opened on the next write; duplicate-ID sets are
         reloaded when ``on_duplicate`` is not ``append``.
+    length_policy:
+        ``error`` (default): reject a file when its ``n_pix`` differs from the
+        first file in the run.  ``pad`` or ``truncate``: allow mixed pixel
+        lengths; widen tiles and pad/truncate rows via
+        :func:`~data_lake.ingest.fits_to_spectra_zarr.append_tile_batch_to_zarr`.
+    wavelength_mode:
+        Wavelength storage when creating or widening tiles (default ``shared``).
 
     Returns
     -------
@@ -695,7 +743,10 @@ def ingest_spectra_parallel(
     # --- Writer state ---
     tile_cache: _TileGroupCache | None = None
     n_pix_known: int | None = None
+    n_pix_for_info: int = 0
     wcs_attrs_known: dict | None = None
+    wavelength_mode_run: str = wavelength_mode
+    strict_n_pix = length_policy == "error"
     failures: list[dict] = []
     index_map: dict[int, int] = {}
     n_spectra_written = 0
@@ -737,7 +788,9 @@ def ingest_spectra_parallel(
             in_flight[fut] = p
 
     def _process_result(path_str: str, res: WorkerResult) -> None:
-        nonlocal n_files_ok, n_files_fail, n_spectra_written, n_pix_known, wcs_attrs_known, tile_cache
+        nonlocal n_files_ok, n_files_fail, n_spectra_written
+        nonlocal n_pix_known, n_pix_for_info, wcs_attrs_known, tile_cache
+        nonlocal wavelength_mode_run
 
         if not res.ok:
             n_files_fail += 1
@@ -762,40 +815,53 @@ def ingest_spectra_parallel(
             _clear_parallel_inflight(resolved_inflight)
             return
 
-        if n_pix_known is None:
-            n_pix_known = res.n_pix
-            wcs_attrs_known = res.wcs_attrs
-        elif res.n_pix != n_pix_known:
-            fail_entry = {
-                "path": res.path,
-                "error": (
-                    f"n_pix={res.n_pix} differs from established "
-                    f"grid n_pix={n_pix_known}; file rejected."
-                ),
-                "traceback": None,
-            }
-            failures.append(fail_entry)
-            n_files_fail += 1
-            if failures_log is not None:
-                with failures_log.open("a") as fh:
-                    fh.write(json.dumps(fail_entry) + "\n")
-            return
+        if wcs_attrs_known is None:
+            wcs_attrs_known = res.wcs_attrs or {}
+
+        if strict_n_pix:
+            if n_pix_known is None:
+                n_pix_known = res.n_pix
+            elif res.n_pix != n_pix_known:
+                fail_entry = {
+                    "path": res.path,
+                    "error": (
+                        f"n_pix={res.n_pix} differs from established "
+                        f"grid n_pix={n_pix_known}; file rejected."
+                    ),
+                    "traceback": None,
+                }
+                failures.append(fail_entry)
+                n_files_fail += 1
+                if failures_log is not None:
+                    with failures_log.open("a") as fh:
+                        fh.write(json.dumps(fail_entry) + "\n")
+                return
+        else:
+            if res.n_pix > n_pix_for_info:
+                n_pix_for_info = res.n_pix
+                if res.wcs_attrs:
+                    wcs_attrs_known = res.wcs_attrs
+
+        if res.wavelength is not None:
+            wavelength_mode_run = "shared"
 
         if tile_cache is None:
             tile_cache = _TileGroupCache(
                 survey_root=survey_root,
                 norder=norder,
-                n_pix_known=n_pix_known,
-                wcs_attrs_known=wcs_attrs_known or {},
+                wcs_attrs=wcs_attrs_known or {},
                 mask_dtype=np.dtype(np.uint8),
+                wavelength_mode=wavelength_mode_run,
+                length_policy=length_policy,
                 on_duplicate=on_duplicate_source_id,
                 max_open=max_open_tiles,
             )
 
         snap: dict[int, int] = {}
         for b in res.batches:
-            root = tile_cache.get(b.npix).root
-            snap[b.npix] = int(root["flux"].shape[0])
+            create_n_pix = int(b.flux.shape[1]) if b.flux.size else res.n_pix
+            open_tile = tile_cache.get(b.npix, create_n_pix=create_n_pix)
+            snap[b.npix] = int(open_tile.root["flux"].shape[0])
 
         _atomic_write_json(
             resolved_inflight,
@@ -808,42 +874,35 @@ def ingest_spectra_parallel(
             },
         )
 
+        file_wavelength_mode = wavelength_mode_run
+        if res.wavelength is not None:
+            file_wavelength_mode = "shared"
+        elif any(b.wavelength_rows is not None for b in res.batches):
+            file_wavelength_mode = "per_source"
+
         for b in res.batches:
-            open_tile = tile_cache.get(b.npix)
-            root = open_tile.root
-            existing = open_tile.existing_ids
-            if existing is None:
-                existing_for_filter: set[int] | np.ndarray = np.array([], dtype=np.int64)
-            else:
-                existing_for_filter = existing
-            filtered = _filter_tile_batch(
-                b, existing_for_filter, on_duplicate_source_id,
+            create_n_pix = int(b.flux.shape[1]) if b.flux.size else res.n_pix
+            open_tile = tile_cache.get(b.npix, create_n_pix=create_n_pix)
+            start_idx = int(open_tile.root["flux"].shape[0])
+            n_appended = append_tile_batch_to_zarr(
+                open_tile.tile_path,
+                open_tile.root,
+                b,
+                file_n_pix=res.n_pix,
+                wavelength_mode_effective=file_wavelength_mode,
+                length_policy=length_policy,
+                mask_dtype=np.dtype(np.uint8),
+                wcs_attrs=wcs_attrs_known or {},
+                on_duplicate=on_duplicate_source_id,
+                shared_wavelength=res.wavelength,
+                existing_ids=open_tile.existing_ids,
             )
-            if filtered is None:
-                continue
-            b = filtered
-            start_idx = root["flux"].shape[0]
-
-            root["flux"].append(b.flux)
-            root["ivar"].append(b.ivar)
-            root["mask"].append(b.mask)
-            from data_lake.ingest.zarr_ids import zarr_join_array
-
-            zarr_join_array(root).append(b.source_ids)
-            meta_arr = np.frombuffer(
-                b.meta_bytes,
-                dtype="|V" + str(_META_DTYPE.itemsize),
-            )
-            root["meta"].append(meta_arr)
-            tile_cache.note_appended(b.npix, b.source_ids)
-
-            if start_idx == 0 and res.wavelength is not None:
-                root["wavelength"][:] = res.wavelength.astype(np.float64)
-
-            if track_index_map:
-                for i, sid in enumerate(b.source_ids.tolist()):
-                    index_map[int(sid)] = start_idx + i
-            n_spectra_written += int(b.source_ids.size)
+            if n_appended:
+                tile_cache.note_appended(b.npix, b.source_ids)
+                if track_index_map:
+                    for i, sid in enumerate(b.source_ids.tolist()):
+                        index_map[int(sid)] = start_idx + i
+                n_spectra_written += n_appended
 
         n_files_ok += 1
         completed.add(res.path)
@@ -888,10 +947,20 @@ def ingest_spectra_parallel(
 
     n_tiles_touched = len(tile_cache.tiles_touched) if tile_cache is not None else 0
 
-    if n_pix_known is not None and wcs_attrs_known is not None:
+    if wcs_attrs_known is not None and tile_cache is not None and tile_cache.tiles_touched:
+        info_n_pix = (
+            n_pix_known
+            if strict_n_pix and n_pix_known is not None
+            else max(n_pix_for_info, 1)
+        )
         _write_spectrum_info(
-            survey_root, survey_name, norder, n_pix_known,
-            "shared", "uint8", wcs_attrs_known,
+            survey_root,
+            survey_name,
+            norder,
+            info_n_pix,
+            wavelength_mode_run,
+            "uint8",
+            wcs_attrs_known,
         )
 
     elapsed = time.perf_counter() - t_start

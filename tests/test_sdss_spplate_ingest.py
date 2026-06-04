@@ -619,3 +619,319 @@ class TestDynamicTileWideningOnIngest:
         assert sp_long.flux.shape[0] == 64
         assert sp_short.flux.shape[0] == 64
         assert np.all(np.isnan(sp_short.flux[32:]))
+
+
+# ---------------------------------------------------------------------------
+# Vectorized decoder tests (spplate_parallel_ingest)
+# ---------------------------------------------------------------------------
+
+
+class TestVectorizedSpplateDecoder:
+    """Tests for the fast vectorized spPlate decode path."""
+
+    def test_equivalence_with_slow_path_source_ids(self, tmp_path: Path) -> None:
+        """Vectorized decoder produces source_ids identical to the triplet-hash reference."""
+        from data_lake.ingest.sdss_specobj_lookup import spplate_source_id_from_triplet
+        from data_lake.ingest.spplate_parallel_ingest import (
+            SpplateBatchConfig,
+            _decode_spplate_to_worker_result,
+        )
+
+        plate, mjd = 7000, 56789
+        n_fiber = 4
+        n_pix = 32
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=n_fiber, n_pix=n_pix)
+
+        # Reference: expected IDs for fibers 1..n_fiber
+        expected_sids = {
+            spplate_source_id_from_triplet(plate, mjd, fid)
+            for fid in range(1, n_fiber + 1)
+        }
+
+        config = SpplateBatchConfig(norder=5, triplet_hash=True)
+        result = _decode_spplate_to_worker_result(sp, config)
+
+        assert result.ok, result.error
+        fast_sids = {sid for b in result.batches for sid in b.source_ids.tolist()}
+
+        assert fast_sids == expected_sids
+        assert result.n_pix == n_pix
+
+        # Shared wavelength is set correctly
+        assert result.wavelength is not None
+        assert result.wavelength.shape == (n_pix,)
+
+        # Each batch has correct pixel width
+        for b in result.batches:
+            assert b.flux.shape[1] == n_pix
+            assert b.ivar.shape[1] == n_pix
+            assert b.mask.shape[1] == n_pix
+
+    def test_decoder_skips_all_zero_flux_fibers(self, tmp_path: Path) -> None:
+        """Fibers with all-zero flux are excluded by the active-flux mask."""
+        import numpy as np
+        from astropy.io import fits
+
+        from data_lake.ingest.spplate_parallel_ingest import (
+            SpplateBatchConfig,
+            _decode_spplate_to_worker_result,
+        )
+
+        plate, mjd = 7001, 56790
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=3, n_pix=32)
+
+        # Zero out first fiber
+        with fits.open(sp, mode="update", memmap=False) as hdul:
+            hdul[0].data[0, :] = 0.0
+            hdul.flush()
+
+        config = SpplateBatchConfig(norder=5, triplet_hash=True)
+        result = _decode_spplate_to_worker_result(sp, config)
+
+        assert result.ok
+        assert result.n_spectra == 2
+
+    def test_decoder_shared_wavelength_attributes(self, tmp_path: Path) -> None:
+        """wcs_attrs contains COEFF0/COEFF1-derived values and n_pix."""
+        from data_lake.ingest.spplate_parallel_ingest import (
+            SpplateBatchConfig,
+            _decode_spplate_to_worker_result,
+        )
+
+        plate, mjd = 7002, 56791
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        n_pix = 48
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=2, n_pix=n_pix)
+
+        config = SpplateBatchConfig(norder=5, triplet_hash=True)
+        result = _decode_spplate_to_worker_result(sp, config)
+
+        assert result.ok
+        assert result.n_pix == n_pix
+        assert result.wcs_attrs["n_pix"] == n_pix
+        assert "crval" in result.wcs_attrs
+        assert result.wavelength is not None
+        assert len(result.wavelength) == n_pix
+
+    def test_meta_bytes_length_matches_n_spectra(self, tmp_path: Path) -> None:
+        """meta_bytes in each TileBatch encodes exactly n_row records."""
+        from data_lake.ingest.fits_to_spectra_zarr import _META_DTYPE
+        from data_lake.ingest.spplate_parallel_ingest import (
+            SpplateBatchConfig,
+            _decode_spplate_to_worker_result,
+        )
+
+        plate, mjd = 7003, 56792
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=4, n_pix=32)
+
+        config = SpplateBatchConfig(norder=5, triplet_hash=True)
+        result = _decode_spplate_to_worker_result(sp, config)
+
+        assert result.ok
+        total_meta_records = sum(
+            len(b.meta_bytes) // _META_DTYPE.itemsize for b in result.batches
+        )
+        total_sids = sum(b.source_ids.size for b in result.batches)
+        assert total_meta_records == total_sids
+
+
+class TestSpplateBatchIngest:
+    """Smoke tests for ingest_spplate_files_parallel."""
+
+    def test_batch_ingest_two_plates(self, tmp_path: Path) -> None:
+        """Batch ingest of two plate files, 1 worker; row counts match fiber count."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from data_lake.ingest.sdss_specobj_lookup import spplate_source_id_from_triplet
+        from data_lake.ingest.spplate_parallel_ingest import ingest_spplate_files_parallel
+        from data_lake.io.spectra import SpectrumAccessor
+
+        plate1, mjd1 = 8000, 57000
+        plate2, mjd2 = 8001, 57001
+        n_fiber = 3
+        lake = tmp_path / "lake"
+
+        sp1 = tmp_path / f"spPlate-{plate1}-{mjd1}.fits"
+        sp2 = tmp_path / f"spPlate-{plate2}-{mjd2}.fits"
+        _write_minimal_spplate(sp1, plate=plate1, mjd=mjd1, n_fiber=n_fiber, n_pix=32)
+        _write_minimal_spplate(sp2, plate=plate2, mjd=mjd2, n_fiber=n_fiber, n_pix=32)
+
+        result = ingest_spplate_files_parallel(
+            file_paths=[sp1, sp2],
+            output_root=lake,
+            survey_name="sdss_test_batch",
+            n_workers=1,
+            norder=5,
+            show_progress=False,
+            on_duplicate_source_id="skip",
+            executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+        )
+
+        assert result["n_files_succeeded"] == 2
+        assert result["n_spectra"] == n_fiber * 2
+
+        acc = SpectrumAccessor(lake, "sdss_test_batch")
+        for plate, mjd in [(plate1, mjd1), (plate2, mjd2)]:
+            for fid in range(1, n_fiber + 1):
+                sid = spplate_source_id_from_triplet(plate, mjd, fid)
+                sp = acc.get_spectrum(sid)
+                assert sp is not None, f"Missing plate={plate} mjd={mjd} fid={fid}"
+                assert sp.flux.shape[0] == 32
+
+    def test_batch_ingest_spectrum_info_wavelength_mode_shared(
+        self, tmp_path: Path
+    ) -> None:
+        """spectrum_info.json records wavelength_mode=shared after batch ingest."""
+        import json
+        from concurrent.futures import ThreadPoolExecutor
+
+        from data_lake.ingest.spplate_parallel_ingest import ingest_spplate_files_parallel
+
+        plate, mjd = 9000, 58000
+        lake = tmp_path / "lake"
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=2, n_pix=32)
+
+        ingest_spplate_files_parallel(
+            file_paths=[sp],
+            output_root=lake,
+            survey_name="sdss_shared_test",
+            n_workers=1,
+            norder=5,
+            show_progress=False,
+            executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+        )
+
+        info_path = lake / "spectra" / "sdss_shared_test" / "spectrum_info.json"
+        assert info_path.exists(), "spectrum_info.json not written"
+        info = json.loads(info_path.read_text())
+        assert info.get("wavelength_mode") == "shared", (
+            f"Expected wavelength_mode='shared', got {info.get('wavelength_mode')!r}"
+        )
+
+    def test_batch_ingest_checkpoint_resumes(self, tmp_path: Path) -> None:
+        """A completed file in the checkpoint is skipped on the second run."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from data_lake.ingest.spplate_parallel_ingest import ingest_spplate_files_parallel
+
+        plate, mjd = 9001, 58001
+        lake = tmp_path / "lake"
+        sp = tmp_path / f"spPlate-{plate}-{mjd}.fits"
+        _write_minimal_spplate(sp, plate=plate, mjd=mjd, n_fiber=2, n_pix=32)
+        ckpt = tmp_path / "checkpoint.json"
+
+        ingest_spplate_files_parallel(
+            file_paths=[sp],
+            output_root=lake,
+            survey_name="sdss_ckpt_test",
+            n_workers=1,
+            norder=5,
+            show_progress=False,
+            checkpoint_path=ckpt,
+            executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+        )
+
+        result2 = ingest_spplate_files_parallel(
+            file_paths=[sp],
+            output_root=lake,
+            survey_name="sdss_ckpt_test",
+            n_workers=1,
+            norder=5,
+            show_progress=False,
+            checkpoint_path=ckpt,
+            executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+        )
+
+        assert result2["n_files_skipped"] == 1
+        assert result2["n_files_processed"] == 0  # all skipped, nothing to process
+        assert result2["n_spectra"] == 0
+
+
+class TestSpplateBatchMixedNPix:
+    """Batch ingest with different n_pix per plate (pad / widen)."""
+
+    def test_batch_mixed_n_pix_pads_to_widest(self, tmp_path: Path) -> None:
+        """Two plates with n_pix 32 and 64 ingest under default pad policy."""
+        import json
+        from concurrent.futures import ThreadPoolExecutor
+
+        from data_lake.ingest.sdss_specobj_lookup import spplate_source_id_from_triplet
+        from data_lake.ingest.spplate_parallel_ingest import ingest_spplate_files_parallel
+        from data_lake.io.spectra import SpectrumAccessor
+
+        plate1, mjd1 = 8100, 58100
+        plate2, mjd2 = 8101, 58101
+        n_fiber = 2
+        lake = tmp_path / "lake"
+
+        sp_short = tmp_path / f"spPlate-{plate1}-{mjd1}.fits"
+        sp_long = tmp_path / f"spPlate-{plate2}-{mjd2}.fits"
+        _write_minimal_spplate(
+            sp_short, plate=plate1, mjd=mjd1, n_fiber=n_fiber, n_pix=32,
+        )
+        _write_minimal_spplate(
+            sp_long, plate=plate2, mjd=mjd2, n_fiber=n_fiber, n_pix=64,
+        )
+
+        result = ingest_spplate_files_parallel(
+            file_paths=[sp_short, sp_long],
+            output_root=lake,
+            survey_name="sdss_mixed_npix",
+            n_workers=1,
+            norder=5,
+            show_progress=False,
+            on_length_mismatch="pad",
+            executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+        )
+
+        assert result["n_files_failed"] == 0
+        assert result["n_files_succeeded"] == 2
+        assert result["n_spectra"] == n_fiber * 2
+
+        info_path = lake / "spectra" / "sdss_mixed_npix" / "spectrum_info.json"
+        info = json.loads(info_path.read_text())
+        assert info["n_pix"] == 64
+
+        acc = SpectrumAccessor(lake, "sdss_mixed_npix")
+        sid_short = spplate_source_id_from_triplet(plate1, mjd1, 1)
+        sid_long = spplate_source_id_from_triplet(plate2, mjd2, 1)
+        sp_from_short = acc.get_spectrum(sid_short)
+        sp_from_long = acc.get_spectrum(sid_long)
+        assert sp_from_short is not None
+        assert sp_from_long is not None
+        assert sp_from_long.flux.shape[0] == 64
+        assert sp_from_short.flux.shape[0] == 64
+        assert np.all(np.isnan(sp_from_short.flux[32:]))
+
+    def test_batch_mixed_n_pix_error_rejects_second_file(self, tmp_path: Path) -> None:
+        """With on_length_mismatch=error, second plate with different n_pix fails."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from data_lake.ingest.spplate_parallel_ingest import ingest_spplate_files_parallel
+
+        plate1, mjd1 = 8102, 58102
+        plate2, mjd2 = 8103, 58103
+        lake = tmp_path / "lake"
+        sp_short = tmp_path / f"spPlate-{plate1}-{mjd1}.fits"
+        sp_long = tmp_path / f"spPlate-{plate2}-{mjd2}.fits"
+        _write_minimal_spplate(sp_short, plate=plate1, mjd=mjd1, n_fiber=2, n_pix=32)
+        _write_minimal_spplate(sp_long, plate=plate2, mjd=mjd2, n_fiber=2, n_pix=64)
+
+        result = ingest_spplate_files_parallel(
+            file_paths=[sp_short, sp_long],
+            output_root=lake,
+            survey_name="sdss_strict_npix",
+            n_workers=1,
+            norder=5,
+            show_progress=False,
+            on_length_mismatch="error",
+            executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+        )
+
+        assert result["n_files_succeeded"] == 1
+        assert result["n_files_failed"] == 1
+        assert any("n_pix=" in (f.get("error") or "") for f in result["failures"])

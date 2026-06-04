@@ -3025,7 +3025,12 @@ def decode_spectrum_file_to_worker_result(
     path_str: str,
     config: SpectrumDecodeConfig,
 ) -> object:
-    """Decode one spectrum FITS file into per-tile batches (worker process)."""
+    """Decode one spectrum FITS file into per-tile batches (worker process).
+
+    For spPlate files when catalog lookup is not requested, decoding is
+    delegated to the vectorized fast path in
+    :mod:`data_lake.ingest.spplate_parallel_ingest`.
+    """
     from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
     from data_lake.ingest.desi_parallel_ingest import WorkerResult
 
@@ -3033,6 +3038,30 @@ def decode_spectrum_file_to_worker_result(
     t0 = time.perf_counter()
     source_path = Path(path_str)
     output_root = Path(config.output_root)
+
+    # Fast-path for spPlate when no catalog scan is needed
+    _is_spplate_fmt = config.fmt == "sdss_spplate" or (
+        config.fmt is None and source_path.name.startswith("spPlate-")
+    )
+    if _is_spplate_fmt and not config.specobj_lookup_from_catalog:
+        from data_lake.ingest.spplate_parallel_ingest import (
+            SpplateBatchConfig,
+            _decode_spplate_to_worker_result,
+        )
+        sp_config = SpplateBatchConfig(
+            norder=config.norder,
+            ra_col=config.ra_col,
+            dec_col=config.dec_col,
+            triplet_hash=(
+                not config.specobj_lookup
+                and not config.specobj_lookup_from_plate
+            ),
+            lookup_path=config.specobj_lookup,
+            lookup_survey=config.specobj_lookup_survey,
+            lookup_from_plate=config.specobj_lookup_from_plate,
+            specobj_id_layout=config.specobj_id_layout,
+        )
+        return _decode_spplate_to_worker_result(source_path, sp_config)
 
     detected_fmt, records, wcs_attrs, res_diags, res_offsets = _load_spectrum_records_from_path(
         source_path,

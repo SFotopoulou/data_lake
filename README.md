@@ -376,12 +376,12 @@ approaching one file per object at very high order).
    and Rubin/LSST **lsdb** interoperability.
 
 3. **Independent orders per modality** — set `--norder` separately for catalog,
-   spectra, and cutouts. They no longer need to match. The catalog stores
+   spectra, and cutouts. The catalog stores
    `_spectrum_npix` / `_cutout_npix` (modality-specific tile pixel) alongside
    `_healpix_norder{N}` (catalog partition key) so accessors can open the right
    Zarr tile regardless of order differences. Linkage uses `_source_id`, not
    positional HEALPix equality. Tile-aligned **cross-survey** join
-   (`crossmatch.py`) still requires identical catalog orders on both sides.
+   (`crossmatch.py`) does not require identical catalog orders on both sides.
 
 4. **Benchmark before TB ingests** — use **`dl-recommend-catalog-norder`** (quick
    FITS scan of RA/Dec only) or ingest a subset, then check tile counts and
@@ -728,10 +728,27 @@ dl-widen-spectrum-tiles --all --dry-run   # list tiles that would change
 dl-ingest-catalog specObj.parquet --survey SDSS_DR17 \
   --link-id-col PLATE,MJD,FIBERID --ra-col RA --dec-col DEC
 
+# Single plate (sequential, uses fast vectorized decoder automatically)
 dl-ingest-spectra spPlate-4002-55645.fits --survey SDSS_DR17 --fmt sdss_spplate
 
-# Many plates in parallel (no lookup flags needed)
-dl-ingest-spectra-from-list spplate_paths.txt --survey SDSS_DR17 --fmt sdss_spplate
+# Recommended for large plate lists: vectorized batch ingest with N workers
+# (architecture mirrors dl-ingest-spectra-batch-desi-coadds)
+dl-ingest-spectra-batch-spplate /path/to/lake --survey SDSS_DR17 \
+  --file-list spplate_paths.txt --n-workers 8
+
+# Alternatively with a directory glob
+dl-ingest-spectra-batch-spplate /path/to/lake --survey SDSS_DR17 \
+  --spplate-root /data/spectro/redux/v5_13_2 --n-workers 8
+
+# Mixed n_pix across plates (e.g. SDSS vs BOSS reductions): batch ingest defaults to
+# --on-length-mismatch pad — tiles widen when a longer plate lands; shorter rows are
+# right-padded (NaN flux, 0 ivar/mask). Use --on-length-mismatch error to reject mismatches.
+# DESI batch ingest (dl-ingest-spectra-batch-desi-coadds) still defaults to error.
+
+# dl-ingest-spectra-from-list also uses the fast vectorized path for spPlate
+# (benefits from --n-workers without requiring the dedicated CLI)
+dl-ingest-spectra-from-list spplate_paths.txt --survey SDSS_DR17 --fmt sdss_spplate \
+  --n-workers 8
 
 # Legacy: synthesize CAS specObjID from header (DR8+/BOSS, no catalog scan)
 dl-ingest-spectra data/spPlate-3523-55144.fits --survey boss_dr12 \
