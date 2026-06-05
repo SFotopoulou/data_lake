@@ -31,7 +31,11 @@ def _write_wig_like(path: Path, *, basename_key: str = "wig225415.fits") -> None
 
 
 class TestWigFormat:
-    def test_source_id_matches_catalog_filename_column(self, tmp_path: Path) -> None:
+    def test_source_id_matches_catalog_filename_column(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
         from data_lake.ingest.fits_to_parquet import normalize_object_id
         from data_lake.ingest.fits_to_spectra_zarr import (
             _read_wig_spectrum,
@@ -43,8 +47,14 @@ class TestWigFormat:
         catalog_id = normalize_object_id("wig225415.fits")
         assert _wig_source_id_from_path(p) == catalog_id
 
+        caplog.set_level(logging.WARNING, logger="data_lake.ingest.fits_to_parquet")
         with fits.open(p, memmap=True) as hdul:
             records, _ = _read_wig_spectrum(hdul, p)
+
+        assert not any(
+            "No object-ID keyword in FITS header" in r.message
+            for r in caplog.records
+        )
 
         assert len(records) == 1
         assert records[0].source_id == catalog_id

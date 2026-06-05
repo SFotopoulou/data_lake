@@ -1105,6 +1105,7 @@ def _read_generic_1d(
     image_hdu: int = 0,
     *,
     link_id_col: str | None = None,
+    source_id: int | None = None,
     ra_col: str = "RA",
     dec_col: str = "DEC",
     source_path: Path | None = None,
@@ -1115,6 +1116,9 @@ def _read_generic_1d(
     Handles both single-spectrum (1-D) and multi-spectrum (2-D) image HDUs.
     When a sibling ``VARIANCE`` (or ``VAR``) / ``IVAR`` extension is present, it
     is aligned to the flux HDU and converted to IVAR (variance → ``1/var``).
+
+    When *source_id* is set, header object-ID lookup is skipped (used by format
+    readers such as WiggleZ that derive ``_source_id`` from the filename).
     """
     hdu = hdul[image_hdu]
     data = np.array(hdu.data, dtype=np.float64)
@@ -1131,7 +1135,10 @@ def _read_generic_1d(
     wavelength = _wavelength_from_wcs(header, n_pix)
     wcs_attrs = _wcs_attrs_from_header(header, n_pix)
 
-    base_id = object_id_from_fits_header(header, link_id_col, hdu_index=image_hdu)
+    if source_id is not None:
+        base_id = source_id
+    else:
+        base_id = object_id_from_fits_header(header, link_id_col, hdu_index=image_hdu)
     ctx = str(source_path or f"HDU {image_hdu}")
     base_ra, base_dec, ra_key, dec_key = sky_from_header_chain(
         header,
@@ -1231,6 +1238,7 @@ def _read_wig_spectrum(
         ra_col="RA_OBJ",
         dec_col="DEC_OBJ",
         source_path=source_path,
+        source_id=source_id,
     )
     out: list[SpectrumRecord] = []
     for rec in records:
