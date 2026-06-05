@@ -49,6 +49,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_lake.io.catalog import CatalogAccessor, ReturnFormat
+from data_lake.io.crossmatch_matchers import (
+    MatchBackend,
+    match_sky_nn_within_radius,
+    validate_match_backend,
+    warn_rapids_worker_config,
+)
 from data_lake.ingest.fits_to_parquet import healpix_dir, _ZSTD_LEVEL
 
 log = logging.getLogger(__name__)
@@ -70,6 +76,8 @@ class CrossmatchResult:
     norder: int
     elapsed_s: float
     n_workers: int = 1
+    match_backend: MatchBackend = "astropy"
+    gpu_id: int = 0
     export_parquet: Path | None = None
     export_fits: Path | None = None
 
@@ -107,6 +115,8 @@ class CrossmatchTileConfig:
     dec_col_b: str
     radius_arcsec: float
     out_root: str
+    match_backend: MatchBackend = "astropy"
+    gpu_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -411,6 +421,8 @@ def _crossmatch_one_tile(
     out_root: Path,
     acc_a: CatalogAccessor,
     acc_b: CatalogAccessor,
+    match_backend: MatchBackend = "astropy",
+    gpu_id: int = 0,
 ) -> int:
     """Match one survey-A tile; write Parquet. Returns number of match rows."""
     nside_a = hp.order2nside(norder_a)
@@ -457,8 +469,10 @@ def _crossmatch_one_tile(
     dec_b = df_b[dec_col_b].to_numpy().astype(np.float64)
     ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
 
-    matched_a, matched_b, sep = _match_sky(
-        ra_a, dec_a, ids_a, ra_b, dec_b, ids_b, radius_deg
+    matched_a, matched_b, sep = match_sky_nn_within_radius(
+        ra_a, dec_a, ids_a, ra_b, dec_b, ids_b, radius_deg,
+        backend=match_backend,
+        gpu_id=gpu_id,
     )
     if matched_a.size == 0:
         return 0
@@ -506,6 +520,8 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
                 out_root=out_root,
                 acc_a=acc_a,
                 acc_b=acc_b,
+                match_backend=config.match_backend,
+                gpu_id=config.gpu_id,
             )
         return CrossmatchTileResult(
             config.npix_a,
@@ -660,6 +676,8 @@ def build_crossmatch(
     populated_tiles_only: bool = True,
     show_progress: bool = False,
     n_workers: int = 1,
+    match_backend: MatchBackend = "astropy",
+    gpu_id: int = 0,
     export_parquet: Path | str | None = None,
     export_fits: Path | str | None = None,
 ) -> CrossmatchResult:
@@ -695,6 +713,10 @@ def build_crossmatch(
         Show a tqdm progress bar over survey-A tiles when available.
     n_workers:
         Parallel worker processes for disjoint survey-A tiles (default 1).
+    match_backend:
+        Sky matcher: ``astropy`` (default) or ``rapids`` (cuML on GPU).
+    gpu_id:
+        CUDA device index when ``match_backend='rapids'``.
     export_parquet / export_fits:
         If set, after the HATS tiles are written, consolidate all match rows into
         a single Parquet or FITS file at these paths (in addition to the tile layout).
@@ -706,6 +728,9 @@ def build_crossmatch(
     """
     if n_workers < 1:
         raise ValueError("n_workers must be >= 1")
+    validate_match_backend(match_backend)
+    if match_backend == "rapids":
+        warn_rapids_worker_config(n_workers=n_workers, gpu_id=gpu_id)
 
     lake_root = Path(lake_root)
     settings = resolve_crossmatch_settings(
@@ -825,6 +850,8 @@ def build_crossmatch(
                     out_root=out_root,
                     acc_a=acc_a,
                     acc_b=acc_b,
+                    match_backend=match_backend,
+                    gpu_id=gpu_id,
                 )
                 if n_rows > 0:
                     n_tiles_written += 1
@@ -846,6 +873,8 @@ def build_crossmatch(
                 dec_col_b=settings.survey_b.dec_col,
                 radius_arcsec=radius_arcsec,
                 out_root=str(out_root),
+                match_backend=match_backend,
+                gpu_id=gpu_id,
             )
             for npix_a in pending
         ]
@@ -897,6 +926,8 @@ def build_crossmatch(
         survey_b,
         settings,
         radius_arcsec,
+        match_backend=match_backend,
+        gpu_id=gpu_id,
     )
     parquet_path, fits_path = _export_crossmatch_outputs(
         out_root,
@@ -915,37 +946,11 @@ def build_crossmatch(
         norder=norder_a,
         elapsed_s=elapsed,
         n_workers=n_workers,
+        match_backend=match_backend,
+        gpu_id=gpu_id,
         export_parquet=parquet_path,
         export_fits=fits_path,
     )
-
-
-def _match_sky(
-    ra_a: np.ndarray,
-    dec_a: np.ndarray,
-    ids_a: np.ndarray,
-    ra_b: np.ndarray,
-    dec_b: np.ndarray,
-    ids_b: np.ndarray,
-    radius_deg: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Nearest-neighbour sky match using astropy.
-
-    Returns (ids_a_matched, ids_b_matched, separations_deg).
-    Only keeps pairs within ``radius_deg``.
-    """
-    from astropy.coordinates import SkyCoord
-    import astropy.units as u
-
-    coords_a = SkyCoord(ra=ra_a * u.deg, dec=dec_a * u.deg)
-    coords_b = SkyCoord(ra=ra_b * u.deg, dec=dec_b * u.deg)
-
-    idx_b, sep2d, _ = coords_a.match_to_catalog_sky(coords_b)
-    sep_deg = sep2d.deg
-
-    mask = sep_deg <= radius_deg
-    return ids_a[mask], ids_b[idx_b[mask]], sep_deg[mask]
 
 
 def _write_xm_info(
@@ -955,6 +960,9 @@ def _write_xm_info(
     survey_b: str,
     settings: CrossmatchSettings,
     radius_arcsec: float,
+    *,
+    match_backend: MatchBackend = "astropy",
+    gpu_id: int = 0,
 ) -> None:
     info = {
         "catalog_name": xm_name,
@@ -962,6 +970,8 @@ def _write_xm_info(
         "survey_a": survey_a,
         "survey_b": survey_b,
         "match_radius_arcsec": radius_arcsec,
+        "match_backend": match_backend,
+        "gpu_id": gpu_id if match_backend == "rapids" else None,
         "hats_order": settings.survey_a.norder,
         "survey_a_norder": settings.survey_a.norder,
         "survey_b_norder": settings.survey_b.norder,
@@ -1119,6 +1129,20 @@ try:
         help="Parallel worker processes (one survey-A tile per task).",
     )
     @click.option(
+        "--match-backend",
+        type=click.Choice(["astropy", "rapids"], case_sensitive=False),
+        default="astropy",
+        show_default=True,
+        help="Sky matcher: astropy (CPU) or rapids (cuML on GPU; requires [rapids] extra).",
+    )
+    @click.option(
+        "--gpu-id",
+        default=0,
+        show_default=True,
+        type=int,
+        help="CUDA device index when --match-backend=rapids.",
+    )
+    @click.option(
         "--export-parquet",
         type=click.Path(path_type=Path),
         default=None,
@@ -1147,6 +1171,8 @@ try:
         all_tiles: bool,
         show_progress: bool,
         n_workers: int,
+        match_backend: str,
+        gpu_id: int,
         export_parquet: Path | None,
         export_fits: Path | None,
         quiet: bool,
@@ -1174,6 +1200,8 @@ try:
 
         if n_workers < 1:
             raise click.ClickException("--n-workers must be >= 1")
+        if gpu_id < 0:
+            raise click.ClickException("--gpu-id must be >= 0")
 
         result = build_crossmatch(
             lake,
@@ -1190,13 +1218,19 @@ try:
             populated_tiles_only=not all_tiles,
             show_progress=show_progress,
             n_workers=n_workers,
+            match_backend=match_backend,  # type: ignore[arg-type]
+            gpu_id=gpu_id,
             export_parquet=export_parquet,
             export_fits=export_fits,
         )
+        backend_note = result.match_backend
+        if result.match_backend == "rapids":
+            backend_note = f"rapids (gpu {result.gpu_id})"
         msg = (
             f"Cross-match {result.crossmatch_name}: "
             f"{result.n_match_rows:,} match row(s) in {result.n_tiles_written:,} tile(s) "
-            f"→ {result.output_root} ({result.elapsed_s:.1f} s, {result.n_workers} process worker(s)"
+            f"→ {result.output_root} ({result.elapsed_s:.1f} s, "
+            f"{result.n_workers} process worker(s), {backend_note}"
         )
         if result.export_parquet is not None:
             msg += f"; parquet → {result.export_parquet}"

@@ -66,7 +66,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake and write `shared/registry/surveys.parquet` |
 | `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
-| `dl-crossmatch` | Positional catalog↔catalog match at lake scale |
+| `dl-crossmatch` | Positional catalog↔catalog match at lake scale (`--match-backend astropy\|rapids`, `--gpu-id`) |
 | `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |
 
 **Agents (MCP)**

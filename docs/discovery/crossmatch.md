@@ -105,7 +105,19 @@ dl-crossmatch SURVEY_A SURVEY_B /data/lake \
 
 # Output: catalogs/crossmatch/SURVEY_A_x_SURVEY_B/
 # Query: CrossmatchAccessor or DuckDB over that tree
+
+# GPU sky matching (optional [rapids] extra; same match semantics as default)
+uv sync --extra rapids
+dl-crossmatch DESI_DR1 GAIA_DR3 /data/lake \
+  --radius-arcsec 1.0 --match-backend rapids --gpu-id 0 --n-workers 1 --progress
 ```
+
+**GPU backend (`--match-backend rapids`)** — uses cuML nearest-neighbour on
+unit-sphere coordinates. Output layout and match policy (survey-A-centric
+nearest neighbour within `--radius-arcsec`) are identical to the default
+astropy backend. Install with `uv sync --extra rapids` (Linux + NVIDIA CUDA 12).
+Prefer `--n-workers 1` on a single GPU; multiple processes can contend for one
+device. `catalog_info.json` records `match_backend` and `gpu_id` for provenance.
 
 Lake exports read **one HEALPix tile at a time** (or use DuckDB
 ``COPY`` via ``--engine duckdb`` for a single Parquet file). Prefer

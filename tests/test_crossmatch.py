@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -26,6 +27,7 @@ from data_lake.io.crossmatch import (
     tile_search_cone,
     _crossmatch_tile_worker,
 )
+from data_lake.io.crossmatch_matchers import rapids_available
 
 
 def _write_catalog_tile(
@@ -420,6 +422,46 @@ class TestCrossmatchNativeIdColumn:
             lake, "SURVEY_A", "SURVEY_B", radius_arcsec=2.0, show_progress=False,
         )
         assert result.n_match_rows == 1
+
+
+@pytest.mark.gpu
+class TestBuildCrossmatchRapids:
+    def test_rapids_backend_end_to_end(self, tmp_path: Path) -> None:
+        if not rapids_available():
+            pytest.skip("cuML/CuPy not installed (uv sync --extra rapids)")
+
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder, npix=npix,
+            source_ids=[1001], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "SURVEY_B", norder=norder, npix=npix,
+            source_ids=[2001], ra=[ra + 0.0001], dec=[dec + 0.0001],
+        )
+
+        result = build_crossmatch(
+            lake,
+            "SURVEY_A",
+            "SURVEY_B",
+            radius_arcsec=2.0,
+            show_progress=False,
+            match_backend="rapids",
+            gpu_id=0,
+            n_workers=1,
+        )
+        assert result.n_match_rows == 1
+        assert result.match_backend == "rapids"
+
+        info = json.loads(
+            (crossmatch_root(lake, "SURVEY_A", "SURVEY_B") / "catalog_info.json").read_text()
+        )
+        assert info["match_backend"] == "rapids"
+        assert info["gpu_id"] == 0
 
 
 class TestCrossmatchExport:

@@ -42,6 +42,9 @@ dev = [
     "napari",
 ]
 mcp = ["mcp>=1.0"]
+rapids = [
+    "cuml-cu12>=24.08",
+]
 
 [project.scripts]
 dl-init                 = "data_lake.admin.init_lake:dl_init"
@@ -84,3 +87,6 @@ include = ["data_lake*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpu: tests requiring CUDA and the optional [rapids] extra",
+]
