@@ -45,7 +45,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-validate-catalog-ingest` | Check Parquet tiles for required columns and schema (`--survey` or `--all`) |
 | `dl-validate-spectra-ingest` | Check Zarr spectrum tiles (`--survey` or `--all`) |
 | `dl-validate-cutout-ingest` | Check Zarr cutout tiles (`--survey` or `--all`) |
-| `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`) |
+| `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`); `--n-workers N` for parallel Zarr scan; `--progress` for tqdm bars |
 | `dl-widen-spectrum-tiles` | Pad narrower `Npix=*.zarr` tiles to survey `n_pix` in `spectrum_info.json` (`--survey` or `--all`) |
 
 **Export and extract**

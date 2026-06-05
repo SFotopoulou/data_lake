@@ -52,6 +52,30 @@ Override partitioning only when needed: ``--norder 1`` (must match catalog ``hat
 Use ``-q`` / ``--quiet`` on ``dl-validate-catalog-spectra-link`` when a survey has
 many orphan spectra — summary counts are still printed without per-row ``WARNING`` lines.
 
+#### Performance at survey scale
+
+For surveys with ``_spectrum_npix`` (the post-v0.2 catalog format used by SDSS_DR17
+and later), ``dl-validate-catalog-spectra-link`` builds a catalog link index in a
+single Parquet pass before validating any Zarr tiles.  This eliminates the previous
+O(n_zarr × n_catalog) read pattern and reduces runtime for 6.5 M spectra / 5.8 M
+catalog rows from several hours to a few minutes.
+
+The remaining cost is proportional to the number of Zarr tiles (one shard open per
+tile).  Parallelise with ``--n-workers``:
+
+```bash
+# Full validation with 8 parallel Zarr-tile workers + tqdm progress bars
+dl-validate-catalog-spectra-link --survey SDSS_DR17 --n-workers 8 --progress
+
+# Smoke test while waiting for the fix — first 50 tiles, sample 200 rows each
+dl-validate-catalog-spectra-link --survey SDSS_DR17 -q --max-tiles 50 --sample 200
+```
+
+``--n-workers`` defaults to 1 (serial).  A good starting value for large surveys is
+``$(nproc) - 1``.  The catalog index is built once in the main process and inherited
+by workers via fork, so memory overhead is proportional to the catalog size (roughly
+50–150 MB for 5 M rows at three int64 columns).
+
 #### Widen spectrum tiles
 
 Pad narrower Zarr tiles to the survey ``n_pix`` in ``spectrum_info.json``:

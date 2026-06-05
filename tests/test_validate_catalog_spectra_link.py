@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,8 @@ import pytest
 
 from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, healpix_dir
 from data_lake.ingest.validate_catalog_spectra_link import (
+    CatalogLinkIndex,
+    build_catalog_link_index,
     discover_surveys_for_spectra_link_validation,
     run_validation,
 )
@@ -74,6 +77,27 @@ def _write_catalog_tile(
             LAKE_JOIN_ID_COLUMN: pa.array(source_ids, type=pa.int64()),
             f"_healpix_norder{NORDER}": pa.array([npix] * len(source_ids), type=pa.int64()),
             "_spectrum_index": pa.array(spectrum_indices, type=pa.int64()),
+        }),
+        cat_path,
+    )
+
+
+def _write_catalog_tile_with_npix(
+    cat_path: Path,
+    *,
+    source_ids: list[int],
+    spectrum_indices: list[int],
+    cat_npix: int,
+    spec_npix_values: list[int],
+) -> None:
+    """Write a catalog tile that includes the ``_spectrum_npix`` column."""
+    cat_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table({
+            LAKE_JOIN_ID_COLUMN: pa.array(source_ids, type=pa.int64()),
+            f"_healpix_norder{NORDER}": pa.array([cat_npix] * len(source_ids), type=pa.int64()),
+            "_spectrum_index": pa.array(spectrum_indices, type=pa.int64()),
+            "_spectrum_npix": pa.array(spec_npix_values, type=pa.int64()),
         }),
         cat_path,
     )
@@ -342,3 +366,201 @@ class TestValidateCatalogSpectraLink:
         rep = run_validation(lake, SURVEY)
         assert rep.ok(strict=True), f"errors={rep.errors} warnings={rep.warnings}"
         assert rep.stats.n_linked == 2
+
+
+def _make_indexed_lake(tmp_path: Path) -> tuple[Path, int]:
+    """Three catalog tiles (cat_npix 100/101/102) → two Zarr tiles (spec_npix 10/20).
+
+    Zarr 10: source_ids [1, 2, 3]
+    Zarr 20: source_ids [4, 5]
+
+    Catalog layout:
+      tile 100: id=1 → spec_npix=10 idx=0,  id=4 → spec_npix=20 idx=0
+      tile 101: id=2 → spec_npix=10 idx=1,  id=3 → spec_npix=10 idx=2
+      tile 102: id=5 → spec_npix=20 idx=1
+    """
+    lake = tmp_path / "lake"
+    spec_root = lake / "spectra" / SURVEY
+    spec_root.mkdir(parents=True, exist_ok=True)
+    (spec_root / "spectrum_info.json").write_text(
+        json.dumps({"n_pix": N_PIX, "hats_order": NORDER, "wavelength_mode": "shared", "wcs": {}})
+    )
+
+    for spec_npix, ids in [(10, [1, 2, 3]), (20, [4, 5])]:
+        _write_min_zarr(
+            spec_root / healpix_dir(NORDER, spec_npix) / f"Npix={spec_npix}.zarr",
+            source_ids=ids,
+        )
+
+    cat_root = lake / "catalogs" / SURVEY
+    cat_root.mkdir(parents=True, exist_ok=True)
+    (cat_root / "catalog_info.json").write_text(json.dumps({
+        "hats_order": NORDER,
+        "link_id_mode": "sequential",
+        "link_id_column": "_source_id",
+        "ra_column": "ra",
+        "dec_column": "dec",
+    }))
+
+    _write_catalog_tile_with_npix(
+        cat_root / healpix_dir(NORDER, 100) / "Npix=100.parquet",
+        source_ids=[1, 4],
+        spectrum_indices=[0, 0],
+        cat_npix=100,
+        spec_npix_values=[10, 20],
+    )
+    _write_catalog_tile_with_npix(
+        cat_root / healpix_dir(NORDER, 101) / "Npix=101.parquet",
+        source_ids=[2, 3],
+        spectrum_indices=[1, 2],
+        cat_npix=101,
+        spec_npix_values=[10, 10],
+    )
+    _write_catalog_tile_with_npix(
+        cat_root / healpix_dir(NORDER, 102) / "Npix=102.parquet",
+        source_ids=[5],
+        spectrum_indices=[1],
+        cat_npix=102,
+        spec_npix_values=[20],
+    )
+    return lake, 5  # total expected linked rows
+
+
+class TestIndexedPathRegression:
+    """Regression tests for the single-pass catalog index path."""
+
+    def test_build_catalog_link_index_unit(self, tmp_path: Path) -> None:
+        """build_catalog_link_index groups rows correctly by _spectrum_npix."""
+        lake, _ = _make_indexed_lake(tmp_path)
+        cat_root = lake / "catalogs" / SURVEY
+        all_parquet = sorted(cat_root.rglob("Npix=*.parquet"))
+
+        idx: CatalogLinkIndex = build_catalog_link_index(
+            all_parquet, "_source_id", NORDER, has_npix_col=True
+        )
+
+        # Three catalog tiles → five rows total, split across two spec_npix keys.
+        assert set(idx.by_spec_npix.keys()) == {10, 20}
+        total_linked = sum(
+            sum(tld.row_indices.size for tld in tiles)
+            for tiles in idx.by_spec_npix.values()
+        )
+        assert total_linked == 5
+
+        # spec_npix=10 must be covered by tiles 100 and 101; spec_npix=20 by 100 and 102.
+        npix10_tiles = {tld.cat_tile.name for tld in idx.by_spec_npix[10]}
+        assert npix10_tiles == {"Npix=100.parquet", "Npix=101.parquet"}
+        npix20_tiles = {tld.cat_tile.name for tld in idx.by_spec_npix[20]}
+        assert npix20_tiles == {"Npix=100.parquet", "Npix=102.parquet"}
+
+        # Global reverse sets cover all five source_ids; none are unpatched.
+        assert idx.all_catalog_sids == {1, 2, 3, 4, 5}
+        assert idx.unpatched_sids == set()
+        assert idx.n_null_source_id == 0
+
+    def test_indexed_path_matches_many_tiles(self, tmp_path: Path) -> None:
+        """3 catalog tiles + 2 Zarr tiles — only relevant catalog rows per Zarr npix."""
+        lake, expected_linked = _make_indexed_lake(tmp_path)
+        rep = run_validation(lake, SURVEY)
+
+        assert rep.ok(strict=True), f"errors={rep.errors!r} warnings={rep.warnings!r}"
+        assert rep.stats.n_linked == expected_linked
+        assert rep.stats.n_orphan_zarr == 0
+        assert rep.stats.n_wrong_id == 0
+        assert rep.stats.n_stale_index == 0
+        assert rep.stats.n_tiles_checked == 2  # two Zarr tiles
+
+    def test_large_fanout_simulated(self, tmp_path: Path) -> None:
+        """Many catalog tiles all pointing at one Zarr tile — assert correct counts."""
+        n_cat_tiles = 20
+        n_rows_each = 5  # rows per catalog tile pointing to the same spec_npix
+        spec_npix = 0
+
+        lake = tmp_path / "lake"
+        spec_root = lake / "spectra" / SURVEY
+        spec_root.mkdir(parents=True, exist_ok=True)
+        (spec_root / "spectrum_info.json").write_text(
+            json.dumps({"n_pix": N_PIX, "hats_order": NORDER, "wavelength_mode": "shared", "wcs": {}})
+        )
+        total_spectra = n_cat_tiles * n_rows_each
+        _write_min_zarr(
+            spec_root / healpix_dir(NORDER, spec_npix) / f"Npix={spec_npix}.zarr",
+            source_ids=list(range(total_spectra)),
+        )
+
+        cat_root = lake / "catalogs" / SURVEY
+        cat_root.mkdir(parents=True, exist_ok=True)
+        (cat_root / "catalog_info.json").write_text(json.dumps({
+            "hats_order": NORDER,
+            "link_id_mode": "sequential",
+            "link_id_column": "_source_id",
+            "ra_column": "ra",
+            "dec_column": "dec",
+        }))
+
+        # Each catalog tile covers a disjoint slice of Zarr rows.
+        for tile_i in range(n_cat_tiles):
+            base = tile_i * n_rows_each
+            cat_npix = 200 + tile_i
+            _write_catalog_tile_with_npix(
+                cat_root / healpix_dir(NORDER, cat_npix) / f"Npix={cat_npix}.parquet",
+                source_ids=list(range(base, base + n_rows_each)),
+                spectrum_indices=list(range(base, base + n_rows_each)),
+                cat_npix=cat_npix,
+                spec_npix_values=[spec_npix] * n_rows_each,
+            )
+
+        rep = run_validation(lake, SURVEY)
+        assert rep.ok(strict=True), f"errors={rep.errors!r} warnings={rep.warnings!r}"
+        assert rep.stats.n_linked == total_spectra
+        assert rep.stats.n_orphan_zarr == 0
+        assert rep.stats.n_tiles_checked == 1
+
+    def test_parallel_matches_serial(self, tmp_path: Path) -> None:
+        """n_workers=2 must produce identical stats to n_workers=1."""
+        lake, _ = _make_indexed_lake(tmp_path)
+
+        serial = run_validation(lake, SURVEY, n_workers=1)
+        parallel = run_validation(lake, SURVEY, n_workers=2)
+
+        assert serial.stats.n_linked == parallel.stats.n_linked
+        assert serial.stats.n_orphan_zarr == parallel.stats.n_orphan_zarr
+        assert serial.stats.n_wrong_id == parallel.stats.n_wrong_id
+        assert serial.stats.n_tiles_checked == parallel.stats.n_tiles_checked
+        assert sorted(serial.errors) == sorted(parallel.errors)
+
+    def test_cli_n_workers_and_progress_flags(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.ingest.validate_catalog_spectra_link import cli
+
+        if cli is None:
+            pytest.skip("click not available")
+
+        lake, _ = _make_indexed_lake(tmp_path)
+        result = CliRunner().invoke(
+            cli,
+            ["--survey", SURVEY, "--n-workers", "2", "--progress", str(lake)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "OK:" in result.output
+
+    def test_indexed_wrong_id_across_tiles(self, tmp_path: Path) -> None:
+        """A catalog row pointing at the wrong Zarr row must produce a wrong_id error."""
+        lake, _ = _make_indexed_lake(tmp_path)
+
+        # Corrupt one catalog tile: row 0 has id=1 but spectrum_index=2
+        # (Zarr[2]=3, so 1 != 3 → wrong_id).
+        cat_root = lake / "catalogs" / SURVEY
+        tile100 = cat_root / healpix_dir(NORDER, 100) / "Npix=100.parquet"
+        _write_catalog_tile_with_npix(
+            tile100,
+            source_ids=[1, 4],
+            spectrum_indices=[2, 0],  # id=1 points at zarr[2]=3, mismatch
+            cat_npix=100,
+            spec_npix_values=[10, 20],
+        )
+
+        rep = run_validation(lake, SURVEY)
+        assert not rep.ok(strict=False)
+        assert rep.stats.n_wrong_id >= 1
