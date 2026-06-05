@@ -3,6 +3,10 @@
 Thank you for considering a contribution. This project is small and
 research-oriented; the guidelines below are deliberately lightweight.
 
+**Documentation:** edit topic guides under `docs/` (not the root `README.md`,
+which is a short navigation hub). Update `docs/cli-reference.md` when adding
+or renaming `dl-*` entry points in `pyproject.toml`.
+
 ## Getting set up
 
 The project is developed against Python 3.11 with [`uv`](https://docs.astral.sh/uv/)

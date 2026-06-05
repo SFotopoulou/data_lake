@@ -41,6 +41,7 @@ dev = [
     "matplotlib",
     "napari",
 ]
+mcp = ["mcp>=1.0"]
 
 [project.scripts]
 dl-init                 = "data_lake.admin.init_lake:dl_init"
@@ -75,6 +76,7 @@ dl-extract-spplate-catalog = "data_lake.export.spplate_catalog:cli"
 dl-extract-catalog = "data_lake.export.catalog_extract:cli"
 dl-pack-tile       = "data_lake.share.pack_tile:cli"
 dl-generate-cutout-fits = "data_lake.cutouts.generate_fits:cli"
+dl-mcp-docs = "data_lake.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
