@@ -2471,12 +2471,15 @@ try:
 
     from ..cli_utils import (
         config_option,
-        configure_warning_filters,
+        configure_cli_logging,
         ingest_token_option,
         load_optional_config,
+        logging_options,
         pick,
         require_ingest_permission,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
 
     @click.command("dl-ingest-catalog")
@@ -2538,7 +2541,14 @@ try:
         type=int,
         help="ZSTD level for catalog tiles (default 3; ignored if --compact).",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @click.option(
+        "--log-file",
+        "log_file",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="File for INFO+ logs (useful with --quiet for an audit trail).",
+    )
+    @logging_options
     def cli(
         source_path: Path,
         output_root: Path | None,
@@ -2556,6 +2566,8 @@ try:
         columns: str | None,
         compact: bool,
         compression_level: int | None,
+        log_file: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Ingest FITS/VOTable SOURCE_PATH into HATS-partitioned Parquet.
@@ -2564,9 +2576,14 @@ try:
         (via --config or $DATA_LAKE_CONFIG); in that case it defaults to
         ``<lake.root>/<paths.catalogs>``.
         """
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            log_file=log_file,
+            quiet=quiet,
+        )
         require_ingest_permission(cfg, ingest_token)
         resolved_output = require_output_root(output_root, cfg, kind="catalogs")
 
@@ -2600,7 +2617,7 @@ try:
     @click.option("--ra-col", default="ra", show_default=True)
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--norder", default=None, type=int)
-    @click.option("-v", "--verbose", is_flag=True)
+    @logging_options
     def cli_finalize(
         output_root: Path | None,
         config_path: Path | None,
@@ -2608,12 +2625,17 @@ try:
         ra_col: str,
         dec_col: str,
         norder: int | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Rebuild ``catalog_info.json``, ``_metadata``, and ``schema_manifest.json`` from tiles."""
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            quiet=quiet,
+        )
         lake = require_output_root(output_root, cfg, kind="catalogs")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
         catalog_root = lake / "catalogs" / survey_name

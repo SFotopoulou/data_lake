@@ -15,7 +15,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file
 
@@ -71,6 +71,7 @@ def _run_file_list(
     skip_completed: bool,
     ingest_one: Callable[[Path], None],
     default_checkpoint: Path,
+    heartbeat: "Any | None" = None,
 ) -> int:
     paths = paths_from_file_list_file(paths_file)
     ck = checkpoint or default_checkpoint
@@ -109,8 +110,12 @@ def _run_file_list(
                     )
                     + "\n"
                 )
+            if heartbeat is not None:
+                heartbeat.update(done=1, failed=1)
             continue
         n_ok += 1
+        if heartbeat is not None:
+            heartbeat.update(done=1)
         if skip_completed:
             _append_checkpoint(ck, key)
 
@@ -128,13 +133,17 @@ try:
     import click
 
     from ..cli_utils import (
+        HeartbeatReporter,
         config_option,
-        configure_warning_filters,
+        configure_cli_logging,
         ingest_token_option,
         load_optional_config,
+        logging_options,
         pick,
         require_ingest_permission,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
     from data_lake.ingest.fits_to_parquet import ingest_catalog
     from data_lake.ingest.catalog_cli_options import (
@@ -211,7 +220,20 @@ try:
         type=int,
         help="Max decoded files buffered when --n-workers > 1 (default: n_workers).",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @click.option(
+        "--log-file",
+        "log_file",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="File for INFO+ logs (useful with --quiet for an audit trail).",
+    )
+    @click.option(
+        "--heartbeat-interval",
+        default=None,
+        type=int,
+        help="Heartbeat summary every N seconds (default: 300 with -q, off otherwise).",
+    )
+    @logging_options
     def cli_catalog_list(
         paths_file: Path,
         output_root: Path | None,
@@ -234,12 +256,20 @@ try:
         compact: bool,
         n_workers: int,
         max_in_flight: int | None,
+        log_file: Path | None,
+        heartbeat_interval: int | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Catalog ingest from a text file list (sequential or parallel decode)."""
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            log_file=log_file,
+            quiet=quiet,
+        )
         require_ingest_permission(cfg, ingest_token)
         lake = require_output_root(output_root, cfg, kind="catalogs")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
@@ -280,6 +310,9 @@ try:
             )
             sys.exit(0 if result["n_files_failed"] == 0 else 1)
 
+        hb_interval = heartbeat_interval if heartbeat_interval is not None else (300 if quiet else 0)
+        hb = HeartbeatReporter(interval_s=hb_interval, label="catalog-ingest")
+
         def one(p: Path) -> None:
             ingest_catalog(
                 source_path=p,
@@ -307,7 +340,10 @@ try:
             skip_completed=not no_skip_completed,
             ingest_one=one,
             default_checkpoint=default_ck,
+            heartbeat=hb,
         )
+        if hb.enabled:
+            hb.final()
         sys.exit(code)
 
     @click.command("dl-ingest-cutouts-from-list")
@@ -353,7 +389,20 @@ try:
         help="Patch _cutout_index in the Parquet catalog after ingest "
              "(skipped silently if no catalog exists for this survey).",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @click.option(
+        "--log-file",
+        "log_file",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="File for INFO+ logs (useful with --quiet for an audit trail).",
+    )
+    @click.option(
+        "--heartbeat-interval",
+        default=None,
+        type=int,
+        help="Heartbeat summary every N seconds (default: 300 with -q, off otherwise).",
+    )
+    @logging_options
     def cli_cutout_list(
         paths_file: Path,
         output_root: Path | None,
@@ -374,14 +423,22 @@ try:
         no_progress: bool,
         no_skip_completed: bool,
         update_catalog: bool,
+        log_file: Path | None,
+        heartbeat_interval: int | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Sequential cutout ingest from a text file list (one FITS path per line)."""
         import numpy as np
 
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            log_file=log_file,
+            quiet=quiet,
+        )
         require_ingest_permission(cfg, ingest_token)
         lake = require_output_root(output_root, cfg, kind="cutouts")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
@@ -408,6 +465,9 @@ try:
             )
             total_index_map.update(m)
 
+        hb_interval = heartbeat_interval if heartbeat_interval is not None else (300 if quiet else 0)
+        hb = HeartbeatReporter(interval_s=hb_interval, label="cutout-ingest")
+
         code = _run_file_list(
             paths_file=paths_file,
             survey_name=survey_name,
@@ -418,7 +478,10 @@ try:
             skip_completed=not no_skip_completed,
             ingest_one=one,
             default_checkpoint=default_ck,
+            heartbeat=hb,
         )
+        if hb.enabled:
+            hb.final()
 
         if update_catalog and total_index_map:
             try:
@@ -547,7 +610,20 @@ try:
         type=int,
         help="Max HEALPix tile Zarr groups open in the writer (parallel path).",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @click.option(
+        "--log-file",
+        "log_file",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="File for INFO+ logs (useful with --quiet for an audit trail).",
+    )
+    @click.option(
+        "--heartbeat-interval",
+        default=None,
+        type=int,
+        help="Heartbeat summary every N seconds (default: 300 with -q, off otherwise).",
+    )
+    @logging_options
     def cli_spectra_list(
         paths_file: Path,
         output_root: Path | None,
@@ -575,12 +651,20 @@ try:
         n_workers: int,
         max_in_flight: int | None,
         max_open_tiles: int,
+        log_file: Path | None,
+        heartbeat_interval: int | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Spectrum ingest from a text file list (sequential or parallel decode)."""
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            log_file=log_file,
+            quiet=quiet,
+        )
         require_ingest_permission(cfg, ingest_token)
         lake = require_output_root(output_root, cfg, kind="spectra")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
@@ -684,6 +768,9 @@ try:
             )
             total_index_map.update(m)
 
+        hb_interval = heartbeat_interval if heartbeat_interval is not None else (300 if quiet else 0)
+        hb = HeartbeatReporter(interval_s=hb_interval, label="spectra-ingest")
+
         code = _run_file_list(
             paths_file=paths_file,
             survey_name=survey_name,
@@ -694,7 +781,10 @@ try:
             skip_completed=not no_skip_completed,
             ingest_one=one,
             default_checkpoint=default_ck,
+            heartbeat=hb,
         )
+        if hb.enabled:
+            hb.final()
 
         if update_catalog and total_index_map:
             try:

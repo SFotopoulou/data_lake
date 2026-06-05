@@ -442,12 +442,15 @@ try:
 
     from ..cli_utils import (
         config_option,
-        configure_warning_filters,
+        configure_cli_logging,
         ingest_token_option,
         load_optional_config,
+        logging_options,
         pick,
         require_ingest_permission,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
 
     @click.command("dl-ingest-cutouts")
@@ -490,7 +493,14 @@ try:
         help="Patch _cutout_index in the Parquet catalog after ingest "
              "(skipped silently if no catalog exists for this survey).",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @click.option(
+        "--log-file",
+        "log_file",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="File for INFO+ logs (useful with --quiet for an audit trail).",
+    )
+    @logging_options
     def cli(
         source_path: Path,
         output_root: Path | None,
@@ -507,6 +517,8 @@ try:
         dtype: str,
         on_duplicate: str,
         update_catalog: bool,
+        log_file: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Ingest FITS cutouts into sharded Zarr v3 stacks.
@@ -517,9 +529,14 @@ try:
         """
         import numpy as np
 
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            log_file=log_file,
+            quiet=quiet,
+        )
         require_ingest_permission(cfg, ingest_token)
         resolved_output = require_output_root(output_root, cfg, kind="cutouts")
         resolved_norder = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)

@@ -322,9 +322,12 @@ try:
 
     from data_lake.cli_utils import (
         config_option,
-        configure_warning_filters,
+        configure_cli_logging,
         load_optional_config,
+        logging_options,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
 
     @click.command("dl-repair-catalog-metadata")
@@ -371,7 +374,7 @@ try:
     )
     @click.option("--spectra", "check_spectra", is_flag=True, help="With --check-only, include spectra Zarr tiles.")
     @click.option("--cutouts", "check_cutouts", is_flag=True, help="With --check-only, include cutout Zarr tiles.")
-    @click.option("-v", "--verbose", is_flag=True)
+    @logging_options
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -383,6 +386,7 @@ try:
         allow_incomplete_link_id: bool | None,
         check_spectra: bool,
         check_cutouts: bool,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Rebuild catalog metadata from Parquet tiles (no FITS re-ingest).
@@ -396,9 +400,13 @@ try:
             dl-repair-catalog-metadata /data/lake --survey zCOSMOS_DR3 --rebuild-link-id filename
             dl-repair-catalog-metadata /data/lake --all --check-only --spectra
         """
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            quiet=quiet,
+        )
         lake = require_output_root(output_root, cfg, kind="catalogs")
 
         if repair_all and surveys:

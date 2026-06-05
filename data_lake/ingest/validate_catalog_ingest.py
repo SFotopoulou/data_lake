@@ -130,6 +130,7 @@ try:
 
     from ..cli_utils import (
         config_option,
+        configure_cli_logging,
         load_optional_config,
         require_output_root,
     )
@@ -164,6 +165,8 @@ try:
     )
     @click.option("--max-tiles", type=int, default=None)
     @click.option("--strict", is_flag=True)
+    @click.option("-q", "--quiet", is_flag=True, default=False,
+                  help="Suppress INFO log messages.")
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -174,8 +177,11 @@ try:
         inflight: Path | None,
         max_tiles: int | None,
         strict: bool,
+        quiet: bool,
     ) -> None:
         """Validate catalog Parquet layout and ingest sidecars."""
+        import logging as _logging
+        configure_cli_logging(level=_logging.WARNING if quiet else _logging.INFO, quiet=quiet)
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="catalogs")
 

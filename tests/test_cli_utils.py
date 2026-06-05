@@ -1,20 +1,17 @@
 """
-Tests for ``data_lake.cli_utils.configure_warning_filters``.
+Tests for ``data_lake.cli_utils``.
 
-The helper deduplicates astropy ``UnitsWarning`` emissions, which spam the
-log once per BINTABLE column carrying an unknown survey unit (e.g.
-``nanomaggy`` in DESI catalogs).
-
-We do **not** test the obvious ``warnings.filterwarnings("once", ...)``
-approach because astropy bypasses Python's once-registry by calling
-``warnings.warn_explicit(..., registry=None)`` for each column.  The
-helper therefore hooks ``warnings.showwarning`` instead — and these tests
-exercise that hook directly, mirroring how astropy actually emits.
+Covers ``configure_warning_filters`` (dedup of astropy UnitsWarning),
+``resolve_log_level``, ``configure_cli_logging``, ``validate_quiet_verbose``,
+and ``HeartbeatReporter``.
 """
 
 from __future__ import annotations
 
 import importlib
+import io
+import logging
+import time
 import warnings
 
 import pytest
@@ -180,6 +177,138 @@ class TestConfigureWarningFilters:
         finally:
             warnings.showwarning = original
             mod._DEDUP_INSTALLED = False
+
+
+class TestResolveLogLevel:
+    def test_verbose_returns_debug(self):
+        from data_lake.cli_utils import resolve_log_level
+
+        assert resolve_log_level(quiet=False, verbose=True) == logging.DEBUG
+
+    def test_quiet_returns_warning(self):
+        from data_lake.cli_utils import resolve_log_level
+
+        assert resolve_log_level(quiet=True, verbose=False) == logging.WARNING
+
+    def test_config_level_parsed(self):
+        from data_lake.cli_utils import resolve_log_level
+
+        assert resolve_log_level(quiet=False, verbose=False, config_level="DEBUG") == logging.DEBUG
+        assert resolve_log_level(quiet=False, verbose=False, config_level="WARNING") == logging.WARNING
+
+    def test_default_is_info(self):
+        from data_lake.cli_utils import resolve_log_level
+
+        assert resolve_log_level(quiet=False, verbose=False) == logging.INFO
+
+    def test_cli_flag_beats_config(self):
+        from data_lake.cli_utils import resolve_log_level
+
+        assert resolve_log_level(quiet=True, verbose=False, config_level="DEBUG") == logging.WARNING
+        assert resolve_log_level(quiet=False, verbose=True, config_level="WARNING") == logging.DEBUG
+
+
+class TestValidateQuietVerbose:
+    def test_mutual_exclusion_raises(self):
+        import click
+
+        from data_lake.cli_utils import validate_quiet_verbose
+
+        with pytest.raises(click.UsageError):
+            validate_quiet_verbose(quiet=True, verbose=True)
+
+    def test_each_alone_is_ok(self):
+        from data_lake.cli_utils import validate_quiet_verbose
+
+        validate_quiet_verbose(quiet=True, verbose=False)
+        validate_quiet_verbose(quiet=False, verbose=True)
+        validate_quiet_verbose(quiet=False, verbose=False)
+
+
+class TestConfigureCliLogging:
+    def test_quiet_suppresses_info_on_stderr(self, tmp_path):
+        """In quiet mode, INFO records must not reach stderr."""
+        from data_lake.cli_utils import configure_cli_logging
+
+        stream = io.StringIO()
+        configure_cli_logging(level=logging.WARNING, log_file=None, quiet=True)
+        root = logging.getLogger()
+        # Patch the last handler to redirect to our StringIO
+        for h in root.handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.stream = stream
+                break
+
+        logging.getLogger("test.quiet").info("should-not-appear")
+        logging.getLogger("test.quiet").warning("should-appear")
+
+        out = stream.getvalue()
+        assert "should-not-appear" not in out
+        assert "should-appear" in out
+
+        logging.basicConfig(level=logging.WARNING, force=True)  # reset
+
+    def test_log_file_receives_info_in_quiet_mode(self, tmp_path):
+        """Even with quiet mode, the log file gets INFO."""
+        from data_lake.cli_utils import configure_cli_logging
+
+        log_file = tmp_path / "test.log"
+        configure_cli_logging(level=logging.WARNING, log_file=log_file, quiet=True)
+        lg = logging.getLogger("test.logfile")
+        lg.info("file-info-message")
+        lg.warning("file-warn-message")
+
+        # Flush handlers
+        for h in logging.getLogger().handlers:
+            h.flush()
+
+        content = log_file.read_text()
+        assert "file-info-message" in content
+        assert "file-warn-message" in content
+
+        logging.basicConfig(level=logging.WARNING, force=True)  # reset
+
+
+class TestHeartbeatReporter:
+    def test_disabled_when_interval_zero(self):
+        from data_lake.cli_utils import HeartbeatReporter
+
+        hb = HeartbeatReporter(total=10, interval_s=0)
+        assert not hb.enabled
+
+    def test_enabled_when_interval_positive(self):
+        from data_lake.cli_utils import HeartbeatReporter
+
+        hb = HeartbeatReporter(total=10, interval_s=5)
+        assert hb.enabled
+
+    def test_emits_at_most_once_per_interval(self, capsys):
+        from data_lake.cli_utils import HeartbeatReporter
+
+        hb = HeartbeatReporter(total=100, interval_s=9999, label="test")
+        # Should not emit on first update (interval not elapsed)
+        hb.update(done=1)
+        hb.update(done=1)
+        out = capsys.readouterr().err
+        assert out == "", f"Expected no output, got {out!r}"
+
+    def test_force_emits(self, capsys):
+        from data_lake.cli_utils import HeartbeatReporter
+
+        hb = HeartbeatReporter(total=100, interval_s=9999, label="hbtest")
+        hb.update(done=5, spectra=50, force=True)
+        out = capsys.readouterr().err
+        assert "hbtest" in out
+        assert "5/100" in out
+
+    def test_final_emits(self, capsys):
+        from data_lake.cli_utils import HeartbeatReporter
+
+        hb = HeartbeatReporter(total=3, interval_s=9999, label="fintest")
+        hb.update(done=3)
+        hb.final()
+        out = capsys.readouterr().err
+        assert "fintest" in out
 
 
 class TestIntegrationWithFITS:

@@ -172,7 +172,15 @@ try:
 
     import click
 
-    from ..cli_utils import config_option, load_optional_config, require_output_root
+    from ..cli_utils import (
+        config_option,
+        configure_cli_logging,
+        load_optional_config,
+        logging_options,
+        require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
     from .validate_cli import (
         discover_spectra_ingest_surveys,
         echo_survey_banner,
@@ -194,6 +202,7 @@ try:
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
     @validation_survey_options
+    @logging_options
     @click.option(
         "--n-pix",
         type=int,
@@ -219,9 +228,17 @@ try:
         n_pix: int | None,
         dry_run: bool,
         max_tiles: int | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Widen spectrum Zarr tiles to the survey pixel width in spectrum_info.json."""
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            quiet=quiet,
+        )
         lake = require_output_root(output_root, cfg, kind="spectra")
 
         names = resolve_validation_survey_names(

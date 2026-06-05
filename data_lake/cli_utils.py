@@ -14,6 +14,7 @@ import logging
 import os
 import secrets
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -302,6 +303,209 @@ def apply_parallel_worker_logging_after_heavy_imports() -> None:
         lg.handlers.clear()
         lg.propagate = True
         lg.setLevel(level if log_file else logging.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers (shared across all dl-* CLIs)
+# ---------------------------------------------------------------------------
+
+_LOG_FORMAT = "[%(asctime)s] %(name)-30s %(levelname)-7s %(message)s"
+_LOG_DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def resolve_log_level(
+    *,
+    quiet: bool,
+    verbose: bool,
+    config_level: str | None = None,
+) -> int:
+    """Resolve the effective terminal log level from CLI flags and config.
+
+    Priority: ``-v`` / ``-q`` CLI flag > ``config_level`` > INFO default.
+    ``quiet`` and ``verbose`` must not both be True (call site should
+    validate with ``click.UsageError``).
+    """
+    if verbose:
+        return logging.DEBUG
+    if quiet:
+        return logging.WARNING
+    if config_level:
+        return getattr(logging, config_level.upper(), logging.INFO)
+    return logging.INFO
+
+
+def configure_cli_logging(
+    *,
+    level: int = logging.INFO,
+    log_file: Path | None = None,
+    quiet: bool = False,
+) -> None:
+    """Set up logging for a ``dl-*`` CLI entry point.
+
+    Terminal (stderr) receives messages at *level*.  When a *log_file* is
+    provided, a ``FileHandler`` is added:
+
+    - In quiet mode the file always receives INFO (preserving the audit
+      trail even when the terminal shows only WARNING+).
+    - Otherwise the file uses the same *level* as the terminal.
+
+    Noisy library loggers (``desispec``, ``astropy``) are silenced on the
+    terminal when *quiet* or *level* >= WARNING.
+
+    Always calls :func:`configure_warning_filters` to deduplicate
+    ``astropy.units.UnitsWarning``.
+    """
+    fmt = logging.Formatter(fmt=_LOG_FORMAT, datefmt=_LOG_DATE_FMT)
+    handlers: list[logging.Handler] = []
+
+    # Terminal handler
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    sh.setLevel(level)
+    handlers.append(sh)
+
+    # Optional file handler — always at least INFO for audit trail
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_level = logging.INFO if quiet else level
+        fh = logging.FileHandler(str(log_file), mode="a", encoding="utf-8")
+        fh.setFormatter(fmt)
+        fh.setLevel(file_level)
+        handlers.append(fh)
+
+    logging.basicConfig(level=min(level, logging.INFO), handlers=handlers, force=True)
+    # Let root level be low enough so FileHandler always gets INFO
+    logging.getLogger().setLevel(min(level, logging.INFO))
+
+    # Silence noisy library loggers on the terminal when quiet
+    if quiet or level >= logging.WARNING:
+        for prefix in ("desispec", "desi", "astropy", "fitsio"):
+            lg = logging.getLogger(prefix)
+            lg.setLevel(logging.WARNING)
+
+    configure_warning_filters()
+
+
+def configure_file_only_logging(log_file: Path, *, verbose: bool) -> None:
+    """Send *all* logging to *log_file* and detach stderr entirely.
+
+    Used by batch parallel CLIs (DESI, spPlate) where the tqdm progress
+    bar owns stderr.  ``verbose=True`` sets DEBUG; otherwise INFO.
+    """
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(str(log_file), mode="a", encoding="utf-8")
+    fh.setFormatter(logging.Formatter(fmt=_LOG_FORMAT, datefmt=_LOG_DATE_FMT))
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, handlers=[fh], force=True)
+
+
+def logging_options(f: F) -> F:
+    """Add ``-q`` / ``--quiet`` and ``-v`` / ``--verbose`` to a click command."""
+    f = click.option(
+        "-q", "--quiet",
+        is_flag=True,
+        default=False,
+        help="Only print warnings and errors on the terminal.  "
+             "Use with --log-file to keep a full INFO audit trail.",
+    )(f)
+    f = click.option(
+        "-v", "--verbose",
+        is_flag=True,
+        default=False,
+        help="Print DEBUG-level output (overrides -q).",
+    )(f)
+    return f
+
+
+def validate_quiet_verbose(quiet: bool, verbose: bool) -> None:
+    """Raise ``click.UsageError`` when ``-q`` and ``-v`` are both set."""
+    if quiet and verbose:
+        raise click.UsageError("--quiet and --verbose are mutually exclusive.")
+
+
+class HeartbeatReporter:
+    """Emit a one-line progress summary on a fixed interval.
+
+    Designed for long ingest loops where per-file INFO is suppressed.
+    Call :meth:`tick` once per file; a summary is printed to stderr at
+    most once per *interval_s* seconds (uses ``time.monotonic``).
+
+    Parameters
+    ----------
+    total:
+        Total number of items expected, or 0 if unknown.
+    interval_s:
+        Minimum seconds between heartbeat lines.  0 disables.
+    label:
+        Short label for the run (e.g. ``"ingest"``).
+    """
+
+    def __init__(
+        self,
+        total: int = 0,
+        *,
+        interval_s: float = 300.0,
+        label: str = "ingest",
+    ) -> None:
+        self._total = total
+        self._interval = interval_s
+        self._label = label
+        self._t_start = time.monotonic()
+        self._t_last = self._t_start
+        self._n_done = 0
+        self._n_fail = 0
+        self._n_spectra = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self._interval > 0
+
+    def update(
+        self,
+        *,
+        done: int = 0,
+        failed: int = 0,
+        spectra: int = 0,
+        force: bool = False,
+    ) -> None:
+        """Accumulate counters and emit a heartbeat if the interval has elapsed."""
+        self._n_done += done
+        self._n_fail += failed
+        self._n_spectra += spectra
+
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and (now - self._t_last) < self._interval:
+            return
+
+        elapsed = now - self._t_start
+        rate = self._n_done / elapsed if elapsed > 0 else 0.0
+        parts: list[str] = []
+        if self._total > 0:
+            pct = 100 * self._n_done / self._total
+            parts.append(f"{self._n_done}/{self._total} files ({pct:.0f}%)")
+            remaining = (self._total - self._n_done) / rate if rate > 0 else float("inf")
+            if remaining < float("inf"):
+                eta_h = remaining / 3600
+                parts.append(f"ETA ~{eta_h:.1f}h" if eta_h >= 0.1 else f"ETA ~{remaining:.0f}s")
+        else:
+            parts.append(f"{self._n_done} files")
+        if self._n_spectra:
+            parts.append(f"{self._n_spectra:,} spectra")
+        if self._n_fail:
+            parts.append(f"{self._n_fail} failed")
+        parts.append(f"{rate:.2f} files/s")
+
+        click.echo(
+            f"[{self._label}] {', '.join(parts)} ({elapsed / 60:.1f} min elapsed)",
+            err=True,
+        )
+        self._t_last = now
+
+    def final(self) -> None:
+        """Emit one last heartbeat regardless of interval."""
+        self.update(force=True)
 
 
 def require_output_root(

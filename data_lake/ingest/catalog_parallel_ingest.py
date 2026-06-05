@@ -22,7 +22,7 @@ from concurrent.futures import FIRST_COMPLETED, Executor, Future, ProcessPoolExe
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import pyarrow as pa
 
@@ -170,6 +170,7 @@ def ingest_catalogs_parallel(
     max_in_flight: int | None = None,
     executor_factory: Callable[[int], Executor] | None = None,
     decoder: Callable[[str, CatalogDecodeConfig], CatalogWorkerResult] | None = None,
+    heartbeat: "Any | None" = None,
 ) -> dict:
     """Ingest many catalog files with parallel decode and a single-thread writer.
 
@@ -332,6 +333,8 @@ def ingest_catalogs_parallel(
             if failures_log is not None:
                 with failures_log.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(fail_entry, ensure_ascii=False) + "\n")
+            if heartbeat is not None:
+                heartbeat.update(done=1, failed=1)
             return
 
         if sid_mode is None:
@@ -361,6 +364,8 @@ def ingest_catalogs_parallel(
 
         n_rows += res.n_rows
         n_files_ok += 1
+        if heartbeat is not None:
+            heartbeat.update(done=1)
         if checkpoint_path is not None:
             _append_checkpoint(checkpoint_path, res.path)
 
@@ -466,12 +471,15 @@ try:
 
     from ..cli_utils import (
         config_option,
-        configure_warning_filters,
+        configure_cli_logging,
         ingest_token_option,
         load_optional_config,
+        logging_options,
         pick,
         require_ingest_permission,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
     from data_lake.ingest.catalog_cli_options import (
         allow_incomplete_link_id_option,
@@ -533,7 +541,14 @@ try:
         is_flag=True,
         help="Ignore checkpoint when deciding which files to run.",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @click.option(
+        "--log-file",
+        "log_file",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="File for INFO+ logs (useful with --quiet for an audit trail).",
+    )
+    @logging_options
     def cli(
         paths_file: Path,
         output_root: Path | None,
@@ -555,12 +570,19 @@ try:
         failures_log: Path | None,
         no_progress: bool,
         no_skip_completed: bool,
+        log_file: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Parallel catalog ingest from a file list (parallel decode, single writer)."""
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            log_file=log_file,
+            quiet=quiet,
+        )
         require_ingest_permission(cfg, ingest_token)
         lake = require_output_root(output_root, cfg, kind="catalogs")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)

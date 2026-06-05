@@ -534,15 +534,16 @@ try:
 
     from data_lake.cli_utils import (
         config_option,
-        configure_warning_filters,
+        configure_file_only_logging,
         ingest_token_option,
         load_optional_config,
+        logging_options,
         pick,
         require_ingest_permission,
         require_output_root,
+        validate_quiet_verbose,
     )
     from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file as _paths_from_file_list_file
-    from data_lake.ingest.desi_parallel_ingest import _configure_file_logging
 
     @click.command("dl-ingest-spectra-batch-spplate")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
@@ -694,12 +695,7 @@ try:
         show_default=True,
         help="Patch _spectrum_index in the Parquet catalog after ingest.",
     )
-    @click.option(
-        "-v",
-        "--verbose",
-        is_flag=True,
-        help="Use DEBUG level in the log file (no terminal effect).",
-    )
+    @logging_options
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -724,6 +720,7 @@ try:
         failures_log: Path | None,
         log_file_path: Path | None,
         update_catalog: bool,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Parallel vectorized ingest of SDSS spPlate FITS files.
@@ -780,8 +777,8 @@ try:
         if log_file_path is None:
             log_file_path = survey_root / ".ingest.log"
 
-        _configure_file_logging(log_file_path, verbose=verbose)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
+        configure_file_only_logging(log_file_path, verbose=verbose)
 
         id_mode = (
             "triplet hash PLATE|MJD|FIBERID"

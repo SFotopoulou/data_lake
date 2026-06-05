@@ -1070,7 +1070,15 @@ class CrossmatchAccessor:
 try:
     import click
 
-    from data_lake.cli_utils import config_option, load_optional_config, require_output_root
+    from data_lake.cli_utils import (
+        config_option,
+        configure_cli_logging,
+        load_optional_config,
+        logging_options,
+        require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
 
     @click.command("dl-crossmatch")
     @click.argument("survey_a")
@@ -1122,7 +1130,7 @@ try:
         default=None,
         help="Also write all match rows to a single FITS BINTABLE.",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @logging_options
     def cli(
         survey_a: str,
         survey_b: str,
@@ -1141,6 +1149,7 @@ try:
         n_workers: int,
         export_parquet: Path | None,
         export_fits: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Build an in-lake positional cross-match between two ingested catalogs.
@@ -1149,8 +1158,13 @@ try:
         Each survey uses its own RA/Dec columns and Norder from ``catalog_info.json``
         unless overridden.  Survey A defines the output partition key.
         """
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            quiet=quiet,
+        )
         lake = require_output_root(output_root, cfg, kind="catalogs")
 
         for name, label in ((survey_a, "survey A"), (survey_b, "survey B")):

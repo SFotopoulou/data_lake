@@ -191,6 +191,7 @@ def ingest_spectra_files_parallel(
     on_duplicate_source_id: ZarrDuplicateMode = "skip",
     executor_factory: Callable[[int], Executor] | None = None,
     decoder: Callable[[str, SpectrumDecodeConfig], WorkerResult] | None = None,
+    heartbeat: "Any | None" = None,
 ) -> dict:
     """Parallel decode of spectrum FITS files with a single-thread Zarr writer."""
     if n_workers < 1:
@@ -314,6 +315,8 @@ def ingest_spectra_files_parallel(
             if failures_log is not None:
                 with failures_log.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(fail_entry, ensure_ascii=False) + "\n")
+            if heartbeat is not None:
+                heartbeat.update(done=1, failed=1)
             return
 
         if not res.batches:
@@ -384,6 +387,9 @@ def ingest_spectra_files_parallel(
                 n_spectra_written += n_appended
 
         n_files_ok += 1
+        if heartbeat is not None:
+            n_in_file = sum(b.flux.shape[0] for b in res.batches if b.flux.ndim >= 1)
+            heartbeat.update(done=1, spectra=n_in_file)
         if checkpoint_path is not None:
             _append_checkpoint(checkpoint_path, res.path)
         _clear_parallel_inflight(resolved_inflight)

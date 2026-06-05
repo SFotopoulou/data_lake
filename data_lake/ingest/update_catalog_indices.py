@@ -537,10 +537,14 @@ try:
 
     from ..cli_utils import (
         config_option,
+        configure_cli_logging,
         ingest_token_option,
         load_optional_config,
+        logging_options,
         require_ingest_permission,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
 
     @click.command("dl-rebuild-catalog-indices")
@@ -568,6 +572,7 @@ try:
     @click.argument("lake_root", type=click.Path(path_type=Path), required=False)
     @config_option
     @ingest_token_option
+    @logging_options
     def cli_rebuild(
         survey_name: str,
         kind: str,
@@ -576,6 +581,8 @@ try:
         lake_root: Path | None,
         config_path: Path | None,
         ingest_token: str | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Rebuild _spectrum_index / _cutout_index in catalog tiles from existing Zarr data.
 
@@ -585,10 +592,13 @@ try:
         Use this to repair a deployment where spectra or cutouts were ingested
         without catalog patching, or after Zarr tiles were replaced.
         """
-        import logging
-        logging.basicConfig(level=logging.INFO)
-
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            quiet=quiet,
+        )
         require_ingest_permission(cfg, ingest_token)
         resolved_root = require_output_root(lake_root, cfg)
 

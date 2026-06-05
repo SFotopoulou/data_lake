@@ -369,6 +369,8 @@ try:
     )
     @click.option("--seed", default=0, show_default=True)
     @click.option("-v", "--verbose", is_flag=True)
+    @click.option("-q", "--quiet", is_flag=True, default=False,
+                  help="Suppress INFO output (default is already WARNING for this tool).")
     def cli(
         paths: tuple[Path, ...],
         file_list: Path | None,
@@ -382,11 +384,15 @@ try:
         target_rows_per_tile: int,
         seed: int,
         verbose: bool,
+        quiet: bool,
     ) -> None:
         """Quick FITS scan: suggest ``--norder`` before ``dl-ingest-catalog*``."""
-        logging.basicConfig(
-            level=logging.DEBUG if verbose else logging.WARNING,
-            format="%(levelname)s %(message)s",
+        import logging as _logging
+        from data_lake.cli_utils import configure_cli_logging, validate_quiet_verbose
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=_logging.DEBUG if verbose else _logging.WARNING,
+            quiet=False,
         )
         rec = recommend_catalog_norder(
             paths,

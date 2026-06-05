@@ -385,20 +385,11 @@ def _configure_file_logging(log_file: Path, *, verbose: bool) -> None:
     """Send all logging to ``log_file`` and detach the root logger from stderr.
 
     The progress bar lives on stderr; routing logs to a file keeps the bar
-    uncorrupted by interleaved log lines.  Any pre-existing handlers are
-    replaced so repeated invocations (tests, REPL) stay consistent.
+    uncorrupted by interleaved log lines.  Delegates to the shared helper in
+    :mod:`data_lake.cli_utils`.
     """
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-    handler.setFormatter(logging.Formatter(
-        fmt="[%(asctime)s] %(name)-26s %(levelname)-7s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        handlers=[handler],
-        force=True,
-    )
+    from data_lake.cli_utils import configure_file_only_logging
+    configure_file_only_logging(log_file, verbose=verbose)
 
 
 def _checkpoint_jsonl_path(checkpoint_path: Path) -> Path:
@@ -580,6 +571,7 @@ def ingest_spectra_parallel(
     max_open_tiles: int = 64,
     length_policy: str = "error",
     wavelength_mode: str = "shared",
+    heartbeat: "Any | None" = None,
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -805,6 +797,8 @@ def ingest_spectra_parallel(
                 with failures_log.open("a") as fh:
                     fh.write(json.dumps(fail_entry) + "\n")
                     fh.flush()
+            if heartbeat is not None:
+                heartbeat.update(done=1, failed=1)
             return
 
         if not res.batches:
@@ -905,6 +899,9 @@ def ingest_spectra_parallel(
                 n_spectra_written += n_appended
 
         n_files_ok += 1
+        if heartbeat is not None:
+            n_in_file = sum(b.flux.shape[0] for b in res.batches if b.flux.ndim >= 1)
+            heartbeat.update(done=1, spectra=n_in_file)
         completed.add(res.path)
         if checkpoint_path is not None:
             _append_checkpoint_path(checkpoint_path, res.path)
@@ -994,12 +991,16 @@ try:
 
     from ..cli_utils import (
         config_option,
-        configure_warning_filters,
+        configure_cli_logging,
+        configure_file_only_logging,
         ingest_token_option,
         load_optional_config,
+        logging_options,
         pick,
         require_ingest_permission,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
 
     @click.command("dl-ingest-spectra-batch-desi-coadds")
@@ -1072,8 +1073,7 @@ try:
         help="Patch _spectrum_index in the Parquet catalog at end "
              "(skipped silently if no catalog exists for this survey).",
     )
-    @click.option("-v", "--verbose", is_flag=True,
-                  help="Use DEBUG level in the log file (no terminal effect).")
+    @logging_options
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -1091,6 +1091,7 @@ try:
         log_file_path: Path | None,
         on_duplicate: str,
         update_catalog: bool,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Parallel ingest of many DESI coadd FITS files.
@@ -1143,8 +1144,8 @@ try:
         if log_file_path is None:
             log_file_path = survey_root / ".ingest.log"
 
-        _configure_file_logging(log_file_path, verbose=verbose)
-        configure_warning_filters()
+        validate_quiet_verbose(quiet, verbose)
+        configure_file_only_logging(log_file_path, verbose=verbose)
 
         click.echo(
             f"Ingesting {len(paths)} coadd files into survey={survey_name!r} "

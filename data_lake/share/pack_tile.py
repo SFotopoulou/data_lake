@@ -384,6 +384,8 @@ try:
                   help="(Re)generate MANIFEST.json after packing.")
     @click.option("--overwrite", is_flag=True)
     @click.option("-v", "--verbose", is_flag=True)
+    @click.option("-q", "--quiet", is_flag=True, default=False,
+                  help="Suppress INFO messages on the terminal.")
     def cli(
         lake_root: Path,
         output_dir: Path,
@@ -395,9 +397,16 @@ try:
         write_manifest: bool,
         overwrite: bool,
         verbose: bool,
+        quiet: bool,
     ) -> None:
         """Pack one or all tiles of LAKE_ROOT into OUTPUT_DIR as .tar archives."""
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        import logging as _logging
+        from data_lake.cli_utils import configure_cli_logging, validate_quiet_verbose
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=_logging.DEBUG if verbose else (_logging.WARNING if quiet else _logging.INFO),
+            quiet=quiet,
+        )
         if npix is not None:
             pack_tile(lake_root, norder, npix, list(surveys), output_dir,
                       include_cutouts, include_spectra, overwrite)
