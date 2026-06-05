@@ -34,27 +34,28 @@ Quick index of all supported `--fmt` values, the **catalog** ingest flag require
 
 | `--fmt` | Catalog `--link-id-col` | Spectrum link source | Spectrum sky source | Example / note |
 |---------|------------------------|----------------------|---------------------|----------------|
-| `desi` | `TARGETID` (or default) | Fibermap `TARGETID` | Fibermap `TARGET_RA` / `TARGET_DEC` (fallbacks: `RA_TARGET`, `FIBER_RA`; `DEC_TARGET`, `FIBER_DEC`) | Auto-detected from DESI coadd layout |
-| `sdss_boss` | `SPECOBJID` | `SPALL` HDU header | Header `RA` / `DEC` (fallback `PLUG_RA` / `PLUG_DEC`) | `spec-PLATE-MJD-FIBER.fits` |
+| `desi_coadd` | `TARGETID` (or default) | Fibermap `TARGETID` | Fibermap `TARGET_RA` / `TARGET_DEC` (fallbacks: `RA_TARGET`, `FIBER_RA`; `DEC_TARGET`, `FIBER_DEC`) | Auto-detected from DESI coadd layout |
+| `sdss_boss` | `SPECOBJID` | Primary header, then `SPALL` BINTABLE (HDU 2) | Header `RA` / `DEC` (fallback `PLUG_RA` / `PLUG_DEC`) | `spec-PLATE-MJD-FIBER.fits` |
 | `sdss_spplate` | `PLATE,MJD,FIBERID` (default) or via sidecar / plate header | plugmap `FIBERID` → composite hash (default), or specObjID from sidecar/synthesis | Fiber table columns (default `RA` / `DEC`, configurable via `--ra-col/--dec-col`) | `spPlate-PLATE-MJD.fits`; see spPlate section |
 | `generic` | `--link-id-col` or auto | Header keyword chain | Header columns from `--ra-col/--dec-col` (default `RA` / `DEC`) | Any 1-D FITS with spectral WCS |
 | `2df` | `SPFILE,FIBRE` (+ `--allow-incomplete-link-id` if some rows have no filename) | Header `SPFILE` \| `FIBRE` per SPECTRUM HDU | `SRRA` / `SRDEC` (fallback `OBSRA` / `OBSDEC`, then PRIMARY `RA` / `DEC`) | `data/389442.fits` |
 | `6df` | `targetname,obsid_v,obsid_r` | Filename stem + V header `OBSID_V` + R header `OBSID_R` per V/R/VR triple | VR header `OBSRA` / `OBSDEC` (fallback header `RA` / `DEC`, PRIMARY WCS, `OBJCTRA` / `OBJCTDEC`) | `data/g2302140-251235.fits` |
 | `gama` | `SPECID` | Primary header `SPECID` | Header columns from `--ra-col/--dec-col` (default `RA` / `DEC`) | `data/G23_Y7_015_265.fit` |
-| `ozdes` | filename column | Basename (stem) | Header `RA` / `DEC` | `OzDES_*.fits` |
-| `vandels` | filename column | Basename | Header `PND OBJRA` / `PND OBJDEC` (fallback `RA` / `DEC`) | `sc_*.fits` (PRIMARY + NOISE) |
-| `vipers` | filename column | Basename | Header `RA` / `DEC` (table/PRIMARY fallback) | `VIPERS_*.fits` |
-| `vuds` | filename column | Basename | Header `ALPHA` / `DELTA` (fallback `RA` / `DEC`) | `sc_*.fits` with `LAM CESAM VO` header |
-| `vvds` | filename column | Basename | Header `RA` / `DEC`, else `ESO INS REF1 OBJ RA` / `DEC`; error if missing | `sc_*.fits` without VUDS header |
-| `wigglez` | filename column | Basename (full, e.g. `wig225415.fits`) | Header `RA_OBJ` / `DEC_OBJ` | `wig*.fits`; stem alone will not match |
+| `ozdes` | filename column | Full filename (`normalize_object_id(path.name)`) | Header `RA` / `DEC` | `OzDES_*.fits` |
+| `zcosmos` | filename column | Full filename (`normalize_object_id(path.name)`) | Container table or PRIMARY header `RA` / `DEC` | `zCOSMOS_*.fits`; BinTable `WAVE`/`FLUX_REDUCED`/`ERR` |
+| `vandels` | filename column | Full filename (`normalize_object_id(path.name)`) | Header `PND OBJRA` / `PND OBJDEC` (fallback `RA` / `DEC`) | `sc_*.fits` (PRIMARY + NOISE) |
+| `vipers` | filename column | Full filename (`normalize_object_id(path.name)`) | Header `RA` / `DEC` (table/PRIMARY fallback) | `VIPERS_*.fits` |
+| `vuds` | filename column | Full filename (`normalize_object_id(path.name)`) | Header `LAM CESAM VO ALPHA` / `DELTA` (fallback `RA` / `DEC`) | `sc_*.fits` with `LAM CESAM VO` header |
+| `vvds` | filename column | Full filename (`normalize_object_id(path.name)`) | Header `RA` / `DEC`, else `ESO INS REF1 OBJ RA` / `DEC`; error if missing | `sc_*.fits` without VUDS header |
+| `wig` | filename column | Full filename (e.g. `wig225415.fits`; stem alone will not match) | Header `RA_OBJ` / `DEC_OBJ` | `wig*.fits`; auto-detect when basename starts with `wig` |
 
-Auto-detection runs before `--fmt` is needed: try `dl-ingest-spectra FILE --survey NAME` first.
+Filename-based readers hash the **full** spectrum filename (including ``.fits``), not the stem alone. Auto-detection runs before ``--fmt`` is needed: try ``dl-ingest-spectra FILE --survey NAME`` first.
 
 #### Catalog vs spectrum CLI flags
 
 ``--link-id-col``, ``--ra-col``, and ``--dec-col`` on **catalog** ingest define
 how native columns map to ``_source_id`` and sky position in Parquet.  Format-specific
-spectrum readers (OzDES, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) resolve object IDs
+spectrum readers (OzDES, zCOSMOS, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) resolve object IDs
 **from the spectrum filename**; 2dF and 6dF read link keys **from FITS extension
 headers** — you do **not** pass those flags on ``dl-ingest-spectra`` for any of
 these formats.
@@ -69,7 +70,7 @@ on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
 |-------|---------------------|------------------------------|
 | Catalog ingest | Required for production (native column → ``_source_id``) | Survey sky columns in degrees |
 | Spectrum ingest (2df, 6df) | **Not used** — reader resolves IDs internally (`SPFILE`/`FIBRE`; filename stem + `OBSID_V`/`OBSID_R`) | **Not used** — reader reads `OBSRA`/`OBSDEC` from header |
-| Spectrum ingest (OzDES, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) | **Not used** — reader hashes the filename | **Not used** — reader reads sky from header |
+| Spectrum ingest (OzDES, zCOSMOS, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) | **Not used** — reader hashes the filename | **Not used** — reader reads sky from header |
 | Spectrum ingest (spPlate, default) | **Not used** — reader hashes `PLATE\|MJD\|FIBERID` per fiber (catalog must use `--link-id-col PLATE,MJD,FIBERID`) | FITS plugmap `RA` / `DEC` |
 | Spectrum ingest (SDSS, DESI, generic) | Header keyword / fibermap column | FITS header keywords |
 | Spectrum ingest (spPlate, legacy modes) | `--link-id-col` used only with `--specobj-lookup-from-catalog` | FITS plugmap `RA` / `DEC` |
@@ -471,7 +472,7 @@ PRIMARY (flux), ``VARIANCE``, ``BADPIX`` (``0`` = good, ``1`` = bad).  Per-epoch
 
 **Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
 that stores the spectrum **filename** (e.g. ``OzDES-DR2_00001.fits``). Spectrum
-ingest derives ``_source_id`` from the FITS basename.  The ``SOURCE`` header
+ingest derives ``_source_id`` from ``normalize_object_id(path.name)``.  The ``SOURCE`` header
 (e.g. ``04D1qt``) remains a science column in the catalog.
 
 ```bash
@@ -482,6 +483,30 @@ dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2 --fmt ozdes
 
 # Auto-detect when the basename starts with OzDES and HDU layout matches
 dl-ingest-spectra OzDES-DR2_00001.fits --survey OZDES_DR2
+```
+
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
+
+#### zCOSMOS spectra ingest
+
+zCOSMOS 1-D spectra are stored in a spectral-container BinTable with columns
+``WAVE``, ``FLUX_REDUCED``, and ``ERR`` (row-per-pixel arrays in one table row).
+
+**Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column that
+stores the spectrum **filename** (e.g.
+``zCOSMOS_BRIGHT_DR3_000960004_ZCMRa65_M1_Q4_6_1.fits``). Spectrum ingest derives
+``_source_id`` from ``normalize_object_id(path.name)``.
+
+```bash
+dl-ingest-catalog zcosmos_catalog.fits --survey zCOSMOS_DR3 \
+  --link-id-col filename --ra-col ra --dec-col dec
+
+dl-ingest-spectra zCOSMOS_BRIGHT_DR3_000960004_ZCMRa65_M1_Q4_6_1.fits \
+  --survey zCOSMOS_DR3 --fmt zcosmos
+
+# Auto-detect works when the filename starts with zCOSMOS and layout matches
+dl-ingest-spectra zCOSMOS_BRIGHT_DR3_000960004_ZCMRa65_M1_Q4_6_1.fits \
+  --survey zCOSMOS_DR3
 ```
 
 ← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags)
@@ -516,7 +541,7 @@ ingested (no remapping).  Redshift is read from ``REDSHIFT``.
 
 **Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
 that stores the spectrum **filename** (e.g. ``VIPERS_406064719.fits``).  Spectrum
-ingest derives ``_source_id`` from the FITS basename.  The ``ID`` table header
+ingest derives ``_source_id`` from ``normalize_object_id(path.name)``.  The ``ID`` table header
 remains a science column in the catalog.
 
 ```bash
@@ -590,8 +615,8 @@ sibling ``VARIANCE`` extension.  Sky coordinates are in ``RA_OBJ`` / ``DEC_OBJ``
 
 **Catalog linkage:** ingest the catalog with ``--link-id-col`` set to the column
 that stores the spectrum **filename** (e.g. ``wig225415.fits``).  Spectrum ingest
-derives the same ``source_id`` from the file basename (``normalize_object_id`` of
-``wig225415.fits``), so the stem alone (``wig225415``) will **not** match.
+derives the same ``source_id`` from the full filename (``normalize_object_id(path.name)``,
+e.g. ``wig225415.fits``); the stem alone (``wig225415``) will **not** match.
 
 ```bash
 # Catalog (already ingested example)

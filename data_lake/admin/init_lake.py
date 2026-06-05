@@ -81,7 +81,7 @@ source /path/to/data_lake/.venv/bin/activate
 export DATA_LAKE_CONFIG="$(pwd)/lake_config.toml"
 
 # 3. Run an ingest – output_root, norder, etc. are read from the config
-dl-ingest-spectra my_fits_dir/*.fits --fmt desi
+dl-ingest-spectra my_fits_dir/*.fits --fmt desi_coadd
 
 # Ingest operators only — export before dl-ingest-* (analysts do not need this):
 # export LAKE_INGEST_TOKEN='your-secret'
