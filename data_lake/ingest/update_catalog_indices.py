@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pyarrow as pa
@@ -209,26 +211,135 @@ def _npix_from_tile_name(name: str) -> int:
     return int(name.split("=")[-1].split(".")[0])
 
 
+# Process-pool worker state for parallel catalog patching.
+_WORKER_INDEX_MAP: dict[int, tuple[int, int]] | None = None
+_WORKER_PATCH_COLS: tuple[str, str, str] | None = None  # sid_col, index_col, npix_col
+
+
+@dataclass
+class _CatalogPatchConfig:
+    """Pickle-friendly per-tile config for parallel catalog patching."""
+
+    tile_file: str
+
+
+def _init_catalog_patch_worker(
+    index_map: dict[int, tuple[int, int]],
+    sid_col: str,
+    index_col: str,
+    npix_col: str,
+) -> None:
+    global _WORKER_INDEX_MAP, _WORKER_PATCH_COLS
+    _WORKER_INDEX_MAP = index_map
+    _WORKER_PATCH_COLS = (sid_col, index_col, npix_col)
+
+
+def _catalog_patch_worker(config: _CatalogPatchConfig) -> bool:
+    if _WORKER_INDEX_MAP is None or _WORKER_PATCH_COLS is None:
+        raise RuntimeError("catalog patch worker not initialized")
+    sid_col, index_col, npix_col = _WORKER_PATCH_COLS
+    return _patch_catalog_parquet_file(
+        Path(config.tile_file),
+        _WORKER_INDEX_MAP,
+        sid_col=sid_col,
+        index_col=index_col,
+        npix_col=npix_col,
+        reset_unmatched=True,
+    )
+
+
+def _patch_all_catalog_tiles(
+    all_parquet: list[Path],
+    index_map: dict[int, tuple[int, int]],
+    *,
+    sid_col: str,
+    index_col: str,
+    npix_col: str,
+    n_workers: int = 1,
+    show_progress: bool = False,
+) -> int:
+    """Patch every catalog tile from a full Zarr index map (single catalog pass).
+
+    Uses ``reset_unmatched=True`` so rows absent from *index_map* get ``-1`` for
+    both index and npix columns — equivalent to the old reset-then-patch flow.
+    """
+    if not all_parquet:
+        return 0
+
+    if n_workers > 1:
+        configs = [_CatalogPatchConfig(tile_file=str(p)) for p in all_parquet]
+        pbar: Any = None
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                pbar = tqdm(total=len(configs), unit="tile", desc="patching catalog")
+            except ImportError:
+                pass
+
+        n_modified = 0
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_catalog_patch_worker,
+            initargs=(index_map, sid_col, index_col, npix_col),
+        ) as pool:
+            futures = {pool.submit(_catalog_patch_worker, cfg): cfg for cfg in configs}
+            for fut in as_completed(futures):
+                if pbar is not None:
+                    pbar.update(1)
+                try:
+                    if fut.result():
+                        n_modified += 1
+                except Exception as exc:
+                    cfg = futures[fut]
+                    log.warning("Failed to patch catalog tile %s: %s", cfg.tile_file, exc)
+        if pbar is not None:
+            pbar.close()
+        return n_modified
+
+    tiles_iter: Any = all_parquet
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm
+            tiles_iter = tqdm(all_parquet, unit="tile", desc="patching catalog")
+        except ImportError:
+            pass
+
+    n_modified = 0
+    for cat_tile in tiles_iter:
+        if _patch_catalog_parquet_file(
+            cat_tile,
+            index_map,
+            sid_col=sid_col,
+            index_col=index_col,
+            npix_col=npix_col,
+            reset_unmatched=True,
+        ):
+            n_modified += 1
+    return n_modified
+
+
 def update_index_column_from_zarr_tiles(
     lake_root: Path | str,
     survey_name: str,
     kind: IndexKind = "spectrum",
     norder: int | None = None,
     link_id_col: str | None = None,
+    *,
+    n_workers: int = 1,
+    show_progress: bool = False,
 ) -> int:
-    """Patch catalog index + npix columns one Zarr tile at a time (bounded memory).
+    """Rebuild catalog index + npix columns from on-disk Zarr tiles.
 
-    For large surveys (millions of spectra), building a single in-memory map can
-    exhaust RAM.  This walks each ``Npix=*.zarr``, builds ``{source_id: (npix,
-    local_idx)}`` for that tile, scans **all** catalog Parquet tiles for matching
-    IDs (catalog and Zarr may use different HEALPix orders), and discards the
-    per-tile map before opening the next Zarr group.
+    Scans every ``Npix=*.zarr`` once to build ``{source_id: (zarr_npix,
+    local_index)}``, then patches each catalog Parquet tile in a single pass.
+    Rows with no matching Zarr entry are reset to ``-1``.
 
-    Both ``_spectrum_index`` / ``_cutout_index`` (local Zarr row) and
-    ``_spectrum_npix`` / ``_cutout_npix`` (which Zarr tile) are updated.
+    Complexity is O(n_zarr_tiles + n_catalog_tiles) instead of the previous
+    O(n_zarr × n_catalog) pattern (one full catalog scan per Zarr tile).
+
+    For surveys with millions of spectra the in-memory map is typically
+    100–200 MB (one dict entry per Zarr row); well within RAM on modern hosts.
     """
-    import zarr
-
     lake_root = Path(lake_root)
     catalog_root = lake_root / "catalogs" / survey_name
     if not catalog_root.exists():
@@ -247,83 +358,48 @@ def update_index_column_from_zarr_tiles(
     sid_col = resolve_link_id_column(
         catalog_root, schema_names=schema_names, override=link_id_col,
     )
-    resolved_cat_norder = _resolve_catalog_norder(catalog_root)
+    resolved_cat_norder = _resolve_catalog_norder(
+        catalog_root, zarr_root, kind=kind, override=norder,
+    )
     log.info(
         "Rebuilding %s/%s using catalog hats_order=%d (id_col=%r)",
         index_col, npix_col, resolved_cat_norder, sid_col,
     )
 
-    # Step 1: Reset index and npix columns to -1 across all catalog tiles.
-    # This ensures stale entries from a previous (now-rebuilt) ingest are cleared.
-    _sentinel = pa.array(np.full(1, -1, dtype=np.int64), type=pa.int64())  # placeholder
-    for cat_tile in all_parquet:
-        table = pq.ParquetFile(str(cat_tile)).read()
-        changed = False
-        for col in (index_col, npix_col):
-            arr = np.full(len(table), -1, dtype=np.int64)
-            if col in table.schema.names:
-                col_pos = table.schema.get_field_index(col)
-                table = table.set_column(col_pos, col, pa.array(arr, type=pa.int64()))
-            else:
-                table = table.append_column(col, pa.array(arr, type=pa.int64()))
-            changed = True
-        if changed:
-            pq.write_table(
-                table, str(cat_tile),
-                compression="zstd", compression_level=_ZSTD_LEVEL,
-                write_statistics=True, use_dictionary=True,
-            )
+    index_map = build_index_map_from_zarr(
+        lake_root,
+        survey_name,
+        kind=kind,
+        show_progress=show_progress,
+    )
+    if not index_map:
+        log.warning(
+            "No source IDs found in %s tiles for survey=%r; catalog indices unchanged",
+            kind, survey_name,
+        )
+        return 0
 
-    # Step 2: For each Zarr tile, patch matching catalog rows (no reset_unmatched,
-    # since we already reset above and different Zarr tiles may share catalog tiles).
-    n_modified = 0
-    tile_paths = sorted(zarr_root.rglob("Npix=*.zarr"))
-    for tile_path in tile_paths:
-        try:
-            root = zarr.open_group(
-                store=zarr.storage.LocalStore(str(tile_path)),
-                mode="r",
-                zarr_format=3,
-            )
-            if LAKE_JOIN_ID_COLUMN not in root:
-                continue
-            sids = np.asarray(zarr_join_array(root)[:], dtype=np.int64)
-            if sids.size == 0:
-                continue
-            zarr_npix = _npix_from_tile_name(tile_path.name)
-            partial_map: dict[int, tuple[int, int]] = {
-                normalize_object_id(int(sid)): (zarr_npix, int(i))
-                for i, sid in enumerate(sids.tolist())
-            }
-        except Exception as exc:
-            log.warning("Could not read Zarr tile %s: %s", tile_path.name, exc)
-            continue
+    n_modified = _patch_all_catalog_tiles(
+        all_parquet,
+        index_map,
+        sid_col=sid_col,
+        index_col=index_col,
+        npix_col=npix_col,
+        n_workers=n_workers,
+        show_progress=show_progress,
+    )
 
-        # Scan ALL catalog tiles — catalog Npix may differ from zarr_npix.
-        tile_modified = False
-        for cat_tile in all_parquet:
-            if _patch_catalog_parquet_file(
-                cat_tile,
-                partial_map,
-                sid_col=sid_col,
-                index_col=index_col,
-                npix_col=npix_col,
-                reset_unmatched=False,
-            ):
-                tile_modified = True
-        if tile_modified:
-            n_modified += 1
-        elif partial_map:
-            log.warning(
-                "Zarr %s: no catalog rows matched %d source IDs (id_col=%r)",
-                tile_path.name,
-                len(partial_map),
-                sid_col,
-            )
+    if index_map and n_modified == 0:
+        log.warning(
+            "No catalog tiles were modified for survey=%r (kind=%r, %d Zarr source IDs). "
+            "Possible causes: survey name mismatch, no catalog ingested yet, "
+            "or wrong source-ID column (resolved to %r).",
+            survey_name, kind, len(index_map), sid_col,
+        )
 
     log.info(
-        "Patched %s from %d Zarr tile(s) for survey=%r (id_col=%r)",
-        index_col, n_modified, survey_name, sid_col,
+        "Patched %s in %d catalog tile(s) from %d Zarr entries for survey=%r (id_col=%r)",
+        index_col, n_modified, len(index_map), survey_name, sid_col,
     )
     if n_modified > 0:
         _regenerate_metadata_from_all_tiles(catalog_root)
@@ -475,6 +551,8 @@ def build_index_map_from_zarr(
     lake_root: Path | str,
     survey_name: str,
     kind: IndexKind = "spectrum",
+    *,
+    show_progress: bool = False,
 ) -> dict[int, tuple[int, int]]:
     """Scan existing Zarr tiles and return ``{source_id: (zarr_npix, local_index)}``.
 
@@ -505,7 +583,15 @@ def build_index_map_from_zarr(
         log.warning("No Zarr tiles found under %s", zarr_root)
         return index_map
 
-    for tile_path in tile_paths:
+    tiles_iter: Any = tile_paths
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm
+            tiles_iter = tqdm(tile_paths, unit="tile", desc=f"scanning {kind}")
+        except ImportError:
+            pass
+
+    for tile_path in tiles_iter:
         try:
             root = zarr.open_group(
                 store=zarr.storage.LocalStore(str(tile_path)),
@@ -569,6 +655,21 @@ try:
         help="Override catalog ID column (e.g. TARGETID). "
              "Auto-detected from Parquet schema when omitted.",
     )
+    @click.option(
+        "--n-workers",
+        default=1,
+        show_default=True,
+        type=int,
+        help="Parallel worker processes for catalog tile patching. "
+             "Default 1 (serial). Use cpu_count()-1 for large surveys.",
+    )
+    @click.option(
+        "--progress",
+        "show_progress",
+        is_flag=True,
+        default=False,
+        help="Show tqdm progress bars (Zarr scan + catalog patch).",
+    )
     @click.argument("lake_root", type=click.Path(path_type=Path), required=False)
     @config_option
     @ingest_token_option
@@ -578,6 +679,8 @@ try:
         kind: str,
         norder: int | None,
         link_id_col: str | None,
+        n_workers: int,
+        show_progress: bool,
         lake_root: Path | None,
         config_path: Path | None,
         ingest_token: str | None,
@@ -602,6 +705,9 @@ try:
         require_ingest_permission(cfg, ingest_token)
         resolved_root = require_output_root(lake_root, cfg)
 
+        if n_workers < 1:
+            raise click.ClickException("--n-workers must be >= 1")
+
         click.echo(f"Scanning {kind} tiles for survey={survey_name!r} …")
         n_modified = update_index_column_from_zarr_tiles(
             lake_root=resolved_root,
@@ -609,6 +715,8 @@ try:
             kind=kind,  # type: ignore[arg-type]
             norder=norder,
             link_id_col=link_id_col,
+            n_workers=n_workers,
+            show_progress=show_progress,
         )
         click.echo(f"Done: patched _{kind}_index in {n_modified} catalog tile(s).")
 

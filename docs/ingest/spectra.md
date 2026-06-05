@@ -691,8 +691,8 @@ Mitigations built into the batch command:
 - Use **`--on-duplicate skip`** when resuming (writer caches IDs per open tile).
 
 Run long jobs under `tmux`/`nohup` so oomd killing the terminal does not stop
-the ingest.  Catalog patching scans Zarr tiles one at a time (bounded RAM); for a
-manual rebuild after ingest use `dl-rebuild-catalog-indices`.
+the ingest.  For a manual rebuild after ingest use ``dl-rebuild-catalog-indices``
+(one Zarr scan + one catalog pass; use ``--n-workers`` on large surveys).
 
 
 

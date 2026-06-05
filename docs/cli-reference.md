@@ -28,7 +28,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-ingest-spectra-batch-desi-coadds` | Multi-process DESI coadd batch |
 | `dl-ingest-spectra-batch-spplate` | Multi-process spPlate batch ingest |
 | `dl-ingest-spectra-from-list` | Spectrum file-list ingest (sequential default; `--n-workers > 1` for parallel decode) |
-| `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles |
+| `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles; `--n-workers N` for parallel catalog patch; `--progress` for tqdm bars |
 
 **Cutout ingest**
 

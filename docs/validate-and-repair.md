@@ -46,6 +46,16 @@ Rebuild sets ``_spectrum_index`` from each Zarr tile's ``_source_id`` array and
 clears the index to ``-1`` for catalog rows with no matching spectrum in that tile
 (fixes ``out of range`` / ``wrong id`` after Zarr was replaced or shrunk).
 
+At survey scale (millions of spectra), rebuild scans all Zarr tiles once to build
+an in-memory ``{source_id: (zarr_npix, local_index)}`` map, then patches each
+catalog Parquet tile in a single pass — the same O(n_zarr + n_catalog) pattern as
+``dl-validate-catalog-spectra-link``.  Parallelise the catalog patch with
+``--n-workers``:
+
+```bash
+dl-rebuild-catalog-indices --survey SDSS_DR17 --kind spectrum --n-workers 8 --progress
+```
+
 Use ``--strict`` to treat orphan Zarr rows and unpatched catalog warnings as errors.
 Override partitioning only when needed: ``--norder 1`` (must match catalog ``hats_order``).
 

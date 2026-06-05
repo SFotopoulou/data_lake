@@ -548,11 +548,10 @@ class TestUpdateIndexFromZarrTiles:
             norder=None,
         )
         assert n_modified == 0
-        # In the new ID-based model the warning message reflects that no catalog
-        # rows matched (rather than "no catalog tile at Npix=X"), because all
-        # catalog tiles are scanned regardless of Zarr Npix.
         assert any(
-            "no catalog rows matched" in r.message or "no catalog tile" in r.message
+            "No catalog tiles were modified" in r.message
+            or "no catalog rows matched" in r.message
+            or "no catalog tile" in r.message
             for r in caplog.records
         )
 
@@ -601,6 +600,39 @@ class TestUpdateIndexFromZarrTiles:
         assert all(v >= 0 for v in spec_npix), f"Unset _spectrum_npix: {spec_npix}"
         # All rows in this survey map to the same Zarr tile (coarse norder=1).
         assert len(set(spec_npix)) == 1, "Expected all rows in one Zarr tile"
+
+    def test_parallel_matches_serial(self, tmp_path: Path) -> None:
+        """n_workers=2 must produce the same patched catalog as n_workers=1."""
+        from data_lake.ingest.update_catalog_indices import (
+            update_index_column_from_zarr_tiles,
+        )
+
+        ids = [5_000_001, 5_000_002, 5_000_003]
+        ra = [50.0, 60.0, 70.0]
+        dec = [20.0, -20.0, 5.0]
+        _write_mini_catalog(tmp_path, "parallel_rebuild", "TARGETID", ids, ra, dec)
+        _write_mini_spectra_zarr(tmp_path, "parallel_rebuild", ids, ra, dec)
+
+        serial = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name="parallel_rebuild",
+            kind="spectrum",
+            n_workers=1,
+        )
+        # Re-run on fresh catalog (rebuild is idempotent but re-write from scratch).
+        _write_mini_catalog(tmp_path, "parallel_rebuild", "TARGETID", ids, ra, dec)
+        parallel = update_index_column_from_zarr_tiles(
+            lake_root=tmp_path,
+            survey_name="parallel_rebuild",
+            kind="spectrum",
+            n_workers=2,
+        )
+        assert serial > 0
+        assert parallel == serial
+
+        tiles = list((tmp_path / "catalogs" / "parallel_rebuild").rglob("Npix=*.parquet"))
+        merged = pa.concat_tables([pq.ParquetFile(str(t)).read() for t in tiles])
+        assert all(v >= 0 for v in merged.column("_spectrum_index").to_pylist())
 
 
 class TestBuildIndexMapFromZarr:
