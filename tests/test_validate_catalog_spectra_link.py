@@ -136,6 +136,43 @@ class TestValidateCatalogSpectraLink:
         assert not rep.ok(strict=True)
         assert rep.stats.n_orphan_zarr >= 1
 
+    def test_quiet_mode_skips_per_row_warnings(self, tmp_path: Path) -> None:
+        lake = _make_lake(tmp_path)
+        npix = 42
+        zarr_path = (
+            lake / "spectra" / SURVEY / healpix_dir(NORDER, npix) / f"Npix={npix}.zarr"
+        )
+        _write_min_zarr(zarr_path, source_ids=[101, 102, 777, 888])
+        rep_verbose = run_validation(lake, SURVEY, quiet=False)
+        rep_quiet = run_validation(lake, SURVEY, quiet=True)
+        assert rep_quiet.stats.n_orphan_zarr == rep_verbose.stats.n_orphan_zarr >= 1
+        assert len(rep_quiet.warnings) < len(rep_verbose.warnings)
+        assert not rep_quiet.ok(strict=True)
+
+    def test_cli_quiet_suppresses_warning_lines(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.ingest.validate_catalog_spectra_link import cli
+
+        if cli is None:
+            pytest.skip("click not available")
+
+        lake = _make_lake(tmp_path)
+        npix = 42
+        zarr_path = (
+            lake / "spectra" / SURVEY / healpix_dir(NORDER, npix) / f"Npix={npix}.zarr"
+        )
+        _write_min_zarr(zarr_path, source_ids=[101, 102, 777])
+
+        verbose = CliRunner().invoke(cli, ["--survey", SURVEY, str(lake)])
+        quiet = CliRunner().invoke(cli, ["-q", "--survey", SURVEY, str(lake)])
+
+        assert verbose.exit_code == 0
+        assert quiet.exit_code == 0
+        assert "WARNING:" in verbose.output
+        assert "WARNING:" not in quiet.output
+        assert "orphan zarr:" in quiet.output
+
     def test_unpatched_catalog_index(self, tmp_path: Path) -> None:
         lake = _make_lake(tmp_path)
         npix = 42

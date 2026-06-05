@@ -53,8 +53,12 @@ class LinkValidationReport:
     def ok(self, *, strict: bool) -> bool:
         if self.errors:
             return False
-        if strict and self.warnings:
-            return False
+        if strict:
+            if self.warnings:
+                return False
+            st = self.stats
+            if st.n_orphan_zarr > 0 or st.n_unpatched_catalog > 0:
+                return False
         return True
 
 
@@ -153,6 +157,7 @@ def validate_tile_link(
     has_npix_col: bool,
     sample: int | None = None,
     rng: random.Random | None = None,
+    quiet: bool = False,
 ) -> None:
     """Validate one Zarr tile against all catalog tiles that reference it.
 
@@ -293,17 +298,19 @@ def validate_tile_link(
         sid = int(normalize_object_id(int(sid_raw)))
         if sid in zarr_sid_unpatched:
             stats.n_unpatched_catalog += 1
-            rep.warnings.append(
-                f"{zarr_tile.name} row {j}: _source_id={sid} in catalog but "
-                f"{index_col}=-1 (run dl-rebuild-catalog-indices)"
-            )
+            if not quiet:
+                rep.warnings.append(
+                    f"{zarr_tile.name} row {j}: _source_id={sid} in catalog but "
+                    f"{index_col}=-1 (run dl-rebuild-catalog-indices)"
+                )
         elif sid not in zarr_sid_in_catalog:
             stats.n_orphan_zarr += 1
-            rep.warnings.append(
-                f"{zarr_tile.name} row {j}: _source_id={sid} not linked by any "
-                f"catalog row with {npix_col if has_npix_col else hp_col}={zarr_npix} "
-                f"(run dl-rebuild-catalog-indices)"
-            )
+            if not quiet:
+                rep.warnings.append(
+                    f"{zarr_tile.name} row {j}: _source_id={sid} not linked by any "
+                    f"catalog row with {npix_col if has_npix_col else hp_col}={zarr_npix} "
+                    f"(run dl-rebuild-catalog-indices)"
+                )
 
 
 def run_validation(
@@ -315,6 +322,7 @@ def run_validation(
     max_tiles: int | None = None,
     sample: int | None = None,
     seed: int = 0,
+    quiet: bool = False,
 ) -> LinkValidationReport:
     """Cross-check catalog ``_spectrum_index`` / ``_spectrum_npix`` against Zarr tiles.
 
@@ -379,6 +387,7 @@ def run_validation(
             has_npix_col=has_npix_col,
             sample=sample,
             rng=rng,
+            quiet=quiet,
         )
 
     return rep
@@ -396,13 +405,15 @@ def _report_validation(
     survey_name: str,
     *,
     strict: bool,
+    quiet: bool = False,
 ) -> bool:
     """Print one survey's report; return whether validation passed."""
     st = rep.stats
     for msg in rep.errors:
         click.echo(f"ERROR:   {msg}", err=True)
-    for msg in rep.warnings:
-        click.echo(f"WARNING: {msg}", err=True)
+    if not quiet:
+        for msg in rep.warnings:
+            click.echo(f"WARNING: {msg}", err=True)
 
     click.echo(
         f"Tiles checked: {st.n_tiles_checked}  linked rows verified: {st.n_linked}  "
@@ -421,9 +432,12 @@ def _report_validation(
         )
 
     if rep.ok(strict=strict):
-        if rep.warnings and not strict:
+        n_warn = len(rep.warnings)
+        if quiet and (st.n_orphan_zarr or st.n_unpatched_catalog):
+            n_warn = st.n_orphan_zarr + st.n_unpatched_catalog
+        if n_warn and not strict:
             click.echo(
-                f"OK (with {len(rep.warnings)} warning(s)): "
+                f"OK (with {n_warn} warning(s)): "
                 f"catalog ↔ spectra link for {survey_name!r}."
             )
         else:
@@ -437,7 +451,12 @@ def _report_validation(
 try:
     import click
 
-    from ..cli_utils import config_option, load_optional_config, require_output_root
+    from ..cli_utils import (
+        config_option,
+        configure_cli_logging,
+        load_optional_config,
+        require_output_root,
+    )
     from .validate_cli import (
         discover_catalog_spectra_link_surveys,
         echo_multi_survey_footer,
@@ -474,6 +493,14 @@ try:
         is_flag=True,
         help="Treat warnings (orphan Zarr, unpatched catalog) as errors.",
     )
+    @click.option(
+        "-q",
+        "--quiet",
+        is_flag=True,
+        default=False,
+        help="Summary only: do not print per-row WARNING lines (use for surveys "
+             "with many orphan spectra). Counts still appear in the stats line.",
+    )
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -485,8 +512,15 @@ try:
         sample: int | None,
         seed: int,
         strict: bool,
+        quiet: bool,
     ) -> None:
         """Verify catalog _spectrum_index matches spectrum Zarr _source_id tiles."""
+        import logging as _logging
+
+        configure_cli_logging(
+            level=_logging.WARNING if quiet else _logging.INFO,
+            quiet=quiet,
+        )
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="spectra")
 
@@ -511,8 +545,9 @@ try:
                 max_tiles=max_tiles,
                 sample=sample,
                 seed=seed,
+                quiet=quiet,
             )
-            if not _report_validation(rep, survey_name, strict=strict):
+            if not _report_validation(rep, survey_name, strict=strict, quiet=quiet):
                 all_ok = False
 
         echo_multi_survey_footer(
