@@ -104,7 +104,10 @@ Checkpoints default to ``catalogs/<survey>/.ingest_checkpoint.json`` or
 Local FITS ingest uses Astropy **memory mapping** (not Astropy's remote download
 cache).  The OS **page cache** keeps recently read file pages in RAM across opens.
 
-**`--fits-memmap auto`** (default on catalog and spectrum ingest):
+**`--fits-memmap auto`** (default) is available on every `dl-*` command that reads FITS
+files (ingest, extract, generate, debug).  It also applies via ``$DATA_LAKE_FITS_MEMMAP``.
+Commands that only read Parquet/Zarr/lake metadata (``dl-describe-*``, ``dl-validate-*``,
+``dl-crossmatch``, ``dl-pack-tile``, ``dl-mcp-docs``, ``dl-init``, …) are unaffected.
 
 - Files **≥ 8 MiB** → `memmap=True` (large catalogs, spPlate, cutout cubes)
 - Files **< 8 MiB** → load into RAM once (typical `spec-*.fits`; avoids mmap setup overhead)

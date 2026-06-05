@@ -1110,9 +1110,9 @@ def read_catalog_sky_columns(
     """
     path = Path(path)
     if is_catalog_fits_path(path):
-        from astropy.io import fits
+        from data_lake.io.fits_read import open_fits
 
-        with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+        with open_fits(path) as hdul:
             idx = _bintable_hdu_index(hdul)
             hdu = hdul[idx]
             if _is_packed_vector_bintable(hdu):
@@ -1149,9 +1149,9 @@ def catalog_source_row_count(path: Path | str) -> int:
     if suffix in {".parquet", ".pq"}:
         return int(pq.read_metadata(str(path)).num_rows)
     if is_catalog_fits_path(path):
-        from astropy.io import fits
+        from data_lake.io.fits_read import open_fits
 
-        with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+        with open_fits(path) as hdul:
             idx = _bintable_hdu_index(hdul)
             hdu = hdul[idx]
             if _is_packed_vector_bintable(hdu):
@@ -2507,6 +2507,7 @@ try:
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
+        fits_memmap_option,
     )
 
     @click.command("dl-ingest-catalog")
@@ -2550,13 +2551,7 @@ try:
              "instead of holding the full table + sorted copy in RAM. "
              "Recommended for catalogs >~ 50 M rows.",
     )
-    @click.option(
-        "--fits-memmap",
-        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
-        default="auto",
-        show_default=True,
-        help="FITS memmap policy: auto uses mmap for files >= 8 MiB.",
-    )
+    @fits_memmap_option
     @click.option(
         "--columns",
         default=None,

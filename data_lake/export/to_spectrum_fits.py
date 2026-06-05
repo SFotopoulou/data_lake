@@ -336,7 +336,9 @@ def verify_spectrum_round_trip(
         fits_path = work_dir / f"round_trip_{source_id}.fits"
         export_spectrum(lake_root, survey, source_id, fits_path, accessor=accessor)
 
-        with fits.open(str(fits_path)) as hdul:
+        from data_lake.io.fits_read import open_fits
+
+        with open_fits(fits_path) as hdul:
             hdr0  = hdul[0].header
             flux_rt = np.array(hdul[0].data, dtype=np.float32)
             tbl     = hdul["SPECDATA"].data

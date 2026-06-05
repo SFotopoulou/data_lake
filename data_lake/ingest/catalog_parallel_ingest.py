@@ -492,6 +492,7 @@ try:
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
+        fits_memmap_option,
     )
     from data_lake.ingest.catalog_cli_options import (
         allow_incomplete_link_id_option,
@@ -553,6 +554,7 @@ try:
         is_flag=True,
         help="Ignore checkpoint when deciding which files to run.",
     )
+    @fits_memmap_option
     @click.option(
         "--log-file",
         "log_file",
@@ -582,6 +584,7 @@ try:
         failures_log: Path | None,
         no_progress: bool,
         no_skip_completed: bool,
+        fits_memmap: str,
         log_file: Path | None,
         quiet: bool,
         verbose: bool,
@@ -621,6 +624,7 @@ try:
             show_progress=not no_progress,
             skip_completed=not no_skip_completed,
             max_in_flight=max_in_flight,
+            fits_memmap=fits_memmap.lower(),
         )
         sys.exit(0 if result["n_files_failed"] == 0 else 1)
 

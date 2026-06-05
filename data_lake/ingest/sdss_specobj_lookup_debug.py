@@ -235,7 +235,9 @@ def debug_specobj_lookup(
 ) -> SpecObjLookupDebugReport:
     """Build a diagnostic report for one spPlate file."""
     path = Path(spplate_path)
-    with fits.open(str(path), memmap=True) as hdul:
+    from data_lake.io.fits_read import open_fits
+
+    with open_fits(path) as hdul:
         plate, mjd = spplate_plate_mjd_from_hdul(hdul, path)
         phdr = hdul[0].header
         header = {k: phdr[k] for k in _HEADER_KEYS if k in phdr}

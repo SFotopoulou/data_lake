@@ -88,9 +88,9 @@ def characterize_targetid_multiplicity(
 
 def _read_fibermap_targetids(path: Path) -> tuple[np.ndarray, int | None, str]:
     """Read TARGETID from FIBERMAP and row count from EXP_FIBERMAP if present."""
-    from astropy.io import fits
+    from data_lake.io.fits_read import open_fits
 
-    with fits.open(path, memmap=True) as hdul:
+    with open_fits(path) as hdul:
         names = {hdu.name for hdu in hdul}
         if "FIBERMAP" not in names:
             raise KeyError(f"{path}: no FIBERMAP extension (found {sorted(names)[:12]}...)")

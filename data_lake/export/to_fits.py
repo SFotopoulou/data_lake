@@ -254,7 +254,9 @@ def verify_round_trip(
             accessor=acc,
         )
 
-        with fits.open(str(fits_path)) as hdul:
+        from data_lake.io.fits_read import open_fits
+
+        with open_fits(fits_path) as hdul:
             hdr = hdul[0].header
             data = np.array(hdul[0].data, dtype=np.float32)
 

@@ -96,7 +96,9 @@ def _parse_image_paths(
 
 def _open_band_cube(path: Path, hdu_index: int) -> tuple[np.ndarray, WCS, fits.HDUList]:
     """Return memmapped data, WCS, and open HDUList (caller must close)."""
-    hdul = fits.open(str(path), memmap=True, lazy_load_hdus=False)
+    from data_lake.io.fits_read import FitsReadPolicy, open_fits_raw
+
+    hdul = open_fits_raw(path, FitsReadPolicy(memmap="on"))
     hdu = hdul[hdu_index]
     if hdu.data is None:
         hdul.close()

@@ -65,6 +65,18 @@ def parse_memmap_mode(value: str | None) -> MemmapMode:
     raise ValueError(f"fits memmap mode must be auto, on, or off; got {value!r}")
 
 
+def default_fits_read_policy(memmap: str | None = None) -> FitsReadPolicy:
+    """Build a read policy from env defaults, optionally overriding memmap mode."""
+    env = FitsReadPolicy.from_env()
+    if memmap is None:
+        return env
+    return FitsReadPolicy(
+        memmap=parse_memmap_mode(memmap),
+        small_file_bytes=env.small_file_bytes,
+        parallel_catalog_max_bytes=env.parallel_catalog_max_bytes,
+    )
+
+
 def resolve_memmap(path: Path | str, policy: FitsReadPolicy) -> bool:
     """Return the boolean ``memmap=`` argument for ``fits.open``."""
     if policy.memmap == "on":
@@ -100,6 +112,15 @@ def check_parallel_catalog_file_size(path: Path | str, policy: FitsReadPolicy) -
 @contextmanager
 def open_fits(path: Path | str, policy: FitsReadPolicy | None = None):
     """Open a local FITS file with the ingest read policy."""
+    hdul = open_fits_raw(path, policy)
+    try:
+        yield hdul
+    finally:
+        hdul.close()
+
+
+def open_fits_raw(path: Path | str, policy: FitsReadPolicy | None = None):
+    """Open FITS and return an HDUList (caller must ``close()``)."""
     from astropy.io import fits
 
     resolved = policy or FitsReadPolicy.from_env()
@@ -109,8 +130,7 @@ def open_fits(path: Path | str, policy: FitsReadPolicy | None = None):
     }
     if resolved.lazy_load_hdus:
         kwargs["lazy_load_hdus"] = True
-    with fits.open(str(path), **kwargs) as hdul:
-        yield hdul
+    return fits.open(str(path), **kwargs)
 
 
 def contiguous_runs(sorted_indices: np.ndarray) -> list[tuple[int, int]]:

@@ -3374,6 +3374,7 @@ def ingest_spectra_from_fits(
     specobj_lookup_from_catalog: bool = False,
     specobj_lookup_from_plate: bool = False,
     specobj_id_layout: str = "auto",
+    fits_memmap: str = "auto",
 ) -> dict[int, int]:
     """
     Ingest 1-D spectra from a FITS file into HEALPix-partitioned Zarr v3 stacks.
@@ -3442,6 +3443,8 @@ def ingest_spectra_from_fits(
             "resolution matrix is defined relative to a fixed wavelength grid."
         )
 
+    from data_lake.io.fits_read import FitsReadPolicy, default_fits_read_policy
+
     detected_fmt, records, wcs_attrs, res_diags, res_offsets = _load_spectrum_records_from_path(
         source_path,
         output_root=output_root,
@@ -3456,6 +3459,7 @@ def ingest_spectra_from_fits(
         specobj_lookup_survey=specobj_lookup_survey,
         specobj_lookup_from_plate=specobj_lookup_from_plate,
         specobj_id_layout=specobj_id_layout,
+        fits_read_policy=default_fits_read_policy(fits_memmap),
     )
 
     if not records:
@@ -3825,6 +3829,7 @@ try:
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
+        fits_memmap_option,
     )
 
     @click.command("dl-ingest-spectra")
@@ -3925,6 +3930,7 @@ try:
         help="Patch _spectrum_index in the Parquet catalog after ingest "
              "(skipped silently if no catalog exists for this survey).",
     )
+    @fits_memmap_option
     @click.option(
         "--log-file",
         "log_file",
@@ -3955,6 +3961,7 @@ try:
         on_duplicate: str,
         with_resolution: bool | None,
         update_catalog: bool,
+        fits_memmap: str,
         log_file: Path | None,
         quiet: bool,
         verbose: bool,
@@ -4002,6 +4009,7 @@ try:
             specobj_lookup_survey=specobj_lookup_survey,
             specobj_lookup_from_plate=specobj_lookup_from_plate,
             specobj_id_layout=specobj_id_layout.lower(),
+            fits_memmap=fits_memmap.lower(),
         )
 
         if update_catalog and index_map:

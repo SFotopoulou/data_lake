@@ -144,6 +144,7 @@ try:
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
+        fits_memmap_option,
     )
     from data_lake.ingest.fits_to_parquet import ingest_catalog
     from data_lake.ingest.catalog_cli_options import (
@@ -220,13 +221,7 @@ try:
         type=int,
         help="Max decoded files buffered when --n-workers > 1 (default: n_workers).",
     )
-    @click.option(
-        "--fits-memmap",
-        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
-        default="auto",
-        show_default=True,
-        help="FITS memmap policy: auto uses mmap for large files only.",
-    )
+    @fits_memmap_option
     @click.option(
         "--log-file",
         "log_file",
@@ -399,6 +394,7 @@ try:
         help="Patch _cutout_index in the Parquet catalog after ingest "
              "(skipped silently if no catalog exists for this survey).",
     )
+    @fits_memmap_option
     @click.option(
         "--log-file",
         "log_file",
@@ -433,6 +429,7 @@ try:
         no_progress: bool,
         no_skip_completed: bool,
         update_catalog: bool,
+        fits_memmap: str,
         log_file: Path | None,
         heartbeat_interval: int | None,
         quiet: bool,
@@ -472,6 +469,7 @@ try:
                 norder=n,
                 dtype=np.dtype(dtype),
                 on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
+                fits_memmap=fits_memmap.lower(),
             )
             total_index_map.update(m)
 
@@ -620,13 +618,7 @@ try:
         type=int,
         help="Max HEALPix tile Zarr groups open in the writer (parallel path).",
     )
-    @click.option(
-        "--fits-memmap",
-        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
-        default="auto",
-        show_default=True,
-        help="FITS memmap policy: auto uses mmap for large files only.",
-    )
+    @fits_memmap_option
     @click.option(
         "--files-per-worker",
         default=1,

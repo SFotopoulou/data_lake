@@ -116,7 +116,9 @@ def extract_spplate_catalog_table(
 ) -> pa.Table:
     """Extract one spPlate file as a PyArrow table."""
     p = Path(path)
-    with fits.open(str(p), memmap=True) as hdul:
+    from data_lake.io.fits_read import open_fits
+
+    with open_fits(p) as hdul:
         rows = extract_spplate_catalog_rows(
             hdul, p, active_only=active_only, ra_col=ra_col, dec_col=dec_col,
         )
@@ -139,7 +141,9 @@ def extract_spplate_catalog_from_paths(
             log.warning("Skipping missing path: %s", p)
             continue
         try:
-            with fits.open(str(p), memmap=True) as hdul:
+            from data_lake.io.fits_read import open_fits
+
+            with open_fits(p) as hdul:
                 all_rows.extend(
                     extract_spplate_catalog_rows(
                         hdul,

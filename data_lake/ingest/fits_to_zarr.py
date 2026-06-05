@@ -200,6 +200,7 @@ def ingest_cutouts_from_fits(
     link_id_col: str | None = None,
     dtype: np.dtype | type = _DEFAULT_DTYPE,
     on_duplicate_source_id: Literal["append", "error", "skip"] = "skip",
+    fits_memmap: str = "auto",
 ) -> dict[int, tuple[int, int]]:
     """
     Ingest cutout images from a FITS file (one HDU = one source or one MEF
@@ -248,7 +249,9 @@ def ingest_cutouts_from_fits(
 
     index_map: dict[int, tuple[int, int]] = {}
 
-    with fits.open(str(source_path), memmap=True) as hdul:
+    from data_lake.io.fits_read import default_fits_read_policy, open_fits
+
+    with open_fits(source_path, default_fits_read_policy(fits_memmap)) as hdul:
         records = _extract_records_from_hdul(
             hdul, ra_col, dec_col, image_hdu_index, band_axis, dtype,
             link_id_col=link_id_col,
@@ -451,6 +454,7 @@ try:
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
+        fits_memmap_option,
     )
 
     @click.command("dl-ingest-cutouts")
@@ -493,6 +497,7 @@ try:
         help="Patch _cutout_index in the Parquet catalog after ingest "
              "(skipped silently if no catalog exists for this survey).",
     )
+    @fits_memmap_option
     @click.option(
         "--log-file",
         "log_file",
@@ -517,6 +522,7 @@ try:
         dtype: str,
         on_duplicate: str,
         update_catalog: bool,
+        fits_memmap: str,
         log_file: Path | None,
         quiet: bool,
         verbose: bool,
@@ -556,6 +562,7 @@ try:
             norder=resolved_norder,
             dtype=np.dtype(dtype),
             on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
+            fits_memmap=fits_memmap.lower(),
         )
 
         if update_catalog and index_map:

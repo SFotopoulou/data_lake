@@ -764,12 +764,13 @@ def stream_extract_from_fits_catalog(
     ra_col: str | None = None,
     dec_col: str | None = None,
     batch_rows: int = _FITS_STREAM_BATCH_ROWS,
+    fits_memmap: str = "auto",
 ) -> ExtractResult:
     """Stream a large FITS BINTABLE to Parquet in row batches."""
-    from astropy.io import fits
     from astropy.table import Table
 
     from data_lake.ingest.fits_to_parquet import _bintable_hdu_index
+    from data_lake.io.fits_read import default_fits_read_policy, open_fits
 
     path = Path(path)
     if path.suffix.lower() not in {".fit", ".fits", ".fz"} and not path.name.lower().endswith(".fits.gz"):
@@ -779,7 +780,9 @@ def stream_extract_from_fits_catalog(
     n_rows = 0
     out_names: tuple[str, ...] = ()
 
-    with fits.open(str(path), memmap=True, ignore_missing_simple=True) as hdul:
+    from data_lake.io.fits_read import open_fits
+
+    with open_fits(path, default_fits_read_policy(fits_memmap)) as hdul:
         idx = _bintable_hdu_index(hdul)
         hdu = hdul[idx]
         data = hdu.data

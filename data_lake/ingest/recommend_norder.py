@@ -75,9 +75,9 @@ class NorderRecommendation:
 
 def _bintable_column_names(path: Path) -> list[str]:
     """Return column names from the catalog BINTABLE HDU (for error hints)."""
-    from astropy.io import fits
+    from data_lake.io.fits_read import open_fits
 
-    with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+    with open_fits(path) as hdul:
         idx = _fits_bintable_hdu_index(hdul)
         hdu = hdul[idx]
         if _is_packed_vector_bintable(hdu):

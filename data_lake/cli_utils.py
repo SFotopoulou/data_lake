@@ -52,6 +52,23 @@ def ingest_token_option(f: F) -> F:
     )(f)
 
 
+def fits_memmap_option(f: F) -> F:
+    """Add ``--fits-memmap`` (also reads ``$DATA_LAKE_FITS_MEMMAP``) to FITS-reading CLIs."""
+    return click.option(
+        "--fits-memmap",
+        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
+        default="auto",
+        show_default=True,
+        envvar="DATA_LAKE_FITS_MEMMAP",
+        help="FITS read policy: auto (mmap files >= 8 MiB), on, or off.",
+    )(f)
+
+
+def apply_fits_memmap_env(fits_memmap: str) -> None:
+    """Set ``DATA_LAKE_FITS_MEMMAP`` so ``FitsReadPolicy.from_env()`` matches the CLI flag."""
+    os.environ["DATA_LAKE_FITS_MEMMAP"] = fits_memmap.strip().lower()
+
+
 def hash_ingest_token(token: str) -> str:
     """Return the SHA-256 hex digest stored in the deployment ``.ingest_token_hash``."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
