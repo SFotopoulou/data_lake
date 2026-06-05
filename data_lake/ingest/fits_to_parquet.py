@@ -1163,17 +1163,20 @@ def catalog_source_row_count(path: Path | str) -> int:
     return len(_read_source_table(path))
 
 
-def _read_fits_catalog_table(path: Path) -> Table:
+def _read_fits_catalog_table(path: Path, *, fits_read_policy=None) -> Table:
     """Read a catalog FITS BINTABLE, including GALEX packed-vector layout."""
-    from astropy.io import fits
+    from astropy.table import Table
 
-    with fits.open(path, memmap=True, ignore_missing_simple=True) as hdul:
+    from data_lake.io.fits_read import FitsReadPolicy, open_fits, resolve_memmap
+
+    policy = fits_read_policy or FitsReadPolicy.from_env()
+    with open_fits(path, policy) as hdul:
         idx = _bintable_hdu_index(hdul)
         hdu = hdul[idx]
         if _is_packed_vector_bintable(hdu):
             return _read_packed_vector_fits(path, hdu_index=idx)
         log.info("Reading %s as FITS (HDU %d) …", path.name, idx)
-        return Table.read(hdul, hdu=idx, format="fits", memmap=True)
+        return Table.read(hdul, hdu=idx, format="fits", memmap=resolve_memmap(path, policy))
 
 
 def _open_text_for_sniff(path: Path):
@@ -1227,7 +1230,7 @@ def _read_delimited_text_table(path: Path) -> Table:
         return Table.read(str(path), format="ascii.csv", guess=True, fast_reader=False)
 
 
-def _read_source_table(path: Path) -> pa.Table:
+def _read_source_table(path: Path, *, fits_read_policy=None) -> pa.Table:
     """Read a catalog file into a PyArrow Table.
 
     Supported inputs (by file suffix):
@@ -1249,7 +1252,9 @@ def _read_source_table(path: Path) -> pa.Table:
         return pq.read_table(str(path))
 
     if name.endswith(".fits.gz") or suffix in {".fit", ".fits", ".fz"}:
-        return _astropy_table_to_arrow(_read_fits_catalog_table(path))
+        return _astropy_table_to_arrow(
+            _read_fits_catalog_table(path, fits_read_policy=fits_read_policy)
+        )
     elif suffix in {".xml", ".vot", ".votable"}:
         fmt = "votable"
     elif suffix == ".ecsv":
@@ -1964,6 +1969,7 @@ def ingest_catalog(
     parquet_options: CatalogParquetOptions | None = None,
     compact: bool = False,
     allow_incomplete_link_id: bool = False,
+    fits_memmap: str = "auto",
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -2027,6 +2033,15 @@ def ingest_catalog(
     )
     resolved_tile_mode: TileMode = tile_mode if tile_mode is not None else "skip"
 
+    from data_lake.io.fits_read import FitsReadPolicy, parse_memmap_mode
+
+    env_policy = FitsReadPolicy.from_env()
+    fits_read_policy = FitsReadPolicy(
+        memmap=parse_memmap_mode(fits_memmap),
+        small_file_bytes=env_policy.small_file_bytes,
+        parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
+    )
+
     if streaming:
         _ingest_catalog_streaming(
             source_path=source_path,
@@ -2041,10 +2056,11 @@ def ingest_catalog(
             columns=columns,
             parquet_options=pq_opts,
             allow_incomplete_link_id=allow_incomplete_link_id,
+            fits_read_policy=fits_read_policy,
         )
         return
 
-    table = _read_source_table(source_path)
+    table = _read_source_table(source_path, fits_read_policy=fits_read_policy)
     log.info("Loaded %d rows × %d columns", len(table), len(table.schema))
 
     table, sid_mode = ensure_catalog_source_ids(
@@ -2142,14 +2158,20 @@ def decode_catalog_file_to_batches(
     link_id_col: str | None = None,
     columns: Sequence[str] | None = None,
     allow_incomplete_link_id: bool = False,
+    fits_read_policy=None,
 ) -> tuple[list[tuple[int, pa.Table]], str, int]:
     """Read one catalog file and partition rows by HEALPix tile (in-memory).
 
     Returns ``(tile_batches, link_id_mode, n_rows)``.  Used by the parallel
     file-list ingest; each worker holds one full file in RAM.
     """
+    from data_lake.io.fits_read import FitsReadPolicy, check_parallel_catalog_file_size
+
     source_path = Path(source_path)
-    table = _read_source_table(source_path)
+    policy = fits_read_policy or FitsReadPolicy.from_env()
+    if is_catalog_fits_path(source_path):
+        check_parallel_catalog_file_size(source_path, policy)
+    table = _read_source_table(source_path, fits_read_policy=policy)
     table, sid_mode = ensure_catalog_source_ids(
         table, link_id_col, allow_incomplete_link_id=allow_incomplete_link_id,
     )
@@ -2180,6 +2202,7 @@ def _ingest_catalog_streaming(
     columns: Sequence[str] | None = None,
     parquet_options: CatalogParquetOptions | None = None,
     allow_incomplete_link_id: bool = False,
+    fits_read_policy=None,
 ) -> None:
     """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
     the full catalog as a PyArrow Table in RAM.
@@ -2207,8 +2230,9 @@ def _ingest_catalog_streaming(
     At Norder=5 over the DESI footprint this is typically a few thousand
     rows → tens of MB, vs ~tens of GB for the full in-memory table.
     """
-    from astropy.io import fits
     from astropy.table import Table
+
+    from data_lake.io.fits_read import FitsReadPolicy, materialize_fits_rows, open_fits
 
     if source_path.suffix.lower() not in {".fit", ".fits", ".fz"} \
             and not source_path.name.lower().endswith(".fits.gz"):
@@ -2220,9 +2244,12 @@ def _ingest_catalog_streaming(
 
     pq_opts = parquet_options or CatalogParquetOptions()
 
+    policy = fits_read_policy or FitsReadPolicy.from_env()
     log.info("Reading %s as fits (streaming, memmapped) …", source_path.name)
 
-    with fits.open(str(source_path), memmap=True) as hdul:
+    with open_fits(str(source_path), policy) as hdul:
+        from astropy.io import fits
+
         bintable_hdu = next(
             (hdu for hdu in hdul if isinstance(hdu, fits.BinTableHDU)), None
         )
@@ -2297,9 +2324,9 @@ def _ingest_catalog_streaming(
             n_tile = e - s
             row_idx = sort_order[s:e]
 
-            # Materialise only this tile's rows from the memmap.  This is
-            # the only place the heavy column data is touched.
-            chunk = np.asarray(data[row_idx])
+            # Materialise only this tile's rows from the memmap using sequential
+            # file-order reads when row indices are not contiguous.
+            chunk = materialize_fits_rows(data, row_idx)
             astropy_chunk = Table(chunk, copy=False)
             tile_table = _astropy_table_to_arrow(astropy_chunk)
 
@@ -2524,6 +2551,13 @@ try:
              "Recommended for catalogs >~ 50 M rows.",
     )
     @click.option(
+        "--fits-memmap",
+        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="FITS memmap policy: auto uses mmap for files >= 8 MiB.",
+    )
+    @click.option(
         "--columns",
         default=None,
         help="Comma-separated FITS columns to keep (sky, ID, HEALPix, and index "
@@ -2563,6 +2597,7 @@ try:
         tile_mode: str | None,
         on_duplicate_id: str,
         streaming: bool,
+        fits_memmap: str,
         columns: str | None,
         compact: bool,
         compression_level: int | None,
@@ -2608,6 +2643,7 @@ try:
             columns=col_list,
             parquet_options=pq_opts,
             compact=compact,
+            fits_memmap=fits_memmap.lower(),
         )
 
     @click.command("dl-finalize-catalog")

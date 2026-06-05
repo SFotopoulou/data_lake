@@ -51,6 +51,7 @@ class CatalogDecodeConfig:
     link_id_col: str | None
     allow_incomplete_link_id: bool
     columns: tuple[str, ...] | None
+    fits_memmap: str = "auto"
 
 
 @dataclass
@@ -91,6 +92,14 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
     apply_parallel_worker_logging_after_heavy_imports()
     t0 = time.perf_counter()
     cols = list(config.columns) if config.columns else None
+    from data_lake.io.fits_read import FitsReadPolicy, parse_memmap_mode
+
+    env_policy = FitsReadPolicy.from_env()
+    fits_read_policy = FitsReadPolicy(
+        memmap=parse_memmap_mode(config.fits_memmap),
+        small_file_bytes=env_policy.small_file_bytes,
+        parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
+    )
     batches_raw, sid_mode, n_rows = decode_catalog_file_to_batches(
         path_str,
         ra_col=config.ra_col,
@@ -99,6 +108,7 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
         link_id_col=config.link_id_col,
         allow_incomplete_link_id=config.allow_incomplete_link_id,
         columns=cols,
+        fits_read_policy=fits_read_policy,
     )
     # Do not pickle pa.Table across processes (ALLWISE/Gaia-scale tables OOM the
     # worker or parent). Spool per-tile fragments in the worker; writer reads them.
@@ -171,6 +181,7 @@ def ingest_catalogs_parallel(
     executor_factory: Callable[[int], Executor] | None = None,
     decoder: Callable[[str, CatalogDecodeConfig], CatalogWorkerResult] | None = None,
     heartbeat: "Any | None" = None,
+    fits_memmap: str = "auto",
 ) -> dict:
     """Ingest many catalog files with parallel decode and a single-thread writer.
 
@@ -204,6 +215,7 @@ def ingest_catalogs_parallel(
         link_id_col=link_id_col,
         allow_incomplete_link_id=allow_incomplete_link_id,
         columns=tuple(columns) if columns else None,
+        fits_memmap=fits_memmap,
     )
     decoder = decoder or _decode_one_catalog_safe
 

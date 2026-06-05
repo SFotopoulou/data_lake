@@ -8,6 +8,7 @@
 | `dl-ingest-catalog` | `--allow-incomplete-link-id` | flag | Null `_source_id` for rows with missing composite/label parts; row kept, `_spectrum_index` = -1 |
 | `dl-ingest-catalog` | `--tile-mode` | `append`, `replace` | Default `append`; `replace` overwrites existing tile |
 | `dl-ingest-catalog` | `--streaming` | flag | FITS-only; bounded RAM; not available on batch path |
+| `dl-ingest-catalog` | `--fits-memmap` | `auto`, `on`, `off` | FITS read policy (default `auto`: mmap files ≥ 8 MiB) |
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
 | `dl-ingest-catalog-from-list` | `--allow-incomplete-link-id` | flag | Same semantics as single-file command; forwarded to parallel path when `--n-workers > 1` |
 | `dl-ingest-catalog-from-list` | `--tile-mode` | `skip`, `overwrite`, `append` | Sequential default `skip`; parallel default `append` (when omitted with `--n-workers > 1`) |
@@ -24,7 +25,10 @@
 | `dl-ingest-spectra-from-list` | `--on-duplicate` | same | Also ``--on-length-mismatch``, ``--wavelength-mode`` |
 | `dl-ingest-spectra-from-list` | `--n-workers` | `1` (default) | `>1` parallel decode + single Zarr writer (not for ``desi_coadd``) |
 | `dl-ingest-spectra-from-list` | `--max-in-flight` | — | Buffered decodes when ``--n-workers > 1`` (default: ``n_workers``) |
+| `dl-ingest-spectra-from-list` | `--fits-memmap` | `auto`, `on`, `off` | FITS read policy for spectrum decode |
+| `dl-ingest-spectra-from-list` | `--files-per-worker` | int | FITS files per worker task (default 1; try 8–32 for small specs) |
 | `dl-ingest-spectra-batch-desi-coadds` | `--on-duplicate` | same | DESI parallel batch; default **`skip`** |
+| `dl-ingest-spectra-batch-desi-coadds` | `--files-per-worker` | int | Coadd FITS files decoded per worker task |
 
 Cutout/spectrum ingest defaults to **`--on-duplicate skip`** so file-list and batch re-runs
 are idempotent. Use **`append`** only when you intentionally want duplicate Zarr rows.
@@ -94,4 +98,39 @@ or ``truncate`` (same as ``dl-ingest-spectra``).
 Checkpoints default to ``catalogs/<survey>/.ingest_checkpoint.json`` or
 ``cutouts/<survey>/.ingest_checkpoint.json`` under the lake root.  Optional
 ``--failures-log`` writes JSONL per-file errors.
+
+#### FITS I/O tuning (memmap and workers)
+
+Local FITS ingest uses Astropy **memory mapping** (not Astropy's remote download
+cache).  The OS **page cache** keeps recently read file pages in RAM across opens.
+
+**`--fits-memmap auto`** (default on catalog and spectrum ingest):
+
+- Files **≥ 8 MiB** → `memmap=True` (large catalogs, spPlate, cutout cubes)
+- Files **< 8 MiB** → load into RAM once (typical `spec-*.fits`; avoids mmap setup overhead)
+
+Override with `--fits-memmap on` or `--fits-memmap off`.  Environment:
+`DATA_LAKE_FITS_MEMMAP`, `DATA_LAKE_FITS_SMALL_BYTES` (default 8388608),
+`DATA_LAKE_PARALLEL_CATALOG_MAX_BYTES` (default 512 MiB — parallel catalog ingest
+rejects larger FITS with a message to use `--streaming`).
+
+**Large single catalog FITS:** use sequential `dl-ingest-catalog --streaming`.
+Streaming reads tile rows in **file-order runs** to reduce random disk I/O on HDD.
+
+**Many small spectrum FITS:**
+
+- Sort file lists (done automatically) for disk locality on spinning rust
+- **`--files-per-worker 16`** amortizes process IPC and keeps the page cache warm
+- **`--n-workers`:** HDD ≈ 2–4; local NVMe ≈ CPU cores; NFS → lower workers + batching
+
+```bash
+# Many SDSS spec-*.fits on SSD
+dl-ingest-spectra-from-list specs.txt --survey sdss_dr17 \
+  --link-id-col SPECOBJID --n-workers 8 --files-per-worker 16 --fits-memmap auto
+
+# One huge DESI target catalog FITS
+dl-ingest-catalog huge_targets.fits --survey desi_targets \
+  --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID \
+  --streaming --fits-memmap on
+```
 

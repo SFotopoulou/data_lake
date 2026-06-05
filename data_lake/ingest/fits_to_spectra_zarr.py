@@ -2670,6 +2670,45 @@ def _read_6df_spectrum(
     return records, wcs_attrs
 
 
+def _detect_format_from_hdul(hdul, path: Path) -> str:
+    """Heuristically detect spectral format from an open HDUList (headers only)."""
+    stem = path.stem.lower()
+    if stem.startswith("spplate-"):
+        return "sdss_spplate"
+    names = [h.name.upper() for h in hdul]
+    if "COADD" in names:
+        return "sdss_boss"
+    if any(arm + "_FLUX" in names for arm in ("B", "R", "Z")):
+        return "desi_coadd"
+    if _is_6df_hdul(hdul):
+        return "6df"
+    phdr = hdul[0].header
+    naxis2 = int(phdr.get("NAXIS2", 0) or 0)
+    if naxis2 in (640, 1000) and ("PLATEID" in phdr or "PLATE" in phdr) and "MJD" in phdr:
+        return "sdss_spplate"
+    if "COEFF0" in phdr and "COEFF1" in phdr and ("PLATEID" in phdr or "PLATE" in phdr):
+        return "sdss_spplate"
+    if _is_2df_hdul(hdul):
+        return "2df"
+    if _is_gama_hdul(hdul, path):
+        return "gama"
+    if _is_vipers_hdul(hdul, path):
+        return "vipers"
+    if _is_vuds_hdul(hdul, path):
+        return "vuds"
+    if _is_vandels_hdul(hdul, path):
+        return "vandels"
+    if _is_vvds_hdul(hdul, path):
+        return "vvds"
+    if _is_zcosmos_hdul(hdul, path):
+        return "zcosmos"
+    if _is_ozdes_hdul(hdul, path):
+        return "ozdes"
+    if stem.startswith("wig") and _is_wig_spectrum_layout(hdul):
+        return "wig"
+    return "generic"
+
+
 def _detect_format_from_path(path: Path) -> str:
     """
     Heuristically detect the FITS spectral format from HDU names only.
@@ -2677,42 +2716,10 @@ def _detect_format_from_path(path: Path) -> str:
     Opens the file with ``lazy_load_hdus=True`` so no data are read,
     then closes it immediately.
     """
-    stem = path.stem.lower()
-    if stem.startswith("spplate-"):
-        return "sdss_spplate"
-    with fits.open(str(path), lazy_load_hdus=True) as hdul:
-        names = [h.name.upper() for h in hdul]
-        if "COADD" in names:
-            return "sdss_boss"
-        if any(arm + "_FLUX" in names for arm in ("B", "R", "Z")):
-            return "desi_coadd"
-        if _is_6df_hdul(hdul):
-            return "6df"
-        phdr = hdul[0].header
-        naxis2 = int(phdr.get("NAXIS2", 0) or 0)
-        if naxis2 in (640, 1000) and ("PLATEID" in phdr or "PLATE" in phdr) and "MJD" in phdr:
-            return "sdss_spplate"
-        if "COEFF0" in phdr and "COEFF1" in phdr and ("PLATEID" in phdr or "PLATE" in phdr):
-            return "sdss_spplate"
-        if _is_2df_hdul(hdul):
-            return "2df"
-        if _is_gama_hdul(hdul, path):
-            return "gama"
-        if _is_vipers_hdul(hdul, path):
-            return "vipers"
-        if _is_vuds_hdul(hdul, path):
-            return "vuds"
-        if _is_vandels_hdul(hdul, path):
-            return "vandels"
-        if _is_vvds_hdul(hdul, path):
-            return "vvds"
-        if _is_zcosmos_hdul(hdul, path):
-            return "zcosmos"
-        if _is_ozdes_hdul(hdul, path):
-            return "ozdes"
-        if stem.startswith("wig") and _is_wig_spectrum_layout(hdul):
-            return "wig"
-    return "generic"
+    from data_lake.io.fits_read import FitsReadPolicy, open_fits
+
+    with open_fits(path, FitsReadPolicy.for_sniff()) as hdul:
+        return _detect_format_from_hdul(hdul, path)
 
 
 def _filter_spectrum_tile_duplicates(
@@ -2754,6 +2761,7 @@ class SpectrumDecodeConfig:
     specobj_lookup_from_plate: bool = False
     specobj_id_layout: str = "auto"
     with_resolution: bool = False
+    fits_memmap: str = "auto"
 
 
 def _effective_spectrum_ingest_modes(
@@ -2814,6 +2822,7 @@ def _load_spectrum_records_from_path(
     specobj_lookup_survey: str | None,
     specobj_lookup_from_plate: bool,
     specobj_id_layout: str,
+    fits_read_policy: "FitsReadPolicy | None" = None,
 ) -> tuple[
     str,
     list[SpectrumRecord],
@@ -2822,123 +2831,141 @@ def _load_spectrum_records_from_path(
     np.ndarray | None,
 ]:
     """Read spectra from one FITS file (format dispatch only; no Zarr writes)."""
-    detected_fmt = fmt or _detect_format_from_path(source_path)
+    from data_lake.io.fits_read import FitsReadPolicy, open_fits
+
+    if fits_read_policy is None:
+        env_policy = FitsReadPolicy.from_env()
+        fits_read_policy = env_policy
+
+    detected_fmt = fmt
     res_diags: list[np.ndarray] | None = None
     res_offsets: np.ndarray | None = None
 
-    if detected_fmt == "desi_coadd":
+    if detected_fmt == "desi_coadd" or (
+        detected_fmt is None and source_path.name.startswith("coadd-")
+    ):
+        detected_fmt = "desi_coadd"
         records, wcs_attrs, res_diags, res_offsets = _read_desi_with_desispec(
             source_path,
             with_resolution=with_resolution,
             link_id_col=link_id_col,
         )
-    else:
-        if with_resolution:
-            raise ValueError(
-                "--with-resolution is only supported for DESI coadd files. "
-                f"Detected format: {detected_fmt!r}"
-            )
-        with fits.open(str(source_path), memmap=True) as hdul:
-            if detected_fmt == "sdss_boss":
-                records, wcs_attrs = _read_sdss_boss(
-                    hdul,
-                    link_id_col=link_id_col,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                    source_path=source_path,
-                )
-            elif detected_fmt == "sdss_spplate":
-                n_lookup_modes = sum(
-                    bool(x)
-                    for x in (
-                        specobj_lookup,
-                        specobj_lookup_from_catalog,
-                        specobj_lookup_from_plate,
-                    )
-                )
-                if n_lookup_modes > 1:
-                    raise ValueError(
-                        "Pass only one of specobj_lookup=, specobj_lookup_from_catalog=True, "
-                        "or specobj_lookup_from_plate=True"
-                    )
-                from data_lake.ingest.sdss_specobj_lookup import (
-                    build_fiber_to_source_id_from_triplet,
-                    build_fiber_to_specobjid_map,
-                    spplate_plate_mjd_from_hdul,
-                )
+        return detected_fmt, records, wcs_attrs, res_diags, res_offsets
 
-                plate, mjd = spplate_plate_mjd_from_hdul(hdul, source_path)
-                if n_lookup_modes == 0:
-                    # Default: composite PLATE|MJD|FIBERID hash — no catalog scan.
-                    # Catalog must be ingested with --link-id-col PLATE,MJD,FIBERID.
-                    ftable = _spplate_fiber_table_hdu(hdul)
-                    if ftable is None:
-                        raise ValueError(
-                            "spPlate: no per-fiber BINTABLE with FIBERID column; "
-                            "cannot build triplet hash IDs."
-                        )
-                    fiber_col = _fits_bintable_column(ftable.data, "fiberid", "FIBERID")
-                    fiber_ids = [int(x) for x in fiber_col]
-                    fiber_map = build_fiber_to_source_id_from_triplet(plate, mjd, fiber_ids)
-                    log.info(
-                        "spPlate %s: composite PLATE|MJD|FIBERID hash → %d fiber IDs "
-                        "(no catalog scan; catalog must use --link-id-col PLATE,MJD,FIBERID)",
-                        source_path.name,
-                        len(fiber_map),
-                    )
-                else:
-                    fiber_map = build_fiber_to_specobjid_map(
-                        survey_name,
-                        plate,
-                        mjd,
-                        lookup_path=specobj_lookup,
-                        catalog_root=output_root if specobj_lookup_from_catalog else None,
-                        lookup_survey=specobj_lookup_survey,
-                        spplate_hdul=hdul,
-                        lookup_from_plate=specobj_lookup_from_plate,
-                        specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
-                        catalog_id_col=link_id_col,
-                    )
-                records, wcs_attrs = _read_sdss_spplate(
-                    hdul,
-                    path=source_path,
-                    fiber_to_specobjid=fiber_map,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
+    if with_resolution:
+        raise ValueError(
+            "--with-resolution is only supported for DESI coadd files. "
+            f"Detected format: {detected_fmt!r}"
+        )
+
+    with open_fits(source_path, fits_read_policy) as hdul:
+        if detected_fmt is None:
+            detected_fmt = _detect_format_from_hdul(hdul, source_path)
+        if detected_fmt == "desi_coadd":
+            records, wcs_attrs, res_diags, res_offsets = _read_desi_with_desispec(
+                source_path,
+                with_resolution=with_resolution,
+                link_id_col=link_id_col,
+            )
+            return detected_fmt, records, wcs_attrs, res_diags, res_offsets
+        if detected_fmt == "sdss_boss":
+            records, wcs_attrs = _read_sdss_boss(
+                hdul,
+                link_id_col=link_id_col,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                source_path=source_path,
+            )
+        elif detected_fmt == "sdss_spplate":
+            n_lookup_modes = sum(
+                bool(x)
+                for x in (
+                    specobj_lookup,
+                    specobj_lookup_from_catalog,
+                    specobj_lookup_from_plate,
                 )
-            elif detected_fmt == "2df":
-                records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
-            elif detected_fmt == "6df":
-                records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
-            elif detected_fmt == "wig":
-                records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
-            elif detected_fmt == "gama":
-                records, wcs_attrs = _read_gama_spectrum(
-                    hdul,
-                    source_path,
-                    link_id_col=link_id_col or "SPECID",
-                    ra_col=ra_col,
-                    dec_col=dec_col,
+            )
+            if n_lookup_modes > 1:
+                raise ValueError(
+                    "Pass only one of specobj_lookup=, specobj_lookup_from_catalog=True, "
+                    "or specobj_lookup_from_plate=True"
                 )
-            elif detected_fmt == "ozdes":
-                records, wcs_attrs = _read_ozdes_spectrum(hdul, source_path)
-            elif detected_fmt == "zcosmos":
-                records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
-            elif detected_fmt == "vandels":
-                records, wcs_attrs = _read_vandels_spectrum(hdul, source_path)
-            elif detected_fmt == "vipers":
-                records, wcs_attrs = _read_vipers_spectrum(hdul, source_path)
-            elif detected_fmt == "vuds":
-                records, wcs_attrs = _read_vuds_spectrum(hdul, source_path)
-            elif detected_fmt == "vvds":
-                records, wcs_attrs = _read_vvds_spectrum(hdul, source_path)
+            from data_lake.ingest.sdss_specobj_lookup import (
+                build_fiber_to_source_id_from_triplet,
+                build_fiber_to_specobjid_map,
+                spplate_plate_mjd_from_hdul,
+            )
+
+            plate, mjd = spplate_plate_mjd_from_hdul(hdul, source_path)
+            if n_lookup_modes == 0:
+                ftable = _spplate_fiber_table_hdu(hdul)
+                if ftable is None:
+                    raise ValueError(
+                        "spPlate: no per-fiber BINTABLE with FIBERID column; "
+                        "cannot build triplet hash IDs."
+                    )
+                fiber_col = _fits_bintable_column(ftable.data, "fiberid", "FIBERID")
+                fiber_ids = [int(x) for x in fiber_col]
+                fiber_map = build_fiber_to_source_id_from_triplet(plate, mjd, fiber_ids)
+                log.info(
+                    "spPlate %s: composite PLATE|MJD|FIBERID hash → %d fiber IDs "
+                    "(no catalog scan; catalog must use --link-id-col PLATE,MJD,FIBERID)",
+                    source_path.name,
+                    len(fiber_map),
+                )
             else:
-                records, wcs_attrs = _read_generic_1d(
-                    hdul,
-                    link_id_col=link_id_col,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
+                fiber_map = build_fiber_to_specobjid_map(
+                    survey_name,
+                    plate,
+                    mjd,
+                    lookup_path=specobj_lookup,
+                    catalog_root=output_root if specobj_lookup_from_catalog else None,
+                    lookup_survey=specobj_lookup_survey,
+                    spplate_hdul=hdul,
+                    lookup_from_plate=specobj_lookup_from_plate,
+                    specobj_id_layout=specobj_id_layout,  # type: ignore[arg-type]
+                    catalog_id_col=link_id_col,
                 )
+            records, wcs_attrs = _read_sdss_spplate(
+                hdul,
+                path=source_path,
+                fiber_to_specobjid=fiber_map,
+                ra_col=ra_col,
+                dec_col=dec_col,
+            )
+        elif detected_fmt == "2df":
+            records, wcs_attrs = _read_2df_spectrum(hdul, source_path)
+        elif detected_fmt == "6df":
+            records, wcs_attrs = _read_6df_spectrum(hdul, source_path)
+        elif detected_fmt == "wig":
+            records, wcs_attrs = _read_wig_spectrum(hdul, source_path)
+        elif detected_fmt == "gama":
+            records, wcs_attrs = _read_gama_spectrum(
+                hdul,
+                source_path,
+                link_id_col=link_id_col or "SPECID",
+                ra_col=ra_col,
+                dec_col=dec_col,
+            )
+        elif detected_fmt == "ozdes":
+            records, wcs_attrs = _read_ozdes_spectrum(hdul, source_path)
+        elif detected_fmt == "zcosmos":
+            records, wcs_attrs = _read_zcosmos_spectrum(hdul, source_path)
+        elif detected_fmt == "vandels":
+            records, wcs_attrs = _read_vandels_spectrum(hdul, source_path)
+        elif detected_fmt == "vipers":
+            records, wcs_attrs = _read_vipers_spectrum(hdul, source_path)
+        elif detected_fmt == "vuds":
+            records, wcs_attrs = _read_vuds_spectrum(hdul, source_path)
+        elif detected_fmt == "vvds":
+            records, wcs_attrs = _read_vvds_spectrum(hdul, source_path)
+        else:
+            records, wcs_attrs = _read_generic_1d(
+                hdul,
+                link_id_col=link_id_col,
+                ra_col=ra_col,
+                dec_col=dec_col,
+            )
 
     return detected_fmt, records, wcs_attrs, res_diags, res_offsets
 
@@ -3041,6 +3068,7 @@ def decode_spectrum_file_to_worker_result(
     """
     from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
     from data_lake.ingest.desi_parallel_ingest import WorkerResult
+    from data_lake.io.fits_read import FitsReadPolicy, parse_memmap_mode
 
     apply_parallel_worker_logging_after_heavy_imports()
     t0 = time.perf_counter()
@@ -3085,6 +3113,11 @@ def decode_spectrum_file_to_worker_result(
         specobj_lookup_survey=config.specobj_lookup_survey,
         specobj_lookup_from_plate=config.specobj_lookup_from_plate,
         specobj_id_layout=config.specobj_id_layout,
+        fits_read_policy=FitsReadPolicy(
+            memmap=parse_memmap_mode(config.fits_memmap),
+            small_file_bytes=FitsReadPolicy.from_env().small_file_bytes,
+            parallel_catalog_max_bytes=FitsReadPolicy.from_env().parallel_catalog_max_bytes,
+        ),
     )
 
     if not records:

@@ -192,6 +192,7 @@ def ingest_spectra_files_parallel(
     executor_factory: Callable[[int], Executor] | None = None,
     decoder: Callable[[str, SpectrumDecodeConfig], WorkerResult] | None = None,
     heartbeat: "Any | None" = None,
+    files_per_worker: int = 1,
 ) -> dict:
     """Parallel decode of spectrum FITS files with a single-thread Zarr writer."""
     if n_workers < 1:
@@ -205,6 +206,8 @@ def ingest_spectra_files_parallel(
             "Parallel file-list ingest does not support desi_coadd; "
             "use dl-ingest-spectra-batch-desi-coadds."
         )
+    if files_per_worker < 1:
+        raise ValueError("files_per_worker must be >= 1")
 
     output_root = Path(output_root)
     resolved_norder = int(decode_config.norder if norder is None else norder)
@@ -272,9 +275,17 @@ def ingest_spectra_files_parallel(
 
     t_start = time.perf_counter()
     work_queue: deque[str] = deque(pending)
-    in_flight: dict[Future, str] = {}
+    in_flight: dict[Future, list[str]] = {}
     pool_recoveries = 0
     max_pool_recoveries = max(len(pending) * 8, 512)
+
+    from data_lake.ingest.parallel_file_batch import decode_path_batch
+
+    def _pop_path_batch() -> list[str]:
+        batch: list[str] = []
+        while work_queue and len(batch) < files_per_worker:
+            batch.append(work_queue.popleft())
+        return batch
 
     pool_cm = executor_factory(n_workers)
     pool: Executor = pool_cm.__enter__()
@@ -296,8 +307,9 @@ def ingest_spectra_files_parallel(
         in_flight.clear()
 
     def _requeue_in_flight_paths() -> None:
-        for _fut, path_str in list(in_flight.items()):
-            work_queue.appendleft(path_str)
+        for _fut, batch_paths in list(in_flight.items()):
+            for path_str in reversed(batch_paths):
+                work_queue.appendleft(path_str)
 
     def _process_result(res: WorkerResult) -> None:
         nonlocal n_files_ok, n_files_fail, n_spectra_written, tile_cache
@@ -408,11 +420,20 @@ def ingest_spectra_files_parallel(
         while work_queue or in_flight:
             submit_broken = False
             while len(in_flight) < max_in_flight and work_queue:
-                p = work_queue.popleft()
+                batch = _pop_path_batch()
+                if not batch:
+                    break
                 try:
-                    in_flight[pool.submit(decoder, p, decode_config)] = p
+                    if len(batch) == 1:
+                        fut = pool.submit(decoder, batch[0], decode_config)
+                    else:
+                        fut = pool.submit(
+                            decode_path_batch, decoder, batch, decode_config,
+                        )
+                    in_flight[fut] = batch
                 except BrokenProcessPool:
-                    work_queue.appendleft(p)
+                    for p in reversed(batch):
+                        work_queue.appendleft(p)
                     _requeue_in_flight_paths()
                     _recycle_pool_after_broken()
                     submit_broken = True
@@ -425,25 +446,31 @@ def ingest_spectra_files_parallel(
             done_set, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
             result_broken = False
             for fut in done_set:
-                path_str = in_flight.pop(fut)
+                batch_paths = in_flight.pop(fut)
                 try:
-                    res = fut.result()
+                    raw = fut.result()
+                    results = raw if isinstance(raw, list) else [raw]
                 except BrokenProcessPool:
-                    work_queue.appendleft(path_str)
+                    for p in reversed(batch_paths):
+                        work_queue.appendleft(p)
                     _requeue_in_flight_paths()
                     _recycle_pool_after_broken()
                     result_broken = True
                     break
                 except Exception as exc:
-                    res = WorkerResult(
-                        path=path_str,
-                        ok=False,
-                        error=f"executor: {type(exc).__name__}: {exc}",
-                        tb=traceback.format_exc(),
-                    )
-                _process_result(res)
+                    results = [
+                        WorkerResult(
+                            path=p,
+                            ok=False,
+                            error=f"executor: {type(exc).__name__}: {exc}",
+                            tb=traceback.format_exc(),
+                        )
+                        for p in batch_paths
+                    ]
+                for res in results:
+                    _process_result(res)
                 if pbar is not None:
-                    pbar.update(1)
+                    pbar.update(len(batch_paths))
             if result_broken:
                 continue
     finally:

@@ -572,6 +572,7 @@ def ingest_spectra_parallel(
     length_policy: str = "error",
     wavelength_mode: str = "shared",
     heartbeat: "Any | None" = None,
+    files_per_worker: int = 1,
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -672,6 +673,8 @@ def ingest_spectra_parallel(
             return x
 
     output_root = Path(output_root)
+    if files_per_worker < 1:
+        raise ValueError("files_per_worker must be >= 1")
     survey_root = output_root / "spectra" / survey_name
     survey_root.mkdir(parents=True, exist_ok=True)
 
@@ -768,16 +771,29 @@ def ingest_spectra_parallel(
         os.environ[PARALLEL_WORKER_VERBOSE_ENV] = "1" if worker_verbose else "0"
 
     path_iter = iter(pending)
-    in_flight: dict[Future, str] = {}
+    in_flight: dict[Future, list[str]] = {}
+
+    from data_lake.ingest.parallel_file_batch import decode_path_batch
+
+    def _next_path_batch() -> list[str] | None:
+        batch: list[str] = []
+        while len(batch) < files_per_worker:
+            try:
+                batch.append(next(path_iter))
+            except StopIteration:
+                break
+        return batch or None
 
     def _submit_more(pool: Executor) -> None:
         while len(in_flight) < max_in_flight:
-            try:
-                p = next(path_iter)
-            except StopIteration:
+            batch = _next_path_batch()
+            if batch is None:
                 break
-            fut = pool.submit(decoder, p, norder)
-            in_flight[fut] = p
+            if len(batch) == 1:
+                fut = pool.submit(decoder, batch[0], norder)
+            else:
+                fut = pool.submit(decode_path_batch, decoder, batch, norder)
+            in_flight[fut] = batch
 
     def _process_result(path_str: str, res: WorkerResult) -> None:
         nonlocal n_files_ok, n_files_fail, n_spectra_written
@@ -919,17 +935,23 @@ def ingest_spectra_parallel(
                 while in_flight:
                     done_set, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                     for fut in done_set:
-                        path_str = in_flight.pop(fut)
+                        batch_paths = in_flight.pop(fut)
                         try:
-                            res = fut.result()
+                            raw = fut.result()
+                            results = raw if isinstance(raw, list) else [raw]
                         except Exception as exc:
-                            res = WorkerResult(
-                                path=path_str, ok=False,
-                                error=f"executor: {type(exc).__name__}: {exc}",
-                                tb=traceback.format_exc(),
-                            )
-                        _process_result(path_str, res)
-                        pbar.update(1)
+                            results = [
+                                WorkerResult(
+                                    path=p,
+                                    ok=False,
+                                    error=f"executor: {type(exc).__name__}: {exc}",
+                                    tb=traceback.format_exc(),
+                                )
+                                for p in batch_paths
+                            ]
+                        for res in results:
+                            _process_result(res.path, res)
+                        pbar.update(len(batch_paths))
                         _submit_more(pool)
 
     finally:
@@ -1040,6 +1062,13 @@ try:
         help="Max HEALPix tile Zarr groups open in the writer; "
              "0 = unlimited (not recommended for large runs).",
     )
+    @click.option(
+        "--files-per-worker",
+        default=1,
+        show_default=True,
+        type=int,
+        help="FITS files decoded per worker task (amortizes IPC; try 8–32 for small files).",
+    )
     @click.option("--norder", default=None, type=int,
                   help="HEALPix order (overrides config; default 5).")
     @click.option(
@@ -1085,6 +1114,7 @@ try:
         n_workers: int,
         max_in_flight: int | None,
         max_open_tiles: int,
+        files_per_worker: int,
         norder: int | None,
         checkpoint_path: Path | None,
         failures_log: Path | None,
@@ -1116,6 +1146,8 @@ try:
             raise click.UsageError("--max-in-flight must be >= 1")
         if max_open_tiles < 0:
             raise click.UsageError("--max-open-tiles must be >= 0")
+        if files_per_worker < 1:
+            raise click.UsageError("--files-per-worker must be >= 1")
 
         cfg = load_optional_config(config_path)
         require_ingest_permission(cfg, ingest_token)
@@ -1167,6 +1199,7 @@ try:
             on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
             max_in_flight=max_in_flight,
             max_open_tiles=max_open_tiles,
+            files_per_worker=files_per_worker,
         )
 
         click.echo(

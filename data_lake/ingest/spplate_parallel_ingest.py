@@ -124,7 +124,7 @@ def _decode_spplate_to_worker_result(
     ``wavelength`` set to the shared log-lambda grid and ``TileBatch`` entries
     without ``wavelength_rows`` (shared-wavelength mode).
     """
-    from astropy.io import fits
+    from data_lake.io.fits_read import FitsReadPolicy, open_fits
 
     from data_lake.ingest.fits_to_spectra_zarr import (
         _fits_bintable_column,
@@ -134,7 +134,7 @@ def _decode_spplate_to_worker_result(
 
     t0 = time.perf_counter()
 
-    with fits.open(str(path), memmap=True) as hdul:
+    with open_fits(str(path), FitsReadPolicy.from_env()) as hdul:
         plate, mjd = spplate_plate_mjd_from_hdul(hdul, path)
         phdr = hdul[0].header
 

@@ -221,6 +221,13 @@ try:
         help="Max decoded files buffered when --n-workers > 1 (default: n_workers).",
     )
     @click.option(
+        "--fits-memmap",
+        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="FITS memmap policy: auto uses mmap for large files only.",
+    )
+    @click.option(
         "--log-file",
         "log_file",
         type=click.Path(path_type=Path),
@@ -256,6 +263,7 @@ try:
         compact: bool,
         n_workers: int,
         max_in_flight: int | None,
+        fits_memmap: str,
         log_file: Path | None,
         heartbeat_interval: int | None,
         quiet: bool,
@@ -307,6 +315,7 @@ try:
                 show_progress=not no_progress,
                 skip_completed=not no_skip_completed,
                 max_in_flight=max_in_flight,
+                fits_memmap=fits_memmap.lower(),
             )
             sys.exit(0 if result["n_files_failed"] == 0 else 1)
 
@@ -328,6 +337,7 @@ try:
                 streaming=streaming,
                 columns=col_list,
                 compact=compact,
+                fits_memmap=fits_memmap.lower(),
             )
 
         code = _run_file_list(
@@ -611,6 +621,20 @@ try:
         help="Max HEALPix tile Zarr groups open in the writer (parallel path).",
     )
     @click.option(
+        "--fits-memmap",
+        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="FITS memmap policy: auto uses mmap for large files only.",
+    )
+    @click.option(
+        "--files-per-worker",
+        default=1,
+        show_default=True,
+        type=int,
+        help="FITS files decoded per worker task (try 8–32 for many small spectra).",
+    )
+    @click.option(
         "--log-file",
         "log_file",
         type=click.Path(path_type=Path),
@@ -651,6 +675,8 @@ try:
         n_workers: int,
         max_in_flight: int | None,
         max_open_tiles: int,
+        fits_memmap: str,
+        files_per_worker: int,
         log_file: Path | None,
         heartbeat_interval: int | None,
         quiet: bool,
@@ -677,6 +703,8 @@ try:
 
         if n_workers < 1:
             raise click.UsageError("--n-workers must be >= 1")
+        if files_per_worker < 1:
+            raise click.UsageError("--files-per-worker must be >= 1")
 
         if n_workers > 1:
             import numpy as np
@@ -708,6 +736,7 @@ try:
                 specobj_lookup_from_plate=specobj_lookup_from_plate,
                 specobj_id_layout=specobj_id_layout.lower(),
                 with_resolution=False,
+                fits_memmap=fits_memmap.lower(),
             )
             paths = paths_from_file_list_file(paths_file)
             result = ingest_spectra_files_parallel(
@@ -723,6 +752,7 @@ try:
                 max_in_flight=max_in_flight,
                 max_open_tiles=max_open_tiles,
                 on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
+                files_per_worker=files_per_worker,
             )
             if update_catalog and result["n_spectra"] > 0:
                 try:
