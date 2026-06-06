@@ -2092,7 +2092,7 @@ def ingest_catalog(
                 columns=columns,
                 parquet_options=pq_opts,
                 allow_incomplete_link_id=allow_incomplete_link_id,
-                fits_read_policy=fits_read_policy,
+                fits_memmap=fits_memmap,
             )
             return
         _ingest_catalog_streaming(
@@ -2512,6 +2512,63 @@ def _merge_spooled_catalog_tiles(
         )
 
 
+@dataclass(frozen=True)
+class StreamingShardConfig:
+    """Picklable worker arguments for parallel streaming catalog ingest."""
+
+    source_path: str
+    catalog_root: str
+    survey_name: str
+    row_start: int
+    row_end: int
+    ra_col: str
+    dec_col: str
+    norder: int
+    link_id_col: str | None
+    on_duplicate_id: DuplicateIdMode
+    columns: tuple[str, ...] | None
+    parquet_options: CatalogParquetOptions
+    allow_incomplete_link_id: bool
+    fits_memmap: str = "auto"
+
+
+def _streaming_shard_worker(config: StreamingShardConfig) -> str:
+    """Process one row-range shard; write tiles under a worker-local spool dir."""
+    import tempfile
+
+    from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
+    from data_lake.io.fits_read import FitsReadPolicy, parse_memmap_mode
+
+    apply_parallel_worker_logging_after_heavy_imports()
+    spool = Path(tempfile.mkdtemp(prefix="dl_stream_spool_"))
+    env_policy = FitsReadPolicy.from_env()
+    fits_read_policy = FitsReadPolicy(
+        memmap=parse_memmap_mode(config.fits_memmap),
+        small_file_bytes=env_policy.small_file_bytes,
+        parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
+    )
+    _ingest_catalog_streaming(
+        Path(config.source_path),
+        Path(config.catalog_root),
+        config.survey_name,
+        ra_col=config.ra_col,
+        dec_col=config.dec_col,
+        norder=config.norder,
+        link_id_col=config.link_id_col,
+        tile_mode="append",
+        on_duplicate_id=config.on_duplicate_id,
+        columns=config.columns,
+        parquet_options=config.parquet_options,
+        allow_incomplete_link_id=config.allow_incomplete_link_id,
+        fits_read_policy=fits_read_policy,
+        row_start=config.row_start,
+        row_end=config.row_end,
+        catalog_root_override=spool,
+        skip_finalize=True,
+    )
+    return str(spool)
+
+
 def _ingest_catalog_streaming_parallel(
     source_path: Path,
     catalog_root: Path,
@@ -2527,20 +2584,21 @@ def _ingest_catalog_streaming_parallel(
     columns: Sequence[str] | None,
     parquet_options: CatalogParquetOptions,
     allow_incomplete_link_id: bool,
-    fits_read_policy,
+    fits_memmap: str = "auto",
 ) -> None:
     """Parallel row-range shards of streaming FITS catalog ingest."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     from data_lake.cli_utils import init_parallel_ingest_subprocess
-    from data_lake.io.fits_read import open_fits
+    from data_lake.io.fits_read import open_fits, default_fits_read_policy
 
     if streaming_parallel < 2:
         raise ValueError("streaming_parallel must be >= 2")
     if tile_mode != "append":
         raise ValueError("streaming parallel ingest requires tile_mode='append'")
 
-    with open_fits(str(source_path), fits_read_policy) as hdul:
+    policy = default_fits_read_policy(fits_memmap)
+    with open_fits(str(source_path), policy) as hdul:
         from astropy.io import fits
 
         bintable_hdu = next(
@@ -2558,44 +2616,34 @@ def _ingest_catalog_streaming_parallel(
     ]
 
     import shutil
-    import tempfile
 
     spool_dirs: list[Path] = []
-
-    def _shard_worker(row_start: int, row_end: int) -> str:
-        from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
-
-        apply_parallel_worker_logging_after_heavy_imports()
-        spool = Path(tempfile.mkdtemp(prefix="dl_stream_spool_"))
-        _ingest_catalog_streaming(
-            source_path,
-            catalog_root,
-            survey_name,
+    col_tuple = tuple(columns) if columns else None
+    configs = [
+        StreamingShardConfig(
+            source_path=str(source_path),
+            catalog_root=str(catalog_root),
+            survey_name=survey_name,
+            row_start=rs,
+            row_end=re,
             ra_col=ra_col,
             dec_col=dec_col,
             norder=norder,
             link_id_col=link_id_col,
-            tile_mode="append",
             on_duplicate_id=on_duplicate_id,
-            columns=columns,
+            columns=col_tuple,
             parquet_options=parquet_options,
             allow_incomplete_link_id=allow_incomplete_link_id,
-            fits_read_policy=fits_read_policy,
-            row_start=row_start,
-            row_end=row_end,
-            catalog_root_override=spool,
-            skip_finalize=True,
+            fits_memmap=fits_memmap,
         )
-        return str(spool)
+        for rs, re in ranges
+    ]
 
     with ProcessPoolExecutor(
-        max_workers=len(ranges),
+        max_workers=len(configs),
         initializer=init_parallel_ingest_subprocess,
     ) as pool:
-        futures = {
-            pool.submit(_shard_worker, rs, re): (rs, re)
-            for rs, re in ranges
-        }
+        futures = [pool.submit(_streaming_shard_worker, cfg) for cfg in configs]
         for fut in as_completed(futures):
             spool_dirs.append(Path(fut.result()))
 
