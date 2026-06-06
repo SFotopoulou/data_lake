@@ -36,6 +36,14 @@ Catalog append uses **`--on-duplicate-id skip`** (default) with **`--tile-mode a
 
 #### Parallel catalog batch (large file lists)
 
+**Pre-flight:** run **`dl-check-fits-table-format --file-list <paths.txt>`** on FITS
+catalogs before batch ingest. The summary reports total estimated **sources** and
+on-disk **size** — keep that output to compare against `dl-describe-survey` after
+ingest (accounting for `--on-duplicate-id skip`). Files classified as
+**`packed-vector`** (e.g. STILTS colfits) are not suited to parallel whole-file
+decode; convert to row-normal FITS or Parquet first. Details:
+[Catalog ingest — check FITS layout](catalog.md#check-fits-layout-before-ingest).
+
 For surveys shipped as **many catalog files** (e.g. Gaia `GaiaSource_*.csv.gz`), use
 parallel decode with a **single-thread Parquet writer** so overlapping HEALPix tiles
 are merged safely:

@@ -19,6 +19,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |
 | `dl-repair-catalog-metadata` | Repair/rebuild link IDs, `--check-only`, `--rebuild-link-id` |
 | `dl-recommend-catalog-norder` | Sample a catalog to suggest a good `--norder` |
+| `dl-check-fits-table-format` | Header-only FITS layout probe (standard vs packed-vector; est. source count) |
 
 **Spectra ingest**
 

@@ -1,5 +1,43 @@
 # Catalog ingest
 
+### Check FITS layout before ingest
+
+Before starting catalog ingest on FITS (especially large file lists), run
+**`dl-check-fits-table-format`**. It reads **headers only** — no column I/O —
+and reports how the lake will read each file:
+
+| Report field | Meaning |
+|--------------|---------|
+| `format` | `standard-bintable` (one row per source) or `packed-vector` (column-oriented / STILTS **colfits** layout, `NAXIS2=1`) |
+| `sources` | Estimated source count from `NAXIS2` or `TDIMn` |
+| `file size` | On-disk bytes (useful for parallel worker RAM planning) |
+| `ingest` | Fast memmap/streaming path vs slow column-by-column reader |
+
+With a file list, the summary line aggregates **total size** and **total estimated
+sources** across all files — use that baseline to verify ingestion completed as
+expected (see below).
+
+```bash
+# One file
+dl-check-fits-table-format /data/galex/photoobjall_001.fits
+
+# Same paths as batch ingest
+dl-check-fits-table-format --file-list galex_files.txt > galex.summary.txt
+
+# Machine-readable (one JSON object per file)
+dl-check-fits-table-format --file-list gaia_files.txt --json
+```
+
+**Verify after ingest:** compare the pre-check **total sources** to on-disk rows.
+With `--on-duplicate-id skip` (default on batch append), `dl-describe-survey`
+counts **unique rows in Parquet tiles** and may be **lower** than the sum of input
+file rows when duplicates were skipped. Ingest progress logs often report **rows
+read from FITS**, not rows written — a small gap is normal under dedup.
+
+If any file is **`packed-vector`**, expect long ingest times and high RAM per
+worker; parallel whole-file ingest is a poor fit. Re-export as row-normal FITS
+(STILTS `col=false`) or Parquet, then ingest. See [Performance tuning](../performance.md).
+
 ### Ingest a survey catalog
 
 With a deployment config in place (`$DATA_LAKE_CONFIG` set), the

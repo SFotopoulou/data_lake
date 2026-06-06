@@ -84,7 +84,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 
 ```
 1-D spectrum FITS  → dl-ingest-spectra / dl-ingest-spectra-from-list / dl-ingest-spectra-batch-desi-coadds
-Catalog table      → dl-ingest-catalog / dl-ingest-catalog-from-list / dl-ingest-catalog-batch
+Catalog table      → dl-check-fits-table-format (FITS pre-check) → dl-ingest-catalog / dl-ingest-catalog-from-list / dl-ingest-catalog-batch
 Image cutouts      → dl-ingest-cutouts / dl-ingest-cutouts-from-list
 What's in the lake → dl-describe-lake --count-total
 ```

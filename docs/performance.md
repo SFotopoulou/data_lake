@@ -14,6 +14,12 @@ Quick reference for ingest, retrieval, and crossmatch throughput in the data lak
 
 ## Ingest
 
+**First step for FITS catalogs:** **`dl-check-fits-table-format --file-list paths.txt`**
+(header-only; reports `standard-bintable` vs `packed-vector` and total estimated
+sources). Use the source total to sanity-check ingest; avoid parallel whole-file
+batch on **`packed-vector`** (colfits) exports — convert to row-normal FITS or
+Parquet first. See [Check FITS layout before ingest](ingest/catalog.md#check-fits-layout-before-ingest).
+
 | Scenario | Flags |
 |----------|--------|
 | Many small spectrum FITS | `--n-workers 8 --files-per-worker 16 --fits-memmap auto` |
