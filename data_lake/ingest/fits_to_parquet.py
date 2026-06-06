@@ -1037,6 +1037,31 @@ def _is_packed_vector_bintable(hdu) -> bool:
     return False
 
 
+def estimate_bintable_source_count(hdu, *, packed: bool | None = None) -> int | None:
+    """Estimate logical source count from BINTABLE headers only (no column I/O)."""
+    if packed is None:
+        packed = _is_packed_vector_bintable(hdu)
+    if not packed:
+        n = int(hdu.header.get("NAXIS2", 0))
+        return n if n > 0 else None
+    if hdu.columns is None:
+        return None
+    for col in hdu.columns:
+        fmt = str(col.format).strip()
+        if _TFORM_REPEAT_RE.match(fmt):
+            repeat = int(re.match(r"^(\d+)", fmt).group(1))  # type: ignore[union-attr]
+            if repeat > 0:
+                return repeat
+        dim = col.dim
+        if dim:
+            parts = [int(x) for x in str(dim).strip("()").split(",") if x.strip()]
+            if len(parts) >= 2 and parts[1] > 1:
+                return parts[1]
+            if len(parts) == 1 and parts[0] > 1:
+                return parts[0]
+    return None
+
+
 def _read_packed_vector_fits(path: Path, *, hdu_index: int) -> Table:
     """Read one-row vector-packed FITS (e.g. GALEX photoobjall) column-by-column."""
     try:
