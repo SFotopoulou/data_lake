@@ -2069,6 +2069,9 @@ def ingest_catalog(
         parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
     )
 
+    if streaming_parallel > 1 and not streaming:
+        streaming = True
+
     if streaming:
         if streaming_parallel > 1:
             if resolved_tile_mode != "append":
@@ -2781,8 +2784,8 @@ try:
         default=0,
         show_default=True,
         type=int,
-        help="FITS streaming only: shard row ranges across N worker processes "
-             "(requires --streaming and --tile-mode append).",
+        help="FITS-only: shard streaming ingest row ranges across N worker processes "
+             "(implies --streaming when N > 0; requires --tile-mode append).",
     )
     @fits_memmap_option
     @click.option(
@@ -2852,8 +2855,19 @@ try:
         resolved_output = require_output_root(output_root, cfg, kind="catalogs")
 
         col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
-        if streaming_parallel > 0 and not streaming:
-            raise click.UsageError("--streaming-parallel requires --streaming.")
+        if streaming_parallel > 0:
+            ctx = click.get_current_context(silent=True)
+            if ctx is not None:
+                from click.core import ParameterSource
+
+                if (
+                    ctx.get_parameter_source("streaming") == ParameterSource.COMMANDLINE
+                    and not streaming
+                ):
+                    raise click.UsageError(
+                        "--streaming-parallel cannot be combined with --no-streaming."
+                    )
+            streaming = True
         if streaming_parallel > 1 and (tile_mode or "skip").lower() != "append":
             raise click.UsageError(
                 "--streaming-parallel requires --tile-mode append."
