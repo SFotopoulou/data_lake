@@ -165,6 +165,33 @@ def inspect_many(paths: Sequence[Path | str]) -> list[FitsTableFormatReport]:
     return [inspect_fits_table_format(p) for p in paths]
 
 
+def format_summary_text(reports: Sequence[FitsTableFormatReport]) -> str:
+    """Aggregate file counts, total on-disk size, and estimated source rows."""
+    packed = sum(1 for r in reports if r.format == "packed-vector")
+    standard = sum(1 for r in reports if r.format == "standard-bintable")
+    errors = sum(1 for r in reports if not r.ok)
+    total_bytes = sum(r.file_size_bytes for r in reports if r.file_size_bytes is not None)
+    sized = sum(1 for r in reports if r.file_size_bytes is not None)
+    sources_known = [r for r in reports if r.est_source_count is not None]
+    total_sources = sum(r.est_source_count for r in sources_known)
+
+    parts = [
+        f"Summary: {len(reports)} file(s); "
+        f"{standard} standard-bintable, {packed} packed-vector, {errors} error(s).",
+    ]
+    if sized:
+        parts.append(f"Total size: {_human_size(total_bytes)} ({sized} file(s)).")
+    if sources_known:
+        parts.append(
+            f"Total sources (est.): {total_sources:,} "
+            f"({len(sources_known)} file(s) with header estimate)."
+        )
+    unknown_sources = len(reports) - len(sources_known) - errors
+    if unknown_sources > 0:
+        parts.append(f"Sources unknown for {unknown_sources} file(s) (header had no repeat/TDIM).")
+    return "\n".join(parts)
+
+
 try:
     import click
 
@@ -203,13 +230,7 @@ try:
                 click.echo(format_report_text(rep))
                 click.echo()
             if summary and len(reports) > 1:
-                packed = sum(1 for r in reports if r.format == "packed-vector")
-                standard = sum(1 for r in reports if r.format == "standard-bintable")
-                errors = sum(1 for r in reports if not r.ok)
-                click.echo(
-                    f"Summary: {len(reports)} file(s); "
-                    f"{standard} standard-bintable, {packed} packed-vector, {errors} error(s)."
-                )
+                click.echo(format_summary_text(reports))
 
         sys.exit(0 if all(r.ok for r in reports) else 1)
 

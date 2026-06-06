@@ -94,3 +94,29 @@ class TestInspectFitsTableFormat:
         result = CliRunner().invoke(cli, [str(path), "--json", "--no-summary"])
         assert result.exit_code == 0
         assert '"format": "standard-bintable"' in result.output
+
+    def test_summary_totals(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.ingest.check_fits_table_format import cli, format_summary_text
+
+        a = tmp_path / "a.fits"
+        b = tmp_path / "b.fits"
+        _write_standard_fits(Table({"id": [1, 2], "ra": [1.0, 2.0], "dec": [3.0, 4.0]}), a)
+        _write_standard_fits(Table({"id": [1, 2, 3], "ra": [1.0, 2.0, 3.0], "dec": [4.0, 5.0, 6.0]}), b)
+        reports = inspect_many([a, b])
+        summary = format_summary_text(reports)
+        assert "2 file(s)" in summary
+        assert "Total size:" in summary
+        assert "Total sources (est.): 5" in summary
+
+        if cli is None:
+            pytest.skip("click not installed")
+        lst = tmp_path / "files.txt"
+        lst.write_text(f"{a}\n{b}\n")
+        result = CliRunner().invoke(cli, ["--file-list", str(lst), "--no-summary"])
+        assert result.exit_code == 0
+        result2 = CliRunner().invoke(cli, ["--file-list", str(lst)])
+        assert result2.exit_code == 0
+        assert "Total sources (est.): 5" in result2.output
+        assert "Total size:" in result2.output
