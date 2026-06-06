@@ -85,7 +85,7 @@ def inspect_fits_table_format(path: Path | str) -> FitsTableFormatReport:
                 fmt = "packed-vector"
                 ingest_path = "fitsio column-by-column (slow; all columns read)"
                 hint = (
-                    "GALEX photoobjall layout. Prefer one-time conversion to row-oriented "
+                    "Prefer one-time conversion to row-oriented "
                     "Parquet, or expect long ingest times. Parallel ingest loads the full "
                     "table per worker."
                 )
@@ -216,7 +216,7 @@ try:
         as_json: bool,
         summary: bool,
     ) -> None:
-        """Report FITS BINTABLE layout (standard vs GALEX packed-vector)."""
+        """Report FITS BINTABLE layout (standard vs vector)."""
         resolved = resolve_inspect_paths(paths, file_list=file_list)
         if not resolved:
             raise click.UsageError("Provide FITS path(s) and/or --file-list.")
