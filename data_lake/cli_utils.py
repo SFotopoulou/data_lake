@@ -69,6 +69,46 @@ def apply_fits_memmap_env(fits_memmap: str) -> None:
     os.environ["DATA_LAKE_FITS_MEMMAP"] = fits_memmap.strip().lower()
 
 
+def warn_high_parallelism_on_slow_storage(
+    n_workers: int,
+    lake_root: Path | str,
+    *,
+    threshold: int = 8,
+) -> None:
+    """Log when many workers may contend on a network filesystem."""
+    if n_workers <= threshold:
+        return
+    root = Path(lake_root).expanduser()
+    mount_type = ""
+    try:
+        with open("/proc/mounts", encoding="utf-8") as fh:
+            best_len = 0
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt, fstype = parts[1], parts[2]
+                try:
+                    root.relative_to(mnt)
+                except ValueError:
+                    continue
+                if len(mnt) >= best_len:
+                    best_len = len(mnt)
+                    mount_type = fstype
+    except OSError:
+        mount_type = ""
+
+    slow_types = {"nfs", "nfs4", "cifs", "smbfs", "fuse", "lustre", "gpfs", "ceph"}
+    if mount_type in slow_types or str(root).startswith("/mnt/"):
+        logging.getLogger(__name__).warning(
+            "--n-workers=%d on path %s (mount %r): many parallel readers on shared "
+            "storage can be slower than fewer workers with --files-per-worker batching.",
+            n_workers,
+            root,
+            mount_type or "unknown",
+        )
+
+
 def hash_ingest_token(token: str) -> str:
     """Return the SHA-256 hex digest stored in the deployment ``.ingest_token_hash``."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()

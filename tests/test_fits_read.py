@@ -7,6 +7,7 @@ import numpy as np
 from data_lake.io.fits_read import (
     FitsReadPolicy,
     contiguous_runs,
+    materialize_fits_columns,
     materialize_fits_rows,
     resolve_memmap,
 )
@@ -45,6 +46,16 @@ def test_materialize_fits_rows_sequential_equivalent() -> None:
     want = np.asarray(data[row_idx])
     assert np.array_equal(got["a"], want["a"])
     assert np.allclose(got["b"], want["b"])
+
+
+def test_materialize_fits_columns_subset() -> None:
+    dtype = np.dtype([("a", "i4"), ("b", "f8"), ("c", "i4")])
+    data = np.array([(i, float(i), i * 10) for i in range(10)], dtype=dtype)
+    row_idx = np.array([1, 3, 5])
+    got = materialize_fits_columns(data, row_idx, ["a", "c"])
+    assert got.dtype.names == ("a", "c")
+    assert list(got["a"]) == [1, 3, 5]
+    assert list(got["c"]) == [10, 30, 50]
 
 
 def test_materialize_fits_rows_empty() -> None:

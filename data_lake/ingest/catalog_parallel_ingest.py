@@ -157,6 +157,16 @@ def _decode_one_catalog_safe(
         )
 
 
+def _decode_catalog_batch_safe(
+    paths: list[str],
+    config: CatalogDecodeConfig,
+) -> list[CatalogWorkerResult]:
+    """Decode up to *files_per_worker* catalog paths in one worker process."""
+    from data_lake.ingest.parallel_file_batch import decode_path_batch
+
+    return decode_path_batch(_decode_one_catalog_safe, paths, config)
+
+
 def ingest_catalogs_parallel(
     file_paths: Sequence[Path | str],
     *,
@@ -182,6 +192,8 @@ def ingest_catalogs_parallel(
     decoder: Callable[[str, CatalogDecodeConfig], CatalogWorkerResult] | None = None,
     heartbeat: "Any | None" = None,
     fits_memmap: str = "auto",
+    files_per_worker: int = 1,
+    partition_by_dir: bool = False,
 ) -> dict:
     """Ingest many catalog files with parallel decode and a single-thread writer.
 
@@ -189,6 +201,8 @@ def ingest_catalogs_parallel(
     """
     if n_workers < 1:
         raise ValueError("n_workers must be >= 1")
+    if files_per_worker < 1:
+        raise ValueError("files_per_worker must be >= 1")
 
     output_root = Path(output_root)
     catalog_root = output_root / "catalogs" / survey_name
@@ -217,9 +231,19 @@ def ingest_catalogs_parallel(
         columns=tuple(columns) if columns else None,
         fits_memmap=fits_memmap,
     )
-    decoder = decoder or _decode_one_catalog_safe
+    decoder = decoder or _decode_catalog_batch_safe
 
+    from data_lake.cli_utils import warn_high_parallelism_on_slow_storage
     from data_lake.ingest.file_list_ingest import _append_checkpoint, _load_completed
+    from data_lake.ingest.parallel_file_batch import paths_grouped_by_directory
+
+    warn_high_parallelism_on_slow_storage(n_workers, output_root)
+
+    def _pop_path_batch() -> list[str]:
+        batch: list[str] = []
+        while work_queue and len(batch) < files_per_worker:
+            batch.append(work_queue.popleft())
+        return batch
 
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
     failures_log = Path(failures_log) if failures_log else None
@@ -228,7 +252,10 @@ def ingest_catalogs_parallel(
     )
 
     requested = [_canonical_catalog_path(p) for p in file_paths]
-    pending = sorted(p for p in requested if p not in completed)
+    pending_list = sorted(p for p in requested if p not in completed)
+    if partition_by_dir:
+        pending_list = paths_grouped_by_directory(pending_list)
+    pending = pending_list
     n_skipped_ckpt = len(requested) - len(pending)
 
     if not pending:
@@ -278,7 +305,7 @@ def ingest_catalogs_parallel(
 
     t_start = time.perf_counter()
     work_queue: deque[str] = deque(sorted(pending))
-    in_flight: dict[Future, str] = {}
+    in_flight: dict[Future, list[str]] = {}
     pool_recoveries = 0
     # Cap recoveries so a pathological loop cannot run forever.
     max_pool_recoveries = max(len(pending) * 8, 512)
@@ -313,8 +340,9 @@ def ingest_catalogs_parallel(
         in_flight.clear()
 
     def _requeue_in_flight_paths() -> None:
-        for _fut, path_str in list(in_flight.items()):
-            work_queue.appendleft(path_str)
+        for _fut, batch_paths in list(in_flight.items()):
+            for path_str in reversed(batch_paths):
+                work_queue.appendleft(path_str)
 
     def _write_batch(batch: CatalogTileBatch) -> None:
         out_dir = catalog_root / healpix_dir(norder, batch.npix)
@@ -395,11 +423,14 @@ def ingest_catalogs_parallel(
         while work_queue or in_flight:
             submit_broken = False
             while len(in_flight) < max_in_flight and work_queue:
-                p = work_queue.popleft()
+                batch = _pop_path_batch()
+                if not batch:
+                    break
                 try:
-                    in_flight[pool.submit(decoder, p, decode_cfg)] = p
+                    in_flight[pool.submit(decoder, batch, decode_cfg)] = batch
                 except BrokenProcessPool:
-                    work_queue.appendleft(p)
+                    for path_str in reversed(batch):
+                        work_queue.appendleft(path_str)
                     _requeue_in_flight_paths()
                     _recycle_pool_after_broken()
                     submit_broken = True
@@ -413,25 +444,35 @@ def ingest_catalogs_parallel(
             done_set, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
             result_broken = False
             for fut in done_set:
-                path_str = in_flight.pop(fut)
+                batch_paths = in_flight.pop(fut)
                 try:
-                    res = fut.result()
+                    results = fut.result()
                 except BrokenProcessPool:
-                    work_queue.appendleft(path_str)
+                    for path_str in reversed(batch_paths):
+                        work_queue.appendleft(path_str)
                     _requeue_in_flight_paths()
                     _recycle_pool_after_broken()
                     result_broken = True
                     break
                 except Exception as exc:
-                    res = CatalogWorkerResult(
-                        path=path_str,
-                        ok=False,
-                        error=f"executor: {type(exc).__name__}: {exc}",
-                        tb=traceback.format_exc(),
-                    )
-                _process_result(res)
+                    for path_str in batch_paths:
+                        _process_result(
+                            CatalogWorkerResult(
+                                path=path_str,
+                                ok=False,
+                                error=f"executor: {type(exc).__name__}: {exc}",
+                                tb=traceback.format_exc(),
+                            )
+                        )
+                    if pbar is not None:
+                        pbar.update(len(batch_paths))
+                    continue
+                if not isinstance(results, list):
+                    results = [results]
+                for res in results:
+                    _process_result(res)
                 if pbar is not None:
-                    pbar.update(1)
+                    pbar.update(len(results))
             if result_broken:
                 continue
     finally:
@@ -543,6 +584,18 @@ try:
         help="Max decoded files buffered (default: n_workers).",
     )
     @click.option(
+        "--files-per-worker",
+        default=1,
+        show_default=True,
+        type=int,
+        help="Catalog files decoded per worker task (try 4–16 for small CSV shards).",
+    )
+    @click.option(
+        "--partition-by-dir",
+        is_flag=True,
+        help="Order file queue by parent directory for better disk locality.",
+    )
+    @click.option(
         "--checkpoint",
         type=click.Path(path_type=Path),
         default=None,
@@ -580,6 +633,8 @@ try:
         compact: bool,
         n_workers: int,
         max_in_flight: int | None,
+        files_per_worker: int,
+        partition_by_dir: bool,
         checkpoint: Path | None,
         failures_log: Path | None,
         no_progress: bool,
@@ -625,6 +680,8 @@ try:
             skip_completed=not no_skip_completed,
             max_in_flight=max_in_flight,
             fits_memmap=fits_memmap.lower(),
+            files_per_worker=files_per_worker,
+            partition_by_dir=partition_by_dir,
         )
         sys.exit(0 if result["n_files_failed"] == 0 else 1)
 

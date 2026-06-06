@@ -169,6 +169,25 @@ def materialize_fits_rows(data, row_indices: np.ndarray) -> np.ndarray:
     return out
 
 
+def materialize_fits_columns(
+    data,
+    row_indices: np.ndarray,
+    column_names: Sequence[str],
+) -> np.ndarray:
+    """Materialize selected BINTABLE columns for *row_indices*."""
+    row_indices = np.asarray(row_indices, dtype=np.int64)
+    names = list(column_names)
+    if not names:
+        return materialize_fits_rows(data, row_indices)
+    missing = [c for c in names if c not in data.dtype.names]
+    if missing:
+        raise KeyError(f"FITS columns not found: {missing}")
+    full = materialize_fits_rows(data, row_indices)
+    if len(names) == len(full.dtype.names):
+        return full
+    return full[names]
+
+
 def iter_path_batches(paths: Sequence[str], batch_size: int) -> Iterator[list[str]]:
     """Yield consecutive path batches of at most *batch_size*."""
     if batch_size < 1:

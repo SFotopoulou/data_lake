@@ -37,7 +37,7 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
@@ -101,12 +101,12 @@ class CrossmatchSettings:
 
 @dataclass(frozen=True)
 class CrossmatchTileConfig:
-    """Pickle-friendly config for one survey-A tile (parallel workers)."""
+    """Pickle-friendly config for one or more survey-A tiles (parallel workers)."""
 
     lake_root: str
     survey_a: str
     survey_b: str
-    npix_a: int
+    npix_a_list: tuple[int, ...]
     norder_a: int
     norder_b: int
     ra_col_a: str
@@ -121,7 +121,6 @@ class CrossmatchTileConfig:
 
 @dataclass(frozen=True)
 class CrossmatchTileResult:
-    npix_a: int
     n_match_rows: int
     n_tiles_written: int
     error: str | None = None
@@ -407,6 +406,9 @@ def _catalog_ids_to_int64(values) -> np.ndarray:
     return np.asarray([normalize_object_id(v) for v in values], dtype=np.int64)
 
 
+_CROSSMATCH_DENSE_TILE_WARN = 50_000
+
+
 def _crossmatch_one_tile(
     *,
     npix_a: int,
@@ -440,6 +442,13 @@ def _crossmatch_one_tile(
 
     ra_a = df_a[ra_col_a].to_numpy().astype(np.float64)
     dec_a = df_a[dec_col_a].to_numpy().astype(np.float64)
+    if ra_a.size > _CROSSMATCH_DENSE_TILE_WARN:
+        log.warning(
+            "Survey-A tile Npix=%d has %d sources; matcher may be slow. "
+            "Consider coarser --norder or pre-filtering.",
+            npix_a,
+            ra_a.size,
+        )
     ids_a = _catalog_ids_to_int64(df_a[id_col_a].to_list())
 
     b_pixels = healpix_pixels_covering_tile(
@@ -504,33 +513,41 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
         out_root = Path(config.out_root)
         radius_deg = config.radius_arcsec / 3600.0
         radius_rad = np.radians(radius_deg)
+        n_match_rows = 0
+        n_tiles_written = 0
 
         with CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a, \
              CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b:
-            n_rows = _crossmatch_one_tile(
-                npix_a=config.npix_a,
-                norder_a=config.norder_a,
-                norder_b=config.norder_b,
-                ra_col_a=config.ra_col_a,
-                dec_col_a=config.dec_col_a,
-                ra_col_b=config.ra_col_b,
-                dec_col_b=config.dec_col_b,
-                radius_deg=radius_deg,
-                radius_rad=radius_rad,
-                out_root=out_root,
-                acc_a=acc_a,
-                acc_b=acc_b,
-                match_backend=config.match_backend,
-                gpu_id=config.gpu_id,
-            )
+            for npix_a in config.npix_a_list:
+                n_rows = _crossmatch_one_tile(
+                    npix_a=npix_a,
+                    norder_a=config.norder_a,
+                    norder_b=config.norder_b,
+                    ra_col_a=config.ra_col_a,
+                    dec_col_a=config.dec_col_a,
+                    ra_col_b=config.ra_col_b,
+                    dec_col_b=config.dec_col_b,
+                    radius_deg=radius_deg,
+                    radius_rad=radius_rad,
+                    out_root=out_root,
+                    acc_a=acc_a,
+                    acc_b=acc_b,
+                    match_backend=config.match_backend,
+                    gpu_id=config.gpu_id,
+                )
+                n_match_rows += n_rows
+                if n_rows > 0:
+                    n_tiles_written += 1
         return CrossmatchTileResult(
-            config.npix_a,
-            n_rows,
-            1 if n_rows > 0 else 0,
+            n_match_rows,
+            n_tiles_written,
         )
     except Exception as exc:
-        log.exception("Cross-match tile %d failed", config.npix_a)
-        return CrossmatchTileResult(config.npix_a, 0, 0, str(exc))
+        log.exception(
+            "Cross-match worker failed for tiles %s",
+            config.npix_a_list[:8],
+        )
+        return CrossmatchTileResult(0, 0, str(exc))
 
 
 def _pending_crossmatch_tiles(
@@ -680,6 +697,7 @@ def build_crossmatch(
     gpu_id: int = 0,
     export_parquet: Path | str | None = None,
     export_fits: Path | str | None = None,
+    tiles_per_worker: int = 1,
 ) -> CrossmatchResult:
     """
     Build a precomputed cross-match between two surveys.
@@ -731,6 +749,12 @@ def build_crossmatch(
     validate_match_backend(match_backend)
     if match_backend == "rapids":
         warn_rapids_worker_config(n_workers=n_workers, gpu_id=gpu_id)
+    if tiles_per_worker < 1:
+        raise ValueError("tiles_per_worker must be >= 1")
+
+    from data_lake.cli_utils import warn_high_parallelism_on_slow_storage
+
+    warn_high_parallelism_on_slow_storage(n_workers, lake_root)
 
     lake_root = Path(lake_root)
     settings = resolve_crossmatch_settings(
@@ -859,12 +883,22 @@ def build_crossmatch(
     else:
         from data_lake.cli_utils import init_parallel_ingest_subprocess
 
+        worker_tiles: list[tuple[int, ...]] = []
+        batch: list[int] = []
+        for npix_a in pending:
+            batch.append(npix_a)
+            if len(batch) >= tiles_per_worker:
+                worker_tiles.append(tuple(batch))
+                batch = []
+        if batch:
+            worker_tiles.append(tuple(batch))
+
         configs = [
             CrossmatchTileConfig(
                 lake_root=str(lake_root),
                 survey_a=survey_a,
                 survey_b=survey_b,
-                npix_a=npix_a,
+                npix_a_list=tiles,
                 norder_a=norder_a,
                 norder_b=norder_b,
                 ra_col_a=settings.survey_a.ra_col,
@@ -876,7 +910,7 @@ def build_crossmatch(
                 match_backend=match_backend,
                 gpu_id=gpu_id,
             )
-            for npix_a in pending
+            for tiles in worker_tiles
         ]
 
         pbar = None
@@ -884,7 +918,7 @@ def build_crossmatch(
             try:
                 from tqdm.auto import tqdm
 
-                pbar = tqdm(total=len(configs), unit="tile", desc=f"{survey_a}×{survey_b}")
+                pbar = tqdm(total=len(pending), unit="tile", desc=f"{survey_a}×{survey_b}")
             except ImportError:
                 pass
 
@@ -892,13 +926,18 @@ def build_crossmatch(
             max_workers=n_workers,
             initializer=init_parallel_ingest_subprocess,
         ) as pool:
-            futures = [pool.submit(_crossmatch_tile_worker, cfg) for cfg in configs]
+            future_to_n_tiles: dict[Future, int] = {}
+            futures = []
+            for cfg in configs:
+                fut = pool.submit(_crossmatch_tile_worker, cfg)
+                future_to_n_tiles[fut] = len(cfg.npix_a_list)
+                futures.append(fut)
             for fut in as_completed(futures):
                 res = fut.result()
                 if pbar is not None:
-                    pbar.update(1)
+                    pbar.update(future_to_n_tiles.get(fut, 1))
                 if res.error:
-                    failures.append(f"Npix={res.npix_a}: {res.error}")
+                    failures.append(res.error)
                     continue
                 n_match_rows += res.n_match_rows
                 n_tiles_written += res.n_tiles_written
@@ -1126,7 +1165,14 @@ try:
         default=1,
         show_default=True,
         type=int,
-        help="Parallel worker processes (one survey-A tile per task).",
+        help="Parallel worker processes.",
+    )
+    @click.option(
+        "--tiles-per-worker",
+        default=1,
+        show_default=True,
+        type=int,
+        help="Survey-A tiles matched per worker task (try 4–16 for large surveys).",
     )
     @click.option(
         "--match-backend",
@@ -1171,6 +1217,7 @@ try:
         all_tiles: bool,
         show_progress: bool,
         n_workers: int,
+        tiles_per_worker: int,
         match_backend: str,
         gpu_id: int,
         export_parquet: Path | None,
@@ -1200,6 +1247,8 @@ try:
 
         if n_workers < 1:
             raise click.ClickException("--n-workers must be >= 1")
+        if tiles_per_worker < 1:
+            raise click.ClickException("--tiles-per-worker must be >= 1")
         if gpu_id < 0:
             raise click.ClickException("--gpu-id must be >= 0")
 
@@ -1218,6 +1267,7 @@ try:
             populated_tiles_only=not all_tiles,
             show_progress=show_progress,
             n_workers=n_workers,
+            tiles_per_worker=tiles_per_worker,
             match_backend=match_backend,  # type: ignore[arg-type]
             gpu_id=gpu_id,
             export_parquet=export_parquet,

@@ -43,8 +43,12 @@ are merged safely:
 ```bash
 dl-ingest-catalog-batch gaia_files.txt --survey GAIA_DR3_source \
   --ra-col ra --dec-col dec --link-id-col source_id --norder 5 \
-  --tile-mode append --on-duplicate-id skip --n-workers 8
+  --tile-mode append --on-duplicate-id skip --n-workers 8 --files-per-worker 4
 ```
+
+`--files-per-worker` batches multiple catalog files per worker task (same as
+spectrum ingest). `--partition-by-dir` orders the queue by parent directory for
+better disk locality on sharded surveys (Gaia run directories, DESI run folders).
 
 `dl-ingest-catalog-from-list` with `--n-workers > 1` uses the same parallel engine and accepts the same flags as `dl-ingest-catalog-batch` (including `--allow-incomplete-link-id` and `--tile-mode`). The sequential path (`--n-workers 1`, the default) additionally supports `--streaming`. When `--tile-mode` is omitted, the parallel path defaults to `append` and the sequential path defaults to `skip`.
 
@@ -136,4 +140,27 @@ dl-ingest-catalog huge_targets.fits --survey desi_targets \
   --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID \
   --streaming --fits-memmap on
 ```
+
+#### Retrieval prerequisites (index columns and finalize)
+
+Fast spectrum/cutout lookup and bulk extract depend on catalog metadata written at
+ingest time. Before relying on ``get_batch``, ``extract_subset_to_zarr``, or
+crossmatch at scale:
+
+1. **Index columns** — catalog tiles should carry ``_spectrum_index`` and/or
+   ``_cutout_index`` (and ``_spectrum_npix`` / ``_cutout_npix`` when spectrum or
+   cutout HEALPix order differs from the catalog). Spectrum and cutout ingest
+   patch these when ``--update-catalog`` is enabled (default on file-list ingest).
+2. **Finalize after batch jobs** — run ``dl-finalize-catalog --survey <name>`` so
+   Parquet ``_metadata`` exists. DuckDB predicate pushdown in
+   ``CatalogAccessor`` depends on it.
+3. **HEALPix order** — use ``dl-recommend-catalog-norder`` on a sample file when
+   unsure; ``--norder`` must match ``hats_order`` in ``catalog_info.json`` for
+   retrieval and crossmatch tile paths.
+4. **Storage locality** — keep the lake root on local SSD when possible; on NFS or
+   Lustre use fewer parallel workers (see FITS I/O tuning above).
+
+If ``_spectrum_index`` is missing, retrieval falls back to scanning every Zarr tile
+(O(tiles × tile_size)) — repair with spectrum ingest + ``--update-catalog`` or
+``dl-rebuild-catalog-indices``.
 

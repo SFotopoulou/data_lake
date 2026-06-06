@@ -116,6 +116,7 @@ class CatalogAccessor:
         self._glob = str(self._catalog_root / f"Norder={self.norder}" / "**" / "*.parquet")
         self._con.execute(f"CREATE OR REPLACE VIEW catalog AS SELECT * FROM parquet_scan('{self._glob}')")
         log.debug("Registered view 'catalog' → %s", self._glob)
+        self._id_column_cache: dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # Info
@@ -203,12 +204,17 @@ class CatalogAccessor:
 
     def resolve_id_column_for_tile(self, npix: int) -> str:
         """Return the object-ID column present in the on-disk tile (and catalog metadata)."""
+        cached = self._id_column_cache.get(int(npix))
+        if cached is not None:
+            return cached
         col = self._link_id_column
         path = self._tile_parquet_path(npix)
         if path is None:
+            self._id_column_cache[int(npix)] = col
             return col
         names = pq.read_schema(str(path)).names
         if col in names:
+            self._id_column_cache[int(npix)] = col
             return col
         resolved = resolve_link_id_column(self._catalog_root, schema_names=names)
         if resolved != col:
@@ -219,7 +225,29 @@ class CatalogAccessor:
                 col,
                 resolved,
             )
+        self._id_column_cache[int(npix)] = resolved
         return resolved
+
+    def bulk_tile_index(
+        self,
+        source_ids: Sequence[int],
+        kind: str = "spectrum",
+        *,
+        batch_size: int = 10_000,
+        show_progress: bool = True,
+    ) -> dict[int, tuple[int, int]]:
+        """Resolve many source IDs to ``(npix, local_index)`` via batched catalog SQL."""
+        from data_lake.io.id_lookup import bulk_tile_index_from_catalog
+
+        if kind not in ("cutout", "spectrum"):
+            raise ValueError(f"kind must be 'cutout' or 'spectrum', got {kind!r}")
+        return bulk_tile_index_from_catalog(
+            self,
+            source_ids,
+            kind,  # type: ignore[arg-type]
+            batch_size=batch_size,
+            show_progress=show_progress,
+        )
 
     def sources_in_tile(
         self,

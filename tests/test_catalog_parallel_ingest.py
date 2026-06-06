@@ -77,6 +77,29 @@ class TestDecodeCatalogFileToBatches:
 
 
 class TestParallelCatalogIngest:
+    def test_decode_catalog_batch_safe(self, tmp_path: Path) -> None:
+        from data_lake.ingest.catalog_parallel_ingest import (
+            CatalogDecodeConfig,
+            _decode_catalog_batch_safe,
+        )
+
+        paths = []
+        for i in range(3):
+            p = tmp_path / f"cat_{i}.fits"
+            _write_table_as_fits(_make_same_pixel_table([i + 1]), p)
+            paths.append(str(p))
+        cfg = CatalogDecodeConfig(
+            norder=5,
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            link_id_col="TARGETID",
+            allow_incomplete_link_id=False,
+            columns=None,
+        )
+        results = _decode_catalog_batch_safe(paths, cfg)
+        assert len(results) == 3
+        assert all(r.ok for r in results)
+
     def test_two_files_append_same_tile(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         fits_a = tmp_path / "a.fits"

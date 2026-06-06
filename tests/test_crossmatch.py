@@ -381,7 +381,7 @@ class TestBuildCrossmatch:
             lake_root=str(lake),
             survey_a="SURVEY_A",
             survey_b="SURVEY_B",
-            npix_a=npix,
+            npix_a_list=(npix,),
             norder_a=norder,
             norder_b=norder,
             ra_col_a="ra",

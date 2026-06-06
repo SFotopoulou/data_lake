@@ -1357,6 +1357,32 @@ def _filter_table_columns(
     return table.select(keep)
 
 
+def _streaming_fits_read_columns(
+    columns: Sequence[str] | None,
+    *,
+    col_names: list[str],
+    ra_col: str,
+    dec_col: str,
+    link_id_col: str | None,
+) -> list[str] | None:
+    """Column names to read from FITS memmap when ``--columns`` is set."""
+    if not columns:
+        return None
+    required = {ra_col, dec_col}
+    if link_id_col:
+        for part in link_id_col.split("+"):
+            part = part.strip()
+            if part:
+                required.add(part)
+    read = []
+    seen: set[str] = set()
+    for name in list(columns) + sorted(required):
+        if name in col_names and name not in seen:
+            read.append(name)
+            seen.add(name)
+    return read
+
+
 def _shrink_tile_table_for_disk(table: pa.Table) -> pa.Table:
     """Narrow ``large_string`` → ``string`` per tile when safe (smaller on disk).
 
@@ -1970,6 +1996,7 @@ def ingest_catalog(
     compact: bool = False,
     allow_incomplete_link_id: bool = False,
     fits_memmap: str = "auto",
+    streaming_parallel: int = 0,
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -2043,6 +2070,28 @@ def ingest_catalog(
     )
 
     if streaming:
+        if streaming_parallel > 1:
+            if resolved_tile_mode != "append":
+                raise ValueError(
+                    "--streaming-parallel requires tile_mode='append' (use --tile-mode append)."
+                )
+            _ingest_catalog_streaming_parallel(
+                source_path,
+                catalog_root,
+                survey_name,
+                streaming_parallel=streaming_parallel,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                norder=norder,
+                link_id_col=link_id_col,
+                tile_mode=resolved_tile_mode,
+                on_duplicate_id=on_duplicate_id,
+                columns=columns,
+                parquet_options=pq_opts,
+                allow_incomplete_link_id=allow_incomplete_link_id,
+                fits_read_policy=fits_read_policy,
+            )
+            return
         _ingest_catalog_streaming(
             source_path=source_path,
             catalog_root=catalog_root,
@@ -2203,6 +2252,10 @@ def _ingest_catalog_streaming(
     parquet_options: CatalogParquetOptions | None = None,
     allow_incomplete_link_id: bool = False,
     fits_read_policy=None,
+    row_start: int = 0,
+    row_end: int | None = None,
+    catalog_root_override: Path | None = None,
+    skip_finalize: bool = False,
 ) -> None:
     """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
     the full catalog as a PyArrow Table in RAM.
@@ -2232,7 +2285,12 @@ def _ingest_catalog_streaming(
     """
     from astropy.table import Table
 
-    from data_lake.io.fits_read import FitsReadPolicy, materialize_fits_rows, open_fits
+    from data_lake.io.fits_read import (
+        FitsReadPolicy,
+        materialize_fits_columns,
+        materialize_fits_rows,
+        open_fits,
+    )
 
     if source_path.suffix.lower() not in {".fit", ".fits", ".fz"} \
             and not source_path.name.lower().endswith(".fits.gz"):
@@ -2258,6 +2316,18 @@ def _ingest_catalog_streaming(
 
         data = bintable_hdu.data
         n_rows = len(data)
+        row_end_eff = n_rows if row_end is None else min(int(row_end), n_rows)
+        row_start_eff = max(0, int(row_start))
+        if row_start_eff >= row_end_eff:
+            log.info("Streaming row range [%d, %d) is empty; nothing to do.", row_start_eff, row_end_eff)
+            return
+        if row_start_eff > 0 or row_end_eff < n_rows:
+            data = data[row_start_eff:row_end_eff]
+            n_rows = len(data)
+            log.info(
+                "Streaming row shard [%d, %d): %d rows × %d columns",
+                row_start_eff, row_end_eff, n_rows, len(data.dtype.names),
+            )
         col_names = list(data.dtype.names)
         log.info(
             "FITS BINTABLE: %d rows × %d columns (memmapped)",
@@ -2312,7 +2382,16 @@ def _ingest_catalog_streaming(
         )
 
         catalog_root.mkdir(parents=True, exist_ok=True)
+        write_root = catalog_root_override or catalog_root
         hp_col = f"_healpix_norder{norder}"
+
+        fits_read_cols = _streaming_fits_read_columns(
+            columns,
+            col_names=col_names,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            link_id_col=link_id_col,
+        )
 
         tile_schema: pa.Schema | None = None
         sid_mode: str | None = None
@@ -2326,7 +2405,10 @@ def _ingest_catalog_streaming(
 
             # Materialise only this tile's rows from the memmap using sequential
             # file-order reads when row indices are not contiguous.
-            chunk = materialize_fits_rows(data, row_idx)
+            if fits_read_cols is not None:
+                chunk = materialize_fits_columns(data, row_idx, fits_read_cols)
+            else:
+                chunk = materialize_fits_rows(data, row_idx)
             astropy_chunk = Table(chunk, copy=False)
             tile_table = _astropy_table_to_arrow(astropy_chunk)
 
@@ -2361,7 +2443,7 @@ def _ingest_catalog_streaming(
             if tile_schema is None:
                 tile_schema = tile_table.schema
 
-            out_dir = catalog_root / healpix_dir(norder, int(npix))
+            out_dir = write_root / healpix_dir(norder, int(npix))
             out_dir.mkdir(parents=True, exist_ok=True)
             out_file = out_dir / f"Npix={int(npix)}.parquet"
 
@@ -2382,7 +2464,7 @@ def _ingest_catalog_streaming(
             len(unique_pixels), tiles_written, elapsed,
         )
 
-        if tile_schema is not None:
+        if tile_schema is not None and not skip_finalize:
             if sid_mode is None:
                 sid_mode = "sequential"
             _finalize_catalog_writes(
@@ -2396,7 +2478,150 @@ def _ingest_catalog_streaming(
                 fallback_n_cols=len(tile_schema),
                 allow_incomplete_link_id=allow_incomplete_link_id,
             )
-        log.info("Catalog written to %s", catalog_root)
+        if not skip_finalize:
+            log.info("Catalog written to %s", catalog_root)
+
+
+def _merge_spooled_catalog_tiles(
+    spool_root: Path,
+    catalog_root: Path,
+    *,
+    tile_mode: TileMode,
+    on_duplicate_id: DuplicateIdMode,
+    link_id_col: str | None,
+    parquet_options: CatalogParquetOptions,
+) -> None:
+    """Merge worker-local streaming shards into the survey catalog root."""
+    import pyarrow.parquet as pq
+
+    for spool_file in sorted(spool_root.rglob("Npix=*.parquet")):
+        rel = spool_file.relative_to(spool_root)
+        dest = catalog_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        table = pq.read_table(spool_file)
+        _write_tile_for_mode(
+            dest,
+            table,
+            tile_mode=tile_mode,
+            on_duplicate_id=on_duplicate_id,
+            link_id_col=link_id_col,
+            parquet_options=parquet_options,
+        )
+
+
+def _ingest_catalog_streaming_parallel(
+    source_path: Path,
+    catalog_root: Path,
+    survey_name: str,
+    *,
+    streaming_parallel: int,
+    ra_col: str,
+    dec_col: str,
+    norder: int,
+    link_id_col: str | None,
+    tile_mode: TileMode,
+    on_duplicate_id: DuplicateIdMode,
+    columns: Sequence[str] | None,
+    parquet_options: CatalogParquetOptions,
+    allow_incomplete_link_id: bool,
+    fits_read_policy,
+) -> None:
+    """Parallel row-range shards of streaming FITS catalog ingest."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from data_lake.cli_utils import init_parallel_ingest_subprocess
+    from data_lake.io.fits_read import open_fits
+
+    if streaming_parallel < 2:
+        raise ValueError("streaming_parallel must be >= 2")
+    if tile_mode != "append":
+        raise ValueError("streaming parallel ingest requires tile_mode='append'")
+
+    with open_fits(str(source_path), fits_read_policy) as hdul:
+        from astropy.io import fits
+
+        bintable_hdu = next(
+            (hdu for hdu in hdul if isinstance(hdu, fits.BinTableHDU)), None
+        )
+        if bintable_hdu is None:
+            raise ValueError(f"No BINTABLE HDU found in {source_path.name}")
+        n_rows = len(bintable_hdu.data)
+
+    chunk = (n_rows + streaming_parallel - 1) // streaming_parallel
+    ranges = [
+        (i * chunk, min(n_rows, (i + 1) * chunk))
+        for i in range(streaming_parallel)
+        if i * chunk < n_rows
+    ]
+
+    import shutil
+    import tempfile
+
+    spool_dirs: list[Path] = []
+
+    def _shard_worker(row_start: int, row_end: int) -> str:
+        from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
+
+        apply_parallel_worker_logging_after_heavy_imports()
+        spool = Path(tempfile.mkdtemp(prefix="dl_stream_spool_"))
+        _ingest_catalog_streaming(
+            source_path,
+            catalog_root,
+            survey_name,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            norder=norder,
+            link_id_col=link_id_col,
+            tile_mode="append",
+            on_duplicate_id=on_duplicate_id,
+            columns=columns,
+            parquet_options=parquet_options,
+            allow_incomplete_link_id=allow_incomplete_link_id,
+            fits_read_policy=fits_read_policy,
+            row_start=row_start,
+            row_end=row_end,
+            catalog_root_override=spool,
+            skip_finalize=True,
+        )
+        return str(spool)
+
+    with ProcessPoolExecutor(
+        max_workers=len(ranges),
+        initializer=init_parallel_ingest_subprocess,
+    ) as pool:
+        futures = {
+            pool.submit(_shard_worker, rs, re): (rs, re)
+            for rs, re in ranges
+        }
+        for fut in as_completed(futures):
+            spool_dirs.append(Path(fut.result()))
+
+    try:
+        for spool in spool_dirs:
+            _merge_spooled_catalog_tiles(
+                spool,
+                catalog_root,
+                tile_mode=tile_mode,
+                on_duplicate_id=on_duplicate_id,
+                link_id_col=link_id_col,
+                parquet_options=parquet_options,
+            )
+    finally:
+        for spool in spool_dirs:
+            shutil.rmtree(spool, ignore_errors=True)
+
+    _finalize_catalog_writes(
+        catalog_root,
+        survey_name,
+        norder,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        link_id_mode=None,
+        streaming=True,
+        fallback_n_cols=0,
+        allow_incomplete_link_id=allow_incomplete_link_id,
+    )
+    log.info("Parallel streaming catalog written to %s", catalog_root)
 
 
 def _write_aggregate_metadata(
@@ -2551,6 +2776,14 @@ try:
              "instead of holding the full table + sorted copy in RAM. "
              "Recommended for catalogs >~ 50 M rows.",
     )
+    @click.option(
+        "--streaming-parallel",
+        default=0,
+        show_default=True,
+        type=int,
+        help="FITS streaming only: shard row ranges across N worker processes "
+             "(requires --streaming and --tile-mode append).",
+    )
     @fits_memmap_option
     @click.option(
         "--columns",
@@ -2592,6 +2825,7 @@ try:
         tile_mode: str | None,
         on_duplicate_id: str,
         streaming: bool,
+        streaming_parallel: int,
         fits_memmap: str,
         columns: str | None,
         compact: bool,
@@ -2618,6 +2852,12 @@ try:
         resolved_output = require_output_root(output_root, cfg, kind="catalogs")
 
         col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+        if streaming_parallel > 0 and not streaming:
+            raise click.UsageError("--streaming-parallel requires --streaming.")
+        if streaming_parallel > 1 and (tile_mode or "skip").lower() != "append":
+            raise click.UsageError(
+                "--streaming-parallel requires --tile-mode append."
+            )
         pq_opts = None
         if compression_level is not None and not compact:
             pq_opts = CatalogParquetOptions(compression_level=compression_level)
@@ -2635,6 +2875,7 @@ try:
             tile_mode=tile_mode.lower() if tile_mode else None,  # type: ignore[arg-type]
             on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
             streaming=streaming,
+            streaming_parallel=streaming_parallel,
             columns=col_list,
             parquet_options=pq_opts,
             compact=compact,

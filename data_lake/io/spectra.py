@@ -242,41 +242,31 @@ class SpectrumTileStore:
         self, indices: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict], np.ndarray | None]:
         """Return batch arrays for sorted indices."""
+        from data_lake.io.zarr_batch import read_zarr_rows
+
         root = self._open()
-        order = np.argsort(indices)
+        flux_arr = read_zarr_rows(root["flux"], indices)
+        ivar_arr = read_zarr_rows(root["ivar"], indices)
+        mask_arr = read_zarr_rows(root["mask"], indices)
+        order = np.argsort(indices, kind="stable")
         sorted_idx = indices[order]
-
-        flux_list  = [np.array(root["flux"][int(i)])  for i in sorted_idx]
-        ivar_list  = [np.array(root["ivar"][int(i)])  for i in sorted_idx]
-        mask_list  = [np.array(root["mask"][int(i)])  for i in sorted_idx]
-        meta_list  = [_decode_meta(root["meta"][int(i)]) for i in sorted_idx]
-
-        flux_arr = np.stack(flux_list)
-        ivar_arr = np.stack(ivar_list)
-        mask_arr = np.stack(mask_list)
+        meta_sorted = [_decode_meta(root["meta"][int(i)]) for i in sorted_idx]
+        unshuffle = np.empty_like(order)
+        unshuffle[order] = np.arange(len(order))
+        meta_list = [meta_sorted[i] for i in unshuffle]
 
         if self.wavelength_mode == "shared":
             wave = self._get_shared_wavelength()
         else:
-            wave_list = [np.array(root["wavelength"][int(i)], dtype=np.float64) for i in sorted_idx]
-            wave = np.stack(wave_list)
+            wave = np.asarray(
+                read_zarr_rows(root["wavelength"], indices), dtype=np.float64,
+            )
 
         res_arr: np.ndarray | None = None
         if self.has_resolution:
-            res_list = [np.array(root["resolution"][int(i)], dtype=np.float32) for i in sorted_idx]
-            res_arr = np.stack(res_list)
+            res_arr = read_zarr_rows(root["resolution"], indices).astype(np.float32)
 
-        # Unshuffle to original order
-        unshuffle = np.empty_like(order)
-        unshuffle[order] = np.arange(len(order))
-        return (
-            flux_arr[unshuffle],
-            ivar_arr[unshuffle],
-            mask_arr[unshuffle],
-            wave if wave.ndim == 1 else wave[unshuffle],
-            [meta_list[i] for i in unshuffle],
-            res_arr[unshuffle] if res_arr is not None else None,
-        )
+        return flux_arr, ivar_arr, mask_arr, wave, meta_list, res_arr
 
     def get_source_ids(self) -> np.ndarray:
         root = self._open()
@@ -439,9 +429,14 @@ class SpectrumAccessor:
             ``(N_pix,)`` float64 in shared mode, or list of per-source arrays.
         """
         from collections import defaultdict
+
+        lookup = self._build_source_id_lookup(source_ids, show_progress=False)
         tile_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
         for orig_pos, sid in enumerate(source_ids):
-            npix, local_idx = self._source_id_to_tile_and_local(sid)
+            loc = lookup.get(int(sid))
+            if loc is None:
+                raise KeyError(f"source_id={sid} not found in spectrum store.")
+            npix, local_idx = loc
             tile_groups[npix].append((orig_pos, local_idx))
 
         # Infer output shape from first tile
@@ -479,97 +474,38 @@ class SpectrumAccessor:
     # Bulk subset extraction
     # ------------------------------------------------------------------
 
+    def _scan_tile_for_ids(
+        self, npix: int, remaining: np.ndarray,
+    ) -> dict[int, tuple[int, int]]:
+        store = self._get_tile_store(npix)
+        sids_in_tile = store.get_source_ids()
+        hit_mask = np.isin(sids_in_tile, remaining, assume_unique=False)
+        if not hit_mask.any():
+            return {}
+        local_idxs = np.nonzero(hit_mask)[0]
+        hit_sids = sids_in_tile[local_idxs]
+        return {
+            int(sid): (npix, int(lidx))
+            for sid, lidx in zip(hit_sids.tolist(), local_idxs.tolist())
+        }
+
     def _build_source_id_lookup(
         self,
         requested: np.ndarray,
         show_progress: bool = True,
     ) -> dict[int, tuple[int, int]]:
-        """Resolve ``source_id -> (npix, local_idx)`` for a batch of IDs.
+        """Resolve ``source_id -> (npix, local_idx)`` for a batch of IDs."""
+        from data_lake.io.id_lookup import bulk_tile_index_with_scan
 
-        Uses two strategies in order:
-
-        1. **Bulk catalog SQL** (when ``self._catalog`` is set and its catalog
-           carries the ``_spectrum_index`` column): one DuckDB query per
-           ~10k-id batch, with predicate pushdown over the per-tile Parquet
-           files via ``_metadata``.
-        2. **Vectorised tile scan** (always works): read each tile's
-           ``source_id`` array once and ``np.isin`` against the remaining
-           requested IDs.  O(N_tiles · (|tile| + |remaining|)) with no
-           per-id Python overhead.
-        """
-        try:
-            from tqdm.auto import tqdm
-        except ImportError:  # tqdm is a hard dep, but stay defensive
-            def tqdm(x, **_kw):
-                return x
-
-        requested_int = np.unique(requested.astype(np.int64, copy=False))
-        result: dict[int, tuple[int, int]] = {}
-
-        # --- 1. Fast path: bulk catalog SQL ---
-        if self._catalog is not None:
-            try:
-                cat_cols = self._catalog.columns
-                sid_col = self._catalog.link_id_column
-                if "_spectrum_index" in cat_cols:
-                    # Prefer modality-specific npix column (decoupled orders).
-                    if "_spectrum_npix" in cat_cols:
-                        tile_col = "_spectrum_npix"
-                    else:
-                        tile_col = f"_healpix_norder{self._catalog.norder}"
-                    if tile_col in cat_cols:
-                        batch_size = 10_000
-                        for start in tqdm(
-                            range(0, len(requested_int), batch_size),
-                            desc="catalog lookup",
-                            disable=not show_progress,
-                            unit="batch",
-                        ):
-                            chunk = requested_int[start : start + batch_size]
-                            ids_csv = ",".join(str(int(s)) for s in chunk)
-                            sql = (
-                                f"SELECT {sid_col}, {tile_col}, _spectrum_index "
-                                f"FROM catalog WHERE {sid_col} IN ({ids_csv}) "
-                                f"AND _spectrum_index >= 0"
-                            )
-                            rows = self._catalog._con.execute(sql).fetchall()
-                            for sid, npix, lidx in rows:
-                                result[int(sid)] = (int(npix), int(lidx))
-            except Exception:  # pragma: no cover - defensive
-                log.warning(
-                    "Catalog fast-path failed, falling back to tile scan.",
-                    exc_info=True,
-                )
-
-        # --- 2. Tile-scan fallback for whatever the catalog did not cover ---
-        remaining = np.setdiff1d(
-            requested_int,
-            np.fromiter(result.keys(), dtype=np.int64, count=len(result)),
-            assume_unique=True,
+        requested_arr = np.asarray(requested, dtype=np.int64).ravel()
+        return bulk_tile_index_with_scan(
+            requested_arr,
+            catalog=self._catalog,
+            kind="spectrum",
+            scan_tile=self._scan_tile_for_ids,
+            available_tiles=self.available_tiles,
+            show_progress=show_progress,
         )
-
-        if remaining.size > 0:
-            tiles = self.available_tiles()
-            for npix in tqdm(
-                tiles,
-                desc="tile scan",
-                disable=not show_progress,
-                unit="tile",
-            ):
-                if remaining.size == 0:
-                    break
-                store = self._get_tile_store(npix)
-                sids_in_tile = store.get_source_ids()
-                hit_mask = np.isin(sids_in_tile, remaining, assume_unique=False)
-                if not hit_mask.any():
-                    continue
-                local_idxs = np.nonzero(hit_mask)[0]
-                hit_sids = sids_in_tile[local_idxs]
-                for sid, lidx in zip(hit_sids.tolist(), local_idxs.tolist()):
-                    result[int(sid)] = (int(npix), int(lidx))
-                remaining = np.setdiff1d(remaining, hit_sids, assume_unique=False)
-
-        return result
 
     def _plan_subset_extraction(
         self,

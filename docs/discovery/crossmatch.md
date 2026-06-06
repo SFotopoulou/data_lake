@@ -119,6 +119,10 @@ astropy backend. Install with `uv sync --extra rapids` (Linux + NVIDIA CUDA 12).
 Prefer `--n-workers 1` on a single GPU; multiple processes can contend for one
 device. `catalog_info.json` records `match_backend` and `gpu_id` for provenance.
 
+**Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A
+HEALPix tiles per worker process, amortizing DuckDB catalog registration. Try
+4–16 on large surveys with ``--n-workers`` set to CPU core count.
+
 Lake exports read **one HEALPix tile at a time** (or use DuckDB
 ``COPY`` via ``--engine duckdb`` for a single Parquet file). Prefer
 ``--output-dir`` when you need a portable extract for external tools.

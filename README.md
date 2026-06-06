@@ -69,6 +69,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 | Lake registry | [discovery/registry.md](docs/discovery/registry.md) |
 | Schema registry (`dl-describe-survey`) | [discovery/schema-registry.md](docs/discovery/schema-registry.md) |
 | Crossmatch and associations | [discovery/crossmatch.md](docs/discovery/crossmatch.md) |
+| Performance tuning | [performance.md](docs/performance.md) |
 | DuckDB ID-list queries | [discovery/duckdb-queries.md](docs/discovery/duckdb-queries.md) |
 
 ### Layout and design

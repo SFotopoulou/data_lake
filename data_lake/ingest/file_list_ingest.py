@@ -221,6 +221,18 @@ try:
         type=int,
         help="Max decoded files buffered when --n-workers > 1 (default: n_workers).",
     )
+    @click.option(
+        "--files-per-worker",
+        default=1,
+        show_default=True,
+        type=int,
+        help="Catalog files decoded per worker task when --n-workers > 1.",
+    )
+    @click.option(
+        "--partition-by-dir",
+        is_flag=True,
+        help="Order file queue by parent directory when --n-workers > 1.",
+    )
     @fits_memmap_option
     @click.option(
         "--log-file",
@@ -258,6 +270,8 @@ try:
         compact: bool,
         n_workers: int,
         max_in_flight: int | None,
+        files_per_worker: int,
+        partition_by_dir: bool,
         fits_memmap: str,
         log_file: Path | None,
         heartbeat_interval: int | None,
@@ -281,6 +295,8 @@ try:
 
         if n_workers < 1:
             raise click.UsageError("--n-workers must be >= 1")
+        if files_per_worker < 1:
+            raise click.UsageError("--files-per-worker must be >= 1")
         if n_workers > 1 and streaming:
             raise click.UsageError(
                 "--streaming is not supported with --n-workers > 1; "
@@ -311,6 +327,8 @@ try:
                 skip_completed=not no_skip_completed,
                 max_in_flight=max_in_flight,
                 fits_memmap=fits_memmap.lower(),
+                files_per_worker=files_per_worker,
+                partition_by_dir=partition_by_dir,
             )
             sys.exit(0 if result["n_files_failed"] == 0 else 1)
 
@@ -394,6 +412,31 @@ try:
         help="Patch _cutout_index in the Parquet catalog after ingest "
              "(skipped silently if no catalog exists for this survey).",
     )
+    @click.option(
+        "--n-workers",
+        default=1,
+        show_default=True,
+        type=int,
+        help="Decode workers; >1 uses parallel decode + single Zarr writer.",
+    )
+    @click.option(
+        "--max-in-flight",
+        default=None,
+        type=int,
+        help="Max decoded files buffered when --n-workers > 1.",
+    )
+    @click.option(
+        "--files-per-worker",
+        default=1,
+        show_default=True,
+        type=int,
+        help="FITS files decoded per worker task when --n-workers > 1.",
+    )
+    @click.option(
+        "--partition-by-dir",
+        is_flag=True,
+        help="Order file queue by parent directory when --n-workers > 1.",
+    )
     @fits_memmap_option
     @click.option(
         "--log-file",
@@ -429,6 +472,10 @@ try:
         no_progress: bool,
         no_skip_completed: bool,
         update_catalog: bool,
+        n_workers: int,
+        max_in_flight: int | None,
+        files_per_worker: int,
+        partition_by_dir: bool,
         fits_memmap: str,
         log_file: Path | None,
         heartbeat_interval: int | None,
@@ -451,6 +498,47 @@ try:
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)
         bn = [x.strip() for x in band_names.split(",")] if band_names else None
         default_ck = lake / "cutouts" / survey_name / ".ingest_checkpoint.json"
+
+        if n_workers < 1:
+            raise click.UsageError("--n-workers must be >= 1")
+        if files_per_worker < 1:
+            raise click.UsageError("--files-per-worker must be >= 1")
+
+        if n_workers > 1:
+            from data_lake.ingest.cutout_parallel_ingest import ingest_cutouts_parallel
+            from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file
+
+            paths = paths_from_file_list_file(paths_file)
+            result = ingest_cutouts_parallel(
+                paths,
+                output_root=lake,
+                survey_name=survey_name,
+                n_workers=n_workers,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                link_id_col=link_id_col,
+                image_hdu_index=image_hdu_index,
+                band_axis=band_axis,
+                band_names=bn,
+                norder=n,
+                dtype=np.dtype(dtype),
+                on_duplicate=on_duplicate,  # type: ignore[arg-type]
+                checkpoint_path=checkpoint or default_ck,
+                failures_log=failures_log,
+                show_progress=not no_progress,
+                skip_completed=not no_skip_completed,
+                max_in_flight=max_in_flight,
+                files_per_worker=files_per_worker,
+                partition_by_dir=partition_by_dir,
+                fits_memmap=fits_memmap.lower(),
+            )
+            if update_catalog and result["n_files_succeeded"] > 0:
+                from data_lake.ingest.update_catalog_indices import update_index_column
+
+                update_index_column(
+                    lake, survey_name, modality="cutout", norder=n,
+                )
+            sys.exit(0 if result["n_files_failed"] == 0 else 1)
 
         # Accumulate index_map across all files so we patch the catalog once.
         total_index_map: dict[int, tuple[int, int]] = {}

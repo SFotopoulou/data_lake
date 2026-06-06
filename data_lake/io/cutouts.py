@@ -111,16 +111,10 @@ class TileStore:
 
     def get_images(self, indices: np.ndarray) -> np.ndarray:
         """Return images for multiple indices; shape = (N, B, H, W)."""
+        from data_lake.io.zarr_batch import read_zarr_rows
+
         root = self._open()
-        images = root["images"]
-        # Sort indices for more sequential reads, then unshuffle
-        order = np.argsort(indices)
-        sorted_idx = indices[order]
-        out_sorted = np.stack([np.array(images[int(i)]) for i in sorted_idx])
-        # Restore original order
-        unshuffle = np.empty_like(order)
-        unshuffle[order] = np.arange(len(order))
-        return out_sorted[unshuffle]
+        return read_zarr_rows(root["images"], indices)
 
     def get_wcs(self, idx: int) -> CutoutWCS:
         root = self._open()
@@ -228,6 +222,39 @@ class CutoutAccessor:
             self._tile_indices[npix] = store.build_index()
         return self._tile_indices[npix]
 
+    def _scan_tile_for_ids(
+        self, npix: int, remaining: np.ndarray,
+    ) -> dict[int, tuple[int, int]]:
+        store = self._get_tile_store(npix)
+        sids_in_tile = store.get_source_ids()
+        hit_mask = np.isin(sids_in_tile, remaining, assume_unique=False)
+        if not hit_mask.any():
+            return {}
+        local_idxs = np.nonzero(hit_mask)[0]
+        hit_sids = sids_in_tile[local_idxs]
+        return {
+            int(sid): (npix, int(lidx))
+            for sid, lidx in zip(hit_sids.tolist(), local_idxs.tolist())
+        }
+
+    def _build_source_id_lookup(
+        self,
+        requested: np.ndarray,
+        show_progress: bool = True,
+    ) -> dict[int, tuple[int, int]]:
+        """Resolve ``source_id -> (npix, local_idx)`` for a batch of IDs."""
+        from data_lake.io.id_lookup import bulk_tile_index_with_scan
+
+        requested_arr = np.asarray(requested, dtype=np.int64).ravel()
+        return bulk_tile_index_with_scan(
+            requested_arr,
+            catalog=self._catalog,
+            kind="cutout",
+            scan_tile=self._scan_tile_for_ids,
+            available_tiles=self.available_tiles,
+            show_progress=show_progress,
+        )
+
     def _source_id_to_tile_and_local(self, source_id: int) -> tuple[int, int]:
         """Return (npix, local_index) for a given source_id."""
         # Fast path: use catalog accessor which has _cutout_index stored
@@ -300,9 +327,14 @@ class CutoutAccessor:
         """
         # Group by tile
         from collections import defaultdict
-        tile_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)  # npix → [(orig_pos, local_idx)]
+
+        lookup = self._build_source_id_lookup(source_ids, show_progress=False)
+        tile_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
         for orig_pos, sid in enumerate(source_ids):
-            npix, local_idx = self._source_id_to_tile_and_local(sid)
+            loc = lookup.get(int(sid))
+            if loc is None:
+                raise KeyError(f"source_id={sid} not found in any tile.")
+            npix, local_idx = loc
             tile_groups[npix].append((orig_pos, local_idx))
 
         # Allocate output (shape inferred from first tile)
