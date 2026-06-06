@@ -98,6 +98,18 @@ def _make_same_pixel_table(targetids: list[int], *, ra: float = 120.0, dec: floa
     })
 
 
+def _make_filename_label_table(n_rows: int = 24) -> Table:
+    """String filename labels (non-integer link IDs)."""
+    rng = np.random.default_rng(3)
+    filenames = np.array(
+        [f"spec_{i:04d}.fits" for i in range(n_rows)],
+        dtype="U32",
+    )
+    ra = rng.uniform(0.0, 360.0, n_rows).astype(np.float64)
+    dec = rng.uniform(-30.0, +30.0, n_rows).astype(np.float64)
+    return Table({"filename": filenames, "alpha": ra, "delta": dec})
+
+
 def _read_merged_catalog(lake_root: Path, survey: str) -> tuple[list[Path], pa.Table]:
     root = lake_root / "catalogs" / survey
     tiles = sorted(root.rglob("Npix=*.parquet"))
@@ -564,6 +576,40 @@ class TestStreamingIngest:
             np.asarray(mem_tbl.column("Z"))[mo],
             np.asarray(stream_tbl.column("Z"))[so],
         )
+
+    def test_streaming_parallel_finalize_label_link_id(self, tmp_path: Path) -> None:
+        """Parallel streaming shards must propagate link_id_mode through finalize."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        tbl = _make_filename_label_table(n_rows=24)
+        fits_path = tmp_path / "label_ids.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        lake_root = tmp_path / "lake"
+        ingest_catalog(
+            source_path=fits_path,
+            output_root=lake_root,
+            survey_name="syn_parallel",
+            ra_col="alpha",
+            dec_col="delta",
+            norder=1,
+            link_id_col="filename",
+            tile_mode="append",
+            on_duplicate_id="skip",
+            allow_incomplete_link_id=True,
+            streaming_parallel=2,
+        )
+
+        info_path = lake_root / "catalogs" / "syn_parallel" / "catalog_info.json"
+        assert info_path.is_file()
+        with open(info_path) as fh:
+            info = json.load(fh)
+        assert info["link_id_mode"] == "label:filename"
+        assert info.get("native_id_column") == "filename"
+
+        tiles, merged = _read_merged_catalog(lake_root, "syn_parallel")
+        assert tiles
+        assert merged.num_rows == 24
 
     def test_streaming_rejects_non_fits(self, tmp_path: Path):
         from data_lake.ingest.fits_to_parquet import ingest_catalog

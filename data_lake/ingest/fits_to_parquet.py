@@ -1847,12 +1847,14 @@ def _finalize_catalog_writes(
     *,
     ra_col: str,
     dec_col: str,
-    link_id_mode: str,
+    link_id_mode: str | None,
     streaming: bool,
     fallback_n_cols: int,
     allow_incomplete_link_id: bool | None = None,
 ) -> None:
     """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles."""
+    if link_id_mode is None:
+        link_id_mode = "sequential"
     catalog_root.mkdir(parents=True, exist_ok=True)
     tile_paths = _iter_valid_parquet_tiles(catalog_root)
     total_rows = _count_catalog_rows(catalog_root)
@@ -2259,7 +2261,7 @@ def _ingest_catalog_streaming(
     row_end: int | None = None,
     catalog_root_override: Path | None = None,
     skip_finalize: bool = False,
-) -> None:
+) -> str | None:
     """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
     the full catalog as a PyArrow Table in RAM.
 
@@ -2323,7 +2325,7 @@ def _ingest_catalog_streaming(
         row_start_eff = max(0, int(row_start))
         if row_start_eff >= row_end_eff:
             log.info("Streaming row range [%d, %d) is empty; nothing to do.", row_start_eff, row_end_eff)
-            return
+            return None
         if row_start_eff > 0 or row_end_eff < n_rows:
             data = data[row_start_eff:row_end_eff]
             n_rows = len(data)
@@ -2467,9 +2469,9 @@ def _ingest_catalog_streaming(
             len(unique_pixels), tiles_written, elapsed,
         )
 
+        if sid_mode is None and tile_schema is not None:
+            sid_mode = "sequential"
         if tile_schema is not None and not skip_finalize:
-            if sid_mode is None:
-                sid_mode = "sequential"
             _finalize_catalog_writes(
                 catalog_root,
                 survey_name,
@@ -2483,6 +2485,7 @@ def _ingest_catalog_streaming(
             )
         if not skip_finalize:
             log.info("Catalog written to %s", catalog_root)
+        return sid_mode
 
 
 def _merge_spooled_catalog_tiles(
@@ -2532,7 +2535,7 @@ class StreamingShardConfig:
     fits_memmap: str = "auto"
 
 
-def _streaming_shard_worker(config: StreamingShardConfig) -> str:
+def _streaming_shard_worker(config: StreamingShardConfig) -> tuple[str, str | None]:
     """Process one row-range shard; write tiles under a worker-local spool dir."""
     import tempfile
 
@@ -2547,7 +2550,7 @@ def _streaming_shard_worker(config: StreamingShardConfig) -> str:
         small_file_bytes=env_policy.small_file_bytes,
         parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
     )
-    _ingest_catalog_streaming(
+    sid_mode = _ingest_catalog_streaming(
         Path(config.source_path),
         Path(config.catalog_root),
         config.survey_name,
@@ -2566,7 +2569,7 @@ def _streaming_shard_worker(config: StreamingShardConfig) -> str:
         catalog_root_override=spool,
         skip_finalize=True,
     )
-    return str(spool)
+    return str(spool), sid_mode
 
 
 def _ingest_catalog_streaming_parallel(
@@ -2618,6 +2621,7 @@ def _ingest_catalog_streaming_parallel(
     import shutil
 
     spool_dirs: list[Path] = []
+    sid_mode: str | None = None
     col_tuple = tuple(columns) if columns else None
     configs = [
         StreamingShardConfig(
@@ -2645,7 +2649,10 @@ def _ingest_catalog_streaming_parallel(
     ) as pool:
         futures = [pool.submit(_streaming_shard_worker, cfg) for cfg in configs]
         for fut in as_completed(futures):
-            spool_dirs.append(Path(fut.result()))
+            spool, shard_sid = fut.result()
+            spool_dirs.append(Path(spool))
+            if sid_mode is None and shard_sid is not None:
+                sid_mode = shard_sid
 
     try:
         for spool in spool_dirs:
@@ -2667,7 +2674,7 @@ def _ingest_catalog_streaming_parallel(
         norder,
         ra_col=ra_col,
         dec_col=dec_col,
-        link_id_mode=None,
+        link_id_mode=sid_mode,
         streaming=True,
         fallback_n_cols=0,
         allow_incomplete_link_id=allow_incomplete_link_id,
