@@ -2498,13 +2498,11 @@ def _merge_spooled_catalog_tiles(
     parquet_options: CatalogParquetOptions,
 ) -> None:
     """Merge worker-local streaming shards into the survey catalog root."""
-    import pyarrow.parquet as pq
-
     for spool_file in sorted(spool_root.rglob("Npix=*.parquet")):
         rel = spool_file.relative_to(spool_root)
         dest = catalog_root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        table = pq.read_table(spool_file)
+        table = _read_catalog_tile(spool_file)
         _write_tile_for_mode(
             dest,
             table,

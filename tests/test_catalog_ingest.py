@@ -610,6 +610,48 @@ class TestStreamingIngest:
         tiles, merged = _read_merged_catalog(lake_root, "syn_parallel")
         assert tiles
         assert merged.num_rows == 24
+        assert "Norder" not in merged.schema.names
+        assert "Dir" not in merged.schema.names
+
+    def test_streaming_parallel_schema_matches_in_memory_append(self, tmp_path: Path) -> None:
+        """Parallel streaming append must not inject hive partition columns."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog
+
+        tbl = _make_desi_like_table(n_rows=24)
+        fits_path = tmp_path / "desi_like.fits"
+        _write_table_as_fits(tbl, fits_path)
+
+        lake_root = tmp_path / "lake"
+        ingest_catalog(
+            source_path=fits_path,
+            output_root=lake_root,
+            survey_name="schema_cmp",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            link_id_col="TARGETID",
+            tile_mode="overwrite",
+            streaming=False,
+        )
+        _, mem_tbl = _read_merged_catalog(lake_root, "schema_cmp")
+        mem_cols = set(mem_tbl.schema.names)
+
+        ingest_catalog(
+            source_path=fits_path,
+            output_root=lake_root,
+            survey_name="schema_cmp",
+            ra_col="TARGET_RA",
+            dec_col="TARGET_DEC",
+            norder=5,
+            link_id_col="TARGETID",
+            tile_mode="append",
+            on_duplicate_id="skip",
+            streaming_parallel=2,
+        )
+        _, par_tbl = _read_merged_catalog(lake_root, "schema_cmp")
+        assert set(par_tbl.schema.names) == mem_cols
+        assert "Norder" not in par_tbl.schema.names
+        assert "Dir" not in par_tbl.schema.names
 
     def test_streaming_rejects_non_fits(self, tmp_path: Path):
         from data_lake.ingest.fits_to_parquet import ingest_catalog
