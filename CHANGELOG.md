@@ -1,0 +1,69 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.3.0] - 2026-06-05
+
+### Added
+
+- **`dl-check-fits-table-format`** — header-only FITS layout probe (`standard-bintable` vs packed-vector / STILTS colfits) with estimated source counts; use before large catalog ingests.
+- **`dl-widen-spectrum-tiles`** — pad narrower spectrum Zarr tiles to the survey `n_pix` in `spectrum_info.json`.
+- **`dl-mcp-docs`** — stdio MCP server for agent access to lake docs and inventory (optional `[mcp]` extra).
+- **RAPIDS GPU crossmatch** — `--match-backend rapids --gpu-id N` on `dl-crossmatch` (optional `[rapids]` extra).
+- **GAMA 1-D spectra loader**.
+- **`--allow-incomplete-link-id`** — keep catalog rows with missing composite/label link parts (`_source_id` null, `_spectrum_index` -1).
+- **Catalog parallel tuning** — `--files-per-worker`, `--partition-by-dir`, `--streaming-parallel N`, and `--columns` projection on streaming ingest.
+- **Cutout parallel file-list ingest** — `dl-ingest-cutouts-from-list --n-workers N`.
+- **Validation `--all`** — run validate commands across every survey in the lake.
+- **Parallel validate/rebuild** — `--n-workers` on `dl-rebuild-catalog-indices` and `dl-validate-catalog-spectra-link`.
+- **Benchmark harness** — `python -m data_lake.bench` for ingest/lookup/crossmatch timing records.
+- **`dl-describe-lake`** — `--modality`, summary row counts; richer `dl-describe-survey` metadata.
+- **Package version** — `data_lake.__version__` and `--version` on describe commands.
+
+### Performance
+
+- Bulk HEALPix tile index lookup for spectra/cutout `get_batch()` (replaces per-ID tile resolution hot loops).
+- Contiguous Zarr slice reads in spectrum and cutout tile stores.
+- FITS reader and memmap policy optimizations.
+- Crossmatch `--tiles-per-worker` batching and cached catalog ID column resolution.
+- Vectorized spPlate ingest; parallel catalog/spectrum file-list decode improvements.
+
+### Fixed
+
+- **`--streaming-parallel` schema mismatch** on finalize (resume/append could fail or produce wrong schema).
+- Catalog streaming logic and `--streaming` option handling.
+- Index rebuild bug in `dl-rebuild-catalog-indices`.
+- Validation failures on null link IDs.
+- Survey ID resolution for 2dF, 6dF, and WiggleZ.
+- spPlate parallel ingest length-mismatch errors.
+- Spectrum tile Npix size validation edge cases.
+
+### Changed
+
+- **Stricter ingest validation** — `--link-id-col` required; invalid RA/Dec rows abort before HEALPix assignment.
+- **Decoupled catalog vs spectrum HEALPix order** — linkage uses `_source_id`; catalog tiles store modality-specific pixel indices.
+
+### Documentation
+
+- Refactored `docs/` tree (ingest, discovery, performance, troubleshooting, MCP).
+- Pre-ingest FITS check workflow (`dl-check-fits-table-format`) in catalog and batch guides.
+- Performance tuning guide and colfits / row-count troubleshooting notes.
+
+## [0.2.0] - 2026-05-31
+
+### Changed
+
+- **Breaking:** Renamed `--source-id-col` to `--link-id-col`; dropped legacy join-column migration paths.
+- Require `_source_id` on all catalog tiles; simplified ingest and repair APIs.
+
+## [0.1.0] - Initial release
+
+- Multi-survey catalog (Parquet/HATS), cutout, and 1-D spectrum (Zarr v3) ingest.
+- Lake registry, crossmatch, validation, and export tooling.
+
+[0.3.0]: https://github.com/SFotopoulou/data_lake/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/SFotopoulou/data_lake/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/SFotopoulou/data_lake/releases/tag/v0.1.0
