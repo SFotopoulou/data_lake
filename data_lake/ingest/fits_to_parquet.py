@@ -376,11 +376,25 @@ def cast_object_id_column_to_int64(column: pa.Array | pa.ChunkedArray) -> pa.Arr
 
 
 def match_schema_column(requested: str, schema_names: Sequence[str]) -> str | None:
-    """Return the exact Parquet/FITS column name matching *requested* (case-insensitive)."""
+    """Return the on-disk column name matching *requested*.
+
+    Tries exact match, case-insensitive match, then leading/trailing whitespace
+    tolerance (common when FITS TTYPE names are padded, e.g. ``' ra'``).
+    """
     if requested in schema_names:
         return requested
     by_upper = {n.upper(): n for n in schema_names}
-    return by_upper.get(requested.upper())
+    hit = by_upper.get(requested.upper())
+    if hit is not None:
+        return hit
+    req_norm = requested.strip()
+    if not req_norm:
+        return None
+    for n in schema_names:
+        if n.strip() == req_norm:
+            return n
+    by_strip_upper = {n.strip().upper(): n for n in schema_names}
+    return by_strip_upper.get(req_norm.upper())
 
 
 def composite_link_label(*parts: object, sep: str = "|") -> str:
@@ -1099,12 +1113,9 @@ def is_catalog_fits_path(path: Path | str) -> bool:
 
 
 def resolve_catalog_column_name(available: Sequence[str], requested: str) -> str:
-    """Match catalog column name exactly or case-insensitively."""
+    """Match catalog column name (exact, case-insensitive, or strip-tolerant)."""
     names = list(available)
-    if requested in names:
-        return requested
-    by_upper = {n.upper(): n for n in names}
-    hit = by_upper.get(requested.upper())
+    hit = match_schema_column(requested, names)
     if hit is not None:
         return hit
     preview = ", ".join(names[:12])
@@ -1305,6 +1316,9 @@ def _add_healpix_columns(
     norder: int,
 ) -> pa.Table:
     """Append ``_healpix_order<N>`` and ``_cutout_index`` placeholder columns."""
+    schema_names = list(table.schema.names)
+    ra_col = resolve_catalog_column_name(schema_names, ra_col)
+    dec_col = resolve_catalog_column_name(schema_names, dec_col)
 
     def _sky_to_float64(col_name: str) -> np.ndarray:
         col = table.column(col_name).combine_chunks()
@@ -1366,13 +1380,15 @@ def _filter_table_columns(
     if link_id_col:
         required.add(link_id_col)
     required.add(LAKE_JOIN_ID_COLUMN)
+    schema_names = list(table.schema.names)
     keep: list[str] = []
     seen: set[str] = set()
     for name in list(columns) + sorted(required):
-        if name in table.schema.names and name not in seen:
-            keep.append(name)
-            seen.add(name)
-    missing = required - seen
+        actual = match_schema_column(name, schema_names)
+        if actual is not None and actual not in seen:
+            keep.append(actual)
+            seen.add(actual)
+    missing = {req for req in required if match_schema_column(req, schema_names) is None}
     if missing:
         raise KeyError(
             f"Required column(s) missing after column filter: {sorted(missing)}. "
@@ -1402,9 +1418,10 @@ def _streaming_fits_read_columns(
     read = []
     seen: set[str] = set()
     for name in list(columns) + sorted(required):
-        if name in col_names and name not in seen:
-            read.append(name)
-            seen.add(name)
+        actual = match_schema_column(name, col_names)
+        if actual is not None and actual not in seen:
+            read.append(actual)
+            seen.add(actual)
     return read
 
 
@@ -2364,16 +2381,18 @@ def _ingest_catalog_streaming(
             n_rows, len(col_names),
         )
 
-        for required in (ra_col, dec_col):
-            if required not in col_names:
-                raise KeyError(
-                    f"Required column {required!r} not in FITS BINTABLE.  "
-                    f"Available columns: {col_names[:20]}"
-                    f"{'…' if len(col_names) > 20 else ''}"
-                )
+        try:
+            ra_name = resolve_catalog_column_name(col_names, ra_col)
+            dec_name = resolve_catalog_column_name(col_names, dec_col)
+        except KeyError as exc:
+            raise KeyError(
+                f"Required sky column not in FITS BINTABLE ({exc}).  "
+                f"Available columns: {col_names[:20]}"
+                f"{'…' if len(col_names) > 20 else ''}"
+            ) from exc
 
-        ra = np.ascontiguousarray(np.asarray(data[ra_col], dtype=np.float64))
-        dec = np.ascontiguousarray(np.asarray(data[dec_col], dtype=np.float64))
+        ra = np.ascontiguousarray(np.asarray(data[ra_name], dtype=np.float64))
+        dec = np.ascontiguousarray(np.asarray(data[dec_name], dtype=np.float64))
 
         if not link_id_col:
             raise ValueError(
