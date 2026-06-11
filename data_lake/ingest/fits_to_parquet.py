@@ -1661,6 +1661,7 @@ def reconcile_catalog_column_names(
     *,
     parquet_options: CatalogParquetOptions | None = None,
     check_only: bool = False,
+    show_progress: bool = False,
 ) -> int:
     """Strip leading/trailing whitespace from column names in every tile.
 
@@ -1670,19 +1671,42 @@ def reconcile_catalog_column_names(
     """
     catalog_root = Path(catalog_root)
     pq_opts = parquet_options or CatalogParquetOptions()
+    tiles = _iter_valid_parquet_tiles(catalog_root)
+
+    try:
+        from tqdm.auto import tqdm as _tqdm
+        pbar = _tqdm(
+            tiles,
+            total=len(tiles),
+            unit="tile",
+            desc=f"normalize {catalog_root.name}",
+            disable=not show_progress,
+        )
+        tile_iter = pbar
+    except ImportError:
+        pbar = None
+        tile_iter = iter(tiles)
+
     n_affected = 0
-    for tile_path in _iter_valid_parquet_tiles(catalog_root):
-        schema = pq.read_schema(str(tile_path))
-        if all(n == n.strip() for n in schema.names):
-            continue
-        n_affected += 1
-        if check_only:
-            padded = [n for n in schema.names if n != n.strip()]
-            log.info("Would rename %d column(s) in %s: %r", len(padded), tile_path.name, padded)
-            continue
-        table = _read_catalog_tile(tile_path)
-        table = strip_catalog_column_names(table)
-        _write_catalog_parquet_tile(table, tile_path, pq_opts)
+    try:
+        for tile_path in tile_iter:
+            schema = pq.read_schema(str(tile_path))
+            if all(n == n.strip() for n in schema.names):
+                continue
+            n_affected += 1
+            if check_only:
+                padded = [n for n in schema.names if n != n.strip()]
+                log.info("Would rename %d column(s) in %s: %r", len(padded), tile_path.name, padded)
+                continue
+            table = _read_catalog_tile(tile_path)
+            table = strip_catalog_column_names(table)
+            _write_catalog_parquet_tile(table, tile_path, pq_opts)
+            if pbar is not None:
+                pbar.set_postfix(renamed=n_affected, refresh=False)
+    finally:
+        if pbar is not None:
+            pbar.close()
+
     if n_affected and not check_only:
         log.info(
             "Stripped padded column names from %d catalog tile(s) under %s",

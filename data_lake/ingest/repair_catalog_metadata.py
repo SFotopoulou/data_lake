@@ -151,6 +151,7 @@ def repair_catalog_metadata(
     rebuild_link_id: str | None = None,
     allow_incomplete_link_id: bool | None = None,
     normalize_column_names: bool = False,
+    show_progress: bool = False,
 ) -> RepairCatalogMetadataResult:
     """Rebuild metadata sidecars for one ingested catalog from its Parquet tiles."""
     catalog_root = Path(catalog_root)
@@ -164,7 +165,7 @@ def repair_catalog_metadata(
 
     try:
         if normalize_column_names:
-            n_col_renamed = reconcile_catalog_column_names(catalog_root)
+            n_col_renamed = reconcile_catalog_column_names(catalog_root, show_progress=show_progress)
             if n_col_renamed:
                 # After renaming, ra/dec stored in catalog_info.json may now match
                 # the stripped names, so re-read the resolved names from Parquet.
@@ -229,33 +230,56 @@ def repair_catalogs_under_lake(
     rebuild_link_id: str | None = None,
     allow_incomplete_link_id: bool | None = None,
     normalize_column_names: bool = False,
+    show_progress: bool = False,
 ) -> list[RepairCatalogMetadataResult]:
     """Repair metadata for each named survey under ``<lake_root>/catalogs/``."""
     lake_root = Path(lake_root)
     catalogs_root = lake_root / "catalogs"
     results: list[RepairCatalogMetadataResult] = []
-    for name in survey_names:
-        catalog_root = catalogs_root / name
-        if not catalog_root.is_dir():
+
+    # Survey-level progress bar (useful when repairing many surveys with --all)
+    survey_iter: object
+    survey_pbar = None
+    if show_progress and len(survey_names) > 1:
+        try:
+            from tqdm.auto import tqdm as _tqdm
+            survey_pbar = _tqdm(survey_names, unit="survey", desc="repair surveys")
+            survey_iter = survey_pbar
+        except ImportError:
+            survey_iter = survey_names
+    else:
+        survey_iter = survey_names
+
+    try:
+        for name in survey_iter:  # type: ignore[union-attr]
+            if survey_pbar is not None:
+                survey_pbar.set_description(f"repair {name}")
+            catalog_root = catalogs_root / name
+            if not catalog_root.is_dir():
+                results.append(
+                    RepairCatalogMetadataResult(
+                        survey=name,
+                        catalog_root=catalog_root,
+                        ok=False,
+                        error=f"catalog directory not found: {catalog_root}",
+                    )
+                )
+                continue
             results.append(
-                RepairCatalogMetadataResult(
-                    survey=name,
-                    catalog_root=catalog_root,
-                    ok=False,
-                    error=f"catalog directory not found: {catalog_root}",
+                repair_catalog_metadata(
+                    catalog_root,
+                    name,
+                    norder=norder,
+                    rebuild_link_id=rebuild_link_id,
+                    allow_incomplete_link_id=allow_incomplete_link_id,
+                    normalize_column_names=normalize_column_names,
+                    show_progress=show_progress,
                 )
             )
-            continue
-        results.append(
-            repair_catalog_metadata(
-                catalog_root,
-                name,
-                norder=norder,
-                rebuild_link_id=rebuild_link_id,
-                allow_incomplete_link_id=allow_incomplete_link_id,
-                normalize_column_names=normalize_column_names,
-            )
-        )
+    finally:
+        if survey_pbar is not None:
+            survey_pbar.close()
+
     return results
 
 
@@ -510,6 +534,7 @@ try:
             rebuild_link_id=rebuild_link_id,
             allow_incomplete_link_id=allow_incomplete_link_id,
             normalize_column_names=normalize_column_names,
+            show_progress=not quiet,
         )
         n_ok = n_fail = 0
         for res in results:
