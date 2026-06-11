@@ -504,3 +504,50 @@ class TestCrossmatchExport:
             crossmatch_root(lake, "SURVEY_A", "SURVEY_B"),
             tmp_path / "reexport.parquet",
         ) == 1
+
+
+class TestCrossmatchPaddedColumnNames:
+    """Crossmatch must work when survey-B tiles have padded FITS TTYPE column names."""
+
+    def test_crossmatch_with_padded_survey_b(self, tmp_path: Path) -> None:
+        """Survey B written with ' ra' / ' dec' should still match via resolve_column."""
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        # Survey A: clean column names
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+        )
+        # Survey B: padded column names (' ra', ' dec') as produced by some FITS writers
+        tile_dir = lake / "catalogs" / "SURVEY_B" / healpix_dir(norder, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        hp_col = f"_healpix_norder{norder}"
+        padded_tile = pa.table({
+            LAKE_JOIN_ID_COLUMN: pa.array([101], type=pa.int64()),
+            " ra": pa.array([ra + 0.00001], type=pa.float64()),
+            " dec": pa.array([dec + 0.00001], type=pa.float64()),
+            hp_col: pa.array([npix], type=pa.int64()),
+            "_cutout_index": pa.array([-1], type=pa.int64()),
+            "_spectrum_index": pa.array([-1], type=pa.int64()),
+        })
+        pq.write_table(padded_tile, tile_dir / f"Npix={npix}.parquet")
+        (lake / "catalogs" / "SURVEY_B" / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": norder,
+                "ra_column": "ra",   # logical name (stripped) in catalog_info
+                "dec_column": "dec",
+                "link_id_mode": "sequential",
+                "link_id_column": LAKE_JOIN_ID_COLUMN,
+                "total_rows": 1,
+                "total_columns": len(padded_tile.schema),
+            })
+        )
+
+        result = build_crossmatch(
+            lake, "SURVEY_A", "SURVEY_B",
+            radius_arcsec=10.0,
+        )
+        assert result.n_match_rows >= 1

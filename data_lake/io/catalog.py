@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 from data_lake.ingest.fits_to_parquet import (
     catalog_tile_schema_names,
     healpix_dir,
+    match_schema_column,
     resolve_redshift_column,
     resolve_link_id_column,
 )
@@ -159,6 +160,21 @@ class CatalogAccessor:
     def columns(self) -> list[str]:
         return self.schema.names
 
+    def resolve_column(self, requested: str) -> str:
+        """Return the on-disk column name matching *requested*.
+
+        Handles exact match, case-insensitive match, and leading/trailing
+        whitespace tolerance (common when FITS TTYPE names are padded, e.g.
+        ``' dec'``).  Raises ``KeyError`` if no match is found.
+        """
+        hit = match_schema_column(requested, self.columns)
+        if hit is not None:
+            return hit
+        raise KeyError(
+            f"Column {requested!r} not found in survey {self.survey_name!r}. "
+            f"Available: {self.columns[:20]}"
+        )
+
     # ------------------------------------------------------------------
     # SQL query
     # ------------------------------------------------------------------
@@ -283,22 +299,32 @@ class CatalogAccessor:
         if not paths:
             return self._empty_result(fmt, columns)
 
-        col_expr = ", ".join(_quote_sql_ident(c) for c in columns) if columns else "*"
+        if columns:
+            resolved_cols = [self.resolve_column(c) for c in columns]
+            # Alias on-disk name back to the requested (logical) name when they differ,
+            # so callers always receive columns with the names they passed in.
+            col_expr = ", ".join(
+                _quote_sql_ident(on_disk) if on_disk == req else
+                f"{_quote_sql_ident(on_disk)} AS {_quote_sql_ident(req)}"
+                for on_disk, req in zip(resolved_cols, columns)
+            )
+        else:
+            resolved_cols = None
+            col_expr = "*"
         escaped = ", ".join("'" + str(p).replace("'", "''") + "'" for p in paths)
         sql = f"SELECT {col_expr} FROM read_parquet([{escaped}])"
 
         filters: list[str] = []
-        if dec_min is not None:
-            dec_name = dec_col or self._info.get("dec_column", "dec")
-            dec_sql = _quote_sql_ident(dec_name)
-            filters.append(f"{dec_sql} >= {dec_min}")
-        if dec_max is not None:
-            dec_name = dec_col or self._info.get("dec_column", "dec")
-            dec_sql = _quote_sql_ident(dec_name)
-            filters.append(f"{dec_sql} <= {dec_max}")
+        if dec_min is not None or dec_max is not None:
+            _dec_logical = dec_col or self._info.get("dec_column", "dec")
+            dec_sql = _quote_sql_ident(self.resolve_column(_dec_logical))
+            if dec_min is not None:
+                filters.append(f"{dec_sql} >= {dec_min}")
+            if dec_max is not None:
+                filters.append(f"{dec_sql} <= {dec_max}")
         if ra_min is not None and ra_max is not None:
-            ra_name = ra_col or self._info.get("ra_column", "ra")
-            ra_sql = _quote_sql_ident(ra_name)
+            _ra_logical = ra_col or self._info.get("ra_column", "ra")
+            ra_sql = _quote_sql_ident(self.resolve_column(_ra_logical))
             if ra_min <= ra_max:
                 filters.append(f"{ra_sql} >= {ra_min} AND {ra_sql} <= {ra_max}")
             else:
@@ -334,8 +360,10 @@ class CatalogAccessor:
         Uses a fast HEALPix tile pre-filter plus a per-row angular separation
         check via DuckDB's haversine-equivalent SQL.
         """
-        ra_name = ra_col or self._info.get("ra_column", "ra")
-        dec_name = dec_col or self._info.get("dec_column", "dec")
+        _ra_logical = ra_col or self._info.get("ra_column", "ra")
+        _dec_logical = dec_col or self._info.get("dec_column", "dec")
+        ra_name = self.resolve_column(_ra_logical)
+        dec_name = self.resolve_column(_dec_logical)
         ra_sql = _quote_sql_ident(ra_name)
         dec_sql = _quote_sql_ident(dec_name)
 

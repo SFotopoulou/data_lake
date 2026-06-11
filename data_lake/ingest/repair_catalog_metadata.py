@@ -21,7 +21,9 @@ from data_lake.ingest.fits_to_parquet import (
     LAKE_JOIN_ID_COLUMN,
     _iter_valid_parquet_tiles,
     finalize_catalog_survey,
+    has_padded_column_names,
     rebuild_parquet_tile_link_id,
+    reconcile_catalog_column_names,
     resolve_link_id_column,
 )
 from data_lake.lake_registry import iter_catalog_surveys
@@ -43,6 +45,7 @@ class RepairCatalogMetadataResult:
     link_id_mode_after: str | None = None
     total_rows: int | None = None
     parquet_tiles_rebuilt: int = 0
+    tiles_column_renamed: int = 0
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,7 @@ def repair_catalog_metadata(
     dec_col: str | None = None,
     rebuild_link_id: str | None = None,
     allow_incomplete_link_id: bool | None = None,
+    normalize_column_names: bool = False,
 ) -> RepairCatalogMetadataResult:
     """Rebuild metadata sidecars for one ingested catalog from its Parquet tiles."""
     catalog_root = Path(catalog_root)
@@ -155,9 +159,17 @@ def repair_catalog_metadata(
     ra = ra_col or str(before.get("ra_column", "ra"))
     dec = dec_col or str(before.get("dec_column", "dec"))
     n_rebuilt = 0
+    n_col_renamed = 0
     rebuilt_mode: str | None = None
 
     try:
+        if normalize_column_names:
+            n_col_renamed = reconcile_catalog_column_names(catalog_root)
+            if n_col_renamed:
+                # After renaming, ra/dec stored in catalog_info.json may now match
+                # the stripped names, so re-read the resolved names from Parquet.
+                ra = ra.strip()
+                dec = dec.strip()
         if rebuild_link_id:
             n_rebuilt, rebuilt_mode = rebuild_catalog_link_ids(
                 catalog_root,
@@ -205,6 +217,7 @@ def repair_catalog_metadata(
         link_id_mode_after=after.get("link_id_mode"),
         total_rows=after.get("total_rows"),
         parquet_tiles_rebuilt=n_rebuilt,
+        tiles_column_renamed=n_col_renamed,
     )
 
 
@@ -215,6 +228,7 @@ def repair_catalogs_under_lake(
     norder: int | None = None,
     rebuild_link_id: str | None = None,
     allow_incomplete_link_id: bool | None = None,
+    normalize_column_names: bool = False,
 ) -> list[RepairCatalogMetadataResult]:
     """Repair metadata for each named survey under ``<lake_root>/catalogs/``."""
     lake_root = Path(lake_root)
@@ -239,6 +253,7 @@ def repair_catalogs_under_lake(
                 norder=norder,
                 rebuild_link_id=rebuild_link_id,
                 allow_incomplete_link_id=allow_incomplete_link_id,
+                normalize_column_names=normalize_column_names,
             )
         )
     return results
@@ -374,6 +389,23 @@ try:
     )
     @click.option("--spectra", "check_spectra", is_flag=True, help="With --check-only, include spectra Zarr tiles.")
     @click.option("--cutouts", "check_cutouts", is_flag=True, help="With --check-only, include cutout Zarr tiles.")
+    @click.option(
+        "--normalize-column-names",
+        is_flag=True,
+        help=(
+            "Strip leading/trailing whitespace from every Parquet column name. "
+            "Fixes FITS TTYPE padding (e.g. ' dec' → 'dec') so DuckDB queries and "
+            "crossmatch work without re-ingesting."
+        ),
+    )
+    @click.option(
+        "--check-padded-columns",
+        is_flag=True,
+        help=(
+            "Report any padded column names (name != name.strip()) without rewriting tiles. "
+            "Implies --check-only behaviour for column names."
+        ),
+    )
     @logging_options
     def cli(
         output_root: Path | None,
@@ -386,6 +418,8 @@ try:
         allow_incomplete_link_id: bool | None,
         check_spectra: bool,
         check_cutouts: bool,
+        normalize_column_names: bool,
+        check_padded_columns: bool,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -399,6 +433,8 @@ try:
             dl-repair-catalog-metadata /data/lake --survey ultraVISTA_DR6 --check-only
             dl-repair-catalog-metadata /data/lake --survey zCOSMOS_DR3 --rebuild-link-id filename
             dl-repair-catalog-metadata /data/lake --all --check-only --spectra
+            dl-repair-catalog-metadata /data/lake --survey ALLWISE --check-padded-columns
+            dl-repair-catalog-metadata /data/lake --survey ALLWISE --normalize-column-names
         """
         validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
@@ -420,6 +456,23 @@ try:
 
         if not names:
             raise click.ClickException(f"No catalogs found under {lake / 'catalogs'}")
+
+        if check_padded_columns:
+            any_padded = False
+            for name in names:
+                catalog_root = lake / "catalogs" / name
+                padded = has_padded_column_names(catalog_root)
+                if padded:
+                    any_padded = True
+                    click.echo(
+                        f"{name}: {len(padded)} padded column name(s): {padded!r}  "
+                        "→ re-run with --normalize-column-names to fix"
+                    )
+                else:
+                    click.echo(f"{name}: no padded column names")
+            if any_padded:
+                raise SystemExit(1)
+            return
 
         if check_only:
             failed = False
@@ -456,6 +509,7 @@ try:
             norder=norder,
             rebuild_link_id=rebuild_link_id,
             allow_incomplete_link_id=allow_incomplete_link_id,
+            normalize_column_names=normalize_column_names,
         )
         n_ok = n_fail = 0
         for res in results:
@@ -477,6 +531,8 @@ try:
                 )
             if res.parquet_tiles_rebuilt:
                 suffix += f"; {res.parquet_tiles_rebuilt} Parquet tile(s) link-id rebuilt"
+            if res.tiles_column_renamed:
+                suffix += f"; {res.tiles_column_renamed} tile(s) column names normalized"
             rows = res.total_rows
             row_txt = f", {rows:,} rows" if rows is not None else ""
             click.echo(f"{res.survey}: OK → {res.catalog_root}{row_txt}{suffix}")

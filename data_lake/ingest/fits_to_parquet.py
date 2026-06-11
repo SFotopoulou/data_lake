@@ -1007,6 +1007,52 @@ def _astropy_table_to_arrow(tbl: Table) -> pa.Table:
         log.info("Preserved %d multidim column(s) as FixedSizeList: %s",
                  len(multidim_cols), ", ".join(multidim_cols))
 
+    return strip_catalog_column_names(table)
+
+
+def strip_catalog_column_names(table: pa.Table) -> pa.Table:
+    """Strip leading/trailing whitespace from every column name.
+
+    FITS BINTABLE TTYPE keywords are often padded (e.g. ``' dec'``).
+    This normalises names so Parquet column names match the user-facing
+    CLI values stored in ``catalog_info.json``.
+
+    Raises ``ValueError`` when stripping produces duplicate names
+    (e.g. both ``'ra'`` and ``' ra'`` in the same table).
+    """
+    names = table.schema.names
+    if all(n == n.strip() for n in names):
+        return table
+
+    stripped = [n.strip() for n in names]
+    seen: set[str] = set()
+    dups = [s for s in stripped if s in seen or seen.add(s)]  # type: ignore[func-returns-value]
+    if dups:
+        raise ValueError(
+            f"Stripping whitespace from column names produces duplicates: {dups!r}. "
+            "The FITS file has columns whose names differ only by padding."
+        )
+
+    n_renamed = sum(1 for orig, new in zip(names, stripped) if orig != new)
+    if n_renamed:
+        log.debug("Stripped whitespace from %d column name(s): %s",
+                  n_renamed,
+                  [orig for orig, new in zip(names, stripped) if orig != new])
+        # Rebuild schema metadata with stripped keys (inner_shapes map)
+        meta = dict(table.schema.metadata or {})
+        inner_key = b"data_lake.inner_shapes"
+        if inner_key in meta:
+            import json as _json
+            shapes = _json.loads(meta[inner_key])
+            meta[inner_key] = _json.dumps(
+                {n.strip(): v for n, v in shapes.items()}
+            ).encode()
+        new_schema = pa.schema(
+            [field.with_name(field.name.strip()) for field in table.schema],
+            metadata=meta,
+        )
+        table = table.rename_columns(stripped).replace_schema_metadata(meta)
+        _ = new_schema  # schema built for metadata; rename_columns already applied names
     return table
 
 
@@ -1095,7 +1141,7 @@ def _read_packed_vector_fits(path: Path, *, hdu_index: int) -> Table:
     with fitsio.FITS(str(path)) as fits:
         hdu = fits[hdu_index]
         for name in hdu.get_colnames():
-            cols[name] = _squeeze_fits_vector_column(hdu[name][:])
+            cols[name.strip()] = _squeeze_fits_vector_column(hdu[name][:])
     n = len(next(iter(cols.values())))
     for name, arr in cols.items():
         if len(arr) != n:
@@ -1598,6 +1644,52 @@ def reconcile_catalog_tile_dtypes(
             catalog_root,
         )
     return n_rewritten
+
+
+def has_padded_column_names(catalog_root: Path | str) -> list[str]:
+    """Return padded column names found in the first valid tile, or empty list."""
+    catalog_root = Path(catalog_root)
+    first = next(iter(_iter_valid_parquet_tiles(catalog_root)), None)
+    if first is None:
+        return []
+    names = pq.read_schema(str(first)).names
+    return [n for n in names if n != n.strip()]
+
+
+def reconcile_catalog_column_names(
+    catalog_root: Path | str,
+    *,
+    parquet_options: CatalogParquetOptions | None = None,
+    check_only: bool = False,
+) -> int:
+    """Strip leading/trailing whitespace from column names in every tile.
+
+    Rewrites each ``Npix=*.parquet`` tile that has any padded column names.
+    Returns the number of tiles rewritten (or, when ``check_only=True``,
+    the number of tiles that *would* be rewritten).
+    """
+    catalog_root = Path(catalog_root)
+    pq_opts = parquet_options or CatalogParquetOptions()
+    n_affected = 0
+    for tile_path in _iter_valid_parquet_tiles(catalog_root):
+        schema = pq.read_schema(str(tile_path))
+        if all(n == n.strip() for n in schema.names):
+            continue
+        n_affected += 1
+        if check_only:
+            padded = [n for n in schema.names if n != n.strip()]
+            log.info("Would rename %d column(s) in %s: %r", len(padded), tile_path.name, padded)
+            continue
+        table = _read_catalog_tile(tile_path)
+        table = strip_catalog_column_names(table)
+        _write_catalog_parquet_tile(table, tile_path, pq_opts)
+    if n_affected and not check_only:
+        log.info(
+            "Stripped padded column names from %d catalog tile(s) under %s",
+            n_affected,
+            catalog_root,
+        )
+    return n_affected
 
 
 def _unified_append_schema(existing: pa.Schema, incoming: pa.Schema) -> pa.Schema:

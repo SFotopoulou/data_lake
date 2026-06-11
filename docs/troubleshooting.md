@@ -7,6 +7,7 @@
 | Registry row counts stale | Registry not refreshed since last ingest | `dl-describe-lake --refresh --count-total` |
 | Batch job killed mid-run, catalog tiles exist but no manifest | `dl-finalize-catalog` not run | `dl-finalize-catalog --survey NAME` then `dl-refresh-lake-registry` |
 | Catalog ingest very slow / tqdm stuck at 0/N | FITS is **packed-vector** (STILTS colfits, `NAXIS2=1`) | Run `dl-check-fits-table-format`; re-export row-normal FITS or Parquet |
+| `Referenced column "dec" not found; Candidate bindings: " dec"` during crossmatch or query | Survey was ingested with padded FITS TTYPE column names before automatic stripping was added | Run `dl-repair-catalog-metadata /data/lake --survey ALLWISE --normalize-column-names` |
 | Row count mismatch (ingest log vs `dl-describe-survey`) | Ingest log sums **input** rows; describe counts **on-disk** after dedup | Compare to pre-check total sources; expect lower counts with `--on-duplicate-id skip` |
 | OOM on catalog batch | `n_workers × largest file` exceeds RAM | Lower `--n-workers`; use `--columns` on wide surveys |
 | `BrokenProcessPool` on catalog batch | Worker OOM | Same — reduce workers; see parallel batch note in README |

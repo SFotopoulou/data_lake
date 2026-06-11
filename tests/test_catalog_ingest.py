@@ -495,6 +495,7 @@ class TestColumnNameResolution:
     def test_match_schema_column_strip_and_case(self) -> None:
         from data_lake.ingest.fits_to_parquet import match_schema_column
 
+        # match_schema_column still resolves padded names (used for query-time compat)
         names = ["designation", " ra", " dec", " source_id"]
         assert match_schema_column("ra", names) == " ra"
         assert match_schema_column("RA", names) == " ra"
@@ -508,7 +509,29 @@ class TestColumnNameResolution:
         with pytest.raises(KeyError, match="not in catalog"):
             resolve_catalog_column_name([" ra", " dec"], "glon")
 
+    def test_strip_catalog_column_names(self) -> None:
+        import pyarrow as pa
+
+        from data_lake.ingest.fits_to_parquet import strip_catalog_column_names
+
+        tbl = pa.table({" ra": [1.0, 2.0], " dec": [-1.0, -2.0], "  z  ": [0.1, 0.2]})
+        out = strip_catalog_column_names(tbl)
+        assert out.schema.names == ["ra", "dec", "z"]
+        # clean names are a no-op
+        clean = pa.table({"ra": [1.0], "dec": [0.0]})
+        assert strip_catalog_column_names(clean) is clean
+
+    def test_strip_catalog_column_names_duplicate_error(self) -> None:
+        import pyarrow as pa
+
+        from data_lake.ingest.fits_to_parquet import strip_catalog_column_names
+
+        tbl = pa.table({" ra": [1.0], "ra": [2.0]})
+        with pytest.raises(ValueError, match="duplicates"):
+            strip_catalog_column_names(tbl)
+
     def test_ingest_padded_fits_column_names(self, tmp_path: Path) -> None:
+        """Ingest strips FITS TTYPE padding so Parquet has clean column names."""
         from data_lake.ingest.fits_to_parquet import ingest_catalog
 
         n = 12
@@ -538,9 +561,13 @@ class TestColumnNameResolution:
         _, mem = _read_merged_catalog(lake / "mem", "padded")
         _, stream = _read_merged_catalog(lake / "stream", "padded")
         assert mem.num_rows == stream.num_rows == n
-        assert " ra" in mem.schema.names
+        # Padding must have been stripped — clean names in Parquet
+        assert "ra" in mem.schema.names
+        assert " ra" not in mem.schema.names
+        assert "dec" in mem.schema.names
+        assert " dec" not in mem.schema.names
         np.testing.assert_array_equal(
-            np.sort(np.asarray(mem.column(" source_id"))),
+            np.sort(np.asarray(mem.column("source_id"))),
             np.arange(1, n + 1, dtype=np.int64),
         )
 

@@ -243,8 +243,26 @@ dl-repair-catalog-metadata /lake --survey 2DFGRS_DR3 \
   --rebuild-link-id SPFILE,FIBRE --allow-incomplete-link-id
 ```
 
-**Whitespace:** leading and trailing spaces are stripped before parsing or
-hashing (common for fixed-width FITS strings). Internal spaces are preserved.
+**Whitespace — cell values:** leading and trailing spaces are stripped from
+link-ID values before parsing or hashing (common for fixed-width FITS strings).
+Internal spaces are preserved.
+
+**Whitespace — column names:** leading and trailing spaces in FITS TTYPE keywords
+(e.g. ``' dec'`` instead of ``'dec'``) are **stripped at ingest** so Parquet
+column names always match the CLI flags you passed (``--ra-col``, ``--dec-col``).
+If you have a survey that was ingested before this normalization, columns like
+``' dec'`` may exist on disk and cause DuckDB query failures (``Referenced column
+"dec" not found; Candidate bindings: " dec"``).
+
+Fix with:
+
+```bash
+# See which columns need normalizing
+dl-repair-catalog-metadata /data/lake --survey ALLWISE --check-padded-columns
+
+# Rewrite tiles in-place and refresh metadata
+dl-repair-catalog-metadata /data/lake --survey ALLWISE --normalize-column-names
+```
 
 **Alphanumeric labels:** the human-readable name stays in your column (e.g.
 ``NAME``). ``_source_id`` holds the deterministic hash (BLAKE2b → 64-bit signed int).
