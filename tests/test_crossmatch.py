@@ -612,6 +612,79 @@ class TestCrossmatchNamingAndReuse:
         # overwrite bypasses the guard
         build_crossmatch(lake, "A", "B", radius_arcsec=1.0, overwrite=True)
 
+    def test_accessor_autodiscovers_single_radius_setup(self, tmp_path: Path) -> None:
+        pass
+
+    def _two_partner_lake(self, tmp_path: Path):
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(lake, "EUCLID", norder=norder, npix=npix,
+                            source_ids=[1], ra=[ra], dec=[dec])
+        _write_catalog_tile(lake, "DESI_DR1", norder=norder, npix=npix,
+                            source_ids=[2], ra=[ra + 0.0001], dec=[dec + 0.0001])
+        _write_catalog_tile(lake, "ALLWISE", norder=norder, npix=npix,
+                            source_ids=[3], ra=[ra + 0.0002], dec=[dec + 0.0002])
+        return lake, ra, dec, npix
+
+    def test_execute_crossmatch_plan(self, tmp_path: Path) -> None:
+        from data_lake.io.crossmatch import execute_crossmatch_plan
+
+        lake, ra, dec, npix = self._two_partner_lake(tmp_path)
+        plan = {
+            "base_catalog": "EUCLID",
+            "partners": [
+                {"survey": "DESI_DR1", "radius_arcsec": 1.0},
+                {"survey": "ALLWISE", "radius_arcsec": 2.0},
+            ],
+        }
+        results = execute_crossmatch_plan(lake, plan)
+        assert len(results) == 2
+        assert crossmatch_root(lake, "EUCLID", "DESI_DR1", 1.0).is_dir()
+        assert crossmatch_root(lake, "EUCLID", "ALLWISE", 2.0).is_dir()
+
+    def test_plan_region_restriction(self, tmp_path: Path) -> None:
+        from data_lake.discovery.region import Region
+        from data_lake.io.crossmatch import execute_crossmatch_plan
+
+        lake, ra, dec, npix = self._two_partner_lake(tmp_path)
+        plan = {"base_catalog": "EUCLID",
+                "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0}]}
+
+        # Region on the opposite side -> no base tiles -> no matches.
+        empty_region = Region.cone(300.0, -45.0, 30.0)
+        results = execute_crossmatch_plan(lake, plan, region=empty_region)
+        assert results[0].n_match_rows == 0
+
+        # Region covering the tile -> matches.
+        good_region = Region.cone(ra, dec, 60.0)
+        results = execute_crossmatch_plan(lake, plan, region=good_region, overwrite=True)
+        assert results[0].n_match_rows == 1
+
+    def test_cli_from_area(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.discovery.areas import make_area, save_area
+        from data_lake.discovery.region import Region
+        from data_lake.io.crossmatch import cli
+
+        lake, ra, dec, npix = self._two_partner_lake(tmp_path)
+        area = make_area(
+            "Field1",
+            Region.cone(ra, dec, 60.0),
+            crossmatch_plan={
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0}],
+            },
+        )
+        save_area(lake, area)
+
+        result = CliRunner().invoke(cli, [str(lake), "--from-area", "Field1"])
+        assert result.exit_code == 0, result.output
+        assert "EUCLID_x_DESI_DR1__r1.0" in result.output
+        assert crossmatch_root(lake, "EUCLID", "DESI_DR1", 1.0).is_dir()
+
     def test_accessor_autodiscovers_single_radius(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         norder = 5

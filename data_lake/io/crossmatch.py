@@ -804,6 +804,7 @@ def build_crossmatch(
     export_parquet: Path | str | None = None,
     export_fits: Path | str | None = None,
     tiles_per_worker: int = 1,
+    restrict_npix: Iterable[int] | None = None,
 ) -> CrossmatchResult:
     """
     Build a precomputed cross-match between two surveys.
@@ -904,6 +905,16 @@ def build_crossmatch(
             survey_b,
             len(tile_npixels),
             norder_a,
+        )
+
+    if restrict_npix is not None:
+        restrict_set = {int(p) for p in restrict_npix}
+        n_before_restrict = len(tile_npixels)
+        tile_npixels = [p for p in tile_npixels if p in restrict_set]
+        log.info(
+            "Region restriction: %d / %d survey-A tile(s) within the requested region",
+            len(tile_npixels),
+            n_before_restrict,
         )
 
     b_populated = set(iter_populated_tile_npixels(catalog_root_b, norder=norder_b))
@@ -1175,6 +1186,113 @@ def _write_xm_info(
 
 
 # ---------------------------------------------------------------------------
+# Crossmatch plan execution
+# ---------------------------------------------------------------------------
+
+
+def _base_catalog_norder(lake_root: Path, survey: str) -> int:
+    info_path = Path(lake_root) / "catalogs" / survey / "catalog_info.json"
+    if info_path.is_file():
+        try:
+            with open(info_path) as fh:
+                return int(json.load(fh).get("hats_order", 5))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return 5
+
+
+def execute_crossmatch_plan(
+    lake_root: Path | str,
+    plan: dict,
+    *,
+    region: "object | None" = None,
+    overwrite: bool = False,
+    n_workers: int = 1,
+    tiles_per_worker: int = 1,
+    match_backend: MatchBackend = "astropy",
+    gpu_id: int = 0,
+    show_progress: bool = False,
+) -> list[CrossmatchResult]:
+    """Execute a crossmatch plan (base catalog x N partners), optionally region-bounded.
+
+    The plan mirrors the ``crossmatch_plan`` block of an area::
+
+        {"base_catalog": "EUCLID",
+         "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0}, ...],
+         "reuse_existing": true}
+
+    Existing trees are gap-filled (resume) unless ``overwrite``; when
+    ``reuse_existing`` is true and a tree is already complete, no tiles are
+    recomputed (resume skips written tiles). A ``region`` (a
+    :class:`data_lake.discovery.region.Region`) restricts survey-A tiles to the
+    region resolved at the base catalog order.
+    """
+    lake_root = Path(lake_root)
+    base = plan.get("base_catalog")
+    if not base:
+        raise ValueError("crossmatch_plan missing 'base_catalog'")
+    partners = plan.get("partners") or []
+    if not partners:
+        raise ValueError("crossmatch_plan has no 'partners'")
+
+    restrict_npix: set[int] | None = None
+    if region is not None:
+        base_norder = _base_catalog_norder(lake_root, base)
+        restrict_npix = region.to_npix(base_norder)  # type: ignore[attr-defined]
+
+    results: list[CrossmatchResult] = []
+    for partner in partners:
+        survey_b = partner.get("survey")
+        if not survey_b:
+            raise ValueError("crossmatch_plan partner missing 'survey'")
+        radius = partner.get("radius_arcsec")
+        if radius is None:
+            raise ValueError(
+                f"crossmatch_plan partner {survey_b!r} missing 'radius_arcsec'"
+            )
+        result = build_crossmatch(
+            lake_root,
+            base,
+            survey_b,
+            radius_arcsec=float(radius),
+            overwrite=overwrite,
+            n_workers=n_workers,
+            tiles_per_worker=tiles_per_worker,
+            match_backend=match_backend,
+            gpu_id=gpu_id,
+            show_progress=show_progress,
+            restrict_npix=restrict_npix,
+        )
+        results.append(result)
+    return results
+
+
+def load_crossmatch_plan(
+    lake_root: Path | str,
+    *,
+    from_area: str | None = None,
+    plan_file: Path | str | None = None,
+) -> tuple[dict, "object | None"]:
+    """Load a crossmatch plan from an area or a JSON file.
+
+    Returns ``(plan_dict, region_or_None)``. The region is only present for an
+    area source (used to bound the matched tiles).
+    """
+    if (from_area is None) == (plan_file is None):
+        raise ValueError("provide exactly one of from_area or plan_file")
+    if from_area is not None:
+        from data_lake.discovery.areas import load_area
+
+        area = load_area(lake_root, from_area)
+        plan = area.crossmatch_plan
+        if plan is None:
+            raise ValueError(f"area {from_area!r} has no 'crossmatch_plan' block")
+        return plan, area.region
+    with open(plan_file) as fh:  # type: ignore[arg-type]
+        return json.load(fh), None
+
+
+# ---------------------------------------------------------------------------
 # Accessor
 # ---------------------------------------------------------------------------
 
@@ -1281,10 +1399,22 @@ try:
     )
 
     @click.command("dl-crossmatch")
-    @click.argument("survey_a")
-    @click.argument("survey_b")
+    @click.argument("survey_a", required=False)
+    @click.argument("survey_b", required=False)
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @click.option(
+        "--from-area",
+        default=None,
+        help="Run the area's crossmatch_plan (base x partners), region-bounded.",
+    )
+    @click.option(
+        "--plan",
+        "plan_file",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="Run a crossmatch plan from a JSON file (no region restriction).",
+    )
     @click.option(
         "--radius-arcsec",
         default=1.0,
@@ -1353,10 +1483,12 @@ try:
     )
     @logging_options
     def cli(
-        survey_a: str,
-        survey_b: str,
+        survey_a: str | None,
+        survey_b: str | None,
         output_root: Path | None,
         config_path: Path | None,
+        from_area: str | None,
+        plan_file: Path | None,
         radius_arcsec: float,
         norder_a: int | None,
         norder_b: int | None,
@@ -1389,19 +1521,62 @@ try:
                                     config_level=cfg.ingest.log_level if cfg else None),
             quiet=quiet,
         )
-        lake = require_output_root(output_root, cfg, kind="catalogs")
-
-        for name, label in ((survey_a, "survey A"), (survey_b, "survey B")):
-            cat_root = lake / "catalogs" / name
-            if not cat_root.is_dir():
-                raise click.ClickException(f"{label} catalog not found: {cat_root}")
-
         if n_workers < 1:
             raise click.ClickException("--n-workers must be >= 1")
         if tiles_per_worker < 1:
             raise click.ClickException("--tiles-per-worker must be >= 1")
         if gpu_id < 0:
             raise click.ClickException("--gpu-id must be >= 0")
+
+        # ---- plan mode: dl-crossmatch [LAKE] --from-area AREA | --plan FILE ----
+        if from_area is not None or plan_file is not None:
+            if from_area is not None and plan_file is not None:
+                raise click.ClickException("Use only one of --from-area or --plan.")
+            # In plan mode the positional args are not survey names; the first
+            # positional (if any) is the lake root.
+            plan_output_root = output_root
+            if plan_output_root is None and survey_a is not None and survey_b is None:
+                plan_output_root = Path(survey_a)
+            lake = require_output_root(plan_output_root, cfg, kind="catalogs")
+            try:
+                plan, region = load_crossmatch_plan(
+                    lake, from_area=from_area, plan_file=plan_file
+                )
+                results = execute_crossmatch_plan(
+                    lake,
+                    plan,
+                    region=region,
+                    overwrite=overwrite,
+                    n_workers=n_workers,
+                    tiles_per_worker=tiles_per_worker,
+                    match_backend=match_backend,  # type: ignore[arg-type]
+                    gpu_id=gpu_id,
+                    show_progress=show_progress,
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                raise click.ClickException(str(exc))
+            total_rows = sum(r.n_match_rows for r in results)
+            click.echo(
+                f"Crossmatch plan: {len(results)} partner tree(s), "
+                f"{total_rows:,} total match row(s)"
+            )
+            for r in results:
+                click.echo(
+                    f"  {r.crossmatch_name}: {r.n_match_rows:,} row(s) in "
+                    f"{r.n_tiles_written:,} tile(s) → {r.output_root}"
+                )
+            return
+
+        if not survey_a or not survey_b:
+            raise click.ClickException(
+                "SURVEY_A and SURVEY_B are required (or use --from-area / --plan)."
+            )
+        lake = require_output_root(output_root, cfg, kind="catalogs")
+
+        for name, label in ((survey_a, "survey A"), (survey_b, "survey B")):
+            cat_root = lake / "catalogs" / name
+            if not cat_root.is_dir():
+                raise click.ClickException(f"{label} catalog not found: {cat_root}")
 
         result = build_crossmatch(
             lake,
