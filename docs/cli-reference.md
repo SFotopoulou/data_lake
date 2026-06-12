@@ -13,7 +13,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 
 | Command | Purpose |
 |---------|---------|
-| `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet |
+| `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet; `--defer-finalize`/`--lifecycle live` for incremental live surveys |
 | `dl-ingest-catalog-batch` | Parallel decode, single-thread writer (large file lists) |
 | `dl-ingest-catalog-from-list` | Sequential (default) or parallel catalog file-list ingest |
 | `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |
@@ -62,12 +62,14 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 
 | Command | Purpose |
 |---------|---------|
-| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--refresh`, `--verbose`, `--pair-surveys` |
+| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--kind ingested\|product\|crossmatch`, `--areas`, `--refresh`, `--verbose`, `--pair-surveys` |
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
-| `dl-refresh-lake-registry` | Scan lake and write `shared/registry/surveys.parquet` |
+| `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |
+| `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area ([docs](discovery/regions-and-areas.md)) |
+| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
 | `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
-| `dl-crossmatch` | Positional catalog↔catalog match at lake scale (`--match-backend astropy\|rapids`, `--gpu-id`) |
+| `dl-crossmatch` | Positional catalog↔catalog match at lake scale; `--from-area`/`--plan` for region-bounded plans (`--match-backend astropy\|rapids`, `--gpu-id`) |
 | `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |
 
 **Agents (MCP)**
