@@ -340,6 +340,118 @@ def _write_product_info(
         json.dump(info, fh, indent=2)
 
 
+def _product_source_ids(lake_root: Path, product: str) -> list[int]:
+    with CatalogAccessor(lake_root, product) as acc:
+        tbl = acc.query(
+            f"SELECT DISTINCT {LAKE_JOIN_ID_COLUMN} FROM catalog", fmt="arrow"
+        )
+    if tbl.num_rows == 0:
+        return []
+    return [int(v) for v in tbl.column(LAKE_JOIN_ID_COLUMN).to_pylist() if v is not None]
+
+
+def _extract_cutouts_to_fits(
+    lake_root: Path,
+    survey: str,
+    source_ids: Sequence[int],
+    out_dir: Path,
+    *,
+    missing: str = "skip",
+) -> dict[str, Any]:
+    from astropy.io import fits
+
+    from data_lake.io.cutouts import CutoutAccessor
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    acc = CutoutAccessor(lake_root, survey)
+    written = 0
+    missing_ids: list[int] = []
+    for sid in source_ids:
+        try:
+            image, wcs = acc.get_cutout(int(sid))
+        except (KeyError, FileNotFoundError):
+            missing_ids.append(int(sid))
+            if missing == "error":
+                raise
+            continue
+        header = wcs.to_fits_header() if hasattr(wcs, "to_fits_header") else None
+        fits.PrimaryHDU(data=image, header=header).writeto(
+            out_dir / f"cutout_{sid}.fits", overwrite=True
+        )
+        written += 1
+    return {"survey": survey, "n_written": written, "missing": len(missing_ids)}
+
+
+def extract_modalities_for_product(
+    lake_root: Path | str,
+    product: str,
+    modalities: Sequence[str],
+    output_dir: Path | str,
+    *,
+    survey: str | None = None,
+    missing: str = "skip",
+) -> dict[str, Any]:
+    """Extract non-catalog modalities for a product's sources into a portable bundle.
+
+    The product catalog drives the source-id list (its ``_source_id`` column).
+    Heavy data (spectra/cutouts) is written **outside** the lake under
+    ``output_dir`` and never duplicated in-lake. ``survey`` defaults to the
+    product's base catalog.
+    """
+    lake_root = Path(lake_root)
+    output_dir = Path(output_dir)
+    info_path = lake_root / "catalogs" / product / "catalog_info.json"
+    base_survey = survey
+    if base_survey is None:
+        try:
+            with open(info_path) as fh:
+                base_survey = json.load(fh).get("provenance", {}).get("base_catalog")
+        except (OSError, json.JSONDecodeError):
+            base_survey = None
+    if not base_survey:
+        raise ValueError(
+            "could not determine source survey for modality extraction; pass survey="
+        )
+
+    source_ids = _product_source_ids(lake_root, product)
+    results: dict[str, Any] = {"survey": base_survey, "n_sources": len(source_ids)}
+    if not source_ids:
+        return results
+
+    import numpy as np
+
+    for modality in modalities:
+        if modality == "spectra":
+            from data_lake.io.spectra import SpectrumAccessor
+
+            acc = SpectrumAccessor(lake_root=lake_root, survey_name=base_survey)
+            out = output_dir / f"spectra_{base_survey}.zarr"
+            res = acc.extract_subset(
+                source_ids=np.asarray(source_ids, dtype=np.int64),
+                output=out,
+                fmt="zarr",
+                missing=missing,
+                show_progress=False,
+                overwrite=True,
+            )
+            results["spectra"] = {
+                "output": str(res.get("output", out)),
+                "n_written": res.get("n_written"),
+            }
+        elif modality == "cutout":
+            res = _extract_cutouts_to_fits(
+                lake_root,
+                base_survey,
+                source_ids,
+                output_dir / f"cutouts_{base_survey}",
+                missing=missing,
+            )
+            results["cutout"] = res
+        else:
+            raise ValueError(f"cannot extract modality {modality!r}; expected spectra|cutout")
+    return results
+
+
 def partners_from_columns(
     columns: dict[str, list[str]],
     radii: dict[str, float],

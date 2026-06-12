@@ -141,6 +141,12 @@ try:
     @click.option("--norder", "npix_norder", type=int, default=None, help="Order for --npix.")
     @click.option("--overwrite", is_flag=True, help="Overwrite an existing product catalog.")
     @click.option("--progress", "show_progress", is_flag=True, help="Show tile progress bar.")
+    @click.option("--extract-modalities", "extract_modalities", default=None,
+                  help="Comma list (spectra,cutout) to export for product sources.")
+    @click.option("--output-dir", "extract_output_dir", type=click.Path(path_type=Path),
+                  default=None, help="Destination dir for --extract-modalities (outside the lake).")
+    @click.option("--extract-survey", "extract_survey", default=None,
+                  help="Survey to extract modalities from (default: product base).")
     @logging_options
     def cli(
         output_root: Path | None,
@@ -162,6 +168,9 @@ try:
         npix_norder: int | None,
         overwrite: bool,
         show_progress: bool,
+        extract_modalities: str | None,
+        extract_output_dir: Path | None,
+        extract_survey: str | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -266,6 +275,29 @@ try:
             f"{result.n_tiles_written:,} tile(s) ({result.multiplicity} match) "
             f"→ {result.output_root} ({result.elapsed_s:.1f} s)"
         )
+
+        if extract_modalities:
+            if extract_output_dir is None:
+                raise click.ClickException(
+                    "--extract-modalities requires --output-dir"
+                )
+            mods = [m.strip() for m in extract_modalities.split(",") if m.strip()]
+            from data_lake.discovery.gather import extract_modalities_for_product
+
+            try:
+                ext = extract_modalities_for_product(
+                    lake,
+                    result.product,
+                    mods,
+                    extract_output_dir,
+                    survey=extract_survey,
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                raise click.ClickException(str(exc))
+            click.echo(
+                f"Extracted modalities {mods} for {ext.get('n_sources', 0):,} "
+                f"source(s) → {extract_output_dir}"
+            )
 
 except ImportError:
     cli = None  # type: ignore[misc, assignment]

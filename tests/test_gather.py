@@ -129,6 +129,67 @@ class TestGatherProduct:
                        overwrite=True, **kw)
 
 
+class TestExtractModalities:
+    def test_spectra_extraction_for_product(self, tmp_path: Path) -> None:
+        from test_extract_subset import SOURCES, SURVEY, _ingest_synthetic_lake
+        from data_lake.discovery.gather import extract_modalities_for_product
+
+        lake = tmp_path / "lake"
+        _ingest_synthetic_lake(lake)
+
+        # Hand-build a product catalog whose _source_id references SURVEY sources.
+        norder = 5
+        ids = [s[0] for s in SOURCES[:2]]
+        ras = [s[1] for s in SOURCES[:2]]
+        decs = [s[2] for s in SOURCES[:2]]
+        npix = int(assign_healpix(np.array([ras[0]]), np.array([decs[0]]), norder)[0])
+        tile_dir = lake / "catalogs" / "PROD" / healpix_dir(norder, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        hp_col = f"_healpix_norder{norder}"
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array(ids, type=pa.int64()),
+                hp_col: pa.array([npix] * len(ids), type=pa.int64()),
+            }),
+            tile_dir / f"Npix={npix}.parquet",
+        )
+        (lake / "catalogs" / "PROD" / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": norder,
+                "kind": "product",
+                "link_id_mode": "column:" + LAKE_JOIN_ID_COLUMN,
+                "link_id_column": LAKE_JOIN_ID_COLUMN,
+                "provenance": {"base_catalog": SURVEY},
+            })
+        )
+
+        out = tmp_path / "bundle"
+        res = extract_modalities_for_product(lake, "PROD", ["spectra"], out, survey=SURVEY)
+        assert res["n_sources"] == 2
+        assert (out / f"spectra_{SURVEY}.zarr").exists()
+
+    def test_unknown_modality_raises(self, tmp_path: Path) -> None:
+        from data_lake.discovery.gather import extract_modalities_for_product
+
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "PROD" / healpix_dir(5, 1)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([1], type=pa.int64()),
+                "_healpix_norder5": pa.array([1], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "PROD" / "catalog_info.json").write_text(
+            json.dumps({"hats_order": 5, "kind": "product",
+                        "link_id_column": LAKE_JOIN_ID_COLUMN,
+                        "provenance": {"base_catalog": "X"}})
+        )
+        with pytest.raises(ValueError, match="cannot extract modality"):
+            extract_modalities_for_product(lake, "PROD", ["bogus"], tmp_path / "b", survey="X")
+
+
 class TestGatherCli:
     def test_cli_from_area(self, joined_lake: Path) -> None:
         from click.testing import CliRunner
