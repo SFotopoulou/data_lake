@@ -42,6 +42,7 @@ dev = [
     "napari",
 ]
 mcp = ["mcp>=1.0"]
+moc = ["mocpy>=0.13"]
 rapids = [
     "cuml-cu12>=24.08",
 ]

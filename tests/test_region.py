@@ -94,3 +94,24 @@ class TestParseNpixArg:
     def test_ints_and_ranges(self) -> None:
         assert parse_npix_arg("1,2,3") == [1, 2, 3]
         assert parse_npix_arg("10-12,20") == [10, 11, 12, 20]
+
+
+class TestMocRegion:
+    def test_missing_mocpy_raises_clear_error(self) -> None:
+        pytest.importorskip  # noqa: B018 - ensure pytest is imported
+        try:
+            import mocpy  # noqa: F401
+        except ImportError:
+            region = Region.from_moc(moc_string="3/1-10")
+            with pytest.raises(ImportError, match="mocpy"):
+                region.to_npix(5)
+        else:
+            pytest.skip("mocpy installed; covered by integration tests")
+
+    def test_moc_roundtrip_when_available(self) -> None:
+        mocpy = pytest.importorskip("mocpy")
+        # Build a MOC at order 4 over a few cells; ensure to_npix returns pixels.
+        moc = mocpy.MOC.from_string("4/0-3")
+        region = Region.from_moc(moc_string="4/0-3")
+        npix = region.to_npix(4)
+        assert npix.issuperset({0, 1, 2, 3})

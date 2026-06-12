@@ -2009,8 +2009,18 @@ def _finalize_catalog_writes(
     streaming: bool,
     fallback_n_cols: int,
     allow_incomplete_link_id: bool | None = None,
+    regenerate_metadata: bool = True,
+    lifecycle: str | None = None,
+    finalized: bool = True,
 ) -> None:
-    """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles."""
+    """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles.
+
+    When ``regenerate_metadata`` is False the expensive ``_metadata`` rebuild
+    (reads every tile footer) is skipped — used for deferred-finalize live
+    ingest where finalization happens once at the end via
+    :func:`finalize_catalog_survey`. ``lifecycle`` (e.g. ``"live"``) and
+    ``finalized`` are recorded in ``catalog_info.json``.
+    """
     if link_id_mode is None:
         link_id_mode = "sequential"
     catalog_root.mkdir(parents=True, exist_ok=True)
@@ -2021,14 +2031,15 @@ def _finalize_catalog_writes(
         if tile_paths
         else fallback_n_cols
     )
-    try:
-        _regenerate_metadata_from_all_tiles(catalog_root)
-    except Exception:
-        log.exception(
-            "Could not rebuild catalog _metadata under %s; "
-            "catalog_info and schema_manifest will still be updated",
-            catalog_root,
-        )
+    if regenerate_metadata:
+        try:
+            _regenerate_metadata_from_all_tiles(catalog_root)
+        except Exception:
+            log.exception(
+                "Could not rebuild catalog _metadata under %s; "
+                "catalog_info and schema_manifest will still be updated",
+                catalog_root,
+            )
     native_col: str | None = native_id_column_from_mode(link_id_mode)
     if tile_paths:
         tile_schema = pq.read_schema(str(tile_paths[0])).names
@@ -2086,7 +2097,20 @@ def _finalize_catalog_writes(
             allow_incomplete_link_id=bool(allow_incomplete_link_id),
         )
 
-    if tile_paths:
+    # Record lifecycle / finalized state. ``finalized`` is always written so a
+    # later dl-finalize-catalog flips a deferred (live) catalog back to true.
+    try:
+        with open(info_path) as fh:
+            info = json.load(fh)
+        if lifecycle is not None:
+            info["lifecycle"] = lifecycle
+        info["finalized"] = bool(finalized)
+        with open(info_path, "w") as fh:
+            json.dump(info, fh, indent=2)
+    except (OSError, json.JSONDecodeError):
+        log.warning("Could not record lifecycle/finalized in %s", info_path)
+
+    if tile_paths and regenerate_metadata:
         from data_lake.schema_registry import write_catalog_schema_manifest
 
         write_catalog_schema_manifest(
@@ -2157,6 +2181,8 @@ def ingest_catalog(
     allow_incomplete_link_id: bool = False,
     fits_memmap: str = "auto",
     streaming_parallel: int = 0,
+    defer_finalize: bool = False,
+    lifecycle: str | None = None,
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -2253,6 +2279,8 @@ def ingest_catalog(
                 parquet_options=pq_opts,
                 allow_incomplete_link_id=allow_incomplete_link_id,
                 fits_memmap=fits_memmap,
+                defer_finalize=defer_finalize,
+                lifecycle=lifecycle,
             )
             return
         _ingest_catalog_streaming(
@@ -2269,6 +2297,8 @@ def ingest_catalog(
             parquet_options=pq_opts,
             allow_incomplete_link_id=allow_incomplete_link_id,
             fits_read_policy=fits_read_policy,
+            defer_finalize=defer_finalize,
+            lifecycle=lifecycle,
         )
         return
 
@@ -2335,6 +2365,9 @@ def ingest_catalog(
         streaming=False,
         fallback_n_cols=len(table.schema),
         allow_incomplete_link_id=allow_incomplete_link_id,
+        regenerate_metadata=not defer_finalize,
+        lifecycle=lifecycle,
+        finalized=not defer_finalize,
     )
     log.info("Catalog written to %s", catalog_root)
 
@@ -2419,6 +2452,8 @@ def _ingest_catalog_streaming(
     row_end: int | None = None,
     catalog_root_override: Path | None = None,
     skip_finalize: bool = False,
+    defer_finalize: bool = False,
+    lifecycle: str | None = None,
 ) -> str | None:
     """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
     the full catalog as a PyArrow Table in RAM.
@@ -2642,6 +2677,9 @@ def _ingest_catalog_streaming(
                 streaming=True,
                 fallback_n_cols=len(tile_schema),
                 allow_incomplete_link_id=allow_incomplete_link_id,
+                regenerate_metadata=not defer_finalize,
+                lifecycle=lifecycle,
+                finalized=not defer_finalize,
             )
         if not skip_finalize:
             log.info("Catalog written to %s", catalog_root)
@@ -2746,6 +2784,8 @@ def _ingest_catalog_streaming_parallel(
     parquet_options: CatalogParquetOptions,
     allow_incomplete_link_id: bool,
     fits_memmap: str = "auto",
+    defer_finalize: bool = False,
+    lifecycle: str | None = None,
 ) -> None:
     """Parallel row-range shards of streaming FITS catalog ingest."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -2836,6 +2876,9 @@ def _ingest_catalog_streaming_parallel(
         streaming=True,
         fallback_n_cols=0,
         allow_incomplete_link_id=allow_incomplete_link_id,
+        regenerate_metadata=not defer_finalize,
+        lifecycle=lifecycle,
+        finalized=not defer_finalize,
     )
     log.info("Parallel streaming catalog written to %s", catalog_root)
 
@@ -3020,6 +3063,20 @@ try:
         help="ZSTD level for catalog tiles (default 3; ignored if --compact).",
     )
     @click.option(
+        "--defer-finalize",
+        is_flag=True,
+        help="Skip the per-ingest _metadata rebuild (the O(all tiles) step). "
+             "Records lifecycle=live and finalized=false. Run dl-finalize-catalog "
+             "once after the last tile-by-tile append. Ideal for live surveys.",
+    )
+    @click.option(
+        "--lifecycle",
+        type=click.Choice(["static", "live"], case_sensitive=False),
+        default=None,
+        help="Dataset lifecycle recorded in catalog_info.json (default: static; "
+             "--defer-finalize implies live).",
+    )
+    @click.option(
         "--log-file",
         "log_file",
         type=click.Path(path_type=Path),
@@ -3046,6 +3103,8 @@ try:
         columns: str | None,
         compact: bool,
         compression_level: int | None,
+        defer_finalize: bool,
+        lifecycle: str | None,
         log_file: Path | None,
         quiet: bool,
         verbose: bool,
@@ -3107,6 +3166,11 @@ try:
             parquet_options=pq_opts,
             compact=compact,
             fits_memmap=fits_memmap.lower(),
+            defer_finalize=defer_finalize,
+            lifecycle=(
+                "live" if (defer_finalize and lifecycle is None)
+                else (lifecycle.lower() if lifecycle else None)
+            ),
         )
 
     @click.command("dl-finalize-catalog")
