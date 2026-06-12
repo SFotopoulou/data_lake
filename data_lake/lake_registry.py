@@ -18,8 +18,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_lake.schema_registry import (
+    CATALOG_KIND_INGESTED,
     MANIFEST_FILENAME,
     MODALITY_CATALOG,
+    MODALITY_CROSSMATCH,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
     SPECTRUM_SKY_META_FIELDS,
@@ -445,6 +447,8 @@ def _catalog_registry_row(
     row: dict[str, Any] = {
         "survey": survey,
         "modality": MODALITY_CATALOG,
+        "kind": info.get("kind") or CATALOG_KIND_INGESTED,
+        "source_area": info.get("source_area"),
         "path": str(survey_root.relative_to(lake_root)),
         "hats_order": info.get("hats_order"),
         "link_id_column": manifest.get("link_id_column") or info.get("link_id_column"),
@@ -578,6 +582,39 @@ def _info_registry_row(
     return row
 
 
+def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
+    """One row per crossmatch tree under the top-level ``crossmatch/`` modality."""
+    from data_lake.io.crossmatch import find_crossmatch_roots
+
+    rows: list[dict[str, Any]] = []
+    for survey_a, survey_b, radius, root in find_crossmatch_roots(lake_root):
+        info: dict[str, Any] = {}
+        info_path = root / "crossmatch_info.json"
+        if info_path.is_file():
+            try:
+                with open(info_path) as fh:
+                    info = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                info = {}
+        rows.append(
+            {
+                "survey": root.name,
+                "modality": MODALITY_CROSSMATCH,
+                "kind": "crossmatch",
+                "path": str(root.relative_to(lake_root)),
+                "hats_order": info.get("hats_order"),
+                "survey_a": survey_a,
+                "survey_b": survey_b,
+                "match_radius_arcsec": info.get("match_radius_arcsec", radius),
+                "match_backend": info.get("match_backend"),
+                "n_tiles": _count_parquet_tiles(root),
+                "schema_version": info.get("schema_version"),
+                "created_utc": info.get("created_utc"),
+            }
+        )
+    return rows
+
+
 def build_lake_registry_table(lake_root: Path | str) -> pa.Table:
     """Scan the lake and build registry rows for all discovered surveys."""
     lake_root = Path(lake_root)
@@ -596,6 +633,8 @@ def build_lake_registry_table(lake_root: Path | str) -> pa.Table:
         row = _info_registry_row(lake_root, survey, root, MODALITY_CUTOUT, "cutout_info.json")
         if row:
             rows.append(row)
+
+    rows.extend(_crossmatch_registry_rows(lake_root))
 
     if rows:
         generated = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -624,6 +663,19 @@ def refresh_lake_registry(lake_root: Path | str) -> Path:
     table = build_lake_registry_table(lake_root)
     pq.write_table(table, str(out_path), compression="zstd")
     log.info("Wrote lake registry (%d rows) → %s", table.num_rows, out_path)
+
+    # Refresh per-survey/per-modality tile indices so discovery (dl-region)
+    # avoids full-tree rglob.
+    try:
+        from data_lake.discovery.tile_index import refresh_tile_indices
+
+        summary = refresh_tile_indices(lake_root)
+        log.info(
+            "Refreshed tile indices: %s",
+            ", ".join(f"{m}={n}" for m, n in summary.items()),
+        )
+    except Exception as exc:  # never fail registry refresh on index build
+        log.warning("Tile index refresh failed: %s", exc)
     return out_path
 
 
@@ -650,7 +702,12 @@ def filter_lake_registry_table(
     return table.filter(pc.equal(table.column("modality"), modality))
 
 
-_REGISTRY_MODALITY_ORDER = (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT)
+_REGISTRY_MODALITY_ORDER = (
+    MODALITY_CATALOG,
+    MODALITY_SPECTRA,
+    MODALITY_CUTOUT,
+    MODALITY_CROSSMATCH,
+)
 
 
 def summarize_registry_row_counts(table: pa.Table) -> dict[str, Any]:
