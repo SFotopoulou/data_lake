@@ -302,6 +302,44 @@ def test_describe_lake_modality_cli(tmp_path: Path) -> None:
     assert "catalog" in result.output
 
 
+def test_describe_lake_kind_filter_cli(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from data_lake.lake_registry import cli_describe_lake
+
+    _ingest_mini_catalog(tmp_path, "INGESTED_SURV")
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+
+    runner = CliRunner()
+    # The mini catalog is an ingested catalog -> appears under --kind ingested.
+    res_ing = runner.invoke(cli_describe_lake, [str(lake), "--kind", "ingested"])
+    assert res_ing.exit_code == 0
+    assert "INGESTED_SURV" in res_ing.output
+    # No product catalogs exist -> product filter yields none of our survey.
+    res_prod = runner.invoke(cli_describe_lake, [str(lake), "--kind", "product"])
+    assert res_prod.exit_code == 0
+    assert "INGESTED_SURV" not in res_prod.output
+
+
+def test_describe_lake_areas_block_cli(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from data_lake.discovery.areas import make_area, save_area
+    from data_lake.discovery.region import Region
+    from data_lake.lake_registry import cli_describe_lake
+
+    _ingest_mini_catalog(tmp_path, "AREA_SURV")
+    lake = tmp_path / "lake"
+    refresh_lake_registry(lake)
+    save_area(lake, make_area("MyArea", Region.cone(10.0, 20.0, 60.0)))
+
+    result = CliRunner().invoke(cli_describe_lake, [str(lake), "--areas"])
+    assert result.exit_code == 0
+    assert "Areas:" in result.output
+    assert "MyArea" in result.output
+
+
 def test_describe_lake_verbose_and_json_cli(tmp_path: Path) -> None:
     from click.testing import CliRunner
 

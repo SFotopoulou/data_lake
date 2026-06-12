@@ -702,6 +702,45 @@ def filter_lake_registry_table(
     return table.filter(pc.equal(table.column("modality"), modality))
 
 
+def filter_registry_by_kind(table: pa.Table, kind: str | None) -> pa.Table:
+    """Return registry rows whose ``kind`` matches (``ingested``/``product``/...)."""
+    if kind is None:
+        return table
+    if "kind" not in table.schema.names:
+        return table.slice(0, 0)
+    import pyarrow.compute as pc
+
+    col = table.column("kind")
+    return table.filter(pc.equal(col, kind))
+
+
+def format_areas_block(lake_root: Path | str) -> str:
+    """Render the areas/ block for ``dl-describe-lake --areas``."""
+    from data_lake.discovery.areas import iter_areas
+
+    areas = list(iter_areas(lake_root))
+    if not areas:
+        return "Areas: (none)"
+    lines = ["Areas:"]
+    for area in areas:
+        region = area.data.get("region", {})
+        rtype = region.get("type", "?")
+        mods = ",".join(area.discover_modalities)
+        surveys = area.discover_surveys
+        surveys_str = surveys if isinstance(surveys, str) else ",".join(surveys)
+        extras = []
+        if area.crossmatch_plan:
+            extras.append("crossmatch_plan")
+        if area.gather:
+            extras.append("gather")
+        suffix = f"  [{', '.join(extras)}]" if extras else ""
+        lines.append(
+            f"  {area.area_id:<24} region={rtype:<6} surveys={surveys_str} "
+            f"modalities={mods}{suffix}"
+        )
+    return "\n".join(lines)
+
+
 _REGISTRY_MODALITY_ORDER = (
     MODALITY_CATALOG,
     MODALITY_SPECTRA,
@@ -990,8 +1029,22 @@ try:
     @click.option(
         "--modality",
         default=None,
-        type=click.Choice([MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT]),
-        help="Show only catalog, spectra, or cutout rows (default: all).",
+        type=click.Choice(
+            [MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT, MODALITY_CROSSMATCH]
+        ),
+        help="Show only one modality's rows (default: all).",
+    )
+    @click.option(
+        "--kind",
+        default=None,
+        type=click.Choice(["ingested", "product", "crossmatch"]),
+        help="Filter catalogs by kind (e.g. --kind product for derived tables).",
+    )
+    @click.option(
+        "--areas",
+        "show_areas",
+        is_flag=True,
+        help="Append the areas/ block (logical groupings; metadata only).",
     )
     @click.option(
         "--count-total",
@@ -1014,6 +1067,8 @@ try:
         config_path: Path | None,
         refresh: bool,
         modality: str | None,
+        kind: str | None,
+        show_areas: bool,
         count_total: bool,
         as_json: bool,
         verbose: bool,
@@ -1024,6 +1079,7 @@ try:
         if refresh or not registry_path(lake_root).is_file():
             refresh_lake_registry(lake_root)
         table = filter_lake_registry_table(load_lake_registry(lake_root), modality)
+        table = filter_registry_by_kind(table, kind)
         summary = summarize_registry_row_counts(table) if count_total else None
         if as_json:
             payload: dict[str, Any] = {"entries": table.to_pylist()}
@@ -1031,6 +1087,10 @@ try:
                 payload["summary"] = summary
             if pair_surveys:
                 payload["pairing"] = _pairing_summary_from_table(table)
+            if show_areas:
+                from data_lake.discovery.areas import iter_areas
+
+                payload["areas"] = [a.data for a in iter_areas(lake_root)]
             click.echo(json.dumps(payload, indent=2, default=str))
         else:
             click.echo(
@@ -1041,6 +1101,8 @@ try:
                     pair_surveys=pair_surveys,
                 ),
             )
+            if show_areas:
+                click.echo("\n" + format_areas_block(lake_root))
 
     @click.command("dl-describe-master")
     @click.argument("master_parquet", type=click.Path(exists=True, path_type=Path))
