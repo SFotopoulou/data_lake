@@ -114,7 +114,18 @@ def _catalog_tile_for_npix(
     return fallback
 
 
-def _read_id_column_as_int64(col: "pa.Array") -> "tuple[np.ndarray, np.ndarray]":
+def _arrow_to_numpy(arr: "pa.Array | pa.ChunkedArray", dtype: "np.dtype | type") -> np.ndarray:
+    """Convert an Arrow Array or ChunkedArray to a numpy array.
+
+    ``ChunkedArray.to_numpy()`` does not accept ``zero_copy_ok`` in all PyArrow
+    versions, so we normalise to a flat ``Array`` first.
+    """
+    if hasattr(arr, "combine_chunks"):
+        arr = arr.combine_chunks()
+    return np.asarray(arr, dtype=dtype)
+
+
+def _read_id_column_as_int64(col: "pa.Array | pa.ChunkedArray") -> "tuple[np.ndarray, np.ndarray]":
     """Return (ids_int64, valid_mask) for a source-ID column.
 
     Fast path for integer-typed columns (avoids per-element Python calls to
@@ -122,8 +133,8 @@ def _read_id_column_as_int64(col: "pa.Array") -> "tuple[np.ndarray, np.ndarray]"
     string / bytes columns.
     """
     if pa.types.is_integer(col.type):
-        valid_mask: np.ndarray = col.is_valid().to_numpy(zero_copy_ok=False)
-        ids: np.ndarray = col.cast(pa.int64()).fill_null(0).to_numpy(zero_copy_ok=False)
+        valid_mask: np.ndarray = _arrow_to_numpy(col.is_valid(), bool)
+        ids: np.ndarray = _arrow_to_numpy(col.cast(pa.int64()).fill_null(0), np.int64)
         return ids, valid_mask
 
     # Fallback: generic per-element path (string IDs etc.)
@@ -179,7 +190,9 @@ def _patch_catalog_parquet_file(
     if npix_col in schema.names:
         probe_cols.append(npix_col)
 
-    probe = pq.read_table(str(tile_file), columns=probe_cols)
+    # Use ParquetFile (not read_table) so hive-style directory names do not
+    # inject Norder/Dir partition columns into the rewritten tile.
+    probe = pq.ParquetFile(str(tile_file)).read(columns=probe_cols)
 
     warn_if_id_column_unsafe(
         sid_col, probe.schema.field(sid_col).type, context="catalog",
@@ -199,16 +212,16 @@ def _patch_catalog_parquet_file(
     # Compute what the new arrays should look like (still using probe columns).
     n_rows = len(probe)
     if index_col in schema.names:
-        idx_arr = probe.column(index_col).cast(pa.int64()).fill_null(-1).to_numpy(
-            zero_copy_ok=False
+        idx_arr = _arrow_to_numpy(
+            probe.column(index_col).cast(pa.int64()).fill_null(-1), np.int64
         ).copy()
     else:
         idx_arr = np.full(n_rows, -1, dtype=np.int64)
         log.debug("Adding missing column %s to %s", index_col, tile_file.name)
 
     if npix_col in schema.names:
-        npix_arr = probe.column(npix_col).cast(pa.int64()).fill_null(-1).to_numpy(
-            zero_copy_ok=False
+        npix_arr = _arrow_to_numpy(
+            probe.column(npix_col).cast(pa.int64()).fill_null(-1), np.int64
         ).copy()
     else:
         npix_arr = np.full(n_rows, -1, dtype=np.int64)
@@ -238,17 +251,17 @@ def _patch_catalog_parquet_file(
         index_col in schema.names and npix_col in schema.names
     )
     if cols_already_present:
-        old_idx = probe.column(index_col).cast(pa.int64()).fill_null(-1).to_numpy(
-            zero_copy_ok=False
+        old_idx = _arrow_to_numpy(
+            probe.column(index_col).cast(pa.int64()).fill_null(-1), np.int64
         )
-        old_npix = probe.column(npix_col).cast(pa.int64()).fill_null(-1).to_numpy(
-            zero_copy_ok=False
+        old_npix = _arrow_to_numpy(
+            probe.column(npix_col).cast(pa.int64()).fill_null(-1), np.int64
         )
         if np.array_equal(idx_arr, old_idx) and np.array_equal(npix_arr, old_npix):
             return False  # tile is already up-to-date
 
     # --- Phase 2: read full table and rewrite with updated columns ---
-    table = pq.read_table(str(tile_file))
+    table = pq.ParquetFile(str(tile_file)).read()
 
     for col_name, arr in ((index_col, idx_arr), (npix_col, npix_arr)):
         if col_name in table.schema.names:
