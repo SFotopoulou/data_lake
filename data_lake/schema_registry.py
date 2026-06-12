@@ -42,6 +42,12 @@ ROLE_RESOLUTION = "resolution"
 MODALITY_CATALOG = "catalog"
 MODALITY_SPECTRA = "spectra"
 MODALITY_CUTOUT = "cutout"
+MODALITY_CROSSMATCH = "crossmatch"
+MODALITY_AREA = "area"
+
+# Catalog provenance kinds (see catalog_info.json "kind").
+CATALOG_KIND_INGESTED = "ingested"
+CATALOG_KIND_PRODUCT = "product"
 
 # Per-source Zarr meta scalars for FITS sky provenance (see fits_to_spectra_zarr._META_DTYPE).
 SPECTRUM_SKY_META_FIELDS: tuple[str, ...] = (
