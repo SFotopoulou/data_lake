@@ -114,6 +114,29 @@ def _catalog_tile_for_npix(
     return fallback
 
 
+def _read_id_column_as_int64(col: "pa.Array") -> "tuple[np.ndarray, np.ndarray]":
+    """Return (ids_int64, valid_mask) for a source-ID column.
+
+    Fast path for integer-typed columns (avoids per-element Python calls to
+    ``normalize_object_id``).  Falls back to the generic scalar normaliser for
+    string / bytes columns.
+    """
+    if pa.types.is_integer(col.type):
+        valid_mask: np.ndarray = col.is_valid().to_numpy(zero_copy_ok=False)
+        ids: np.ndarray = col.cast(pa.int64()).fill_null(0).to_numpy(zero_copy_ok=False)
+        return ids, valid_mask
+
+    # Fallback: generic per-element path (string IDs etc.)
+    py_list = col.to_pylist()
+    ids_out = np.zeros(len(py_list), dtype=np.int64)
+    valid_out = np.zeros(len(py_list), dtype=bool)
+    for i, x in enumerate(py_list):
+        if x is not None:
+            ids_out[i] = normalize_object_id(x)
+            valid_out[i] = True
+    return ids_out, valid_out
+
+
 def _patch_catalog_parquet_file(
     tile_file: Path,
     source_id_to_tile: dict[int, tuple[int, int]],
@@ -133,9 +156,15 @@ def _patch_catalog_parquet_file(
     When *reset_unmatched* is True (full Zarr-tile rebuild), rows whose
     ``sid_col`` value is absent from *source_id_to_tile* get ``-1`` for both
     columns.
+
+    Two-phase I/O: reads only [sid_col, index_col, npix_col] to decide whether
+    a write is needed, then reads the full table only when a change is required.
+    For large catalogs (many columns) this avoids deserialising every column on
+    the common "tile already correct" path, which can be >90 % of tiles on
+    re-runs.
     """
-    table = pq.ParquetFile(str(tile_file)).read()
-    if sid_col not in table.schema.names:
+    schema = pq.read_schema(str(tile_file))
+    if sid_col not in schema.names:
         log.warning(
             "Source-ID column %r not found in %s. "
             "Check survey name, catalog ingest, or pass --link-id-col.",
@@ -143,31 +172,46 @@ def _patch_catalog_parquet_file(
         )
         return False
 
+    # --- Phase 1: lightweight column read (3 cols instead of all columns) ---
+    probe_cols = [sid_col]
+    if index_col in schema.names:
+        probe_cols.append(index_col)
+    if npix_col in schema.names:
+        probe_cols.append(npix_col)
+
+    probe = pq.read_table(str(tile_file), columns=probe_cols)
+
     warn_if_id_column_unsafe(
-        sid_col, table.schema.field(sid_col).type, context="catalog",
+        sid_col, probe.schema.field(sid_col).type, context="catalog",
     )
 
-    tile_ids: list[int | None] = []
-    for x in table.column(sid_col).to_pylist():
-        if x is None:
-            tile_ids.append(None)
-        else:
-            tile_ids.append(normalize_object_id(x))
+    ids, valid_mask = _read_id_column_as_int64(probe.column(sid_col))
+    # Build tile_ids list (None for nulls) – needed for id_to_row and reset loop.
+    tile_ids: list[int | None] = [
+        int(ids[i]) if valid_mask[i] else None for i in range(len(ids))
+    ]
+
     source_id_set = set(source_id_to_tile.keys())
     matches = [sid for sid in tile_ids if sid is not None and sid in source_id_set]
     if not matches and not reset_unmatched:
         return False
 
-    if index_col in table.schema.names:
-        idx_arr = np.array(table.column(index_col).to_pylist(), dtype=np.int64)
+    # Compute what the new arrays should look like (still using probe columns).
+    n_rows = len(probe)
+    if index_col in schema.names:
+        idx_arr = probe.column(index_col).cast(pa.int64()).fill_null(-1).to_numpy(
+            zero_copy_ok=False
+        ).copy()
     else:
-        idx_arr = np.full(len(table), -1, dtype=np.int64)
+        idx_arr = np.full(n_rows, -1, dtype=np.int64)
         log.debug("Adding missing column %s to %s", index_col, tile_file.name)
 
-    if npix_col in table.schema.names:
-        npix_arr = np.array(table.column(npix_col).to_pylist(), dtype=np.int64)
+    if npix_col in schema.names:
+        npix_arr = probe.column(npix_col).cast(pa.int64()).fill_null(-1).to_numpy(
+            zero_copy_ok=False
+        ).copy()
     else:
-        npix_arr = np.full(len(table), -1, dtype=np.int64)
+        npix_arr = np.full(n_rows, -1, dtype=np.int64)
         log.debug("Adding missing column %s to %s", npix_col, tile_file.name)
 
     id_to_row: dict[int, list[int]] = {}
@@ -187,6 +231,24 @@ def _patch_catalog_parquet_file(
             if sid is None or sid not in source_id_set:
                 idx_arr[row_i] = -1
                 npix_arr[row_i] = -1
+
+    # --- Early exit: skip the expensive full-table read + write when the
+    # existing on-disk values are already identical to what we'd write. ---
+    cols_already_present = (
+        index_col in schema.names and npix_col in schema.names
+    )
+    if cols_already_present:
+        old_idx = probe.column(index_col).cast(pa.int64()).fill_null(-1).to_numpy(
+            zero_copy_ok=False
+        )
+        old_npix = probe.column(npix_col).cast(pa.int64()).fill_null(-1).to_numpy(
+            zero_copy_ok=False
+        )
+        if np.array_equal(idx_arr, old_idx) and np.array_equal(npix_arr, old_npix):
+            return False  # tile is already up-to-date
+
+    # --- Phase 2: read full table and rewrite with updated columns ---
+    table = pq.read_table(str(tile_file))
 
     for col_name, arr in ((index_col, idx_arr), (npix_col, npix_arr)):
         if col_name in table.schema.names:
@@ -664,11 +726,11 @@ try:
              "Default 1 (serial). Use cpu_count()-1 for large surveys.",
     )
     @click.option(
-        "--progress",
+        "--progress/--no-progress",
         "show_progress",
-        is_flag=True,
-        default=False,
-        help="Show tqdm progress bars (Zarr scan + catalog patch).",
+        default=True,
+        show_default=True,
+        help="Show tqdm progress bars (Zarr scan + catalog patch). On by default.",
     )
     @click.argument("lake_root", type=click.Path(path_type=Path), required=False)
     @config_option
@@ -708,6 +770,17 @@ try:
         if n_workers < 1:
             raise click.ClickException("--n-workers must be >= 1")
 
+        # Warn early when the job is likely to be slow.
+        import os as _os
+        cpu_count = _os.cpu_count() or 1
+        if n_workers == 1 and cpu_count > 2:
+            click.echo(
+                f"[hint] Running single-threaded. For large surveys consider "
+                f"--n-workers {max(1, cpu_count - 1)} to parallelise tile patching.",
+                err=True,
+            )
+
+        effective_progress = show_progress and not quiet
         click.echo(f"Scanning {kind} tiles for survey={survey_name!r} …")
         n_modified = update_index_column_from_zarr_tiles(
             lake_root=resolved_root,
@@ -716,7 +789,7 @@ try:
             norder=norder,
             link_id_col=link_id_col,
             n_workers=n_workers,
-            show_progress=show_progress,
+            show_progress=effective_progress,
         )
         click.echo(f"Done: patched _{kind}_index in {n_modified} catalog tile(s).")
 
