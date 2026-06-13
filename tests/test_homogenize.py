@@ -156,3 +156,99 @@ class TestHomogenizeCli:
         result = CliRunner().invoke(cli, [str(lake), "--from-area", "WiseCone"])
         assert result.exit_code == 0, result.output
         assert (lake / "catalogs" / "ALLWISE_from_area").is_dir()
+
+
+def _write_gather_like_product(lake: Path, norder: int, npix: int, w1: float) -> None:
+    tile_dir = lake / "catalogs" / "EUCLID_wise_native" / healpix_dir(norder, npix)
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    hp = f"_healpix_norder{norder}"
+    pq.write_table(
+        pa.table({
+            LAKE_JOIN_ID_COLUMN: pa.array([1], type=pa.int64()),
+            "ra": pa.array([120.0], type=pa.float64()),
+            "dec": pa.array([45.0], type=pa.float64()),
+            hp: pa.array([npix], type=pa.int64()),
+            "ALLWISE_w1mpro": pa.array([w1], type=pa.float32()),
+            "ALLWISE_w1sigmpro": pa.array([0.05], type=pa.float32()),
+        }),
+        tile_dir / f"Npix={npix}.parquet",
+    )
+    (lake / "catalogs" / "EUCLID_wise_native" / "catalog_info.json").write_text(
+        json.dumps({
+            "hats_order": norder,
+            "ra_column": "ra",
+            "dec_column": "dec",
+            "link_id_column": LAKE_JOIN_ID_COLUMN,
+            "kind": "product",
+            "provenance": {
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "ALLWISE", "columns": ["w1mpro", "w1sigmpro"]}],
+            },
+        })
+    )
+    ti.write_tile_index(lake, "EUCLID_wise_native", "catalog")
+
+
+class TestHomogenizeProduct:
+    def test_from_product_wide_table(self, tmp_path: Path) -> None:
+        from data_lake.discovery.selection import selection_from_all_tiles
+        from data_lake.homogenize.engine import homogenize_product
+
+        lake = tmp_path / "lake"
+        norder = 5
+        npix = 0
+        _write_gather_like_product(lake, norder, npix, w1=10.0)
+        sel = selection_from_all_tiles(lake, "EUCLID_wise_native")
+        result = homogenize_product(
+            lake, "EUCLID_wise_native", "phot_ab_v1", sel,
+            materialize_as="EUCLID_wise_ab",
+        )
+        assert result.n_rows == 1
+        from data_lake.io.catalog import CatalogAccessor
+
+        with CatalogAccessor(lake, "EUCLID_wise_ab") as acc:
+            df = acc.query("SELECT phot_ab_w1 FROM catalog", fmt="polars")
+        assert df["phot_ab_w1"][0] == pytest.approx(12.699)
+        info = json.loads(
+            (lake / "catalogs" / "EUCLID_wise_ab" / "catalog_info.json").read_text()
+        )
+        assert info["provenance"]["source_product"] == "EUCLID_wise_native"
+
+
+class TestValidateHomogenization:
+    def test_golden_phot_ab(self) -> None:
+        from data_lake.homogenize.validate_homogenization import validate_golden_transform
+
+        rep = validate_golden_transform("phot_ab_v1")
+        assert rep.errors == []
+
+    def test_registry_lint(self) -> None:
+        from data_lake.homogenize.validate_homogenization import validate_transform_registry
+
+        rep = validate_transform_registry(None)
+        assert rep.errors == []
+
+
+class TestZarrHomogenize:
+    def test_spectra_flux_scale(self, tmp_path: Path) -> None:
+        from data_lake.discovery.selection import selection_from_all_tiles
+        from data_lake.homogenize.zarr_engine import homogenize_zarr
+        from synthetic_lake_helpers import NORDER, SURVEY, ingest_synthetic_spectrum_lake
+
+        lake = tmp_path / "lake"
+        ingest_synthetic_spectrum_lake(lake)
+        ti.write_tile_index(lake, SURVEY, "spectra")
+        sel = selection_from_all_tiles(lake, SURVEY, modality="spectra")
+        result = homogenize_zarr(
+            lake, "spectra", SURVEY, "spec_observed_v1", sel,
+            materialize_as="synthetic_spec_hom",
+        )
+        assert result.n_sources > 0
+        import zarr
+
+        tiles = list((lake / "spectra" / "synthetic_spec_hom").rglob("Npix=*.zarr"))
+        assert tiles
+        root = zarr.open_group(
+            store=zarr.storage.LocalStore(str(tiles[0])), mode="r", zarr_format=3,
+        )
+        assert root["flux"].shape[0] > 0

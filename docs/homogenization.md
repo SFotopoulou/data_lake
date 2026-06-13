@@ -41,8 +41,8 @@ Output: `catalogs/<materialize-as>/` with `kind: product`, `product_subtype: hom
 | Pack | Modality | Purpose |
 |------|----------|---------|
 | `phot_ab_v1` | catalog | Vega/mm mag → AB via offsets and scales |
-| `spec_observed_v1` | spectra | Phase F — flux unit normalization |
-| `cutout_njy_v1` | cutout | Phase F — nJy/pixel calibration |
+| `spec_observed_v1` | spectra | Observed-frame flux unit normalization (`flux_scale`) |
+| `cutout_njy_v1` | cutout | nJy/pixel calibration via `flux_scale` on image stamps |
 
 Bandpass metadata for FM conditioning: `data_lake/homogenize/bandpass.json`.
 
@@ -63,12 +63,38 @@ Top-level `homogenize` block in `areas/<id>.json`:
 }
 ```
 
-Multi-survey: use `gather` first, then `homogenize.from_product` (planned).
+Multi-survey: use `gather` first, then homogenize the native wide product:
+
+```bash
+dl-homogenize /data/lake \
+  --from-product EUCLID_wise_native \
+  --transform phot_ab_v1 \
+  --materialize-as EUCLID_wise_ab_v1
+```
 
 Run from an area file (uses the top-level `homogenize` block):
 
 ```bash
 dl-homogenize /data/lake --from-area Euclid_North
+```
+
+## Spectra and cutouts (Phase F)
+
+```bash
+dl-homogenize /data/lake --modality spectra --survey SDSS_DR17 \
+  --from-area Euclid_North --transform spec_observed_v1 \
+  --materialize-as SDSS_DR17_spec_obs_v1
+
+dl-homogenize /data/lake --modality cutout --survey DESI_DR1 \
+  --cone 150.1 2.2 --radius-arcsec 600 --transform cutout_njy_v1 \
+  --materialize-as DESI_DR1_cutout_njy_v1
+```
+
+## Validation
+
+```bash
+dl-validate-homogenization /data/lake --golden --transform phot_ab_v1
+dl-validate-homogenization /data/lake --product ALLWISE_ab_test --transform phot_ab_v1
 ```
 
 See also: [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md).

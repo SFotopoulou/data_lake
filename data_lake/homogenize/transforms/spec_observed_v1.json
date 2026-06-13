@@ -1,0 +1,30 @@
+{
+  "transform_id": "spec_observed_v1",
+  "version": 1,
+  "modality": "spectra",
+  "output_flux_unit": "erg/s/cm2/Angstrom",
+  "description": "Normalize spectrum flux arrays to a consistent observed-frame unit scale.",
+  "rules": [
+    {
+      "survey": "synthetic",
+      "flux_array": "flux",
+      "ivar_array": "ivar",
+      "transform": {"type": "flux_scale", "factor": 1.0},
+      "wavelength_unit": "Angstrom"
+    },
+    {
+      "survey": "SDSS_DR17",
+      "flux_array": "flux",
+      "ivar_array": "ivar",
+      "transform": {"type": "flux_scale", "factor": 1.0, "note": "native coadd units"},
+      "wavelength_unit": "Angstrom"
+    },
+    {
+      "survey": "DESI_DR1",
+      "flux_array": "flux",
+      "ivar_array": "ivar",
+      "transform": {"type": "flux_scale", "factor": 1.0},
+      "wavelength_unit": "Angstrom"
+    }
+  ]
+}

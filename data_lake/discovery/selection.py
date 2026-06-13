@@ -57,6 +57,7 @@ def selection_from_region(
     region: Region,
     *,
     allow_scan: bool = True,
+    modality: str = MODALITY_CATALOG,
 ) -> BaseSelection:
     """Tile-granular base selection from a spatial region.
 
@@ -64,7 +65,7 @@ def selection_from_region(
     with populated tiles. ``source_ids`` is ``None`` (downstream filters by tile).
     """
     npix_set, hats_order = ti.survey_npix(
-        lake_root, base_survey, MODALITY_CATALOG, allow_scan=allow_scan
+        lake_root, base_survey, modality, allow_scan=allow_scan
     )
     if hats_order is None:
         # Fall back to the accessor's order if the index lacks it.
@@ -133,6 +134,28 @@ def selection_from_where(
         ids = [int(r[0]) for r in rows]
         npix = {int(r[1]) for r in rows}
         return BaseSelection(base_survey, acc.norder, npix, ids)
+
+
+def selection_from_all_tiles(
+    lake_root: Path | str,
+    base_survey: str,
+    *,
+    allow_scan: bool = True,
+    modality: str = MODALITY_CATALOG,
+) -> BaseSelection:
+    """Select every populated tile in a catalog (used for full-product homogenize)."""
+    npix_set, hats_order = ti.survey_npix(
+        lake_root, base_survey, modality, allow_scan=allow_scan,
+    )
+    if hats_order is None:
+        with CatalogAccessor(lake_root, base_survey) as acc:
+            hats_order = acc.norder
+    return BaseSelection(
+        base_survey=base_survey,
+        norder=hats_order,
+        npix=set(npix_set),
+        source_ids=None,
+    )
 
 
 def read_ids_file(path: str | Path, id_col: str | None = None) -> list[int]:
