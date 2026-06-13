@@ -79,3 +79,35 @@ class TestAreaValidation:
         )
         msgs = validate_area(area.data)
         assert any("multiplicity" in m for m in msgs)
+
+    def test_homogenize_block_valid(self) -> None:
+        area = make_area(
+            "A", Region.cone(1.0, 2.0, 10.0),
+            homogenize={
+                "survey": "ALLWISE",
+                "transform": "phot_ab_v1",
+                "materialize_as": "ALLWISE_ab",
+            },
+        )
+        assert area_is_valid(area.data)
+
+    def test_homogenize_requires_transform(self) -> None:
+        area = make_area(
+            "A", Region.cone(1.0, 2.0, 10.0),
+            homogenize={"survey": "ALLWISE", "materialize_as": "x"},
+        )
+        msgs = validate_area(area.data)
+        assert any("transform" in m for m in msgs)
+
+    def test_homogenize_survey_and_product_mutually_exclusive(self) -> None:
+        area = make_area(
+            "A", Region.cone(1.0, 2.0, 10.0),
+            homogenize={
+                "survey": "ALLWISE",
+                "from_product": "joined",
+                "transform": "phot_ab_v1",
+                "materialize_as": "x",
+            },
+        )
+        msgs = validate_area(area.data)
+        assert any("survey+region OR from_product" in m for m in msgs)

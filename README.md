@@ -71,6 +71,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 | Crossmatch and associations | [discovery/crossmatch.md](docs/discovery/crossmatch.md) |
 | Regions, areas, `dl-region` | [discovery/regions-and-areas.md](docs/discovery/regions-and-areas.md) |
 | Gather products (`dl-gather`) | [discovery/gather.md](docs/discovery/gather.md) |
+| Homogenization (`dl-homogenize`) | [homogenization.md](docs/homogenization.md) |
 | Performance tuning | [performance.md](docs/performance.md) |
 | DuckDB ID-list queries | [discovery/duckdb-queries.md](docs/discovery/duckdb-queries.md) |
 

@@ -448,6 +448,7 @@ def _catalog_registry_row(
         "survey": survey,
         "modality": MODALITY_CATALOG,
         "kind": info.get("kind") or CATALOG_KIND_INGESTED,
+        "product_subtype": info.get("product_subtype"),
         "lifecycle": info.get("lifecycle") or "static",
         "finalized": info.get("finalized"),
         "source_area": info.get("source_area"),

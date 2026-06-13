@@ -1,0 +1,9 @@
+{
+  "bands": {
+    "phot_ab_w1": {"lambda_eff_um": 3.4, "fwhm_um": 0.75, "system": "AB", "survey_ref": "WISE W1"},
+    "phot_ab_w2": {"lambda_eff_um": 4.6, "fwhm_um": 1.04, "system": "AB", "survey_ref": "WISE W2"},
+    "phot_ab_g": {"lambda_eff_um": 0.677, "fwhm_um": 0.25, "system": "Vega-as-AB", "survey_ref": "Gaia G"},
+    "phot_ab_bp": {"lambda_eff_um": 0.532, "fwhm_um": 0.25, "system": "Vega-as-AB", "survey_ref": "Gaia BP"},
+    "phot_ab_rp": {"lambda_eff_um": 0.797, "fwhm_um": 0.25, "system": "Vega-as-AB", "survey_ref": "Gaia RP"}
+  }
+}

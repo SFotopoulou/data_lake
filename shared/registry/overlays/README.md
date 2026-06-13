@@ -20,3 +20,5 @@ Each file maps column names to metadata:
 ```
 
 `homogenized_ab_offset` documents the constant added to Vega magnitudes for AB (see notebook §8).
+
+**Execution** of offsets lives in the transform registry (`phot_ab_v1.json`), not in overlays. Overlays document native units; transforms apply at `dl-homogenize` time. See [homogenization.md](../../../docs/homogenization.md).

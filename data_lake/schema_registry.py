@@ -48,6 +48,7 @@ MODALITY_AREA = "area"
 # Catalog provenance kinds (see catalog_info.json "kind").
 CATALOG_KIND_INGESTED = "ingested"
 CATALOG_KIND_PRODUCT = "product"
+PRODUCT_SUBTYPE_HOMOGENIZED = "homogenized"
 
 # Per-source Zarr meta scalars for FITS sky provenance (see fits_to_spectra_zarr._META_DTYPE).
 SPECTRUM_SKY_META_FIELDS: tuple[str, ...] = (

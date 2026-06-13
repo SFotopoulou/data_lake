@@ -76,6 +76,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 
 | Command | Purpose |
 |---------|---------|
+| `dl-homogenize` | Apply transform registry to a survey+region → homogenized product catalog ([docs](homogenization.md)) |
 | `dl-mcp-docs` | Stdio MCP server: search docs, describe lake/survey (requires `--extra mcp`) |
 | `dl-mcp-lake` | Stdio MCP server: region discovery, provenance, query builder, QA, ingest advisor ([docs](mcp-lake.md)) |
 
