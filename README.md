@@ -42,7 +42,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 | All `dl-*` commands | [cli-reference.md](docs/cli-reference.md) |
 | `lake_config.toml` | [lake-config.md](docs/lake-config.md) |
 | Example notebooks | [notebooks.md](docs/notebooks.md) |
-| MCP access for agents | [mcp.md](docs/mcp.md) |
+| MCP access for agents | [mcp.md](docs/mcp.md), [mcp-lake.md](docs/mcp-lake.md) |
 
 ### Ingest
 

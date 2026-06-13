@@ -18,18 +18,11 @@ from data_lake.doc_index import (
 )
 
 
-def _resolve_lake_root(lake_root: str | None) -> Path:
-    if lake_root:
-        return Path(lake_root).expanduser().resolve()
-    from data_lake.config import LakeConfig, LakeConfigNotFound
+from data_lake.mcp_common import json_dumps, resolve_lake_root
 
-    try:
-        cfg = LakeConfig.discover(None)
-    except LakeConfigNotFound as exc:
-        raise ValueError(
-            "No lake root: pass lake_root or set DATA_LAKE_CONFIG / lake_config.toml."
-        ) from exc
-    return cfg.lake.root
+
+def _resolve_lake_root(lake_root: str | None) -> Path:
+    return resolve_lake_root(lake_root)
 
 
 def tool_search_docs(query: str, limit: int = 5) -> list[dict[str, str]]:
