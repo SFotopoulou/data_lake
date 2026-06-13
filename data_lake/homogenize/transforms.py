@@ -119,14 +119,44 @@ def resolve_rules_from_manifest(
     *,
     columns: Sequence[str] | None = None,
 ) -> RuleResolution:
+    from data_lake.homogenize.survey_registry import resolve_catalog_rules
+
     manifest = get_survey_manifest(lake_root, survey, "catalog", apply_overlay=True)
     available = _manifest_column_names(manifest)
+
+    survey_rules = resolve_catalog_rules(
+        lake_root, survey, str(transform.get("transform_id", "")),
+    )
+
     if columns is None:
-        # Auto: photometry role columns that have a matching rule source.
         photo = _photometry_columns(manifest)
-        rule_sources = {r.source_column for r in _rules_for_survey(transform, survey)}
+        rule_sources = {r.source_column for r in survey_rules}
         columns = sorted(photo & rule_sources) if photo else None
-    return resolve_applicable_rules(transform, survey, available, columns=columns)
+
+    res = RuleResolution()
+    want_sources: set[str] | None = set(columns) if columns else None
+    for rule in survey_rules:
+        if rule.source_column not in available:
+            res.skipped_missing.append(
+                {
+                    "survey": survey,
+                    "source_column": rule.source_column,
+                    "reason": "column not in manifest/tiles",
+                }
+            )
+            continue
+        if want_sources is not None and rule.source_column not in want_sources:
+            continue
+        res.applied.append(rule)
+
+    if not survey_rules:
+        res.skipped_survey.append(
+            {
+                "survey": survey,
+                "reason": f"no rules in survey homogenize or {transform.get('transform_id')}",
+            }
+        )
+    return res
 
 
 def _mag_expr(col: str):

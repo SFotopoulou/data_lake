@@ -228,6 +228,14 @@ class TestValidateHomogenization:
         rep = validate_transform_registry(None)
         assert rep.errors == []
 
+    def test_survey_registry_allwise(self) -> None:
+        from data_lake.homogenize.survey_registry import load_survey_homogenize, resolve_catalog_rules
+
+        doc = load_survey_homogenize(None, "ALLWISE")
+        assert doc is not None
+        rules = resolve_catalog_rules(None, "ALLWISE", "phot_ab_v1")
+        assert any(r.target_column == "phot_ab_w1" for r in rules)
+
 
 class TestZarrHomogenize:
     def test_spectra_flux_scale(self, tmp_path: Path) -> None:

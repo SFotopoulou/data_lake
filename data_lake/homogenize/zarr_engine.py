@@ -16,6 +16,7 @@ import zarr
 
 from data_lake.discovery.selection import BaseSelection
 from data_lake.homogenize.registry import load_transform
+from data_lake.homogenize.survey_registry import zarr_rule_for_survey
 from data_lake.ingest.fits_to_parquet import healpix_dir
 from data_lake.schema_registry import MODALITY_CUTOUT, MODALITY_SPECTRA, PRODUCT_SUBTYPE_HOMOGENIZED
 
@@ -53,11 +54,33 @@ def _read_info(lake_root: Path, modality: str, survey: str) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def _rule_for_survey(transform: dict[str, Any], survey: str) -> dict[str, Any] | None:
+def _rule_from_transform_pack(
+    lake_root: Path,
+    transform_id: str,
+    survey: str,
+) -> dict[str, Any] | None:
+    transform = load_transform(lake_root, transform_id)
     for raw in transform.get("rules") or []:
         if raw.get("survey") == survey:
-            return raw
+            return dict(raw)
     return None
+
+
+def _resolve_zarr_spec(
+    lake_root: Path,
+    survey: str,
+    modality: str,
+    transform_id: str,
+) -> dict[str, Any]:
+    spec = zarr_rule_for_survey(lake_root, survey, modality, transform_id)
+    if spec is None:
+        spec = _rule_from_transform_pack(lake_root, transform_id, survey)
+    if spec is None:
+        raise ValueError(
+            f"No {modality} homogenize recipe for survey {survey!r} "
+            f"(check shared/registry/homogenize/{survey}.json)"
+        )
+    return spec
 
 
 def _flux_scale_factor(rule: dict[str, Any]) -> float:
@@ -106,6 +129,7 @@ def _homogenize_cutout_tile(
     out_survey: str,
     norder: int,
     factor: float,
+    band_factors: np.ndarray | None = None,
 ) -> int:
     src_root = lake_root / "cutouts" / survey / healpix_dir(norder, npix) / f"Npix={npix}.zarr"
     if not src_root.is_dir():
@@ -119,8 +143,24 @@ def _homogenize_cutout_tile(
     store = zarr.storage.LocalStore(str(dst_root))
     root = zarr.open_group(store=store, mode="a", zarr_format=3)
     images = np.array(root["images"][:], dtype=np.float32)
-    root["images"][:] = images * factor
+    if band_factors is not None:
+        images = images * band_factors
+    else:
+        images = images * factor
+    root["images"][:] = images
     return int(root["images"].shape[0])
+
+
+def _cutout_band_factors(rule: dict[str, Any], band_names: list[str]) -> np.ndarray | None:
+    bands = rule.get("bands")
+    if not isinstance(bands, dict) or not bands:
+        return None
+    default = _flux_scale_factor(rule)
+    scales = [
+        float((bands.get(name) or {}).get("flux_scale", default))
+        for name in band_names
+    ]
+    return np.array(scales, dtype=np.float32).reshape(1, len(scales), 1, 1)
 
 
 def _write_zarr_product_info(
@@ -184,12 +224,13 @@ def homogenize_zarr(
             f"!= requested {modality!r}"
         )
 
-    rule = _rule_for_survey(transform, survey)
-    if rule is None:
-        raise ValueError(f"No {modality} rule for survey {survey!r} in {transform_id!r}")
-
+    rule = _resolve_zarr_spec(lake_root, survey, modality, transform_id)
     factor = _flux_scale_factor(rule)
     source_info = _read_info(lake_root, modality, survey)
+    band_factors: np.ndarray | None = None
+    if modality == MODALITY_CUTOUT:
+        band_names = list(source_info.get("band_names") or [])
+        band_factors = _cutout_band_factors(rule, band_names)
     out_root = lake_root / _modality_root(lake_root, modality) / materialize_as
     if out_root.exists() and not overwrite and not check_only:
         raise FileExistsError(
@@ -198,7 +239,12 @@ def homogenize_zarr(
 
     resolution = {
         "n_applied": 1,
-        "applied": [{"survey": survey, "factor": factor, "type": "flux_scale"}],
+        "applied": [{
+            "survey": survey,
+            "factor": factor,
+            "type": "flux_scale",
+            "bands": list((rule.get("bands") or {}).keys()) or None,
+        }],
     }
     npix_list = sorted(selection.npix)
     if check_only:
@@ -215,20 +261,29 @@ def homogenize_zarr(
         )
 
     norder = selection.norder
-    tile_fn = _homogenize_spectrum_tile if modality == MODALITY_SPECTRA else _homogenize_cutout_tile
     t0 = time.perf_counter()
     n_sources = 0
     n_tiles = 0
     workers = max(1, min(n_workers, _MAX_WORKERS, len(npix_list) or 1))
 
     def _work(npix: int) -> int:
-        return tile_fn(
+        if modality == MODALITY_SPECTRA:
+            return _homogenize_spectrum_tile(
+                npix,
+                lake_root=lake_root,
+                survey=survey,
+                out_survey=materialize_as,
+                norder=norder,
+                factor=factor,
+            )
+        return _homogenize_cutout_tile(
             npix,
             lake_root=lake_root,
             survey=survey,
             out_survey=materialize_as,
             norder=norder,
             factor=factor,
+            band_factors=band_factors,
         )
 
     counts: list[int] = []

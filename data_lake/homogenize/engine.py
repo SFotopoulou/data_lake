@@ -379,7 +379,7 @@ def homogenize_product(
         dec_col = str(source_info.get("dec_column") or "dec")
 
     resolution = resolve_rules_for_product(
-        transform, provenance, available, columns=columns,
+        lake_root, transform, provenance, available, columns=columns,
     )
     if not resolution.applied:
         raise ValueError(

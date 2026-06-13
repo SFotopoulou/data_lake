@@ -4,11 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from data_lake.homogenize.transforms import (
-    RuleResolution,
-    TransformRule,
-    _rules_for_survey,
-)
+from data_lake.homogenize.survey_registry import resolve_catalog_rules
+from data_lake.homogenize.transforms import RuleResolution, TransformRule
 
 
 def product_column_name(base_catalog: str, survey: str, source_column: str) -> str:
@@ -33,6 +30,7 @@ def product_surveys(provenance: dict[str, Any]) -> frozenset[str]:
 
 
 def resolve_rules_for_product(
+    lake_root,
     transform: dict[str, Any],
     provenance: dict[str, Any],
     available_columns: set[str],
@@ -49,9 +47,11 @@ def resolve_rules_for_product(
     contributors = product_surveys(provenance)
     res = RuleResolution()
     want_native: set[str] | None = set(columns) if columns else None
+    transform_id = str(transform.get("transform_id", "phot_ab_v1"))
 
     for survey in sorted(contributors):
-        for rule in _rules_for_survey(transform, survey):
+        survey_rules = resolve_catalog_rules(lake_root, survey, transform_id)
+        for rule in survey_rules:
             prod_col = product_column_name(base, survey, rule.source_column)
             if prod_col not in available_columns:
                 res.skipped_missing.append(

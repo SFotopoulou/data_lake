@@ -10,7 +10,9 @@ Native ingest preserves survey column names and photometric systems. Homogenizat
 | Crossmatch (`dl-crossmatch`) | No — geometry only |
 | **Homogenize (`dl-homogenize`)** | **Yes** — pick `transform_id` + survey + region |
 
-Recipes live in `data_lake/homogenize/transforms/` (defaults) or `shared/registry/transforms/` (lake overrides). Column matching uses **`dl-describe-survey`** manifests at apply time — no manual survey inventory required.
+Recipes live in **`shared/registry/homogenize/<SURVEY>.json`** (lake overrides) or bundled **`data_lake/homogenize/surveys/<SURVEY>.json`**. One file per survey covers catalog photometry, spectra flux, and cutout zero points. Global transform packs (`phot_ab_v1`, etc.) define profile semantics; survey files hold survey-specific numbers.
+
+Column matching uses **`dl-describe-survey`** manifests at apply time — no manual survey inventory required.
 
 ## Primary workflow: single survey + region
 
@@ -96,5 +98,16 @@ dl-homogenize /data/lake --modality cutout --survey DESI_DR1 \
 dl-validate-homogenization /data/lake --golden --transform phot_ab_v1
 dl-validate-homogenization /data/lake --product ALLWISE_ab_test --transform phot_ab_v1
 ```
+
+## ML export from homogenized products
+
+```bash
+dl-extract-catalog --lake-root /data/lake \
+  --from-product ALLWISE_euclid_north_ab_v1 \
+  -c _source_id -c ra -c dec -c phot_ab_w1 \
+  -o /scratch/allwise_ab.parquet
+```
+
+`--from-product` implies `product_subtype: homogenized` and writes `extract_provenance.json` (or `*.homogenize_provenance.json` for single-file exports) with `transform_id` and lineage for ML training configs.
 
 See also: [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md).

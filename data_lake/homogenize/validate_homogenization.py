@@ -39,6 +39,57 @@ def _bundled_transform_ids() -> list[str]:
     return sorted(p.stem for p in root.glob("*.json"))
 
 
+def _bundled_survey_ids() -> list[str]:
+    root = Path(__file__).resolve().parent / "surveys"
+    return sorted(p.stem for p in root.glob("*.json"))
+
+
+def validate_survey_homogenize_registry(lake_root: Path | str | None) -> ValidationReport:
+    """Lint bundled and lake-local per-survey homogenize files."""
+    from data_lake.homogenize.survey_registry import (
+        load_survey_homogenize,
+        validate_survey_homogenize,
+    )
+
+    rep = ValidationReport()
+    seen: set[str] = set()
+    for sid in _bundled_survey_ids():
+        seen.add(sid)
+        try:
+            data = load_survey_homogenize(None, sid)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            rep.errors.append(f"survey homogenize {sid!r}: {exc}")
+            continue
+        if data is None:
+            continue
+        for msg in validate_survey_homogenize(data):
+            if msg.startswith("ERROR"):
+                rep.errors.append(f"survey homogenize {sid!r}: {msg}")
+            else:
+                rep.warnings.append(f"survey homogenize {sid!r}: {msg}")
+
+    if lake_root is not None:
+        lake_dir = Path(lake_root) / "shared" / "registry" / "homogenize"
+        if lake_dir.is_dir():
+            for path in sorted(lake_dir.glob("*.json")):
+                sid = path.stem
+                try:
+                    data = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    rep.errors.append(f"survey homogenize {sid!r}: {exc}")
+                    continue
+                for msg in validate_survey_homogenize(data):
+                    if msg.startswith("ERROR"):
+                        rep.errors.append(f"survey homogenize {sid!r}: {msg}")
+                    else:
+                        rep.warnings.append(f"survey homogenize {sid!r}: {msg}")
+                if sid in seen:
+                    rep.warnings.append(
+                        f"survey homogenize {sid!r}: lake override shadows bundled default"
+                    )
+    return rep
+
+
 def validate_transform_registry(lake_root: Path | str | None) -> ValidationReport:
     """Lint bundled and lake-local transform packs."""
     rep = ValidationReport()
@@ -193,6 +244,9 @@ def run_validation(
     reg = validate_transform_registry(lake_root)
     rep.errors.extend(reg.errors)
     rep.warnings.extend(reg.warnings)
+    sreg = validate_survey_homogenize_registry(lake_root)
+    rep.errors.extend(sreg.errors)
+    rep.warnings.extend(sreg.warnings)
 
     tids = list(transform_ids) if transform_ids else _bundled_transform_ids()
     if golden:

@@ -242,6 +242,74 @@ def _lake_norder(catalog_root: Path, norder: int | None) -> int:
     return 5
 
 
+def read_lake_catalog_info(lake_root: Path | str, survey: str) -> dict[str, Any]:
+    """Load ``catalog_info.json`` for a lake catalog or product."""
+    info_path = _lake_catalog_root(lake_root, survey) / "catalog_info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"Missing catalog metadata: {info_path}")
+    return json.loads(info_path.read_text())
+
+
+def validate_homogenized_export(
+    lake_root: Path | str,
+    survey: str,
+    *,
+    require_homogenized: bool,
+) -> dict[str, Any]:
+    """Ensure a catalog export source meets homogenized product expectations."""
+    from data_lake.schema_registry import PRODUCT_SUBTYPE_HOMOGENIZED
+
+    info = read_lake_catalog_info(lake_root, survey)
+    subtype = info.get("product_subtype")
+    if require_homogenized and subtype != PRODUCT_SUBTYPE_HOMOGENIZED:
+        raise ValueError(
+            f"catalog {survey!r} has product_subtype={subtype!r}; "
+            f"expected {PRODUCT_SUBTYPE_HOMOGENIZED!r} (use dl-homogenize first "
+            "or omit --require-subtype homogenized)"
+        )
+    return info
+
+
+def homogenized_export_provenance(catalog_info: dict[str, Any]) -> dict[str, Any]:
+    """Build provenance payload for ML export sidecars."""
+    prov = catalog_info.get("provenance") or {}
+    return {
+        "source_catalog": catalog_info.get("catalog_name"),
+        "kind": catalog_info.get("kind"),
+        "product_subtype": catalog_info.get("product_subtype"),
+        "transform_id": prov.get("transform_id"),
+        "transform_version": prov.get("transform_version"),
+        "source_survey": prov.get("source_survey"),
+        "source_product": prov.get("source_product"),
+        "column_lineage": prov.get("column_lineage"),
+    }
+
+
+def write_homogenize_export_provenance(
+    catalog_info: dict[str, Any],
+    *,
+    output: Path | None,
+    output_dir: Path | None,
+) -> Path | None:
+    """Write ``*.homogenize_provenance.json`` beside a lake catalog export."""
+    from data_lake.schema_registry import PRODUCT_SUBTYPE_HOMOGENIZED
+
+    if catalog_info.get("product_subtype") != PRODUCT_SUBTYPE_HOMOGENIZED:
+        return None
+    payload = homogenized_export_provenance(catalog_info)
+    if output_dir is not None:
+        sidecar = Path(output_dir) / "extract_provenance.json"
+    elif output is not None:
+        out = Path(output)
+        sidecar = out.with_name(out.name + ".homogenize_provenance.json")
+    else:
+        return None
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    with open(sidecar, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    return sidecar
+
+
 def iter_lake_catalog_tiles(
     catalog_root: Path,
     *,
@@ -293,6 +361,8 @@ def stream_extract_from_lake_catalog(
     output_format: OutputFormat | None = None,
     engine: LakeEngine = "auto",
     show_progress: bool = False,
+    require_homogenized: bool = False,
+    write_homogenize_provenance: bool = True,
 ) -> ExtractResult:
     """Stream column projection from lake Parquet tiles without loading the full survey."""
     if output is None and output_dir is None:
@@ -300,6 +370,9 @@ def stream_extract_from_lake_catalog(
     if output is not None and output_dir is not None:
         raise ValueError("pass output or output_dir, not both")
 
+    catalog_info = validate_homogenized_export(
+        lake_root, survey, require_homogenized=require_homogenized,
+    )
     catalog_root = _lake_catalog_root(lake_root, survey)
     order = _lake_norder(catalog_root, norder)
     tiles = list(iter_lake_catalog_tiles(catalog_root, norder=order))
@@ -329,7 +402,7 @@ def stream_extract_from_lake_catalog(
     )
     if use_duckdb:
         try:
-            return _stream_lake_via_duckdb(
+            result = _stream_lake_via_duckdb(
                 tiles,
                 mapping,
                 output=output,
@@ -338,12 +411,19 @@ def stream_extract_from_lake_catalog(
                 ra_col=ra_col,
                 dec_col=dec_col,
             )
+            return _finalize_lake_extract_result(
+                result,
+                catalog_info=catalog_info,
+                output=output,
+                output_dir=output_dir,
+                write_homogenize_provenance=write_homogenize_provenance,
+            )
         except Exception as exc:
             log.warning(
                 "DuckDB export failed (%s); falling back to tile streaming.", exc
             )
 
-    return _stream_lake_tile_by_tile(
+    result = _stream_lake_tile_by_tile(
         catalog_root,
         tiles,
         mapping,
@@ -357,6 +437,28 @@ def stream_extract_from_lake_catalog(
         dec_col=dec_col,
         show_progress=show_progress,
     )
+    return _finalize_lake_extract_result(
+        result,
+        catalog_info=catalog_info,
+        output=output,
+        output_dir=output_dir,
+        write_homogenize_provenance=write_homogenize_provenance,
+    )
+
+
+def _finalize_lake_extract_result(
+    result: ExtractResult,
+    *,
+    catalog_info: dict[str, Any],
+    output: Path | None,
+    output_dir: Path | None,
+    write_homogenize_provenance: bool,
+) -> ExtractResult:
+    if write_homogenize_provenance:
+        write_homogenize_export_provenance(
+            catalog_info, output=output, output_dir=output_dir,
+        )
+    return result
 
 
 def _duckdb_sky_predicate(
@@ -964,6 +1066,8 @@ def extract_catalog(
     streaming: bool = False,
     batch_rows: int = _FITS_STREAM_BATCH_ROWS,
     show_progress: bool = False,
+    require_homogenized: bool = False,
+    write_homogenize_provenance: bool = True,
 ) -> ExtractResult | pa.Table:
     """Extract columns and write output; returns summary or small in-memory table."""
     if specs is None:
@@ -987,6 +1091,8 @@ def extract_catalog(
             output_format=output_format,
             engine=engine,
             show_progress=show_progress,
+            require_homogenized=require_homogenized,
+            write_homogenize_provenance=write_homogenize_provenance,
         )
         return result
 
@@ -1065,6 +1171,21 @@ import click
     help="Data lake root; stream from catalogs/<survey>/ tiles.",
 )
 @click.option("--survey", default=None, help="Survey name under catalogs/ (with --lake-root).")
+@click.option(
+    "--from-product",
+    default=None,
+    help="Export a homogenized catalog product (alias for --survey with subtype check).",
+)
+@click.option(
+    "--require-subtype",
+    default=None,
+    help="Require catalog_info product_subtype (e.g. homogenized).",
+)
+@click.option(
+    "--no-homogenize-provenance",
+    is_flag=True,
+    help="Do not write extract_provenance.json / sidecar for homogenized exports.",
+)
 @click.option("--norder", type=int, default=None, help="HEALPix order (default: catalog_info.json).")
 @click.option(
     "--engine",
@@ -1108,6 +1229,9 @@ def cli(
     output_format: str | None,
     lake_root: Path | None,
     survey: str | None,
+    from_product: str | None,
+    require_subtype: str | None,
+    no_homogenize_provenance: bool,
     norder: int | None,
     engine: str,
     valid_sky_only: bool,
@@ -1135,8 +1259,22 @@ def cli(
         raise click.ClickException(
             "Pass catalog path(s), --file-list, or --lake-root with --survey."
         )
-    if lake_root is not None and not survey:
-        raise click.ClickException("--survey is required with --lake-root.")
+    if lake_root is not None and not survey and not from_product:
+        raise click.ClickException(
+            "--survey or --from-product is required with --lake-root."
+        )
+    if survey and from_product:
+        raise click.ClickException("Use either --survey or --from-product, not both.")
+    if from_product:
+        survey = from_product
+    require_homogenized = (
+        require_subtype == "homogenized"
+        or from_product is not None
+    )
+    if require_subtype and require_subtype != "homogenized":
+        raise click.ClickException(
+            f"Unsupported --require-subtype {require_subtype!r} (only homogenized)"
+        )
     if lake_root is not None and all_paths:
         raise click.ClickException("Use either input paths or --lake-root/--survey, not both.")
     if output is not None and output_dir is not None:
@@ -1169,6 +1307,8 @@ def cli(
         streaming=streaming,
         batch_rows=batch_rows,
         show_progress=show_progress,
+        require_homogenized=require_homogenized,
+        write_homogenize_provenance=not no_homogenize_provenance,
     )
 
     if isinstance(result, ExtractResult):
@@ -1178,6 +1318,19 @@ def cli(
             f"Wrote {result.n_rows} row(s), {len(result.column_names)} column(s)"
             f"{extra} → {dest}"
         )
+        if lake_root is not None and survey and not no_homogenize_provenance:
+            from data_lake.schema_registry import PRODUCT_SUBTYPE_HOMOGENIZED
+
+            info = read_lake_catalog_info(lake_root, survey)
+            if info.get("product_subtype") == PRODUCT_SUBTYPE_HOMOGENIZED:
+                if output_dir is not None:
+                    sidecar = Path(output_dir) / "extract_provenance.json"
+                elif output is not None:
+                    sidecar = output.with_name(output.name + ".homogenize_provenance.json")
+                else:
+                    sidecar = None
+                if sidecar is not None and sidecar.is_file():
+                    click.echo(f"  homogenize provenance → {sidecar}")
     else:
         click.echo(
             f"Wrote {result.num_rows} row(s), {len(result.schema.names)} column(s) → {output}"
