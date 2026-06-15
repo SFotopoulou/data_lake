@@ -120,45 +120,26 @@ def _fetch_partner_catalog(
     base_order: int,
     cache: PartnerTileCache | None,
     fetch_cols: list[str],
-    pid: str,
 ):
     """Load partner catalog rows for crossmatch matches (exact or geometric tiles)."""
     import polars as pl
 
-    if CROSSMATCH_HEALPIX_NPIX_B in matches.columns:
-        parts: list[pl.DataFrame] = []
-        for npix_b in matches[CROSSMATCH_HEALPIX_NPIX_B].unique().to_list():
-            group = matches.filter(pl.col(CROSSMATCH_HEALPIX_NPIX_B) == npix_b)
-            sids = group["source_id_b"].unique().to_list()
-            if cache is not None:
-                chunk = cache.lookup(
-                    pacc, partner.survey, int(npix_b), fetch_cols, sids,
-                )
-            else:
-                chunk = pacc.get_sources_by_id_in_healpix_pixels(
-                    sids, [int(npix_b)], columns=fetch_cols, fmt="polars",
-                )
-            if not chunk.is_empty():
-                parts.append(chunk)
-        if not parts:
-            return pacc._empty_result("polars", fetch_cols)
-        return pl.concat(parts, how="vertical_relaxed")
-
     sids_b = matches["source_id_b"].unique().to_list()
-    partner_npix = _partner_healpix_pixels_covering_base_tile(
-        base_npix, base_order, pacc.norder,
-    )
-    if cache is not None:
-        parts = []
-        for npix_b in sorted(partner_npix):
-            chunk = cache.lookup(
-                pacc, partner.survey, npix_b, fetch_cols, sids_b,
+    if CROSSMATCH_HEALPIX_NPIX_B in matches.columns:
+        partner_npix = [
+            int(n) for n in matches[CROSSMATCH_HEALPIX_NPIX_B].unique().to_list()
+        ]
+    else:
+        partner_npix = sorted(
+            _partner_healpix_pixels_covering_base_tile(
+                base_npix, base_order, pacc.norder,
             )
-            if not chunk.is_empty():
-                parts.append(chunk)
-        if not parts:
-            return pacc._empty_result("polars", fetch_cols)
-        return pl.concat(parts, how="vertical_relaxed").unique(subset=[pid], keep="first")
+        )
+
+    if cache is not None and cache.enabled:
+        return cache.lookup_many(
+            pacc, partner.survey, partner_npix, fetch_cols, sids_b,
+        )
     return pacc.get_sources_by_id_in_healpix_pixels(
         sids_b, partner_npix, columns=fetch_cols, fmt="polars",
     )
@@ -228,7 +209,6 @@ def _gather_one_tile(
             base_order=base_order,
             cache=partner_cache,
             fetch_cols=fetch_cols,
-            pid=pid,
         )
         rename = {c: _prefixed(partner.survey, c) for c in pcols if c != pid}
         pdf = pdf.rename(rename)

@@ -125,3 +125,35 @@ class TestPartnerTileCache:
             cache.lookup(acc, "DESI_DR1", npix + 1, cols, [101])
             cache.lookup(acc, "DESI_DR1", npix, cols, [101])
         assert len(calls) >= 2
+
+    def test_lookup_many_batches_multiple_npix(self, tmp_path: Path, monkeypatch) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix_a = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        npix_b = npix_a + 1
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix_a,
+            source_ids=[101], ra=[ra], dec=[dec], extra={"z": [0.5]},
+        )
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix_b,
+            source_ids=[102], ra=[ra + 0.01], dec=[dec + 0.01], extra={"z": [1.2]},
+        )
+        calls: list[tuple] = []
+        orig = CatalogAccessor.get_sources_by_id_in_healpix_pixels
+
+        def counting(self, source_ids, npixels, columns=None, fmt="polars", **kwargs):
+            calls.append((list(npixels), list(source_ids)))
+            return orig(self, source_ids, npixels, columns=columns, fmt=fmt, **kwargs)
+
+        monkeypatch.setattr(
+            CatalogAccessor, "get_sources_by_id_in_healpix_pixels", counting,
+        )
+        cache = PartnerTileCache(PartnerTileCacheConfig(max_bytes=10 * 1024 * 1024, max_tiles=8))
+        with CatalogAccessor(lake, "DESI_DR1") as acc:
+            cols = [acc.link_id_column, "z"]
+            out = cache.lookup_many(acc, "DESI_DR1", [npix_a, npix_b], cols, [101, 102])
+        assert len(calls) == 1
+        assert set(calls[0][0]) == {npix_a, npix_b}
+        assert out.height == 2

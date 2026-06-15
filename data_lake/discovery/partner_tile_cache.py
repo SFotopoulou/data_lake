@@ -45,10 +45,22 @@ class PartnerTileCache:
         ids: Sequence[int],
     ):
         """Return partner rows for *ids* in one HEALPix tile, using cache when enabled."""
+        return self.lookup_many(pacc, survey, [int(npix)], columns, ids)
+
+    def lookup_many(
+        self,
+        pacc: CatalogAccessor,
+        survey: str,
+        npix_list: Sequence[int],
+        columns: list[str],
+        ids: Sequence[int],
+    ):
+        """Return partner rows for *ids*, batching disk reads across *npix_list*."""
         import polars as pl
 
         id_list = [int(i) for i in ids]
-        if not id_list:
+        npix_ints = [int(n) for n in npix_list]
+        if not id_list or not npix_ints:
             return pacc._empty_result("polars", columns)
 
         pid = pacc.link_id_column
@@ -56,34 +68,67 @@ class PartnerTileCache:
 
         if not self._config.enabled:
             return pacc.get_sources_by_id_in_healpix_pixels(
-                id_list, [npix], columns=columns, fmt="polars",
+                id_list, npix_ints, columns=columns, fmt="polars",
             )
 
-        key = (survey, int(npix), col_key)
-        cached = self._entries.get(key)
-        if cached is not None:
-            self._entries.move_to_end(key)
+        hp_col = f"_healpix_norder{pacc.norder}"
+        need_fetch: list[int] = []
+        parts: list[pl.DataFrame] = []
 
-        present: set[int] = set()
-        if cached is not None and not cached.is_empty():
-            present = set(cached[pid].to_list())
+        for npix in npix_ints:
+            key = (survey, npix, col_key)
+            cached = self._entries.get(key)
+            if cached is not None:
+                self._entries.move_to_end(key)
+            present: set[int] = set()
+            if cached is not None and not cached.is_empty():
+                present = set(cached[pid].to_list())
+            if [i for i in id_list if i not in present]:
+                need_fetch.append(npix)
+            elif cached is not None and not cached.is_empty():
+                parts.append(cached.filter(pl.col(pid).is_in(id_list)))
 
-        missing = [i for i in id_list if i not in present]
-        if missing:
+        if need_fetch:
+            fetch_cols = list(columns)
+            if hp_col not in fetch_cols:
+                fetch_cols.append(hp_col)
             fetched = pacc.get_sources_by_id_in_healpix_pixels(
-                missing, [npix], columns=columns, fmt="polars",
+                id_list, need_fetch, columns=fetch_cols, fmt="polars",
             )
-            if cached is None or cached.is_empty():
-                cached = fetched
-            elif fetched.is_empty():
-                pass
-            else:
-                cached = pl.concat([cached, fetched], how="vertical_relaxed")
-            self._put(key, cached)
+            if not fetched.is_empty():
+                if hp_col in fetched.columns:
+                    for npix in need_fetch:
+                        key = (survey, npix, col_key)
+                        chunk = fetched.filter(pl.col(hp_col) == npix)
+                        if hp_col not in columns:
+                            chunk = chunk.drop(hp_col)
+                        if chunk.is_empty():
+                            continue
+                        cached = self._entries.get(key)
+                        if cached is not None and not cached.is_empty():
+                            merged = pl.concat([cached, chunk], how="vertical_relaxed")
+                        else:
+                            merged = chunk
+                        self._put(key, merged)
+                        parts.append(merged.filter(pl.col(pid).is_in(id_list)))
+                elif len(need_fetch) == 1:
+                    npix = need_fetch[0]
+                    key = (survey, npix, col_key)
+                    cached = self._entries.get(key)
+                    if cached is not None and not cached.is_empty():
+                        merged = pl.concat([cached, fetched], how="vertical_relaxed")
+                    else:
+                        merged = fetched
+                    self._put(key, merged)
+                    parts.append(merged.filter(pl.col(pid).is_in(id_list)))
+                else:
+                    parts.append(fetched.filter(pl.col(pid).is_in(id_list)))
 
-        if cached is None or cached.is_empty():
+        if not parts:
             return pacc._empty_result("polars", columns)
-        return cached.filter(pl.col(pid).is_in(id_list))
+        if len(parts) == 1:
+            return parts[0]
+        return pl.concat(parts, how="vertical_relaxed")
 
     def _put(self, key: tuple, df) -> None:
         if key in self._entries:

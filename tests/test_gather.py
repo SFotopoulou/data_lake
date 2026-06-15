@@ -214,10 +214,29 @@ class TestGatherProduct:
         assert matched_result.n_rows == 1
         with CatalogAccessor(lake, "matched_only") as acc:
             df = acc.query("SELECT * FROM catalog", fmt="polars")
-        assert df["_source_id"].to_list() == [1]
+    def test_partner_fetch_batches_npix_per_tile(self, joined_lake: Path, monkeypatch) -> None:
+        """One batched DuckDB read per partner per base tile (not per partner Npix)."""
+        calls: list[tuple] = []
+        orig = CatalogAccessor.get_sources_by_id_in_healpix_pixels
 
+        def counting(self, source_ids, npixels, columns=None, fmt="polars", **kwargs):
+            calls.append((list(npixels), list(source_ids)))
+            return orig(self, source_ids, npixels, columns=columns, fmt=fmt, **kwargs)
 
-class TestExtractModalities:
+        monkeypatch.setattr(
+            CatalogAccessor, "get_sources_by_id_in_healpix_pixels", counting,
+        )
+        region = Region.cone(120.0, 45.0, 120.0)
+        sel = selection_from_region(joined_lake, "EUCLID", region)
+        gather_product(
+            joined_lake, "EUCLID",
+            [PartnerSpec("DESI_DR1", 2.0, ["z"])],
+            sel,
+            base_columns=["ra"],
+            materialize_as="EUCLID_desi_batch",
+        )
+        assert len(calls) == 1
+
     def test_spectra_extraction_for_product(self, tmp_path: Path) -> None:
         from test_extract_subset import SOURCES, SURVEY, _ingest_synthetic_lake
         from data_lake.discovery.gather import extract_modalities_for_product

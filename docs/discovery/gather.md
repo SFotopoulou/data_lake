@@ -126,8 +126,10 @@ are fetched from the partner's own `Npix` files:
   to the partner order plus a one-pixel neighbour ring.
 
 Partner Parquet reads use **column projection** only (`gather.columns` + link
-ID). A bounded **LRU cache** avoids re-opening the same partner tile when
-adjacent base tiles overlap:
+ID). For each base tile, partner rows are loaded in **one batched DuckDB query**
+over all relevant partner `Npix` files (exact list from `healpix_npix_b`, or the
+geometric fallback set). A bounded **LRU cache** avoids re-opening the same
+partner tile when adjacent base tiles overlap:
 
 | Flag | Default | Meaning |
 |------|---------|---------|
