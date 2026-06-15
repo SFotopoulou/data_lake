@@ -69,6 +69,21 @@ def normalize_area_id(area_id: str) -> str:
     return aid
 
 
+def resolve_area_path(lake_root: Path | str, area_id: str) -> Path | None:
+    """Return the first existing area JSON path for *area_id*, or ``None``."""
+    raw = area_id.strip()
+    normalized = normalize_area_id(raw)
+    d = areas_dir(lake_root)
+    seen: set[Path] = set()
+    for stem in (normalized, raw):
+        candidate = d / f"{stem}.json"
+        if candidate not in seen:
+            seen.add(candidate)
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 @dataclass
 class Area:
     """Parsed view over an ``areas/<area_id>.json`` definition."""
@@ -119,9 +134,12 @@ def make_area(area_id: str, region: Region, **blocks: Any) -> Area:
 
 def load_area(lake_root: Path | str, area_id: str) -> Area:
     normalized = normalize_area_id(area_id)
-    path = area_path(lake_root, normalized)
-    if not path.is_file():
-        raise FileNotFoundError(f"area not found: {path}")
+    path = resolve_area_path(lake_root, area_id)
+    if path is None:
+        raise FileNotFoundError(
+            f"area not found: {area_path(lake_root, normalized)} "
+            f"(also tried {areas_dir(lake_root) / f'{area_id.strip()}.json'})"
+        )
     with open(path) as fh:
         data = json.load(fh)
     return Area(area_id=data.get("area_id", normalized), data=data)

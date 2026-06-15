@@ -30,9 +30,10 @@ dl-gather /data/lake \
 When you run `dl-gather --from-area`, column selection and output options come
 from the area file (`areas/<area_id>.json`). The area id may be given with or
 without a `.area` or `.json` suffix (`EDFF-test-01` and `EDFF-test-01.area` are
-equivalent). The `columns` key is a mapping
-**survey name → list of native catalog column names** (same shape as the CLI
-`--columns` JSON):
+equivalent). Legacy files named `areas/<id>.area.json` (from older
+`dl-region --save-as <id>.area` runs) are found automatically. The `columns` key
+is a mapping **survey name → list of native catalog column names** (same shape
+as the CLI `--columns` JSON):
 
 ```json
 "gather": {

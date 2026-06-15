@@ -10,6 +10,7 @@ import pytest
 from data_lake.discovery.areas import (
     Area,
     area_is_valid,
+    areas_dir,
     list_areas,
     load_area,
     make_area,
@@ -96,5 +97,20 @@ class TestNormalizeAreaId:
         lake = tmp_path / "lake"
         area = make_area("EDFF-test-01", Region.cone(1.0, 2.0, 10.0))
         save_area(lake, area)
+        loaded = load_area(lake, "EDFF-test-01.area")
+        assert loaded.area_id == "EDFF-test-01"
+
+    def test_load_area_legacy_area_json_filename(self, tmp_path: Path) -> None:
+        """``--save-as Foo.area`` before canonical naming → ``areas/Foo.area.json``."""
+        lake = tmp_path / "lake"
+        legacy = areas_dir(lake) / "EDFF-test-01.area.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text(
+            json.dumps({
+                "area_id": "EDFF-test-01",
+                "schema_version": "1",
+                "region": Region.cone(1.0, 2.0, 10.0).to_dict(),
+            })
+        )
         loaded = load_area(lake, "EDFF-test-01.area")
         assert loaded.area_id == "EDFF-test-01"
