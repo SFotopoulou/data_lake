@@ -128,6 +128,62 @@ class TestGatherProduct:
         gather_product(joined_lake, "EUCLID", [PartnerSpec("DESI_DR1", 2.0, ["z"])], sel,
                        overwrite=True, **kw)
 
+    def test_tile_bounded_partner_lookup(self, tmp_path: Path) -> None:
+        """Partner fetch reads only the requested HEALPix tiles."""
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix_a = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        npix_b = npix_a + 1 if npix_a < 100 else npix_a - 1
+
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix_a,
+            source_ids=[101], ra=[ra], dec=[dec], extra={"z": [0.42]},
+        )
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix_b,
+            source_ids=[999], ra=[ra + 1.0], dec=[dec + 1.0], extra={"z": [9.99]},
+        )
+
+        with CatalogAccessor(lake, "DESI_DR1") as acc:
+            df = acc.get_sources_by_id_in_healpix_pixels(
+                [101, 999], [npix_a], columns=["z"], fmt="polars",
+            )
+        assert df["z"].to_list() == [pytest.approx(0.42)]
+        assert len(df) == 1
+
+    def test_partner_at_finer_healpix_order(self, tmp_path: Path) -> None:
+        """Gather tile-bounds partner reads when partner hats_order > base."""
+        lake = tmp_path / "lake"
+        base_order, partner_order = 5, 6
+        ra, dec = 120.0, 45.0
+        base_npix = int(assign_healpix(np.array([ra]), np.array([dec]), base_order)[0])
+        partner_npix = int(assign_healpix(np.array([ra]), np.array([dec]), partner_order)[0])
+
+        _write_catalog_tile(
+            lake, "EUCLID", norder=base_order, npix=base_npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=partner_order, npix=partner_npix,
+            source_ids=[101], ra=[ra + 0.00001], dec=[dec + 0.00001],
+            extra={"z": [1.7]},
+        )
+        build_crossmatch(lake, "EUCLID", "DESI_DR1", radius_arcsec=2.0)
+
+        sel = selection_from_region(lake, "EUCLID", Region.cone(ra, dec, 120.0))
+        result = gather_product(
+            lake, "EUCLID",
+            [PartnerSpec("DESI_DR1", 2.0, ["z"])],
+            sel,
+            base_columns=["ra", "dec"],
+            materialize_as="EUCLID_desi_fine",
+        )
+        assert result.n_rows == 1
+        with CatalogAccessor(lake, "EUCLID_desi_fine") as acc:
+            df = acc.query("SELECT * FROM catalog", fmt="polars")
+        assert df["DESI_DR1_z"].to_list() == [pytest.approx(1.7)]
+
 
 class TestExtractModalities:
     def test_spectra_extraction_for_product(self, tmp_path: Path) -> None:

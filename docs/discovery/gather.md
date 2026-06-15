@@ -125,6 +125,13 @@ overrides the source survey (default: the product's base catalog).
 
 ## Parallelism
 
-Gather is tile-bounded and processes the selected base tiles; counting and
-tile-index builds use a thread pool, crossmatch uses a process pool. All
-honour the global `max_workers ≤ 64` cap.
+Gather processes base tiles **sequentially**. Per tile it reads one base Parquet
+file, one crossmatch file per partner, and **only the partner catalog tiles that
+overlap that base pixel** (plus a one-pixel neighbour ring), not the full
+partner survey.
+
+Partner lookups use
+:meth:`~data_lake.io.catalog.CatalogAccessor.get_sources_by_id_in_healpix_pixels`
+instead of scanning the whole ``catalog`` DuckDB view. CPU use can still spike
+when several DuckDB/Polars threads run per tile — cap with ``DUCKDB_THREADS`` and
+``POLARS_MAX_THREADS`` if needed.

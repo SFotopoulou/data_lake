@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -65,6 +64,30 @@ class GatherResult:
 
 def _prefixed(survey: str, col: str) -> str:
     return col if col.startswith(f"{survey}_") else f"{survey}_{col}"
+
+
+def _partner_healpix_pixels_covering_base_tile(
+    base_npix: int,
+    base_order: int,
+    partner_order: int,
+) -> set[int]:
+    """Partner HEALPix pixels that may hold matches for a base tile.
+
+    Rescales the base pixel to the partner order, then adds a one-pixel neighbour
+    ring so sources matched across tile edges are still found.
+    """
+    import healpy as hp
+
+    from data_lake.discovery.region import rescale_npix_nested
+
+    pixels = rescale_npix_nested([int(base_npix)], base_order, partner_order)
+    nside = hp.order2nside(int(partner_order))
+    expanded: set[int] = set(pixels)
+    for npix in pixels:
+        for neighbour in hp.get_all_neighbours(nside, int(npix), nest=True):
+            if neighbour >= 0:
+                expanded.add(int(neighbour))
+    return expanded
 
 
 def _gather_one_tile(
@@ -122,7 +145,12 @@ def _gather_one_tile(
         pcols = partner.columns or []
         pid = pacc.link_id_column
         fetch_cols = [pid] + [c for c in pcols if c != pid]
-        pdf = pacc.get_sources_by_id(sids_b, columns=fetch_cols, fmt="polars")
+        partner_npix = _partner_healpix_pixels_covering_base_tile(
+            npix, base_order, pacc.norder,
+        )
+        pdf = pacc.get_sources_by_id_in_healpix_pixels(
+            sids_b, partner_npix, columns=fetch_cols, fmt="polars",
+        )
         rename = {c: _prefixed(partner.survey, c) for c in pcols if c != pid}
         pdf = pdf.rename(rename)
         joined = matches.join(
