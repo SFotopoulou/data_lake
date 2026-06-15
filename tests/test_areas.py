@@ -13,6 +13,7 @@ from data_lake.discovery.areas import (
     list_areas,
     load_area,
     make_area,
+    normalize_area_id,
     save_area,
     validate_area,
 )
@@ -79,3 +80,21 @@ class TestAreaValidation:
         )
         msgs = validate_area(area.data)
         assert any("multiplicity" in m for m in msgs)
+
+
+class TestNormalizeAreaId:
+    def test_strips_json_suffix(self) -> None:
+        assert normalize_area_id("EDFF-test-01.json") == "EDFF-test-01"
+
+    def test_strips_area_suffix(self) -> None:
+        assert normalize_area_id("EDFF-test-01.area") == "EDFF-test-01"
+
+    def test_plain_id_unchanged(self) -> None:
+        assert normalize_area_id("Wide_Field_47") == "Wide_Field_47"
+
+    def test_load_area_accepts_area_suffix(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        area = make_area("EDFF-test-01", Region.cone(1.0, 2.0, 10.0))
+        save_area(lake, area)
+        loaded = load_area(lake, "EDFF-test-01.area")
+        assert loaded.area_id == "EDFF-test-01"

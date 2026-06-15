@@ -28,7 +28,9 @@ dl-gather /data/lake \
 ## Area JSON (`gather` block)
 
 When you run `dl-gather --from-area`, column selection and output options come
-from the area file (`areas/<area_id>.json`). The `columns` key is a mapping
+from the area file (`areas/<area_id>.json`). The area id may be given with or
+without a `.area` or `.json` suffix (`EDFF-test-01` and `EDFF-test-01.area` are
+equivalent). The `columns` key is a mapping
 **survey name → list of native catalog column names** (same shape as the CLI
 `--columns` JSON):
 
@@ -51,7 +53,7 @@ from the area file (`areas/<area_id>.json`). The `columns` key is a mapping
 |-------|----------|---------|
 | `base` | yes | Base catalog; defines the row set and HEALPix tiling. |
 | `columns` | yes | `{survey: [col, …]}`. Every survey except `base` is joined as a partner. |
-| `materialize_as` | yes | Product name under `catalogs/<name>/`. |
+| `materialize_as` | yes | Product name under `catalogs/<name>/`. Overridden by CLI `--materialize-as` when set. |
 | `multiplicity` | no | `nearest` (default) or `all`. |
 | `include_sep` | no | Default `true`; set `false` to omit `<survey>_sep_arcsec` columns. |
 | `keep_all` | no | Default `true`; set `false` for matches-only (same as `--matches-only`). |
@@ -79,6 +81,12 @@ gather so the `A_x_B__r<radius>` trees exist.
 
 Only columns listed under each survey are read and written; surveys omitted from
 `columns` are not joined.
+
+**CLI overrides:** explicit flags take precedence over the area file (same as
+other `dl-*` commands). For example, `--materialize-as MyProduct` writes to
+`catalogs/MyProduct/` even when the area has a different `gather.materialize_as`.
+At the start of a run, `dl-gather` prints the resolved product name, base
+survey, partner count, and tile count.
 
 ## Selection (one of)
 

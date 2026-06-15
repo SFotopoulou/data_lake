@@ -80,6 +80,10 @@ class TestGatherProduct:
         )
         assert info["kind"] == "product"
         assert info["provenance"]["base_catalog"] == "EUCLID"
+        assert info["ra_column"] == "ra"
+        assert info["dec_column"] == "dec"
+        assert info["total_columns"] is not None
+        assert info["total_columns"] >= 4
 
         with CatalogAccessor(joined_lake, "EUCLID_desi") as acc:
             df = acc.query("SELECT * FROM catalog ORDER BY _source_id", fmt="polars")
@@ -322,5 +326,45 @@ class TestGatherCli:
 
         result = CliRunner().invoke(cli, [str(joined_lake), "--from-area", "WideField"])
         assert result.exit_code == 0, result.output
+        assert "Gather EUCLID_desi_area:" in result.output
         assert "EUCLID_desi_area" in result.output
         assert (joined_lake / "catalogs" / "EUCLID_desi_area" / "catalog_info.json").is_file()
+
+    def test_cli_materialize_as_overrides_area(self, joined_lake: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.discovery.areas import make_area, save_area
+        from data_lake.discovery.gather_cli import cli
+
+        area = make_area(
+            "OverrideTest",
+            Region.cone(120.0, 45.0, 120.0),
+            crossmatch_plan={
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "DESI_DR1", "radius_arcsec": 2.0}],
+            },
+            gather={
+                "base": "EUCLID",
+                "columns": {"EUCLID": ["ra", "dec"], "DESI_DR1": ["z"]},
+                "materialize_as": "from_area_json",
+            },
+        )
+        save_area(joined_lake, area)
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                str(joined_lake),
+                "--from-area",
+                "OverrideTest",
+                "--materialize-as",
+                "cli_wins",
+                "--overwrite",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Gather cli_wins:" in result.output
+        assert "cli_wins" in result.output
+        assert "from_area_json" not in result.output
+        assert (joined_lake / "catalogs" / "cli_wins" / "catalog_info.json").is_file()
+        assert not (joined_lake / "catalogs" / "from_area_json").exists()

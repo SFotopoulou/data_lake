@@ -246,7 +246,8 @@ try:
                     no_sep = not g["include_sep"]
                 if not matches_only and g.get("keep_all") is not None:
                     keep_all = bool(g["keep_all"])
-                materialize_as = g.get("materialize_as") or materialize_as
+                if materialize_as is None:
+                    materialize_as = g.get("materialize_as")
                 where_joined = where_joined or g.get("where_joined")
             else:
                 if not base:
@@ -298,6 +299,11 @@ try:
                 bbox=bbox,
                 npix=npix,
                 npix_norder=npix_norder,
+            )
+            out_path = lake / "catalogs" / materialize_as
+            click.echo(
+                f"Gather {materialize_as}: base={base}, {len(partners)} partner(s), "
+                f"{len(selection.npix)} tile(s) → {out_path}/"
             )
             result = gather_product(
                 lake,

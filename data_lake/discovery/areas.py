@@ -57,7 +57,16 @@ def areas_dir(lake_root: Path | str) -> Path:
 
 
 def area_path(lake_root: Path | str, area_id: str) -> Path:
-    return areas_dir(lake_root) / f"{area_id}.json"
+    return areas_dir(lake_root) / f"{normalize_area_id(area_id)}.json"
+
+
+def normalize_area_id(area_id: str) -> str:
+    """Strip optional ``.area`` / ``.json`` suffixes from a CLI area id."""
+    aid = area_id.strip()
+    for suffix in (".json", ".area"):
+        if aid.endswith(suffix):
+            return aid[: -len(suffix)]
+    return aid
 
 
 @dataclass
@@ -109,12 +118,13 @@ def make_area(area_id: str, region: Region, **blocks: Any) -> Area:
 
 
 def load_area(lake_root: Path | str, area_id: str) -> Area:
-    path = area_path(lake_root, area_id)
+    normalized = normalize_area_id(area_id)
+    path = area_path(lake_root, normalized)
     if not path.is_file():
         raise FileNotFoundError(f"area not found: {path}")
     with open(path) as fh:
         data = json.load(fh)
-    return Area(area_id=data.get("area_id", area_id), data=data)
+    return Area(area_id=data.get("area_id", normalized), data=data)
 
 
 def save_area(lake_root: Path | str, area: Area, *, overwrite: bool = False) -> Path:

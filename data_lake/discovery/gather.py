@@ -293,6 +293,7 @@ def gather_product(
     t0 = time.perf_counter()
     n_rows = 0
     n_tiles_written = 0
+    product_n_columns: int | None = None
 
     iterator: Any = npix_list
     if show_progress:
@@ -352,6 +353,8 @@ def gather_product(
             )
             n_rows += table.num_rows
             n_tiles_written += 1
+            if product_n_columns is None:
+                product_n_columns = table.num_columns
     finally:
         base_acc.close()
         for acc in partner_acc.values():
@@ -360,6 +363,7 @@ def gather_product(
     _write_product_info(
         out_root,
         materialize_as,
+        lake_root=lake_root,
         base=base,
         base_order=base_order,
         partners=partners,
@@ -370,6 +374,7 @@ def gather_product(
         where_joined=where_joined,
         keep_all=keep_all,
         n_rows=n_rows,
+        n_columns=product_n_columns,
     )
 
     return GatherResult(
@@ -383,10 +388,19 @@ def gather_product(
     )
 
 
+def _base_catalog_info(lake_root: Path, base: str) -> dict[str, Any]:
+    info_path = lake_root / "catalogs" / base / "catalog_info.json"
+    if not info_path.is_file():
+        return {}
+    with open(info_path) as fh:
+        return json.load(fh)
+
+
 def _write_product_info(
     out_root: Path,
     name: str,
     *,
+    lake_root: Path,
     base: str,
     base_order: int,
     partners: list[PartnerSpec],
@@ -397,7 +411,9 @@ def _write_product_info(
     where_joined: str | None,
     keep_all: bool,
     n_rows: int,
+    n_columns: int | None = None,
 ) -> None:
+    base_info = _base_catalog_info(lake_root, base)
     info = {
         "catalog_name": name,
         "kind": CATALOG_KIND_PRODUCT,
@@ -405,9 +421,11 @@ def _write_product_info(
         "hats_order": base_order,
         "link_id_mode": "column:" + LAKE_JOIN_ID_COLUMN,
         "link_id_column": LAKE_JOIN_ID_COLUMN,
-        "ra_column": None,
-        "dec_column": None,
+        "ra_column": base_info.get("ra_column"),
+        "dec_column": base_info.get("dec_column"),
         "total_rows": n_rows,
+        "total_columns": n_columns,
+        "n_columns": n_columns,
         "provenance": {
             "base_catalog": base,
             "base_columns": base_columns,
