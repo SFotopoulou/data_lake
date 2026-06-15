@@ -133,6 +133,12 @@ There is no backward compatibility for the old `catalogs/crossmatch/` location:
 move existing trees up one level (`mv catalogs/crossmatch/* crossmatch/`, renaming
 to add `__r<radius>`) or recompute them.
 
+**Per-tile Parquet columns:** `source_id_a`, `source_id_b`, `sep_arcsec`,
+`_healpix_norder<N_a>` (base partition key), and `healpix_npix_b` (partner survey
+B pixel, written on new crossmatch runs). [`dl-gather`](gather.md) uses
+`healpix_npix_b` for exact partner tile reads; older trees without it still work
+via a geometric fallback. Re-run `dl-crossmatch` with `--overwrite` to refresh.
+
 ### Region-bounded plans (`--from-area` / `--plan`)
 
 Instead of matching whole surveys, drive a **crossmatch plan** (a base catalog ×

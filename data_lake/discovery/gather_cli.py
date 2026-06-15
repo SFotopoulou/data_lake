@@ -24,6 +24,7 @@ from data_lake.discovery.gather import (
     gather_product,
     partners_from_columns,
 )
+from data_lake.discovery.partner_tile_cache import PartnerTileCache, PartnerTileCacheConfig
 from data_lake.discovery.region import Region, parse_npix_arg
 from data_lake.discovery.selection import (
     BaseSelection,
@@ -127,6 +128,30 @@ try:
                   default="nearest", show_default=True,
                   help="nearest match per source (default) or all matches (fan-out).")
     @click.option("--no-sep", is_flag=True, help="Omit per-partner sep_arcsec columns.")
+    @click.option(
+        "--matches-only",
+        is_flag=True,
+        help="Keep only base rows with at least one partner crossmatch (default: keep all).",
+    )
+    @click.option(
+        "--partner-cache-mb",
+        default=512,
+        show_default=True,
+        type=int,
+        help="Max partner-tile cache size in MiB (0 disables cache).",
+    )
+    @click.option(
+        "--partner-cache-tiles",
+        default=48,
+        show_default=True,
+        type=int,
+        help="Max partner tiles cached per gather run.",
+    )
+    @click.option(
+        "--no-partner-cache",
+        is_flag=True,
+        help="Disable partner catalog tile cache.",
+    )
     @click.option("--where-joined", "where_joined", default=None,
                   help="Predicate over partner columns, applied after the join.")
     # selection selectors
@@ -158,6 +183,10 @@ try:
         materialize_as: str | None,
         multiplicity: str,
         no_sep: bool,
+        matches_only: bool,
+        partner_cache_mb: int,
+        partner_cache_tiles: int,
+        no_partner_cache: bool,
         where_joined: str | None,
         ids_file: Path | None,
         where: str | None,
@@ -195,6 +224,7 @@ try:
         area_obj: Area | None = None
         base_columns: list[str] = []
         partners: list[PartnerSpec]
+        keep_all = not matches_only
 
         try:
             if from_area is not None:
@@ -214,6 +244,8 @@ try:
                 multiplicity = g.get("multiplicity", multiplicity)
                 if g.get("include_sep") is not None:
                     no_sep = not g["include_sep"]
+                if not matches_only and g.get("keep_all") is not None:
+                    keep_all = bool(g["keep_all"])
                 materialize_as = g.get("materialize_as") or materialize_as
                 where_joined = where_joined or g.get("where_joined")
             else:
@@ -241,6 +273,19 @@ try:
                 with CatalogAccessor(lake, base) as acc:
                     base_order = acc.norder
 
+            if partner_cache_mb < 0:
+                raise click.ClickException("--partner-cache-mb must be >= 0")
+            if partner_cache_tiles < 0:
+                raise click.ClickException("--partner-cache-tiles must be >= 0")
+            cache_enabled = not no_partner_cache and partner_cache_mb > 0 and partner_cache_tiles > 0
+            partner_cache = PartnerTileCache(
+                PartnerTileCacheConfig(
+                    max_bytes=partner_cache_mb * 1024 * 1024,
+                    max_tiles=partner_cache_tiles,
+                    enabled=cache_enabled,
+                )
+            )
+
             selection = _resolve_selection(
                 lake,
                 base=base,
@@ -264,6 +309,8 @@ try:
                 include_sep=not no_sep,
                 materialize_as=materialize_as,
                 where_joined=where_joined,
+                keep_all=keep_all,
+                partner_cache=partner_cache,
                 overwrite=overwrite,
                 show_progress=show_progress,
             )

@@ -184,6 +184,38 @@ class TestGatherProduct:
             df = acc.query("SELECT * FROM catalog", fmt="polars")
         assert df["DESI_DR1_z"].to_list() == [pytest.approx(1.7)]
 
+    def test_matches_only_drops_unmatched_base_rows(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(
+            lake, "EUCLID", norder=norder, npix=npix,
+            source_ids=[1, 2], ra=[ra, ra + 0.5], dec=[dec, dec + 0.5],
+        )
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix,
+            source_ids=[101], ra=[ra + 0.00001], dec=[dec + 0.00001],
+            extra={"z": [0.5]},
+        )
+        build_crossmatch(lake, "EUCLID", "DESI_DR1", radius_arcsec=2.0)
+        sel = selection_from_region(lake, "EUCLID", Region.cone(ra, dec, 120.0))
+
+        all_result = gather_product(
+            lake, "EUCLID", [PartnerSpec("DESI_DR1", 2.0, ["z"])], sel,
+            base_columns=["ra"], materialize_as="all_rows", keep_all=True,
+        )
+        assert all_result.n_rows == 2
+
+        matched_result = gather_product(
+            lake, "EUCLID", [PartnerSpec("DESI_DR1", 2.0, ["z"])], sel,
+            base_columns=["ra"], materialize_as="matched_only", keep_all=False,
+        )
+        assert matched_result.n_rows == 1
+        with CatalogAccessor(lake, "matched_only") as acc:
+            df = acc.query("SELECT * FROM catalog", fmt="polars")
+        assert df["_source_id"].to_list() == [1]
+
 
 class TestExtractModalities:
     def test_spectra_extraction_for_product(self, tmp_path: Path) -> None:

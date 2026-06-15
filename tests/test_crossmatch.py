@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, assign_healpix, healpix_dir
 from data_lake.io.crossmatch import (
+    CROSSMATCH_HEALPIX_NPIX_B,
     CrossmatchAccessor,
     CrossmatchTileConfig,
     build_crossmatch,
@@ -245,6 +246,30 @@ class TestBuildCrossmatch:
         row = matches.row(0, named=True)
         assert row["source_id_b"] == 2001
         assert row["sep_arcsec"] < 2.0
+        assert CROSSMATCH_HEALPIX_NPIX_B in matches.columns
+
+    def test_crossmatch_writes_healpix_npix_b(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder, npix=npix,
+            source_ids=[1001], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "SURVEY_B", norder=norder, npix=npix,
+            source_ids=[2001], ra=[ra + 0.00001], dec=[dec + 0.00001],
+        )
+        build_crossmatch(lake, "SURVEY_A", "SURVEY_B", radius_arcsec=2.0)
+        xm_path = (
+            crossmatch_root(lake, "SURVEY_A", "SURVEY_B", 2.0)
+            / healpix_dir(norder, npix)
+            / f"Npix={npix}.parquet"
+        )
+        table = pq.read_table(str(xm_path))
+        assert CROSSMATCH_HEALPIX_NPIX_B in table.column_names
+        assert table.column(CROSSMATCH_HEALPIX_NPIX_B)[0].as_py() == npix
 
     def test_mixed_columns_and_norder(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"

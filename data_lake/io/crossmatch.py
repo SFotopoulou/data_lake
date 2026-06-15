@@ -17,7 +17,8 @@ Each Parquet row contains::
     source_id_a  int64  – source_id from surveyA
     source_id_b  int64  – source_id from surveyB
     sep_arcsec   float32 – angular separation in arcseconds
-    _healpix_norder<N>  int64 – tile of surveyA source (determines partition)
+    _healpix_norder<N_a>  int64 – tile of surveyA source (determines partition)
+    healpix_npix_b  int64 – partner survey B HEALPix pixel (optional; new trees)
 
 Usage
 -----
@@ -513,6 +514,7 @@ def _catalog_ids_to_int64(values) -> np.ndarray:
 
 
 _CROSSMATCH_DENSE_TILE_WARN = 50_000
+CROSSMATCH_HEALPIX_NPIX_B = "healpix_npix_b"
 
 
 def _crossmatch_one_tile(
@@ -565,7 +567,8 @@ def _crossmatch_one_tile(
         if b_pixels
         else acc_b.link_id_column
     )
-    cols_b = [id_col_b, ra_col_b, dec_col_b]
+    hp_col_b = f"_healpix_norder{norder_b}"
+    cols_b = [id_col_b, ra_col_b, dec_col_b, hp_col_b]
     ra_min, ra_max, dec_min, dec_max = _source_bbox_deg(ra_a, dec_a, radius_deg)
     df_b = acc_b.sources_in_healpix_pixels(
         b_pixels,
@@ -592,11 +595,21 @@ def _crossmatch_one_tile(
     if matched_a.size == 0:
         return 0
 
+    id_to_npix_b = dict(zip(
+        df_b[id_col_b].to_list(),
+        df_b[hp_col_b].to_list(),
+    ))
+    npix_b_matched = np.array(
+        [int(id_to_npix_b[b]) for b in matched_b],
+        dtype=np.int64,
+    )
+
     table = pa.table({
         "source_id_a": pa.array(matched_a, type=pa.int64()),
         "source_id_b": pa.array(matched_b, type=pa.int64()),
         "sep_arcsec": pa.array((sep * 3600.0).astype(np.float32), type=pa.float32()),
         hp_col: pa.array(np.full(len(matched_a), npix_a, dtype=np.int64), type=pa.int64()),
+        CROSSMATCH_HEALPIX_NPIX_B: pa.array(npix_b_matched, type=pa.int64()),
     })
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -703,6 +716,7 @@ def _empty_crossmatch_table(norder: int) -> pa.Table:
         "source_id_b": pa.array([], type=pa.int64()),
         "sep_arcsec": pa.array([], type=pa.float32()),
         hp_col: pa.array([], type=pa.int64()),
+        CROSSMATCH_HEALPIX_NPIX_B: pa.array([], type=pa.int64()),
     })
 
 

@@ -54,6 +54,7 @@ from the area file (`areas/<area_id>.json`). The `columns` key is a mapping
 | `materialize_as` | yes | Product name under `catalogs/<name>/`. |
 | `multiplicity` | no | `nearest` (default) or `all`. |
 | `include_sep` | no | Default `true`; set `false` to omit `<survey>_sep_arcsec` columns. |
+| `keep_all` | no | Default `true`; set `false` for matches-only (same as `--matches-only`). |
 | `where_joined` | no | SQL predicate on **joined** (prefixed) partner columns, applied after the join. |
 | `partners` | no | Optional `[{survey, radius_arcsec}]` override when radii differ from `crossmatch_plan`. |
 
@@ -102,11 +103,52 @@ and predicate selections stay tile-scoped (no full-tree scans).
 
 Per-partner `<survey>_sep_arcsec` columns are included unless `--no-sep`.
 
+## Base row policy (`--keep-all` / `--matches-only`)
+
+| Mode | Semantics |
+|------|-----------|
+| **`--keep-all`** (default) | Every base source in the selection; partner columns are `null` when unmatched. |
+| **`--matches-only`** | Drop base rows with **no** partner crossmatch (any partner). |
+
+Filter order: partner joins → `matches_only` (if set) → `--where-joined`.
+
+Area JSON: `"keep_all": false` mirrors `--matches-only`.
+
+## Partner tile reads and cache
+
+Crossmatch tiles are read at the **base** survey's `Npix`. Partner catalog rows
+are fetched from the partner's own `Npix` files:
+
+- **New crossmatch trees** include `healpix_npix_b` per match row — gather opens
+  exactly that partner tile (no geometric guesswork). Re-run
+  `dl-crossmatch --from-area` (or `--overwrite`) on older trees to add it.
+- **Older trees** without `healpix_npix_b` fall back to rescaling the base pixel
+  to the partner order plus a one-pixel neighbour ring.
+
+Partner Parquet reads use **column projection** only (`gather.columns` + link
+ID). A bounded **LRU cache** avoids re-opening the same partner tile when
+adjacent base tiles overlap:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--partner-cache-mb` | 512 | Max cache size (MiB); `0` disables. |
+| `--partner-cache-tiles` | 48 | Max cached partner tiles. |
+| `--no-partner-cache` | off | Disable cache entirely. |
+
+On full-sky gathers the cache evicts old tiles under the budget (no OOM); evicted
+tiles may be re-read later in the run.
+
 ## Partner-column predicates
 
 `--where-joined` applies **after** the join (crossmatch-then-filter), e.g.
 `--where-joined "DESI_DR1_z > 1.0"`. Use `--where` for base-only predicates
 (applied during selection, before crossmatch).
+
+## Parallelism
+
+Gather processes base tiles **sequentially**. CPU use can spike when DuckDB and
+Polars use many threads per tile — cap with ``DUCKDB_THREADS`` and
+``POLARS_MAX_THREADS`` if needed.
 
 ## Extracting other modalities
 
@@ -122,16 +164,3 @@ dl-gather /data/lake --from-area Euclid_North \
 This drives the existing extractors (`dl-extract-spectra-subset`,
 per-source cutout FITS) from the product's `_source_id` list. `--extract-survey`
 overrides the source survey (default: the product's base catalog).
-
-## Parallelism
-
-Gather processes base tiles **sequentially**. Per tile it reads one base Parquet
-file, one crossmatch file per partner, and **only the partner catalog tiles that
-overlap that base pixel** (plus a one-pixel neighbour ring), not the full
-partner survey.
-
-Partner lookups use
-:meth:`~data_lake.io.catalog.CatalogAccessor.get_sources_by_id_in_healpix_pixels`
-instead of scanning the whole ``catalog`` DuckDB view. CPU use can still spike
-when several DuckDB/Polars threads run per tile — cap with ``DUCKDB_THREADS`` and
-``POLARS_MAX_THREADS`` if needed.
