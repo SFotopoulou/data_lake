@@ -229,6 +229,8 @@ try:
         try:
             if from_area is not None:
                 area_obj = load_area(lake, from_area)
+                if area_obj.path is not None:
+                    click.echo(f"Area config: {area_obj.path.resolve()}")
                 g = area_obj.gather
                 if g is None:
                     raise click.ClickException(

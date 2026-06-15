@@ -86,8 +86,8 @@ Only columns listed under each survey are read and written; surveys omitted from
 **CLI overrides:** explicit flags take precedence over the area file (same as
 other `dl-*` commands). For example, `--materialize-as MyProduct` writes to
 `catalogs/MyProduct/` even when the area has a different `gather.materialize_as`.
-At the start of a run, `dl-gather` prints the resolved product name, base
-survey, partner count, and tile count.
+At the start of a run, `dl-gather` prints the resolved area file path (when using
+`--from-area`), product name, base survey, partner count, and tile count.
 
 ## Selection (one of)
 

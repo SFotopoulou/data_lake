@@ -326,6 +326,8 @@ class TestGatherCli:
 
         result = CliRunner().invoke(cli, [str(joined_lake), "--from-area", "WideField"])
         assert result.exit_code == 0, result.output
+        assert "Area config:" in result.output
+        assert "areas/WideField.json" in result.output
         assert "Gather EUCLID_desi_area:" in result.output
         assert "EUCLID_desi_area" in result.output
         assert (joined_lake / "catalogs" / "EUCLID_desi_area" / "catalog_info.json").is_file()

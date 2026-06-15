@@ -90,6 +90,7 @@ class Area:
 
     area_id: str
     data: dict[str, Any]
+    path: Path | None = None
 
     @property
     def region(self) -> Region:
@@ -142,7 +143,7 @@ def load_area(lake_root: Path | str, area_id: str) -> Area:
         )
     with open(path) as fh:
         data = json.load(fh)
-    return Area(area_id=data.get("area_id", normalized), data=data)
+    return Area(area_id=data.get("area_id", normalized), data=data, path=path)
 
 
 def save_area(lake_root: Path | str, area: Area, *, overwrite: bool = False) -> Path:
