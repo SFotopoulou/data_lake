@@ -25,6 +25,60 @@ dl-gather /data/lake \
   --materialize-as EUCLID_desi_wide47
 ```
 
+## Area JSON (`gather` block)
+
+When you run `dl-gather --from-area`, column selection and output options come
+from the area file (`areas/<area_id>.json`). The `columns` key is a mapping
+**survey name → list of native catalog column names** (same shape as the CLI
+`--columns` JSON):
+
+```json
+"gather": {
+  "base": "EUCLID",
+  "columns": {
+    "EUCLID":   ["ra", "dec"],
+    "DESI_DR1": ["z"],
+    "ALLWISE":  ["w1mpro"]
+  },
+  "multiplicity": "nearest",
+  "include_sep": true,
+  "materialize_as": "EUCLID_north_joined",
+  "where_joined": "DESI_DR1_z > 0.5"
+}
+```
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `base` | yes | Base catalog; defines the row set and HEALPix tiling. |
+| `columns` | yes | `{survey: [col, …]}`. Every survey except `base` is joined as a partner. |
+| `materialize_as` | yes | Product name under `catalogs/<name>/`. |
+| `multiplicity` | no | `nearest` (default) or `all`. |
+| `include_sep` | no | Default `true`; set `false` to omit `<survey>_sep_arcsec` columns. |
+| `where_joined` | no | SQL predicate on **joined** (prefixed) partner columns, applied after the join. |
+| `partners` | no | Optional `[{survey, radius_arcsec}]` override when radii differ from `crossmatch_plan`. |
+
+**Column names** must match ingested catalog columns — check with
+`dl-describe-survey <name> --modality catalog`. Survey keys must match
+`dl-describe-lake` names.
+
+**Match radii** for partners are taken from `crossmatch_plan.partners` on the
+same area (each partner in `columns` needs a radius there, or in
+`gather.partners`). Run [`dl-crossmatch --from-area`](crossmatch.md) before
+gather so the `A_x_B__r<radius>` trees exist.
+
+### Output column naming
+
+- Base link ID is always written as **`_source_id`** (you do not list it in
+  `columns[base]`).
+- Base columns keep their native names (`ra`, `dec`, …).
+- Partner columns are prefixed: `DESI_DR1_z`, `ALLWISE_w1mpro` (unless the
+  name already starts with `SURVEY_`).
+- Separations: `DESI_DR1_sep_arcsec`, etc., when `include_sep` is true.
+- **`_healpix_norder<N>`** is added from the base catalog order.
+
+Only columns listed under each survey are read and written; surveys omitted from
+`columns` are not joined.
+
 ## Selection (one of)
 
 `dl-gather` keeps only the base rows you select, then joins partner columns:

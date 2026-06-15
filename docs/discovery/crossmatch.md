@@ -136,7 +136,11 @@ to add `__r<radius>`) or recompute them.
 ### Region-bounded plans (`--from-area` / `--plan`)
 
 Instead of matching whole surveys, drive a **crossmatch plan** (a base catalog ×
-N partners, each with its own radius) and restrict it to a sky region:
+N partners, each with its own radius) and restrict it to a sky region.
+
+**Typical setup:** save a cone (or npix/bbox) with `dl-region --save-as`, then
+edit `areas/<id>.json` to add the `crossmatch_plan` block — `--save-as` does not
+write the plan for you. See [End-to-end workflow](regions-and-areas.md#end-to-end-workflow-cone--crossmatch--gather).
 
 ```bash
 # Run the area's crossmatch_plan, bounded to the area region (reuses + gap-fills)
