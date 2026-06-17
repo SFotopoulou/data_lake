@@ -16,21 +16,27 @@ Column matching uses **`dl-describe-survey`** manifests at apply time — no man
 
 ## Primary workflow: single survey + region
 
+``dl-homogenize`` honours ``--config`` and ``$DATA_LAKE_CONFIG`` like other lake
+CLIs: when a deployment config is set, omit the ``OUTPUT_ROOT`` positional (it
+defaults to ``lake.root``).
+
 ```bash
-dl-describe-lake /data/lake --modality catalog
+export DATA_LAKE_CONFIG=/path/to/lake_config.toml
+
+dl-describe-lake --modality catalog
 dl-describe-survey ALLWISE --modality catalog
 
-dl-homogenize /data/lake \
+dl-homogenize \
   --survey ALLWISE \
   --from-area Euclid_North \
   --transform phot_ab_v1 \
   --materialize-as ALLWISE_euclid_north_ab_v1
 
 # Dry run: rule resolution only
-dl-homogenize /data/lake --from-area Euclid_North --check-only
+dl-homogenize --from-area Euclid_North --check-only
 
 # Or ad-hoc flags with area region:
-dl-homogenize /data/lake --survey ALLWISE --cone 150.1 2.2 --radius-arcsec 600 \
+dl-homogenize --survey ALLWISE --cone 150.1 2.2 --radius-arcsec 600 \
   --transform phot_ab_v1 --materialize-as tmp --check-only
 ```
 
@@ -68,7 +74,7 @@ Top-level `homogenize` block in `areas/<id>.json`:
 Multi-survey: use `gather` first, then homogenize the native wide product:
 
 ```bash
-dl-homogenize /data/lake \
+dl-homogenize \
   --from-product EUCLID_wise_native \
   --transform phot_ab_v1 \
   --materialize-as EUCLID_wise_ab_v1
@@ -77,17 +83,17 @@ dl-homogenize /data/lake \
 Run from an area file (uses the top-level `homogenize` block):
 
 ```bash
-dl-homogenize /data/lake --from-area Euclid_North
+dl-homogenize --from-area Euclid_North
 ```
 
 ## Spectra and cutouts (Phase F)
 
 ```bash
-dl-homogenize /data/lake --modality spectra --survey SDSS_DR17 \
+dl-homogenize --modality spectra --survey SDSS_DR17 \
   --from-area Euclid_North --transform spec_observed_v1 \
   --materialize-as SDSS_DR17_spec_obs_v1
 
-dl-homogenize /data/lake --modality cutout --survey DESI_DR1 \
+dl-homogenize --modality cutout --survey DESI_DR1 \
   --cone 150.1 2.2 --radius-arcsec 600 --transform cutout_njy_v1 \
   --materialize-as DESI_DR1_cutout_njy_v1
 ```
@@ -95,8 +101,8 @@ dl-homogenize /data/lake --modality cutout --survey DESI_DR1 \
 ## Validation
 
 ```bash
-dl-validate-homogenization /data/lake --golden --transform phot_ab_v1
-dl-validate-homogenization /data/lake --product ALLWISE_ab_test --transform phot_ab_v1
+dl-validate-homogenization --golden --transform phot_ab_v1
+dl-validate-homogenization --product ALLWISE_ab_test --transform phot_ab_v1
 ```
 
 ## ML export from homogenized products

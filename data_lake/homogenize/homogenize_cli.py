@@ -1,4 +1,8 @@
-"""``dl-homogenize`` – materialise homogenized catalog products."""
+"""``dl-homogenize`` – materialise homogenized catalog products.
+
+Accepts ``--config`` / ``$DATA_LAKE_CONFIG`` for the lake deployment; when set,
+the ``OUTPUT_ROOT`` positional argument may be omitted (defaults to ``lake.root``).
+"""
 
 from __future__ import annotations
 
@@ -170,7 +174,10 @@ try:
         quiet: bool,
         verbose: bool,
     ) -> None:
-        """Apply a homogenization transform to a survey selection → product."""
+        """Apply a homogenization transform to a survey selection → product.
+
+        OUTPUT_ROOT is optional when ``--config`` or ``$DATA_LAKE_CONFIG`` is set.
+        """
         validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
         configure_cli_logging(

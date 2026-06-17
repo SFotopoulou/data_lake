@@ -129,7 +129,55 @@ class TestHomogenizeCatalog:
         assert not (lake / "catalogs" / "ALLWISE_ab_check").exists()
 
 
+def _write_minimal_lake_config(lake: Path) -> Path:
+    cfg_path = lake.parent / "lake_config.toml"
+    cfg_path.write_text(
+        f"""
+schema_version = "1"
+[lake]
+name = "test"
+root = "{lake.as_posix()}"
+[paths]
+catalogs = "catalogs"
+spectra = "spectra"
+cutouts = "cutouts"
+shared = "shared"
+"""
+    )
+    return cfg_path
+
+
 class TestHomogenizeCli:
+    def test_data_lake_config_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.homogenize.homogenize_cli import cli
+
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_wise_tile(lake, norder, npix, w1=10.0)
+        ti.write_tile_index(lake, "ALLWISE", "catalog")
+
+        area = make_area(
+            "WiseCone",
+            Region.cone(ra, dec, 60.0),
+            homogenize={
+                "survey": "ALLWISE",
+                "transform": "phot_ab_v1",
+                "materialize_as": "ALLWISE_from_config",
+            },
+        )
+        save_area(lake, area)
+
+        cfg_path = _write_minimal_lake_config(lake)
+        monkeypatch.setenv("DATA_LAKE_CONFIG", str(cfg_path))
+
+        result = CliRunner().invoke(cli, ["--from-area", "WiseCone"])
+        assert result.exit_code == 0, result.output
+        assert (lake / "catalogs" / "ALLWISE_from_config").is_dir()
+
     def test_from_area_homogenize_block(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
 
