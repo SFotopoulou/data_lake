@@ -184,9 +184,10 @@ product name like any lake catalog. ``-o file.parquet`` (or ``.fits``, ``.csv``,
 tree (Parquet only).
 
 ```bash
-dl-extract-catalog --lake-root /data/lake --survey EDFF-test-01 \
+dl-extract-catalog --survey EDFF-test-01 \
   --all-columns -o EDFF-test-01.fits --format fits --progress
 ```
 
-Use ``-c`` to project a subset; ``--all-columns`` exports the full wide schema
+With ``$DATA_LAKE_CONFIG`` set (or ``--config``), ``--lake-root`` is optional when
+``--survey`` is given. Use ``-c`` to project a subset; ``--all-columns`` exports the full wide schema
 (mutually exclusive with ``-c``).

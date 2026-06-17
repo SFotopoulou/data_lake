@@ -351,6 +351,43 @@ class TestExtractCatalogCli:
         assert result.exit_code != 0
         assert "--all-columns" in result.output
 
+    def test_cli_lake_root_from_config(self, tmp_path: Path, monkeypatch) -> None:
+        import textwrap
+
+        from click.testing import CliRunner
+
+        from data_lake.config import CONFIG_FILENAME, SCHEMA_VERSION
+        from data_lake.export.catalog_extract import cli
+
+        lake_data = tmp_path / "lake_data"
+        tile_dir = lake_data / "catalogs" / "S" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"ra": pa.array([1.0], type=pa.float64())}),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake_data / "catalogs" / "S" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 1}',
+        )
+        cfg_path = tmp_path / CONFIG_FILENAME
+        cfg_path.write_text(textwrap.dedent(f"""
+            schema_version = "{SCHEMA_VERSION}"
+
+            [lake]
+            name = "test"
+            root = "{lake_data}"
+            description = "test"
+        """).strip() + "\n")
+        monkeypatch.setenv("DATA_LAKE_CONFIG", str(cfg_path))
+        out = tmp_path / "out.parquet"
+        result = CliRunner().invoke(
+            cli,
+            ["--survey", "S", "--all-columns", "-o", str(out)],
+        )
+        assert result.exit_code == 0, result.output
+        assert pq.read_table(out).column_names == ["ra"]
+
 
 class TestFilterValidSky:
     def test_requires_sky_columns(self) -> None:

@@ -1062,8 +1062,11 @@ def extract_catalog(
 
 import click
 
+from data_lake.cli_utils import config_option, load_optional_config
+
 
 @click.command("dl-extract-catalog")
+@config_option
 @click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
 @click.option(
     "--file-list",
@@ -1105,9 +1108,9 @@ import click
 )
 @click.option(
     "--lake-root",
-    type=click.Path(exists=True, path_type=Path),
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=None,
-    help="Data lake root; stream from catalogs/<survey>/ tiles.",
+    help="Data lake root (default: lake.root from $DATA_LAKE_CONFIG when --survey is set).",
 )
 @click.option("--survey", default=None, help="Survey name under catalogs/ (with --lake-root).")
 @click.option("--norder", type=int, default=None, help="HEALPix order (default: catalog_info.json).")
@@ -1164,6 +1167,7 @@ def cli(
     batch_rows: int,
     show_progress: bool,
     verbose: bool,
+    config_path: Path | None,
 ) -> None:
     """Export selected catalog columns for catalog–catalog association (sky matching)."""
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
@@ -1181,9 +1185,20 @@ def cli(
         raise click.ClickException("Use --all-columns or -c, not both.")
     if not all_columns and not columns:
         raise click.ClickException("Pass -c or --all-columns.")
+
+    cfg = load_optional_config(config_path)
+    if lake_root is None and survey is not None:
+        if cfg is None:
+            raise click.ClickException(
+                "--lake-root is required when no lake config is provided. "
+                "Either pass it explicitly, set $DATA_LAKE_CONFIG, or use --config."
+            )
+        lake_root = cfg.lake.root
+
     if lake_root is None and not all_paths:
         raise click.ClickException(
-            "Pass catalog path(s), --file-list, or --lake-root with --survey."
+            "Pass catalog path(s), --file-list, or --survey "
+            "(with --lake-root or $DATA_LAKE_CONFIG)."
         )
     if lake_root is not None and not survey:
         raise click.ClickException("--survey is required with --lake-root.")
