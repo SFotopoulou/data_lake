@@ -86,6 +86,12 @@ dl-extract-catalog huge_cat.fits -o sky.parquet --streaming \
 # Many files
 dl-extract-catalog --file-list catalog_paths.txt -o all_a.parquet \
   -c serial -c RA -c DEC --add-input-path
+
+# Full gathered product → single FITS (or Parquet/CSV/VOTable)
+dl-extract-catalog --lake-root /data/lake --survey EUCLID_north_joined \
+  --all-columns -o EUCLID_north_joined.fits --format fits --progress
+
+# -o writes one merged file; --output-dir writes a HATS tile tree (Parquet only)
 ```
 
 **Very large surveys** — avoid materialising hundreds of millions of rows in
@@ -103,7 +109,7 @@ dl-crossmatch SURVEY_A SURVEY_B /data/lake \
   --ra-col RA --dec-col DEC --norder 5 \
   --ra-col-b RAJ2000 --dec-col-b DEJ2000 --norder-b 6
 
-# Output: catalogs/crossmatch/SURVEY_A_x_SURVEY_B/
+# Output: crossmatch/SURVEY_A_x_SURVEY_B__r1.0/   (top-level modality; radius in name)
 # Query: CrossmatchAccessor or DuckDB over that tree
 
 # GPU sky matching (optional [rapids] extra; same match semantics as default)
@@ -117,7 +123,57 @@ unit-sphere coordinates. Output layout and match policy (survey-A-centric
 nearest neighbour within `--radius-arcsec`) are identical to the default
 astropy backend. Install with `uv sync --extra rapids` (Linux + NVIDIA CUDA 12).
 Prefer `--n-workers 1` on a single GPU; multiple processes can contend for one
-device. `catalog_info.json` records `match_backend` and `gpu_id` for provenance.
+device. `crossmatch_info.json` records `match_backend` and `gpu_id` for provenance.
+
+### Crossmatch is a top-level modality
+
+Crossmatch trees live under `<lake>/crossmatch/<A>_x_<B>__r<radius>/` (a
+first-class modality alongside `catalogs/`, `spectra/`, `cutouts/`), **not** under
+`catalogs/`. The **match radius is part of the tree name** (`__r1.0`), so different
+radii are distinct trees that never collide. Each tree carries a
+`crossmatch_info.json` sidecar (radius, survey-A/B `hats_order`, backend). On reuse,
+a mismatch in survey order or backend is rejected unless you pass `--overwrite`
+(radius can't mismatch — it's path-encoded).
+
+There is no backward compatibility for the old `catalogs/crossmatch/` location:
+move existing trees up one level (`mv catalogs/crossmatch/* crossmatch/`, renaming
+to add `__r<radius>`) or recompute them.
+
+**Per-tile Parquet columns:** `source_id_a`, `source_id_b`, `sep_arcsec`,
+`_healpix_norder<N_a>` (base partition key), and `healpix_npix_b` (partner survey
+B pixel, written on new crossmatch runs). [`dl-gather`](gather.md) uses
+`healpix_npix_b` for exact partner tile reads; older trees without it still work
+via a geometric fallback. Re-run `dl-crossmatch` with `--overwrite` to refresh.
+
+### Region-bounded plans (`--from-area` / `--plan`)
+
+Instead of matching whole surveys, drive a **crossmatch plan** (a base catalog ×
+N partners, each with its own radius) and restrict it to a sky region.
+
+**Typical setup:** save a cone (or npix/bbox) with `dl-region --save-as`, then
+edit `areas/<id>.json` to add the `crossmatch_plan` block — `--save-as` does not
+write the plan for you. See [End-to-end workflow](regions-and-areas.md#end-to-end-workflow-cone--crossmatch--gather).
+
+```bash
+# Run the area's crossmatch_plan, bounded to the area region (reuses + gap-fills)
+dl-crossmatch /data/lake --from-area Euclid_North --n-workers 8 --progress
+
+# Or a standalone plan file (no region restriction)
+dl-crossmatch /data/lake --plan plans/euclid_partners.json
+```
+
+A plan is the `crossmatch_plan` block of an area (see
+[Regions and areas](regions-and-areas.md)):
+
+```json
+{"base_catalog": "EUCLID",
+ "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0},
+              {"survey": "ALLWISE",  "radius_arcsec": 2.0}],
+ "reuse_existing": true}
+```
+
+Existing tiles are skipped (resume), so re-running after more live tiles arrive
+only fills gaps. See [`dl-gather`](gather.md) to materialise the joined columns.
 
 **Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A
 HEALPix tiles per worker process, amortizing DuckDB catalog registration. Try

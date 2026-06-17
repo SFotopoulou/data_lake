@@ -12,12 +12,14 @@ from astropy.table import Table
 
 from data_lake.export.catalog_extract import (
     ExtractResult,
+    _promote_arrow_type,
     extract_catalog,
     extract_from_catalog_path,
     filter_valid_sky_rows,
     parse_column_spec,
     resolve_column_specs,
     select_catalog_columns,
+    specs_from_schema,
     stream_extract_from_lake_catalog,
 )
 
@@ -40,6 +42,19 @@ class TestColumnSpecs:
     def test_resolve_case_insensitive(self) -> None:
         mapping = resolve_column_specs(["RA", "Dec", "id"], ["ra", "dec:DEC", "ID"])
         assert mapping == [("RA", "RA"), ("Dec", "DEC"), ("id", "id")]
+
+    def test_specs_from_schema_all_columns(self) -> None:
+        assert specs_from_schema(
+            ["a", "b", "c"], all_columns=True, specs=[],
+        ) == ["a", "b", "c"]
+
+    def test_specs_from_schema_requires_specs(self) -> None:
+        with pytest.raises(ValueError, match="column specs"):
+            specs_from_schema(["a"], all_columns=False, specs=[])
+
+    def test_promote_null_with_float(self) -> None:
+        assert _promote_arrow_type(pa.null(), pa.float64()) == pa.float64()
+        assert _promote_arrow_type(pa.float64(), pa.null()) == pa.float64()
 
 
 class TestExtractFromFile:
@@ -232,6 +247,182 @@ class TestExtractFromLake:
         with fits.open(out) as hdul:
             tbl = Table(hdul[1].data)
         assert int(tbl["TARGETID"][0]) == 42
+
+    def test_lake_all_columns_parquet(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "PROD" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "_source_id": pa.array([1], type=pa.int64()),
+                "ra": pa.array([10.0], type=pa.float64()),
+                "dec": pa.array([0.5], type=pa.float64()),
+                "PARTNER_z": pa.array([0.42], type=pa.float64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "PROD" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 1}',
+        )
+        out = tmp_path / "all.parquet"
+        result = extract_catalog(
+            output=out,
+            all_columns=True,
+            lake_root=lake,
+            survey="PROD",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 1
+        assert set(pq.read_table(out).column_names) == {
+            "_source_id", "ra", "dec", "PARTNER_z",
+        }
+
+    def test_lake_all_columns_fits(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "PROD" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "TARGETID": pa.array([42], type=pa.int64()),
+                "Z": pa.array([0.5], type=pa.float64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "PROD" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 1}',
+        )
+        out = tmp_path / "all.fits"
+        result = extract_catalog(
+            output=out,
+            all_columns=True,
+            lake_root=lake,
+            survey="PROD",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 1
+        assert set(result.column_names) == {"TARGETID", "Z"}
+
+    def test_lake_export_unifies_null_and_float_columns(self, tmp_path: Path) -> None:
+        """Gather-style tiles: null-type partner cols in one tile, float64 in another."""
+        lake = tmp_path / "lake"
+        for npix, z_vals in ((1, None), (2, [0.5])):
+            tile_dir = lake / "catalogs" / "PROD" / "Norder=5" / "Dir=0"
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            cols: dict = {
+                "_source_id": pa.array([npix], type=pa.int64()),
+                "ra": pa.array([10.0], type=pa.float64()),
+            }
+            if z_vals is None:
+                cols["PARTNER_z"] = pa.array([None], type=pa.null())
+            else:
+                cols["PARTNER_z"] = pa.array(z_vals, type=pa.float64())
+            pq.write_table(pa.table(cols), tile_dir / f"Npix={npix}.parquet")
+        (lake / "catalogs" / "PROD" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 2}',
+        )
+        out = tmp_path / "merged.fits"
+        result = extract_catalog(
+            output=out,
+            all_columns=True,
+            lake_root=lake,
+            survey="PROD",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        assert out.is_file()
+
+
+class TestExtractCatalogCli:
+    def test_cli_all_columns(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "S" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"ra": pa.array([1.0], type=pa.float64())}),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "S" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 1}',
+        )
+        out = tmp_path / "out.parquet"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--lake-root", str(lake), "--survey", "S",
+                "--all-columns", "-o", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert pq.read_table(out).column_names == ["ra"]
+
+    def test_cli_rejects_all_columns_and_column(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        result = CliRunner().invoke(
+            cli,
+            ["--all-columns", "-c", "ra", "-o", "out.parquet"],
+        )
+        assert result.exit_code != 0
+        assert "not both" in result.output
+
+    def test_cli_requires_column_or_all_columns(self) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        result = CliRunner().invoke(cli, ["-o", "out.parquet"])
+        assert result.exit_code != 0
+        assert "--all-columns" in result.output
+
+    def test_cli_lake_root_from_config(self, tmp_path: Path, monkeypatch) -> None:
+        import textwrap
+
+        from click.testing import CliRunner
+
+        from data_lake.config import CONFIG_FILENAME, SCHEMA_VERSION
+        from data_lake.export.catalog_extract import cli
+
+        lake_data = tmp_path / "lake_data"
+        tile_dir = lake_data / "catalogs" / "S" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"ra": pa.array([1.0], type=pa.float64())}),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake_data / "catalogs" / "S" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 1}',
+        )
+        cfg_path = tmp_path / CONFIG_FILENAME
+        cfg_path.write_text(textwrap.dedent(f"""
+            schema_version = "{SCHEMA_VERSION}"
+
+            [lake]
+            name = "test"
+            root = "{lake_data}"
+            description = "test"
+        """).strip() + "\n")
+        monkeypatch.setenv("DATA_LAKE_CONFIG", str(cfg_path))
+        out = tmp_path / "out.parquet"
+        result = CliRunner().invoke(
+            cli,
+            ["--survey", "S", "--all-columns", "-o", str(out)],
+        )
+        assert result.exit_code == 0, result.output
+        assert pq.read_table(out).column_names == ["ra"]
 
 
 class TestFilterValidSky:

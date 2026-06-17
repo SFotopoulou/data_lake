@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, assign_healpix, healpix_dir
 from data_lake.io.crossmatch import (
+    CROSSMATCH_HEALPIX_NPIX_B,
     CrossmatchAccessor,
     CrossmatchTileConfig,
     build_crossmatch,
@@ -237,7 +238,7 @@ class TestBuildCrossmatch:
             show_progress=False,
         )
         assert result.n_match_rows == 1
-        assert crossmatch_root(lake, "SURVEY_A", "SURVEY_B").is_dir()
+        assert crossmatch_root(lake, "SURVEY_A", "SURVEY_B", 2.0).is_dir()
 
         with CrossmatchAccessor(lake, "SURVEY_A", "SURVEY_B") as xm:
             matches = xm.get_matches(source_id_a=1001, fmt="polars")
@@ -245,6 +246,30 @@ class TestBuildCrossmatch:
         row = matches.row(0, named=True)
         assert row["source_id_b"] == 2001
         assert row["sep_arcsec"] < 2.0
+        assert CROSSMATCH_HEALPIX_NPIX_B in matches.columns
+
+    def test_crossmatch_writes_healpix_npix_b(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(
+            lake, "SURVEY_A", norder=norder, npix=npix,
+            source_ids=[1001], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "SURVEY_B", norder=norder, npix=npix,
+            source_ids=[2001], ra=[ra + 0.00001], dec=[dec + 0.00001],
+        )
+        build_crossmatch(lake, "SURVEY_A", "SURVEY_B", radius_arcsec=2.0)
+        xm_path = (
+            crossmatch_root(lake, "SURVEY_A", "SURVEY_B", 2.0)
+            / healpix_dir(norder, npix)
+            / f"Npix={npix}.parquet"
+        )
+        table = pq.read_table(str(xm_path))
+        assert CROSSMATCH_HEALPIX_NPIX_B in table.column_names
+        assert table.column(CROSSMATCH_HEALPIX_NPIX_B)[0].as_py() == npix
 
     def test_mixed_columns_and_norder(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
@@ -376,7 +401,7 @@ class TestBuildCrossmatch:
             source_ids=[2001], ra=[ra + 0.0001], dec=[dec + 0.0001],
         )
 
-        out_root = crossmatch_root(lake, "SURVEY_A", "SURVEY_B")
+        out_root = crossmatch_root(lake, "SURVEY_A", "SURVEY_B", 2.0)
         cfg = CrossmatchTileConfig(
             lake_root=str(lake),
             survey_a="SURVEY_A",
@@ -458,7 +483,7 @@ class TestBuildCrossmatchRapids:
         assert result.match_backend == "rapids"
 
         info = json.loads(
-            (crossmatch_root(lake, "SURVEY_A", "SURVEY_B") / "catalog_info.json").read_text()
+            (crossmatch_root(lake, "SURVEY_A", "SURVEY_B", 2.0) / "crossmatch_info.json").read_text()
         )
         assert info["match_backend"] == "rapids"
         assert info["gpu_id"] == 0
@@ -497,11 +522,11 @@ class TestCrossmatchExport:
         assert parquet_out.is_file()
         assert fits_out.is_file()
 
-        table = load_crossmatch_table(crossmatch_root(lake, "SURVEY_A", "SURVEY_B"))
+        table = load_crossmatch_table(crossmatch_root(lake, "SURVEY_A", "SURVEY_B", 2.0))
         assert table.num_rows == 1
 
         assert export_crossmatch_flat(
-            crossmatch_root(lake, "SURVEY_A", "SURVEY_B"),
+            crossmatch_root(lake, "SURVEY_A", "SURVEY_B", 2.0),
             tmp_path / "reexport.parquet",
         ) == 1
 
@@ -551,3 +576,155 @@ class TestCrossmatchPaddedColumnNames:
             radius_arcsec=10.0,
         )
         assert result.n_match_rows >= 1
+
+
+class TestCrossmatchNamingAndReuse:
+    def test_radius_in_tree_name(self, tmp_path: Path) -> None:
+        from data_lake.io.crossmatch import (
+            crossmatch_name,
+            format_match_radius,
+            parse_crossmatch_dirname,
+        )
+
+        assert crossmatch_name("A", "B", 1.0) == "A_x_B__r1.0"
+        assert crossmatch_name("A", "B", 0.5) == "A_x_B__r0.5"
+        assert format_match_radius(2.0) == "2.0"
+        assert parse_crossmatch_dirname("EUCLID_x_DESI_DR1__r1.5") == (
+            "EUCLID", "DESI_DR1", 1.5,
+        )
+        assert parse_crossmatch_dirname("not_a_match") is None
+
+    def test_different_radii_are_distinct_trees(self, tmp_path: Path) -> None:
+        from data_lake.io.crossmatch import find_crossmatch_roots
+
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(lake, "A", norder=norder, npix=npix,
+                            source_ids=[1], ra=[ra], dec=[dec])
+        _write_catalog_tile(lake, "B", norder=norder, npix=npix,
+                            source_ids=[2], ra=[ra + 0.0001], dec=[dec + 0.0001])
+
+        build_crossmatch(lake, "A", "B", radius_arcsec=1.0)
+        build_crossmatch(lake, "A", "B", radius_arcsec=2.0)
+
+        found = find_crossmatch_roots(lake, "A", "B")
+        radii = sorted(r for _, _, r, _ in found)
+        assert radii == [1.0, 2.0]
+        assert crossmatch_root(lake, "A", "B", 1.0).is_dir()
+        assert crossmatch_root(lake, "A", "B", 2.0).is_dir()
+
+    def test_reuse_rejects_norder_mismatch(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(lake, "A", norder=norder, npix=npix,
+                            source_ids=[1], ra=[ra], dec=[dec])
+        _write_catalog_tile(lake, "B", norder=norder, npix=npix,
+                            source_ids=[2], ra=[ra + 0.0001], dec=[dec + 0.0001])
+        build_crossmatch(lake, "A", "B", radius_arcsec=1.0)
+
+        # Tamper with the sidecar to simulate a tree built at a different B order.
+        info_path = crossmatch_root(lake, "A", "B", 1.0) / "crossmatch_info.json"
+        info = json.loads(info_path.read_text())
+        info["survey_b_norder"] = norder + 1
+        info_path.write_text(json.dumps(info))
+
+        with pytest.raises(ValueError, match="different"):
+            build_crossmatch(lake, "A", "B", radius_arcsec=1.0)
+        # overwrite bypasses the guard
+        build_crossmatch(lake, "A", "B", radius_arcsec=1.0, overwrite=True)
+
+    def test_accessor_autodiscovers_single_radius_setup(self, tmp_path: Path) -> None:
+        pass
+
+    def _two_partner_lake(self, tmp_path: Path):
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(lake, "EUCLID", norder=norder, npix=npix,
+                            source_ids=[1], ra=[ra], dec=[dec])
+        _write_catalog_tile(lake, "DESI_DR1", norder=norder, npix=npix,
+                            source_ids=[2], ra=[ra + 0.0001], dec=[dec + 0.0001])
+        _write_catalog_tile(lake, "ALLWISE", norder=norder, npix=npix,
+                            source_ids=[3], ra=[ra + 0.0002], dec=[dec + 0.0002])
+        return lake, ra, dec, npix
+
+    def test_execute_crossmatch_plan(self, tmp_path: Path) -> None:
+        from data_lake.io.crossmatch import execute_crossmatch_plan
+
+        lake, ra, dec, npix = self._two_partner_lake(tmp_path)
+        plan = {
+            "base_catalog": "EUCLID",
+            "partners": [
+                {"survey": "DESI_DR1", "radius_arcsec": 1.0},
+                {"survey": "ALLWISE", "radius_arcsec": 2.0},
+            ],
+        }
+        results = execute_crossmatch_plan(lake, plan)
+        assert len(results) == 2
+        assert crossmatch_root(lake, "EUCLID", "DESI_DR1", 1.0).is_dir()
+        assert crossmatch_root(lake, "EUCLID", "ALLWISE", 2.0).is_dir()
+
+    def test_plan_region_restriction(self, tmp_path: Path) -> None:
+        from data_lake.discovery.region import Region
+        from data_lake.io.crossmatch import execute_crossmatch_plan
+
+        lake, ra, dec, npix = self._two_partner_lake(tmp_path)
+        plan = {"base_catalog": "EUCLID",
+                "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0}]}
+
+        # Region on the opposite side -> no base tiles -> no matches.
+        empty_region = Region.cone(300.0, -45.0, 30.0)
+        results = execute_crossmatch_plan(lake, plan, region=empty_region)
+        assert results[0].n_match_rows == 0
+
+        # Region covering the tile -> matches.
+        good_region = Region.cone(ra, dec, 60.0)
+        results = execute_crossmatch_plan(lake, plan, region=good_region, overwrite=True)
+        assert results[0].n_match_rows == 1
+
+    def test_cli_from_area(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.discovery.areas import make_area, save_area
+        from data_lake.discovery.region import Region
+        from data_lake.io.crossmatch import cli
+
+        lake, ra, dec, npix = self._two_partner_lake(tmp_path)
+        area = make_area(
+            "Field1",
+            Region.cone(ra, dec, 60.0),
+            crossmatch_plan={
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0}],
+            },
+        )
+        save_area(lake, area)
+
+        result = CliRunner().invoke(cli, [str(lake), "--from-area", "Field1"])
+        assert result.exit_code == 0, result.output
+        assert "EUCLID_x_DESI_DR1__r1.0" in result.output
+        assert crossmatch_root(lake, "EUCLID", "DESI_DR1", 1.0).is_dir()
+
+    def test_accessor_autodiscovers_single_radius(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(lake, "A", norder=norder, npix=npix,
+                            source_ids=[1], ra=[ra], dec=[dec])
+        _write_catalog_tile(lake, "B", norder=norder, npix=npix,
+                            source_ids=[2], ra=[ra + 0.0001], dec=[dec + 0.0001])
+        build_crossmatch(lake, "A", "B", radius_arcsec=1.0)
+        build_crossmatch(lake, "A", "B", radius_arcsec=2.0)
+
+        # Ambiguous without radius
+        with pytest.raises(ValueError, match="Multiple"):
+            CrossmatchAccessor(lake, "A", "B")
+        # Explicit radius resolves
+        with CrossmatchAccessor(lake, "A", "B", radius_arcsec=1.0) as xm:
+            assert xm.get_matches(source_id_a=1, fmt="polars").height == 1

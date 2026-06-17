@@ -382,7 +382,7 @@ try:
         "--all",
         "repair_all",
         is_flag=True,
-        help="Repair every catalog under catalogs/ (except crossmatch/).",
+        help="Repair every catalog under catalogs/.",
     )
     @click.option(
         "--norder",

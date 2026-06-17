@@ -416,6 +416,70 @@ class CatalogAccessor:
         sql = f"SELECT {col_expr} FROM catalog WHERE {sid_col} IN ({id_list})"
         return self.query(sql, fmt=fmt)
 
+    def get_sources_by_id_in_healpix_pixels(
+        self,
+        source_ids: Sequence[int],
+        npixels: Sequence[int],
+        columns: list[str] | None = None,
+        fmt: ReturnFormat = "polars",
+        *,
+        batch_size: int = 10_000,
+    ):
+        """Fetch rows by ID, reading only the given HEALPix tile Parquet files.
+
+        Unlike :meth:`get_sources_by_id`, this never scans the full survey
+        ``catalog`` view — only existing ``Npix=*.parquet`` paths for *npixels*.
+        """
+        ids = [int(s) for s in source_ids]
+        if not ids:
+            return self._empty_result(fmt, columns)
+
+        paths = [
+            p
+            for npix in npixels
+            if (p := self._tile_parquet_path(int(npix))) is not None
+        ]
+        if not paths:
+            return self._empty_result(fmt, columns)
+
+        if columns:
+            resolved_cols = [self.resolve_column(c) for c in columns]
+            col_expr = ", ".join(
+                _quote_sql_ident(on_disk)
+                if on_disk == req
+                else f"{_quote_sql_ident(on_disk)} AS {_quote_sql_ident(req)}"
+                for on_disk, req in zip(resolved_cols, columns)
+            )
+        else:
+            col_expr = "*"
+        sid_sql = _quote_sql_ident(self._link_id_column)
+        escaped = ", ".join("'" + str(p).replace("'", "''") + "'" for p in paths)
+        from_clause = f"read_parquet([{escaped}])"
+
+        chunks: list = []
+        for start in range(0, len(ids), batch_size):
+            chunk = ids[start : start + batch_size]
+            id_list = ", ".join(str(i) for i in chunk)
+            sql = f"SELECT {col_expr} FROM {from_clause} WHERE {sid_sql} IN ({id_list})"
+            chunks.append(self.query(sql, fmt=fmt))
+
+        if not chunks:
+            return self._empty_result(fmt, columns)
+        if len(chunks) == 1:
+            return chunks[0]
+
+        if fmt == "polars":
+            import polars as pl
+
+            return pl.concat(chunks, how="vertical_relaxed")
+        if fmt == "arrow":
+            return pa.concat_tables(
+                [c if isinstance(c, pa.Table) else pa.table(c) for c in chunks]
+            )
+        from astropy.table import vstack
+
+        return vstack(chunks)
+
     def redshifts_for_source_ids(
         self,
         source_ids: Sequence[int] | np.ndarray,

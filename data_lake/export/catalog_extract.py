@@ -97,6 +97,20 @@ def resolve_column_specs(
     return out
 
 
+def specs_from_schema(
+    names: Sequence[str],
+    *,
+    all_columns: bool,
+    specs: Sequence[str],
+) -> list[str]:
+    """Resolve export column specs from a table schema."""
+    if all_columns:
+        return list(names)
+    if not specs:
+        raise ValueError("pass column specs or all_columns=True")
+    return list(specs)
+
+
 def select_catalog_columns(
     table: pa.Table,
     specs: Sequence[str],
@@ -214,13 +228,58 @@ def _canonicalize_column_types(table: pa.Table) -> pa.Table:
     return pa.table(cols)
 
 
+def _promote_arrow_type(a: pa.DataType, b: pa.DataType) -> pa.DataType:
+    """Pick the wider of two Arrow types (e.g. null + float64 → float64)."""
+    if a.equals(b) or pa.types.is_null(a):
+        return b
+    if pa.types.is_null(b):
+        return a
+    if pa.types.is_floating(a) or pa.types.is_floating(b):
+        if pa.types.is_floating(a) and pa.types.is_floating(b):
+            return pa.float64() if (a == pa.float64() or b == pa.float64()) else pa.float32()
+        return pa.float64()
+    if pa.types.is_integer(a) and pa.types.is_integer(b):
+        return a if a.bit_width >= b.bit_width else b
+    return a
+
+
+def _unified_schema_for_mapping(
+    tile_paths: Sequence[Path],
+    mapping: Sequence[tuple[str, str]],
+) -> pa.Schema:
+    """Merge per-tile Parquet schemas so null-only columns unify with typed columns."""
+    src_types: dict[str, pa.DataType] = {}
+    for path in tile_paths:
+        sch = pq.read_schema(str(path))
+        for src, _out in mapping:
+            if src not in sch.names:
+                continue
+            t = sch.field(src).type
+            if src in src_types:
+                src_types[src] = _promote_arrow_type(src_types[src], t)
+            else:
+                src_types[src] = t
+    return pa.schema([
+        pa.field(out, src_types[src])
+        for src, out in mapping
+        if src in src_types
+    ])
+
+
 def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     """Cast *table* to *schema* so a multi-tile ``ParquetWriter`` stays consistent."""
     arrays: list[pa.ChunkedArray] = []
     for field in schema:
+        if field.name not in table.schema.names:
+            arrays.append(pa.nulls(table.num_rows, type=field.type))
+            continue
         col = table.column(field.name).combine_chunks()
-        if col.type != field.type:
-            col = pc.cast(col, field.type, safe=False)
+        target_type = field.type
+        if col.type != target_type:
+            if pa.types.is_null(col.type):
+                col = pa.nulls(len(col), type=target_type)
+            else:
+                col = pc.cast(col, target_type, safe=False)
         arrays.append(col)
     return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -284,6 +343,7 @@ def stream_extract_from_lake_catalog(
     survey: str,
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     output: Path | None = None,
     output_dir: Path | None = None,
     norder: int | None = None,
@@ -307,7 +367,10 @@ def stream_extract_from_lake_catalog(
         raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
 
     schema_names = pq.read_schema(str(tiles[0])).names
-    mapping = resolve_column_specs(schema_names, specs)
+    effective_specs = specs_from_schema(
+        schema_names, all_columns=all_columns, specs=specs,
+    )
+    mapping = resolve_column_specs(schema_names, effective_specs)
     src_cols = [src for src, _ in mapping]
     out_names = tuple(out for _, out in mapping)
 
@@ -502,9 +565,11 @@ def _write_chunks_to_csv(chunks: Iterable[pa.Table], output: Path) -> int:
 def _write_chunks_to_parquet(
     chunks: Iterable[pa.Table],
     output: Path,
+    *,
+    schema: pa.Schema | None = None,
 ) -> int:
     writer: pq.ParquetWriter | None = None
-    writer_schema: pa.Schema | None = None
+    writer_schema: pa.Schema | None = schema
     n_rows = 0
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -513,15 +578,17 @@ def _write_chunks_to_parquet(
 
     try:
         for chunk in chunks:
+            if writer_schema is not None:
+                chunk = _align_table_to_schema(chunk, writer_schema)
             if writer is None:
-                writer_schema = chunk.schema
+                writer_schema = writer_schema or chunk.schema
                 writer = pq.ParquetWriter(
                     str(output),
                     writer_schema,
                     compression="zstd",
                     compression_level=_ZSTD_LEVEL,
                 )
-            elif writer_schema is not None and not chunk.schema.equals(writer_schema):
+            elif not chunk.schema.equals(writer_schema):
                 chunk = _align_table_to_schema(chunk, writer_schema)
             writer.write_table(chunk)
             n_rows += chunk.num_rows
@@ -673,6 +740,10 @@ def _stream_lake_tile_by_tile(
     assert output is not None
     output = Path(output)
 
+    unified_schema: pa.Schema | None = None
+    if output_dir is None:
+        unified_schema = _unified_schema_for_mapping(tiles, mapping)
+
     if output_format in ("fits", "votable"):
         with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
             tmp_pq = Path(tmp) / "lake_extract.parquet"
@@ -688,12 +759,13 @@ def _stream_lake_tile_by_tile(
                     show_progress=show_progress,
                 ),
                 tmp_pq,
+                schema=unified_schema,
             )
             write_catalog_extract_from_parquet(tmp_pq, output, output_format=output_format)
     elif output_format == "csv":
         n_rows = _write_chunks_to_csv(chunk_iter, output)
     else:
-        n_rows = _write_chunks_to_parquet(chunk_iter, output)
+        n_rows = _write_chunks_to_parquet(chunk_iter, output, schema=unified_schema)
 
     log.info("Streamed %d row(s) from %d tile(s) → %s", n_rows, len(tiles), output)
     return ExtractResult(
@@ -709,6 +781,7 @@ def extract_from_lake_catalog(
     survey: str,
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     norder: int | None = None,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
@@ -719,7 +792,11 @@ def extract_from_lake_catalog(
 
     catalog_root = _lake_catalog_root(lake_root, survey)
     tiles = list(iter_lake_catalog_tiles(catalog_root, norder=_lake_norder(catalog_root, norder)))
-    mapping = resolve_column_specs(pq.read_schema(str(tiles[0])).names, specs)
+    schema_names = pq.read_schema(str(tiles[0])).names
+    mapping = resolve_column_specs(
+        schema_names,
+        specs_from_schema(schema_names, all_columns=all_columns, specs=specs),
+    )
 
     with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
         out = Path(tmp) / "extract.parquet"
@@ -727,6 +804,7 @@ def extract_from_lake_catalog(
             lake_root,
             survey,
             specs,
+            all_columns=all_columns,
             output=out,
             norder=norder,
             valid_sky_only=valid_sky_only,
@@ -743,13 +821,17 @@ def extract_from_catalog_path(
     path: Path | str,
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
 ) -> pa.Table:
     """Read one catalog file and return the selected columns (in memory)."""
     table = _read_source_table(Path(path))
-    out = select_catalog_columns(table, specs)
+    effective_specs = specs_from_schema(
+        table.schema.names, all_columns=all_columns, specs=specs,
+    )
+    out = select_catalog_columns(table, effective_specs)
     if valid_sky_only:
         out = filter_valid_sky_rows(out, ra_col=ra_col, dec_col=dec_col)
     return out
@@ -760,6 +842,7 @@ def stream_extract_from_fits_catalog(
     specs: Sequence[str],
     output: Path,
     *,
+    all_columns: bool = False,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
@@ -790,7 +873,10 @@ def stream_extract_from_fits_catalog(
             raise ValueError(f"{path}: BINTABLE HDU {idx} has no data")
         n_total = len(data)
         names = data.dtype.names or ()
-        mapping = resolve_column_specs(list(names), specs)
+        effective_specs = specs_from_schema(
+            list(names), all_columns=all_columns, specs=specs,
+        )
+        mapping = resolve_column_specs(list(names), effective_specs)
         src_cols = [src for src, _ in mapping]
         out_names = tuple(out for _, out in mapping)
 
@@ -832,6 +918,7 @@ def extract_from_catalog_paths(
     paths: Iterable[Path | str],
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
@@ -854,6 +941,7 @@ def extract_from_catalog_paths(
             path_list[0],
             specs,
             output,
+            all_columns=all_columns,
             valid_sky_only=valid_sky_only,
             ra_col=ra_col,
             dec_col=dec_col,
@@ -865,6 +953,7 @@ def extract_from_catalog_paths(
         chunk = extract_from_catalog_path(
             p,
             specs,
+            all_columns=all_columns,
             valid_sky_only=valid_sky_only,
             ra_col=ra_col,
             dec_col=dec_col,
@@ -950,6 +1039,7 @@ def extract_catalog(
     output: Path | str | None = None,
     specs: Sequence[str] | None = None,
     *,
+    all_columns: bool = False,
     paths: Sequence[Path | str] | None = None,
     lake_root: Path | str | None = None,
     survey: str | None = None,
@@ -966,8 +1056,11 @@ def extract_catalog(
     show_progress: bool = False,
 ) -> ExtractResult | pa.Table:
     """Extract columns and write output; returns summary or small in-memory table."""
-    if specs is None:
-        raise ValueError("specs required")
+    if all_columns and specs:
+        raise ValueError("use all_columns or column specs, not both")
+    if not all_columns and not specs:
+        raise ValueError("pass column specs or all_columns=True")
+    column_specs: Sequence[str] = specs or ()
 
     if lake_root is not None:
         if not survey:
@@ -977,7 +1070,8 @@ def extract_catalog(
         result = stream_extract_from_lake_catalog(
             lake_root,
             survey,
-            specs,
+            column_specs,
+            all_columns=all_columns,
             output=Path(output) if output is not None else None,
             output_dir=Path(output_dir) if output_dir is not None else None,
             norder=norder,
@@ -997,7 +1091,8 @@ def extract_catalog(
 
     raw_result = extract_from_catalog_paths(
         paths,
-        specs,
+        column_specs,
+        all_columns=all_columns,
         valid_sky_only=valid_sky_only,
         ra_col=ra_col,
         dec_col=dec_col,
@@ -1021,8 +1116,11 @@ def extract_catalog(
 
 import click
 
+from data_lake.cli_utils import config_option, load_optional_config
+
 
 @click.command("dl-extract-catalog")
+@config_option
 @click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
 @click.option(
     "--file-list",
@@ -1048,8 +1146,12 @@ import click
     "--column",
     "columns",
     multiple=True,
-    required=True,
     help="Column to export (repeatable). Use NAME:alias to rename (e.g. ra:RA).",
+)
+@click.option(
+    "--all-columns",
+    is_flag=True,
+    help="Export every column in the catalog schema (mutually exclusive with -c).",
 )
 @click.option(
     "--format",
@@ -1060,9 +1162,9 @@ import click
 )
 @click.option(
     "--lake-root",
-    type=click.Path(exists=True, path_type=Path),
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=None,
-    help="Data lake root; stream from catalogs/<survey>/ tiles.",
+    help="Data lake root (default: lake.root from $DATA_LAKE_CONFIG when --survey is set).",
 )
 @click.option("--survey", default=None, help="Survey name under catalogs/ (with --lake-root).")
 @click.option("--norder", type=int, default=None, help="HEALPix order (default: catalog_info.json).")
@@ -1105,6 +1207,7 @@ def cli(
     output: Path | None,
     output_dir: Path | None,
     columns: tuple[str, ...],
+    all_columns: bool,
     output_format: str | None,
     lake_root: Path | None,
     survey: str | None,
@@ -1118,6 +1221,7 @@ def cli(
     batch_rows: int,
     show_progress: bool,
     verbose: bool,
+    config_path: Path | None,
 ) -> None:
     """Export selected catalog columns for catalog–catalog association (sky matching)."""
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
@@ -1131,9 +1235,24 @@ def cli(
 
     if output is None and output_dir is None:
         raise click.ClickException("Pass -o/--output or --output-dir.")
+    if all_columns and columns:
+        raise click.ClickException("Use --all-columns or -c, not both.")
+    if not all_columns and not columns:
+        raise click.ClickException("Pass -c or --all-columns.")
+
+    cfg = load_optional_config(config_path)
+    if lake_root is None and survey is not None:
+        if cfg is None:
+            raise click.ClickException(
+                "--lake-root is required when no lake config is provided. "
+                "Either pass it explicitly, set $DATA_LAKE_CONFIG, or use --config."
+            )
+        lake_root = cfg.lake.root
+
     if lake_root is None and not all_paths:
         raise click.ClickException(
-            "Pass catalog path(s), --file-list, or --lake-root with --survey."
+            "Pass catalog path(s), --file-list, or --survey "
+            "(with --lake-root or $DATA_LAKE_CONFIG)."
         )
     if lake_root is not None and not survey:
         raise click.ClickException("--survey is required with --lake-root.")
@@ -1154,7 +1273,8 @@ def cli(
 
     result = extract_catalog(
         output=output,
-        specs=list(columns),
+        specs=list(columns) if columns else None,
+        all_columns=all_columns,
         paths=all_paths or None,
         lake_root=lake_root,
         survey=survey,
