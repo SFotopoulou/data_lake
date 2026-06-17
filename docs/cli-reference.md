@@ -54,7 +54,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | Command | Purpose |
 |---------|---------|
 | `dl-extract-spectra-subset` | Export a curated ID list → flat Zarr / Parquet / HDF5 / FITS |
-| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS |
+| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; `--all-columns` for full schema |
 | `dl-extract-spplate-catalog` | Build a specObj-style catalog from spPlate files |
 | `dl-pack-tile` | Package one HEALPix tile as a `.tar` for sharing |
 

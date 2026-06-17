@@ -97,6 +97,20 @@ def resolve_column_specs(
     return out
 
 
+def specs_from_schema(
+    names: Sequence[str],
+    *,
+    all_columns: bool,
+    specs: Sequence[str],
+) -> list[str]:
+    """Resolve export column specs from a table schema."""
+    if all_columns:
+        return list(names)
+    if not specs:
+        raise ValueError("pass column specs or all_columns=True")
+    return list(specs)
+
+
 def select_catalog_columns(
     table: pa.Table,
     specs: Sequence[str],
@@ -284,6 +298,7 @@ def stream_extract_from_lake_catalog(
     survey: str,
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     output: Path | None = None,
     output_dir: Path | None = None,
     norder: int | None = None,
@@ -307,7 +322,10 @@ def stream_extract_from_lake_catalog(
         raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
 
     schema_names = pq.read_schema(str(tiles[0])).names
-    mapping = resolve_column_specs(schema_names, specs)
+    effective_specs = specs_from_schema(
+        schema_names, all_columns=all_columns, specs=specs,
+    )
+    mapping = resolve_column_specs(schema_names, effective_specs)
     src_cols = [src for src, _ in mapping]
     out_names = tuple(out for _, out in mapping)
 
@@ -709,6 +727,7 @@ def extract_from_lake_catalog(
     survey: str,
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     norder: int | None = None,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
@@ -719,7 +738,11 @@ def extract_from_lake_catalog(
 
     catalog_root = _lake_catalog_root(lake_root, survey)
     tiles = list(iter_lake_catalog_tiles(catalog_root, norder=_lake_norder(catalog_root, norder)))
-    mapping = resolve_column_specs(pq.read_schema(str(tiles[0])).names, specs)
+    schema_names = pq.read_schema(str(tiles[0])).names
+    mapping = resolve_column_specs(
+        schema_names,
+        specs_from_schema(schema_names, all_columns=all_columns, specs=specs),
+    )
 
     with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
         out = Path(tmp) / "extract.parquet"
@@ -727,6 +750,7 @@ def extract_from_lake_catalog(
             lake_root,
             survey,
             specs,
+            all_columns=all_columns,
             output=out,
             norder=norder,
             valid_sky_only=valid_sky_only,
@@ -743,13 +767,17 @@ def extract_from_catalog_path(
     path: Path | str,
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
 ) -> pa.Table:
     """Read one catalog file and return the selected columns (in memory)."""
     table = _read_source_table(Path(path))
-    out = select_catalog_columns(table, specs)
+    effective_specs = specs_from_schema(
+        table.schema.names, all_columns=all_columns, specs=specs,
+    )
+    out = select_catalog_columns(table, effective_specs)
     if valid_sky_only:
         out = filter_valid_sky_rows(out, ra_col=ra_col, dec_col=dec_col)
     return out
@@ -760,6 +788,7 @@ def stream_extract_from_fits_catalog(
     specs: Sequence[str],
     output: Path,
     *,
+    all_columns: bool = False,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
@@ -790,7 +819,10 @@ def stream_extract_from_fits_catalog(
             raise ValueError(f"{path}: BINTABLE HDU {idx} has no data")
         n_total = len(data)
         names = data.dtype.names or ()
-        mapping = resolve_column_specs(list(names), specs)
+        effective_specs = specs_from_schema(
+            list(names), all_columns=all_columns, specs=specs,
+        )
+        mapping = resolve_column_specs(list(names), effective_specs)
         src_cols = [src for src, _ in mapping]
         out_names = tuple(out for _, out in mapping)
 
@@ -832,6 +864,7 @@ def extract_from_catalog_paths(
     paths: Iterable[Path | str],
     specs: Sequence[str],
     *,
+    all_columns: bool = False,
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
@@ -854,6 +887,7 @@ def extract_from_catalog_paths(
             path_list[0],
             specs,
             output,
+            all_columns=all_columns,
             valid_sky_only=valid_sky_only,
             ra_col=ra_col,
             dec_col=dec_col,
@@ -865,6 +899,7 @@ def extract_from_catalog_paths(
         chunk = extract_from_catalog_path(
             p,
             specs,
+            all_columns=all_columns,
             valid_sky_only=valid_sky_only,
             ra_col=ra_col,
             dec_col=dec_col,
@@ -950,6 +985,7 @@ def extract_catalog(
     output: Path | str | None = None,
     specs: Sequence[str] | None = None,
     *,
+    all_columns: bool = False,
     paths: Sequence[Path | str] | None = None,
     lake_root: Path | str | None = None,
     survey: str | None = None,
@@ -966,8 +1002,11 @@ def extract_catalog(
     show_progress: bool = False,
 ) -> ExtractResult | pa.Table:
     """Extract columns and write output; returns summary or small in-memory table."""
-    if specs is None:
-        raise ValueError("specs required")
+    if all_columns and specs:
+        raise ValueError("use all_columns or column specs, not both")
+    if not all_columns and not specs:
+        raise ValueError("pass column specs or all_columns=True")
+    column_specs: Sequence[str] = specs or ()
 
     if lake_root is not None:
         if not survey:
@@ -977,7 +1016,8 @@ def extract_catalog(
         result = stream_extract_from_lake_catalog(
             lake_root,
             survey,
-            specs,
+            column_specs,
+            all_columns=all_columns,
             output=Path(output) if output is not None else None,
             output_dir=Path(output_dir) if output_dir is not None else None,
             norder=norder,
@@ -997,7 +1037,8 @@ def extract_catalog(
 
     raw_result = extract_from_catalog_paths(
         paths,
-        specs,
+        column_specs,
+        all_columns=all_columns,
         valid_sky_only=valid_sky_only,
         ra_col=ra_col,
         dec_col=dec_col,
@@ -1048,8 +1089,12 @@ import click
     "--column",
     "columns",
     multiple=True,
-    required=True,
     help="Column to export (repeatable). Use NAME:alias to rename (e.g. ra:RA).",
+)
+@click.option(
+    "--all-columns",
+    is_flag=True,
+    help="Export every column in the catalog schema (mutually exclusive with -c).",
 )
 @click.option(
     "--format",
@@ -1105,6 +1150,7 @@ def cli(
     output: Path | None,
     output_dir: Path | None,
     columns: tuple[str, ...],
+    all_columns: bool,
     output_format: str | None,
     lake_root: Path | None,
     survey: str | None,
@@ -1131,6 +1177,10 @@ def cli(
 
     if output is None and output_dir is None:
         raise click.ClickException("Pass -o/--output or --output-dir.")
+    if all_columns and columns:
+        raise click.ClickException("Use --all-columns or -c, not both.")
+    if not all_columns and not columns:
+        raise click.ClickException("Pass -c or --all-columns.")
     if lake_root is None and not all_paths:
         raise click.ClickException(
             "Pass catalog path(s), --file-list, or --lake-root with --survey."
@@ -1154,7 +1204,8 @@ def cli(
 
     result = extract_catalog(
         output=output,
-        specs=list(columns),
+        specs=list(columns) if columns else None,
+        all_columns=all_columns,
         paths=all_paths or None,
         lake_root=lake_root,
         survey=survey,

@@ -86,6 +86,12 @@ dl-extract-catalog huge_cat.fits -o sky.parquet --streaming \
 # Many files
 dl-extract-catalog --file-list catalog_paths.txt -o all_a.parquet \
   -c serial -c RA -c DEC --add-input-path
+
+# Full gathered product → single FITS (or Parquet/CSV/VOTable)
+dl-extract-catalog --lake-root /data/lake --survey EUCLID_north_joined \
+  --all-columns -o EUCLID_north_joined.fits --format fits --progress
+
+# -o writes one merged file; --output-dir writes a HATS tile tree (Parquet only)
 ```
 
 **Very large surveys** — avoid materialising hundreds of millions of rows in

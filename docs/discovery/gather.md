@@ -175,3 +175,18 @@ dl-gather /data/lake --from-area Euclid_North \
 This drives the existing extractors (`dl-extract-spectra-subset`,
 per-source cutout FITS) from the product's `_source_id` list. `--extract-survey`
 overrides the source survey (default: the product's base catalog).
+
+## Exporting the product catalog
+
+Use [`dl-extract-catalog`](crossmatch.md#export-columns-for-matching) on the
+product name like any lake catalog. ``-o file.parquet`` (or ``.fits``, ``.csv``,
+``.votable``) writes **one merged file**; ``--output-dir`` writes a HATS tile
+tree (Parquet only).
+
+```bash
+dl-extract-catalog --lake-root /data/lake --survey EDFF-test-01 \
+  --all-columns -o EDFF-test-01.fits --format fits --progress
+```
+
+Use ``-c`` to project a subset; ``--all-columns`` exports the full wide schema
+(mutually exclusive with ``-c``).
