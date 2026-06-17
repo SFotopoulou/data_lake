@@ -12,6 +12,7 @@ from astropy.table import Table
 
 from data_lake.export.catalog_extract import (
     ExtractResult,
+    _promote_arrow_type,
     extract_catalog,
     extract_from_catalog_path,
     filter_valid_sky_rows,
@@ -50,6 +51,10 @@ class TestColumnSpecs:
     def test_specs_from_schema_requires_specs(self) -> None:
         with pytest.raises(ValueError, match="column specs"):
             specs_from_schema(["a"], all_columns=False, specs=[])
+
+    def test_promote_null_with_float(self) -> None:
+        assert _promote_arrow_type(pa.null(), pa.float64()) == pa.float64()
+        assert _promote_arrow_type(pa.float64(), pa.null()) == pa.float64()
 
 
 class TestExtractFromFile:
@@ -300,6 +305,37 @@ class TestExtractFromLake:
         assert isinstance(result, ExtractResult)
         assert result.n_rows == 1
         assert set(result.column_names) == {"TARGETID", "Z"}
+
+    def test_lake_export_unifies_null_and_float_columns(self, tmp_path: Path) -> None:
+        """Gather-style tiles: null-type partner cols in one tile, float64 in another."""
+        lake = tmp_path / "lake"
+        for npix, z_vals in ((1, None), (2, [0.5])):
+            tile_dir = lake / "catalogs" / "PROD" / "Norder=5" / "Dir=0"
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            cols: dict = {
+                "_source_id": pa.array([npix], type=pa.int64()),
+                "ra": pa.array([10.0], type=pa.float64()),
+            }
+            if z_vals is None:
+                cols["PARTNER_z"] = pa.array([None], type=pa.null())
+            else:
+                cols["PARTNER_z"] = pa.array(z_vals, type=pa.float64())
+            pq.write_table(pa.table(cols), tile_dir / f"Npix={npix}.parquet")
+        (lake / "catalogs" / "PROD" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 2}',
+        )
+        out = tmp_path / "merged.fits"
+        result = extract_catalog(
+            output=out,
+            all_columns=True,
+            lake_root=lake,
+            survey="PROD",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        assert out.is_file()
 
 
 class TestExtractCatalogCli:

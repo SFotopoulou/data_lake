@@ -228,13 +228,58 @@ def _canonicalize_column_types(table: pa.Table) -> pa.Table:
     return pa.table(cols)
 
 
+def _promote_arrow_type(a: pa.DataType, b: pa.DataType) -> pa.DataType:
+    """Pick the wider of two Arrow types (e.g. null + float64 → float64)."""
+    if a.equals(b) or pa.types.is_null(a):
+        return b
+    if pa.types.is_null(b):
+        return a
+    if pa.types.is_floating(a) or pa.types.is_floating(b):
+        if pa.types.is_floating(a) and pa.types.is_floating(b):
+            return pa.float64() if (a == pa.float64() or b == pa.float64()) else pa.float32()
+        return pa.float64()
+    if pa.types.is_integer(a) and pa.types.is_integer(b):
+        return a if a.bit_width >= b.bit_width else b
+    return a
+
+
+def _unified_schema_for_mapping(
+    tile_paths: Sequence[Path],
+    mapping: Sequence[tuple[str, str]],
+) -> pa.Schema:
+    """Merge per-tile Parquet schemas so null-only columns unify with typed columns."""
+    src_types: dict[str, pa.DataType] = {}
+    for path in tile_paths:
+        sch = pq.read_schema(str(path))
+        for src, _out in mapping:
+            if src not in sch.names:
+                continue
+            t = sch.field(src).type
+            if src in src_types:
+                src_types[src] = _promote_arrow_type(src_types[src], t)
+            else:
+                src_types[src] = t
+    return pa.schema([
+        pa.field(out, src_types[src])
+        for src, out in mapping
+        if src in src_types
+    ])
+
+
 def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     """Cast *table* to *schema* so a multi-tile ``ParquetWriter`` stays consistent."""
     arrays: list[pa.ChunkedArray] = []
     for field in schema:
+        if field.name not in table.schema.names:
+            arrays.append(pa.nulls(table.num_rows, type=field.type))
+            continue
         col = table.column(field.name).combine_chunks()
-        if col.type != field.type:
-            col = pc.cast(col, field.type, safe=False)
+        target_type = field.type
+        if col.type != target_type:
+            if pa.types.is_null(col.type):
+                col = pa.nulls(len(col), type=target_type)
+            else:
+                col = pc.cast(col, target_type, safe=False)
         arrays.append(col)
     return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -520,9 +565,11 @@ def _write_chunks_to_csv(chunks: Iterable[pa.Table], output: Path) -> int:
 def _write_chunks_to_parquet(
     chunks: Iterable[pa.Table],
     output: Path,
+    *,
+    schema: pa.Schema | None = None,
 ) -> int:
     writer: pq.ParquetWriter | None = None
-    writer_schema: pa.Schema | None = None
+    writer_schema: pa.Schema | None = schema
     n_rows = 0
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -531,15 +578,17 @@ def _write_chunks_to_parquet(
 
     try:
         for chunk in chunks:
+            if writer_schema is not None:
+                chunk = _align_table_to_schema(chunk, writer_schema)
             if writer is None:
-                writer_schema = chunk.schema
+                writer_schema = writer_schema or chunk.schema
                 writer = pq.ParquetWriter(
                     str(output),
                     writer_schema,
                     compression="zstd",
                     compression_level=_ZSTD_LEVEL,
                 )
-            elif writer_schema is not None and not chunk.schema.equals(writer_schema):
+            elif not chunk.schema.equals(writer_schema):
                 chunk = _align_table_to_schema(chunk, writer_schema)
             writer.write_table(chunk)
             n_rows += chunk.num_rows
@@ -691,6 +740,10 @@ def _stream_lake_tile_by_tile(
     assert output is not None
     output = Path(output)
 
+    unified_schema: pa.Schema | None = None
+    if output_dir is None:
+        unified_schema = _unified_schema_for_mapping(tiles, mapping)
+
     if output_format in ("fits", "votable"):
         with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
             tmp_pq = Path(tmp) / "lake_extract.parquet"
@@ -706,12 +759,13 @@ def _stream_lake_tile_by_tile(
                     show_progress=show_progress,
                 ),
                 tmp_pq,
+                schema=unified_schema,
             )
             write_catalog_extract_from_parquet(tmp_pq, output, output_format=output_format)
     elif output_format == "csv":
         n_rows = _write_chunks_to_csv(chunk_iter, output)
     else:
-        n_rows = _write_chunks_to_parquet(chunk_iter, output)
+        n_rows = _write_chunks_to_parquet(chunk_iter, output, schema=unified_schema)
 
     log.info("Streamed %d row(s) from %d tile(s) → %s", n_rows, len(tiles), output)
     return ExtractResult(
