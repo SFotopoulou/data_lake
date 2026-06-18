@@ -62,14 +62,12 @@ class TestTransforms:
     def test_wise_mag_offset(self) -> None:
         import polars as pl
 
+        from data_lake.homogenize.survey_registry import resolve_catalog_rules
         from data_lake.homogenize.transforms import TransformRule
 
-        t = load_transform(None, "phot_ab_v1")
-        res = resolve_applicable_rules(
-            t, "ALLWISE", {"w1mpro", "w1sigmpro", "ra", "dec"},
-        )
-        assert len(res.applied) >= 1
-        rule = next(r for r in res.applied if r.target_column == "phot_ab_w1")
+        rules = resolve_catalog_rules(None, "ALLWISE", "phot_ab_v1")
+        assert len(rules) >= 1
+        rule = next(r for r in rules if r.target_column == "phot_ab_w1")
         df = pl.DataFrame({"w1mpro": [10.0], "w1sigmpro": [0.05]})
         out, lin = apply_rules_to_frame(df, [rule])
         assert out["phot_ab_w1"][0] == pytest.approx(12.699)
@@ -77,7 +75,7 @@ class TestTransforms:
 
     def test_view_sql(self) -> None:
         t = load_transform(None, "phot_ab_v1")
-        sql = build_homogenized_view_sql("ALLWISE", t)
+        sql = build_homogenized_view_sql("ALLWISE", t, lake_root=None)
         assert "phot_ab_w1" in sql
         assert "2.699" in sql
 
@@ -283,6 +281,16 @@ class TestValidateHomogenization:
         assert doc is not None
         rules = resolve_catalog_rules(None, "ALLWISE", "phot_ab_v1")
         assert any(r.target_column == "phot_ab_w1" for r in rules)
+
+    def test_transform_pack_has_no_survey_rules(self) -> None:
+        t = load_transform(None, "phot_ab_v1")
+        assert not t.get("rules")
+
+    def test_missing_survey_recipe_raises(self) -> None:
+        from data_lake.homogenize.survey_registry import SurveyHomogenizeNotFound, resolve_catalog_rules
+
+        with pytest.raises(SurveyHomogenizeNotFound):
+            resolve_catalog_rules(None, "NONEXISTENT_SURVEY_XX", "phot_ab_v1")
 
 
 class TestZarrHomogenize:

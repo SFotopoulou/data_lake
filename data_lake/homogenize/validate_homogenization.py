@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 
 from data_lake.homogenize.registry import (
     load_transform,
+    transforms_dir,
     validate_transform_schema,
 )
 from data_lake.homogenize.transforms import TransformRule, apply_rules_to_frame
@@ -140,8 +141,11 @@ def validate_golden_transform(
     transform_id: str,
     *,
     fixture_name: str | None = None,
+    lake_root: Path | str | None = None,
 ) -> ValidationReport:
     """Spot-check transform rules against golden input/output pairs."""
+    from data_lake.homogenize.survey_registry import resolve_catalog_rules
+
     rep = ValidationReport()
     fixture = _golden_path(fixture_name or f"{transform_id}_golden.json")
     spec = json.loads(fixture.read_text())
@@ -151,21 +155,29 @@ def validate_golden_transform(
         )
         return rep
 
-    transform = load_transform(None, transform_id)
     import polars as pl
 
     for case in spec.get("cases") or []:
         survey = case["survey"]
         src = case["source_column"]
         tgt = case["target_column"]
-        rules = [
-            r for r in transform.get("rules") or []
-            if r.get("survey") == survey and r.get("source_column") == src
-        ]
+        try:
+            survey_rules = resolve_catalog_rules(lake_root, survey, transform_id)
+        except Exception as exc:
+            rep.errors.append(f"golden case {survey}.{src}: {exc}")
+            continue
+        rules = [r for r in survey_rules if r.source_column == src and r.target_column == tgt]
         if not rules:
             rep.errors.append(f"golden case missing rule for {survey}.{src}")
             continue
-        raw = dict(rules[0])
+        raw = {
+            "survey": rules[0].survey,
+            "source_column": rules[0].source_column,
+            "target_column": rules[0].target_column,
+            "transform": dict(rules[0].transform),
+            "uncertainty_column": rules[0].uncertainty_column,
+            "target_uncertainty_column": rules[0].target_uncertainty_column,
+        }
         if case.get("transform_override"):
             raw["transform"] = case["transform_override"]
         rule = TransformRule.from_dict(raw)
@@ -238,6 +250,7 @@ def run_validation(
     golden: bool = False,
     products: Sequence[str] = (),
     strict: bool = False,
+    ab_coverage: bool = False,
 ) -> ValidationReport:
     """Run registry lint, optional golden checks, and product validation."""
     rep = ValidationReport()
@@ -252,12 +265,18 @@ def run_validation(
     if golden:
         for tid in tids:
             try:
-                gold = validate_golden_transform(tid)
+                gold = validate_golden_transform(tid, lake_root=lake_root)
             except FileNotFoundError as exc:
                 rep.warnings.append(str(exc))
                 continue
             rep.errors.extend(gold.errors)
             rep.warnings.extend(gold.warnings)
+
+    if ab_coverage and lake_root is not None:
+        from data_lake.homogenize.phot_ab_coverage import phot_ab_coverage_report
+
+        cov = phot_ab_coverage_report(lake_root)
+        rep.warnings.extend(cov.warnings())
 
     if lake_root is not None:
         for product in products:

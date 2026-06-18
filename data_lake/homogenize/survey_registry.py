@@ -125,17 +125,8 @@ def zarr_rule_for_survey(
     return spec
 
 
-def fallback_rules_from_transform_pack(
-    lake_root: Path | str | None,
-    survey: str,
-    transform_id: str,
-) -> list[TransformRule]:
-    transform = load_transform(lake_root, transform_id)
-    return [
-        TransformRule.from_dict(raw)
-        for raw in transform.get("rules") or []
-        if raw.get("survey") == survey
-    ]
+class SurveyHomogenizeNotFound(LookupError):
+    """Raised when no per-survey homogenize recipe exists for a transform."""
 
 
 def resolve_catalog_rules(
@@ -143,11 +134,19 @@ def resolve_catalog_rules(
     survey: str,
     transform_id: str,
 ) -> list[TransformRule]:
-    """Survey file first, then rules embedded in the transform pack."""
+    """Return catalog rules from the per-survey homogenize file only."""
     rules = catalog_rules_for_survey(lake_root, survey, transform_id)
     if rules is not None:
         return rules
-    return fallback_rules_from_transform_pack(lake_root, survey, transform_id)
+    path = survey_homogenize_path(lake_root, survey)
+    if path is None:
+        raise SurveyHomogenizeNotFound(
+            f"No homogenize recipe for survey {survey!r} "
+            f"(add homogenize/{survey}.json with catalog.{transform_id}.rules)"
+        )
+    raise SurveyHomogenizeNotFound(
+        f"Survey {survey!r} homogenize file {path} has no catalog.{transform_id} rules"
+    )
 
 
 def default_transform_id(modality: str) -> str:
@@ -162,6 +161,11 @@ def validate_survey_homogenize(data: dict[str, Any]) -> list[str]:
     msgs: list[str] = []
     if not data.get("survey"):
         msgs.append("ERROR: missing survey")
+    status = str(data.get("recipe_status") or "")
+    if status == "skeleton":
+        msgs.append(
+            "WARN: recipe_status is skeleton — fill calibration before production homogenize"
+        )
     for modality in (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT):
         block = data.get(modality)
         if block is None:

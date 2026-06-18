@@ -10,7 +10,9 @@ Native ingest preserves survey column names and photometric systems. Homogenizat
 | Crossmatch (`dl-crossmatch`) | No — geometry only |
 | **Homogenize (`dl-homogenize`)** | **Yes** — pick `transform_id` + survey + region |
 
-Recipes live in **`shared/registry/homogenize/<SURVEY>.json`** (lake overrides) or bundled **`data_lake/homogenize/surveys/<SURVEY>.json`**. One file per survey covers catalog photometry, spectra flux, and cutout zero points. Global transform packs (`phot_ab_v1`, etc.) define profile semantics; survey files hold survey-specific numbers.
+Recipes live in **`shared/registry/homogenize/<SURVEY>.json`** (lake overrides) or bundled **`data_lake/homogenize/surveys/<SURVEY>.json`**. Transform packs (`phot_ab_v1`, etc.) define profile semantics only — **executable rules live only in per-survey files**.
+
+Check coverage with `dl-validate-homogenization --ab-coverage` (requires lake root / `$DATA_LAKE_CONFIG`).
 
 Column matching uses **`dl-describe-survey`** manifests at apply time — no manual survey inventory required.
 

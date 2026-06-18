@@ -21,7 +21,7 @@
     },
     {
       "description": "Gaia G mmag to mag scale",
-      "survey": "GAIA_DR3",
+      "survey": "GAIA_DR3_source",
       "source_column": "phot_g_mean_mag",
       "target_column": "phot_ab_g",
       "input_value": 15000.0,

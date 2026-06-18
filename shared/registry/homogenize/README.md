@@ -50,6 +50,6 @@ Lake overrides win over bundled defaults.
 
 Omit a modality block when the survey has no data for it.
 
-Transform profile ids (`phot_ab_v1`, `spec_observed_v1`, `cutout_njy_v1`) match the global transform packs under `data_lake/homogenize/transforms/`. Those packs define semantics; **per-survey files hold the numeric calibration**.
+Transform profile ids (`phot_ab_v1`, `spec_observed_v1`, `cutout_njy_v1`) match the global transform packs under `data_lake/homogenize/transforms/`. Those packs define semantics only (no per-survey rules). **Per-survey files are the sole source of executable rules**; lake overrides replace bundled defaults.
 
 See [homogenization.md](../../../docs/homogenization.md).

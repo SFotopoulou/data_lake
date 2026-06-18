@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from data_lake.homogenize.survey_registry import resolve_catalog_rules
+from data_lake.homogenize.survey_registry import SurveyHomogenizeNotFound, resolve_catalog_rules
 from data_lake.homogenize.transforms import RuleResolution, TransformRule
 
 
@@ -50,7 +50,13 @@ def resolve_rules_for_product(
     transform_id = str(transform.get("transform_id", "phot_ab_v1"))
 
     for survey in sorted(contributors):
-        survey_rules = resolve_catalog_rules(lake_root, survey, transform_id)
+        try:
+            survey_rules = resolve_catalog_rules(lake_root, survey, transform_id)
+        except SurveyHomogenizeNotFound:
+            res.skipped_survey.append(
+                {"survey": survey, "reason": f"no homogenize/{survey}.json recipe"}
+            )
+            continue
         for rule in survey_rules:
             prod_col = product_column_name(base, survey, rule.source_column)
             if prod_col not in available_columns:

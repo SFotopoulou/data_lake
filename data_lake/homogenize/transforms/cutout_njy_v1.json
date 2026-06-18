@@ -3,17 +3,5 @@
   "version": 1,
   "modality": "cutout",
   "output_unit": "nJy/pixel",
-  "description": "Scale cutout image stamps to nJy/pixel using per-survey calibration factors.",
-  "rules": [
-    {
-      "survey": "synthetic",
-      "image_array": "images",
-      "transform": {"type": "flux_scale", "factor": 1.0}
-    },
-    {
-      "survey": "DESI_DR1",
-      "image_array": "images",
-      "transform": {"type": "flux_scale", "factor": 1.0, "note": "apply survey zero-point table in lake override"}
-    }
-  ]
+  "description": "Scale cutout image stamps to nJy/pixel. Per-survey calibration lives in homogenize/<SURVEY>.json."
 }

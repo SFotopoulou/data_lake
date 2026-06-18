@@ -16,7 +16,7 @@ import zarr
 
 from data_lake.discovery.selection import BaseSelection
 from data_lake.homogenize.registry import load_transform
-from data_lake.homogenize.survey_registry import zarr_rule_for_survey
+from data_lake.homogenize.survey_registry import zarr_rule_for_survey, survey_homogenize_path
 from data_lake.ingest.fits_to_parquet import healpix_dir
 from data_lake.schema_registry import MODALITY_CUTOUT, MODALITY_SPECTRA, PRODUCT_SUBTYPE_HOMOGENIZED
 
@@ -54,18 +54,6 @@ def _read_info(lake_root: Path, modality: str, survey: str) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def _rule_from_transform_pack(
-    lake_root: Path,
-    transform_id: str,
-    survey: str,
-) -> dict[str, Any] | None:
-    transform = load_transform(lake_root, transform_id)
-    for raw in transform.get("rules") or []:
-        if raw.get("survey") == survey:
-            return dict(raw)
-    return None
-
-
 def _resolve_zarr_spec(
     lake_root: Path,
     survey: str,
@@ -74,11 +62,15 @@ def _resolve_zarr_spec(
 ) -> dict[str, Any]:
     spec = zarr_rule_for_survey(lake_root, survey, modality, transform_id)
     if spec is None:
-        spec = _rule_from_transform_pack(lake_root, transform_id, survey)
-    if spec is None:
+        path = survey_homogenize_path(lake_root, survey)
+        hint = (
+            f"shared/registry/homogenize/{survey}.json"
+            if path is None
+            else str(path)
+        )
         raise ValueError(
             f"No {modality} homogenize recipe for survey {survey!r} "
-            f"(check shared/registry/homogenize/{survey}.json)"
+            f"transform {transform_id!r} (check {hint})"
         )
     return spec
 

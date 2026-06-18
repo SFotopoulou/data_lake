@@ -1,6 +1,7 @@
 {
-  "survey": "GAIA_DR3",
+  "survey": "GAIA_DR3_source",
   "version": 1,
+  "recipe_status": "ready",
   "catalog": {
     "phot_ab_v1": {
       "output_system": "AB_mag",

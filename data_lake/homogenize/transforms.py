@@ -218,11 +218,16 @@ def build_homogenized_view_sql(
     survey: str,
     transform: dict[str, Any],
     *,
+    lake_root=None,
     catalog_view: str = "catalog",
 ) -> str:
     """Generate DuckDB SQL expressions for query-time homogenization (no materialize)."""
+    from data_lake.homogenize.survey_registry import resolve_catalog_rules
+
+    transform_id = str(transform.get("transform_id", "phot_ab_v1"))
+    rules = resolve_catalog_rules(lake_root, survey, transform_id)
     lines: list[str] = []
-    for rule in _rules_for_survey(transform, survey):
+    for rule in rules:
         src = rule.source_column
         tgt = rule.target_column
         ttype = rule.transform.get("type")

@@ -48,6 +48,10 @@ try:
         help="Homogenized catalog product to validate under catalogs/.",
     )
     @click.option("--strict", is_flag=True, help="Treat warnings as errors.")
+    @click.option(
+        "--ab-coverage", is_flag=True,
+        help="Warn on missing/skeleton phot_ab_v1 recipes (ingested catalogs).",
+    )
     @logging_options
     def cli(
         output_root: Path | None,
@@ -56,6 +60,7 @@ try:
         golden: bool,
         products: tuple[str, ...],
         strict: bool,
+        ab_coverage: bool,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -82,6 +87,7 @@ try:
             golden=golden,
             products=products,
             strict=strict,
+            ab_coverage=ab_coverage,
         )
         print_validation_messages(rep, strict=strict)
 

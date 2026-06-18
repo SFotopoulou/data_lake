@@ -1,0 +1,45 @@
+{
+  "survey": "VHS_DR3",
+  "version": 1,
+  "recipe_status": "skeleton",
+  "notes": "VISTA Hemisphere Survey YJHKs; Vega system PSF mags. Fill Vega→AB offsets per filter.",
+  "catalog": {
+    "phot_ab_v1": {
+      "output_system": "AB_mag",
+      "rules": [
+        {
+          "source_column": "YPSFMAG",
+          "target_column": "phot_ab_y",
+          "uncertainty_column": "YPSFMAGERR",
+          "target_uncertainty_column": "phot_ab_y_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set Y-band Vega→AB offset"}
+        },
+        {
+          "source_column": "JPSFMAG",
+          "target_column": "phot_ab_j",
+          "uncertainty_column": "JPSFMAGERR",
+          "target_uncertainty_column": "phot_ab_j_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set J-band Vega→AB offset"}
+        },
+        {
+          "source_column": "HPSFMAG",
+          "target_column": "phot_ab_h",
+          "uncertainty_column": "HPSFMAGERR",
+          "target_uncertainty_column": "phot_ab_h_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set H-band Vega→AB offset"}
+        },
+        {
+          "source_column": "KSPSFMAG",
+          "target_column": "phot_ab_ks",
+          "uncertainty_column": "KSPSFMAGERR",
+          "target_uncertainty_column": "phot_ab_ks_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set Ks-band Vega→AB offset"}
+        }
+      ]
+    }
+  }
+}

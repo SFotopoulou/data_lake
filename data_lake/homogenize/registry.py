@@ -49,28 +49,14 @@ def load_bandpass_metadata() -> dict[str, Any]:
 
 
 def validate_transform_schema(data: dict[str, Any]) -> list[str]:
-    """Return ERROR/WARN messages for a transform pack."""
+    """Return ERROR/WARN messages for a transform pack (profile only, no survey rules)."""
     msgs: list[str] = []
     if not data.get("transform_id"):
         msgs.append("ERROR: missing transform_id")
-    if not data.get("rules"):
-        msgs.append("ERROR: missing rules")
-    for i, rule in enumerate(data.get("rules") or []):
-        if not rule.get("survey"):
-            msgs.append(f"ERROR: rule[{i}] missing survey")
-        modality = data.get("modality", "catalog")
-        if modality == "catalog":
-            if not rule.get("source_column"):
-                msgs.append(f"ERROR: rule[{i}] missing source_column")
-            if not rule.get("target_column"):
-                msgs.append(f"ERROR: rule[{i}] missing target_column")
-        elif modality == "spectra":
-            if not rule.get("flux_array"):
-                msgs.append(f"ERROR: rule[{i}] missing flux_array")
-        elif modality == "cutout":
-            if not rule.get("image_array"):
-                msgs.append(f"ERROR: rule[{i}] missing image_array")
-        t = (rule.get("transform") or {}).get("type")
-        if t not in ("mag_offset", "scale", "identity", "null_if_sentinel", "flux_scale"):
-            msgs.append(f"ERROR: rule[{i}] unknown transform type {t!r}")
+    rules = data.get("rules") or []
+    if rules:
+        msgs.append(
+            "ERROR: transform pack must not embed per-survey rules; "
+            "use homogenize/<SURVEY>.json instead"
+        )
     return msgs
