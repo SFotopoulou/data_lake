@@ -80,6 +80,10 @@ class TestGatherProduct:
         )
         assert info["kind"] == "product"
         assert info["provenance"]["base_catalog"] == "EUCLID"
+        assert info["ra_column"] == "ra"
+        assert info["dec_column"] == "dec"
+        assert info["total_columns"] is not None
+        assert info["total_columns"] >= 4
 
         with CatalogAccessor(joined_lake, "EUCLID_desi") as acc:
             df = acc.query("SELECT * FROM catalog ORDER BY _source_id", fmt="polars")
@@ -128,8 +132,115 @@ class TestGatherProduct:
         gather_product(joined_lake, "EUCLID", [PartnerSpec("DESI_DR1", 2.0, ["z"])], sel,
                        overwrite=True, **kw)
 
+    def test_tile_bounded_partner_lookup(self, tmp_path: Path) -> None:
+        """Partner fetch reads only the requested HEALPix tiles."""
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix_a = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        npix_b = npix_a + 1 if npix_a < 100 else npix_a - 1
 
-class TestExtractModalities:
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix_a,
+            source_ids=[101], ra=[ra], dec=[dec], extra={"z": [0.42]},
+        )
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix_b,
+            source_ids=[999], ra=[ra + 1.0], dec=[dec + 1.0], extra={"z": [9.99]},
+        )
+
+        with CatalogAccessor(lake, "DESI_DR1") as acc:
+            df = acc.get_sources_by_id_in_healpix_pixels(
+                [101, 999], [npix_a], columns=["z"], fmt="polars",
+            )
+        assert df["z"].to_list() == [pytest.approx(0.42)]
+        assert len(df) == 1
+
+    def test_partner_at_finer_healpix_order(self, tmp_path: Path) -> None:
+        """Gather tile-bounds partner reads when partner hats_order > base."""
+        lake = tmp_path / "lake"
+        base_order, partner_order = 5, 6
+        ra, dec = 120.0, 45.0
+        base_npix = int(assign_healpix(np.array([ra]), np.array([dec]), base_order)[0])
+        partner_npix = int(assign_healpix(np.array([ra]), np.array([dec]), partner_order)[0])
+
+        _write_catalog_tile(
+            lake, "EUCLID", norder=base_order, npix=base_npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+        )
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=partner_order, npix=partner_npix,
+            source_ids=[101], ra=[ra + 0.00001], dec=[dec + 0.00001],
+            extra={"z": [1.7]},
+        )
+        build_crossmatch(lake, "EUCLID", "DESI_DR1", radius_arcsec=2.0)
+
+        sel = selection_from_region(lake, "EUCLID", Region.cone(ra, dec, 120.0))
+        result = gather_product(
+            lake, "EUCLID",
+            [PartnerSpec("DESI_DR1", 2.0, ["z"])],
+            sel,
+            base_columns=["ra", "dec"],
+            materialize_as="EUCLID_desi_fine",
+        )
+        assert result.n_rows == 1
+        with CatalogAccessor(lake, "EUCLID_desi_fine") as acc:
+            df = acc.query("SELECT * FROM catalog", fmt="polars")
+        assert df["DESI_DR1_z"].to_list() == [pytest.approx(1.7)]
+
+    def test_matches_only_drops_unmatched_base_rows(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(
+            lake, "EUCLID", norder=norder, npix=npix,
+            source_ids=[1, 2], ra=[ra, ra + 0.5], dec=[dec, dec + 0.5],
+        )
+        _write_catalog_tile(
+            lake, "DESI_DR1", norder=norder, npix=npix,
+            source_ids=[101], ra=[ra + 0.00001], dec=[dec + 0.00001],
+            extra={"z": [0.5]},
+        )
+        build_crossmatch(lake, "EUCLID", "DESI_DR1", radius_arcsec=2.0)
+        sel = selection_from_region(lake, "EUCLID", Region.cone(ra, dec, 120.0))
+
+        all_result = gather_product(
+            lake, "EUCLID", [PartnerSpec("DESI_DR1", 2.0, ["z"])], sel,
+            base_columns=["ra"], materialize_as="all_rows", keep_all=True,
+        )
+        assert all_result.n_rows == 2
+
+        matched_result = gather_product(
+            lake, "EUCLID", [PartnerSpec("DESI_DR1", 2.0, ["z"])], sel,
+            base_columns=["ra"], materialize_as="matched_only", keep_all=False,
+        )
+        assert matched_result.n_rows == 1
+        with CatalogAccessor(lake, "matched_only") as acc:
+            df = acc.query("SELECT * FROM catalog", fmt="polars")
+    def test_partner_fetch_batches_npix_per_tile(self, joined_lake: Path, monkeypatch) -> None:
+        """One batched DuckDB read per partner per base tile (not per partner Npix)."""
+        calls: list[tuple] = []
+        orig = CatalogAccessor.get_sources_by_id_in_healpix_pixels
+
+        def counting(self, source_ids, npixels, columns=None, fmt="polars", **kwargs):
+            calls.append((list(npixels), list(source_ids)))
+            return orig(self, source_ids, npixels, columns=columns, fmt=fmt, **kwargs)
+
+        monkeypatch.setattr(
+            CatalogAccessor, "get_sources_by_id_in_healpix_pixels", counting,
+        )
+        region = Region.cone(120.0, 45.0, 120.0)
+        sel = selection_from_region(joined_lake, "EUCLID", region)
+        gather_product(
+            joined_lake, "EUCLID",
+            [PartnerSpec("DESI_DR1", 2.0, ["z"])],
+            sel,
+            base_columns=["ra"],
+            materialize_as="EUCLID_desi_batch",
+        )
+        assert len(calls) == 1
+
     def test_spectra_extraction_for_product(self, tmp_path: Path) -> None:
         from test_extract_subset import SOURCES, SURVEY, _ingest_synthetic_lake
         from data_lake.discovery.gather import extract_modalities_for_product
@@ -215,5 +326,47 @@ class TestGatherCli:
 
         result = CliRunner().invoke(cli, [str(joined_lake), "--from-area", "WideField"])
         assert result.exit_code == 0, result.output
+        assert "Area config:" in result.output
+        assert "areas/WideField.json" in result.output
+        assert "Gather EUCLID_desi_area:" in result.output
         assert "EUCLID_desi_area" in result.output
         assert (joined_lake / "catalogs" / "EUCLID_desi_area" / "catalog_info.json").is_file()
+
+    def test_cli_materialize_as_overrides_area(self, joined_lake: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.discovery.areas import make_area, save_area
+        from data_lake.discovery.gather_cli import cli
+
+        area = make_area(
+            "OverrideTest",
+            Region.cone(120.0, 45.0, 120.0),
+            crossmatch_plan={
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "DESI_DR1", "radius_arcsec": 2.0}],
+            },
+            gather={
+                "base": "EUCLID",
+                "columns": {"EUCLID": ["ra", "dec"], "DESI_DR1": ["z"]},
+                "materialize_as": "from_area_json",
+            },
+        )
+        save_area(joined_lake, area)
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                str(joined_lake),
+                "--from-area",
+                "OverrideTest",
+                "--materialize-as",
+                "cli_wins",
+                "--overwrite",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Gather cli_wins:" in result.output
+        assert "cli_wins" in result.output
+        assert "from_area_json" not in result.output
+        assert (joined_lake / "catalogs" / "cli_wins" / "catalog_info.json").is_file()
+        assert not (joined_lake / "catalogs" / "from_area_json").exists()

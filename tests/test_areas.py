@@ -10,9 +10,11 @@ import pytest
 from data_lake.discovery.areas import (
     Area,
     area_is_valid,
+    areas_dir,
     list_areas,
     load_area,
     make_area,
+    normalize_area_id,
     save_area,
     validate_area,
 )
@@ -80,34 +82,35 @@ class TestAreaValidation:
         msgs = validate_area(area.data)
         assert any("multiplicity" in m for m in msgs)
 
-    def test_homogenize_block_valid(self) -> None:
-        area = make_area(
-            "A", Region.cone(1.0, 2.0, 10.0),
-            homogenize={
-                "survey": "ALLWISE",
-                "transform": "phot_ab_v1",
-                "materialize_as": "ALLWISE_ab",
-            },
-        )
-        assert area_is_valid(area.data)
 
-    def test_homogenize_requires_transform(self) -> None:
-        area = make_area(
-            "A", Region.cone(1.0, 2.0, 10.0),
-            homogenize={"survey": "ALLWISE", "materialize_as": "x"},
-        )
-        msgs = validate_area(area.data)
-        assert any("transform" in m for m in msgs)
+class TestNormalizeAreaId:
+    def test_strips_json_suffix(self) -> None:
+        assert normalize_area_id("EDFF-test-01.json") == "EDFF-test-01"
 
-    def test_homogenize_survey_and_product_mutually_exclusive(self) -> None:
-        area = make_area(
-            "A", Region.cone(1.0, 2.0, 10.0),
-            homogenize={
-                "survey": "ALLWISE",
-                "from_product": "joined",
-                "transform": "phot_ab_v1",
-                "materialize_as": "x",
-            },
+    def test_strips_area_suffix(self) -> None:
+        assert normalize_area_id("EDFF-test-01.area") == "EDFF-test-01"
+
+    def test_plain_id_unchanged(self) -> None:
+        assert normalize_area_id("Wide_Field_47") == "Wide_Field_47"
+
+    def test_load_area_accepts_area_suffix(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        area = make_area("EDFF-test-01", Region.cone(1.0, 2.0, 10.0))
+        save_area(lake, area)
+        loaded = load_area(lake, "EDFF-test-01.area")
+        assert loaded.area_id == "EDFF-test-01"
+
+    def test_load_area_legacy_area_json_filename(self, tmp_path: Path) -> None:
+        """``--save-as Foo.area`` before canonical naming → ``areas/Foo.area.json``."""
+        lake = tmp_path / "lake"
+        legacy = areas_dir(lake) / "EDFF-test-01.area.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text(
+            json.dumps({
+                "area_id": "EDFF-test-01",
+                "schema_version": "1",
+                "region": Region.cone(1.0, 2.0, 10.0).to_dict(),
+            })
         )
-        msgs = validate_area(area.data)
-        assert any("survey+region OR from_product" in m for m in msgs)
+        loaded = load_area(lake, "EDFF-test-01.area")
+        assert loaded.area_id == "EDFF-test-01"

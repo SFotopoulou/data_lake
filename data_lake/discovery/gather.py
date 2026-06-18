@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -32,11 +31,12 @@ from typing import Any, Sequence
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from data_lake.discovery.partner_tile_cache import PartnerTileCache, PartnerTileCacheConfig
 from data_lake.discovery.region import Region
 from data_lake.discovery.selection import BaseSelection
 from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, healpix_dir
 from data_lake.io.catalog import CatalogAccessor
-from data_lake.io.crossmatch import resolve_crossmatch_root
+from data_lake.io.crossmatch import CROSSMATCH_HEALPIX_NPIX_B, resolve_crossmatch_root
 from data_lake.schema_registry import CATALOG_KIND_PRODUCT, MODALITY_CATALOG
 
 log = logging.getLogger(__name__)
@@ -67,6 +67,84 @@ def _prefixed(survey: str, col: str) -> str:
     return col if col.startswith(f"{survey}_") else f"{survey}_{col}"
 
 
+def _partner_healpix_pixels_covering_base_tile(
+    base_npix: int,
+    base_order: int,
+    partner_order: int,
+) -> set[int]:
+    """Partner HEALPix pixels that may hold matches for a base tile.
+
+    Rescales the base pixel to the partner order, then adds a one-pixel neighbour
+    ring so sources matched across tile edges are still found.
+    """
+    import healpy as hp
+
+    from data_lake.discovery.region import rescale_npix_nested
+
+    pixels = rescale_npix_nested([int(base_npix)], base_order, partner_order)
+    nside = hp.order2nside(int(partner_order))
+    expanded: set[int] = set(pixels)
+    for npix in pixels:
+        for neighbour in hp.get_all_neighbours(nside, int(npix), nest=True):
+            if neighbour >= 0:
+                expanded.add(int(neighbour))
+    return expanded
+
+
+def _apply_matches_only_filter(out, partners: list[PartnerSpec], include_sep: bool):
+    """Drop base rows with no partner crossmatch (any partner)."""
+    import polars as pl
+
+    if not partners:
+        return out
+    checks = []
+    for partner in partners:
+        sep_name = f"{partner.survey}_sep_arcsec"
+        if include_sep and sep_name in out.columns:
+            checks.append(pl.col(sep_name).is_not_null())
+        for c in partner.columns:
+            col = _prefixed(partner.survey, c)
+            if col in out.columns:
+                checks.append(pl.col(col).is_not_null())
+    if not checks:
+        return out
+    return out.filter(pl.any_horizontal(checks))
+
+
+def _fetch_partner_catalog(
+    matches,
+    *,
+    partner: PartnerSpec,
+    pacc: CatalogAccessor,
+    base_npix: int,
+    base_order: int,
+    cache: PartnerTileCache | None,
+    fetch_cols: list[str],
+):
+    """Load partner catalog rows for crossmatch matches (exact or geometric tiles)."""
+    import polars as pl
+
+    sids_b = matches["source_id_b"].unique().to_list()
+    if CROSSMATCH_HEALPIX_NPIX_B in matches.columns:
+        partner_npix = [
+            int(n) for n in matches[CROSSMATCH_HEALPIX_NPIX_B].unique().to_list()
+        ]
+    else:
+        partner_npix = sorted(
+            _partner_healpix_pixels_covering_base_tile(
+                base_npix, base_order, pacc.norder,
+            )
+        )
+
+    if cache is not None and cache.enabled:
+        return cache.lookup_many(
+            pacc, partner.survey, partner_npix, fetch_cols, sids_b,
+        )
+    return pacc.get_sources_by_id_in_healpix_pixels(
+        sids_b, partner_npix, columns=fetch_cols, fmt="polars",
+    )
+
+
 def _gather_one_tile(
     npix: int,
     *,
@@ -79,6 +157,8 @@ def _gather_one_tile(
     multiplicity: str,
     include_sep: bool,
     selection_ids: set[int] | None,
+    keep_all: bool = True,
+    partner_cache: PartnerTileCache | None = None,
 ):
     """Build the joined polars DataFrame for one base tile (or None if empty)."""
     import polars as pl
@@ -118,11 +198,18 @@ def _gather_one_tile(
             )
 
         pacc = partner_acc[partner.survey]
-        sids_b = matches["source_id_b"].unique().to_list()
         pcols = partner.columns or []
         pid = pacc.link_id_column
         fetch_cols = [pid] + [c for c in pcols if c != pid]
-        pdf = pacc.get_sources_by_id(sids_b, columns=fetch_cols, fmt="polars")
+        pdf = _fetch_partner_catalog(
+            matches,
+            partner=partner,
+            pacc=pacc,
+            base_npix=npix,
+            base_order=base_order,
+            cache=partner_cache,
+            fetch_cols=fetch_cols,
+        )
         rename = {c: _prefixed(partner.survey, c) for c in pcols if c != pid}
         pdf = pdf.rename(rename)
         joined = matches.join(
@@ -140,6 +227,10 @@ def _gather_one_tile(
     out = out.with_columns(
         pl.lit(npix).cast(pl.Int64).alias(f"_healpix_norder{base_order}")
     )
+    if not keep_all:
+        out = _apply_matches_only_filter(out, partners, include_sep)
+        if out.is_empty():
+            return None
     return out
 
 
@@ -166,6 +257,8 @@ def gather_product(
     include_sep: bool = True,
     materialize_as: str,
     where_joined: str | None = None,
+    keep_all: bool = True,
+    partner_cache: PartnerTileCache | None = None,
     overwrite: bool = False,
     show_progress: bool = False,
 ) -> GatherResult:
@@ -200,6 +293,7 @@ def gather_product(
     t0 = time.perf_counter()
     n_rows = 0
     n_tiles_written = 0
+    product_n_columns: int | None = None
 
     iterator: Any = npix_list
     if show_progress:
@@ -212,6 +306,8 @@ def gather_product(
 
     base_acc = CatalogAccessor(lake_root, base, norder=base_order)
     partner_acc = {p.survey: CatalogAccessor(lake_root, p.survey) for p in partners}
+    if partner_cache is None:
+        partner_cache = PartnerTileCache()
     try:
         import polars as pl
 
@@ -227,6 +323,8 @@ def gather_product(
                 multiplicity=multiplicity,
                 include_sep=include_sep,
                 selection_ids=selection_ids,
+                keep_all=keep_all,
+                partner_cache=partner_cache,
             )
             if df is None or df.is_empty():
                 continue
@@ -255,6 +353,8 @@ def gather_product(
             )
             n_rows += table.num_rows
             n_tiles_written += 1
+            if product_n_columns is None:
+                product_n_columns = table.num_columns
     finally:
         base_acc.close()
         for acc in partner_acc.values():
@@ -263,6 +363,7 @@ def gather_product(
     _write_product_info(
         out_root,
         materialize_as,
+        lake_root=lake_root,
         base=base,
         base_order=base_order,
         partners=partners,
@@ -271,7 +372,9 @@ def gather_product(
         multiplicity=multiplicity,
         include_sep=include_sep,
         where_joined=where_joined,
+        keep_all=keep_all,
         n_rows=n_rows,
+        n_columns=product_n_columns,
     )
 
     return GatherResult(
@@ -285,10 +388,19 @@ def gather_product(
     )
 
 
+def _base_catalog_info(lake_root: Path, base: str) -> dict[str, Any]:
+    info_path = lake_root / "catalogs" / base / "catalog_info.json"
+    if not info_path.is_file():
+        return {}
+    with open(info_path) as fh:
+        return json.load(fh)
+
+
 def _write_product_info(
     out_root: Path,
     name: str,
     *,
+    lake_root: Path,
     base: str,
     base_order: int,
     partners: list[PartnerSpec],
@@ -297,8 +409,11 @@ def _write_product_info(
     multiplicity: str,
     include_sep: bool,
     where_joined: str | None,
+    keep_all: bool,
     n_rows: int,
+    n_columns: int | None = None,
 ) -> None:
+    base_info = _base_catalog_info(lake_root, base)
     info = {
         "catalog_name": name,
         "kind": CATALOG_KIND_PRODUCT,
@@ -306,9 +421,11 @@ def _write_product_info(
         "hats_order": base_order,
         "link_id_mode": "column:" + LAKE_JOIN_ID_COLUMN,
         "link_id_column": LAKE_JOIN_ID_COLUMN,
-        "ra_column": None,
-        "dec_column": None,
+        "ra_column": base_info.get("ra_column"),
+        "dec_column": base_info.get("dec_column"),
         "total_rows": n_rows,
+        "total_columns": n_columns,
+        "n_columns": n_columns,
         "provenance": {
             "base_catalog": base,
             "base_columns": base_columns,
@@ -331,6 +448,7 @@ def _write_product_info(
             "multiplicity": multiplicity,
             "include_sep": include_sep,
             "where_joined": where_joined,
+            "keep_all": keep_all,
         },
         "schema_version": "1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

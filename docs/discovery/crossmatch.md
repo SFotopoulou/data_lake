@@ -86,6 +86,12 @@ dl-extract-catalog huge_cat.fits -o sky.parquet --streaming \
 # Many files
 dl-extract-catalog --file-list catalog_paths.txt -o all_a.parquet \
   -c serial -c RA -c DEC --add-input-path
+
+# Full gathered product → single FITS (or Parquet/CSV/VOTable)
+dl-extract-catalog --lake-root /data/lake --survey EUCLID_north_joined \
+  --all-columns -o EUCLID_north_joined.fits --format fits --progress
+
+# -o writes one merged file; --output-dir writes a HATS tile tree (Parquet only)
 ```
 
 **Very large surveys** — avoid materialising hundreds of millions of rows in
@@ -133,10 +139,20 @@ There is no backward compatibility for the old `catalogs/crossmatch/` location:
 move existing trees up one level (`mv catalogs/crossmatch/* crossmatch/`, renaming
 to add `__r<radius>`) or recompute them.
 
+**Per-tile Parquet columns:** `source_id_a`, `source_id_b`, `sep_arcsec`,
+`_healpix_norder<N_a>` (base partition key), and `healpix_npix_b` (partner survey
+B pixel, written on new crossmatch runs). [`dl-gather`](gather.md) uses
+`healpix_npix_b` for exact partner tile reads; older trees without it still work
+via a geometric fallback. Re-run `dl-crossmatch` with `--overwrite` to refresh.
+
 ### Region-bounded plans (`--from-area` / `--plan`)
 
 Instead of matching whole surveys, drive a **crossmatch plan** (a base catalog ×
-N partners, each with its own radius) and restrict it to a sky region:
+N partners, each with its own radius) and restrict it to a sky region.
+
+**Typical setup:** save a cone (or npix/bbox) with `dl-region --save-as`, then
+edit `areas/<id>.json` to add the `crossmatch_plan` block — `--save-as` does not
+write the plan for you. See [End-to-end workflow](regions-and-areas.md#end-to-end-workflow-cone--crossmatch--gather).
 
 ```bash
 # Run the area's crossmatch_plan, bounded to the area region (reuses + gap-fills)

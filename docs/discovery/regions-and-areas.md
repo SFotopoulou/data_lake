@@ -101,3 +101,39 @@ table short even with many live tiles.
 
 Each can be saved with `--save-as` and then matched (`dl-crossmatch --from-area`)
 and joined (`dl-gather --from-area`).
+
+## End-to-end workflow (cone → crossmatch → gather)
+
+`dl-region --save-as` writes **only the region** (and optional `discover` block).
+It does **not** create `crossmatch_plan` or `gather` — add those by editing
+`areas/<area_id>.json` (there is no separate CLI for plan blocks yet).
+
+```bash
+# 1. Save the sky selection
+dl-region /data/lake --cone 150.1 2.2 --radius-arcsec 600 --save-as MyCone
+
+# 2. Edit areas/MyCone.json — add crossmatch_plan and gather (see example above)
+
+# 3. Match base × partners inside the cone
+dl-crossmatch /data/lake --from-area MyCone --n-workers 8 --progress
+
+# 4. Materialise the joined product catalog
+dl-gather /data/lake --from-area MyCone
+```
+
+### `crossmatch_plan` fields
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `base_catalog` | yes | Survey A (defines HEALPix partitioning for the match). |
+| `partners` | yes | `[{survey, radius_arcsec, …}]` — one tree per partner. |
+| `reuse_existing` | no | Default `true`; skip finished tiles and gap-fill on re-run. |
+
+`dl-crossmatch --from-area` loads this block **and** bounds tiles to the area's
+`region` (cone, npix, bbox, or MOC). A standalone plan file
+(`dl-crossmatch --plan file.json`) runs on the full base survey with no region
+cut.
+
+See [Crossmatch — region-bounded plans](crossmatch.md#region-bounded-plans---from-area--plan)
+and [Gather — area JSON](gather.md#area-json-gather-block) for column selection
+and output naming.

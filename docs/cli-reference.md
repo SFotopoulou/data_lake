@@ -54,7 +54,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | Command | Purpose |
 |---------|---------|
 | `dl-extract-spectra-subset` | Export a curated ID list → flat Zarr / Parquet / HDF5 / FITS |
-| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS |
+| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; `--all-columns` for full schema |
 | `dl-extract-spplate-catalog` | Build a specObj-style catalog from spPlate files |
 | `dl-pack-tile` | Package one HEALPix tile as a `.tar` for sharing |
 
@@ -67,7 +67,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |
 | `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area ([docs](discovery/regions-and-areas.md)) |
-| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
+| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--keep-all`/`--matches-only`, partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
 | `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
 | `dl-crossmatch` | Positional catalog↔catalog match at lake scale; `--from-area`/`--plan` for region-bounded plans (`--match-backend astropy\|rapids`, `--gpu-id`) |
 | `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |

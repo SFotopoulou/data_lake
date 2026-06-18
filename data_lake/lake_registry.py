@@ -517,6 +517,8 @@ def _info_registry_row(
         manifest_rel = str(manifest_path.relative_to(lake_root))
         n_columns = manifest.get("n_columns")
         source_id = manifest.get("link_id_column") or source_id
+    if n_columns is None:
+        n_columns = info.get("total_columns") or info.get("n_columns")
 
     total_rows: int | None = None
     if modality == MODALITY_SPECTRA:
