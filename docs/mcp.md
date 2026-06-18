@@ -60,6 +60,8 @@ Documentation files are available as MCP resources:
 - `docs://troubleshooting`
 - … (mirrors the `docs/` tree)
 
+See also [MCP lake explorer](mcp-lake.md) for region discovery, provenance, and ingest recommendations.
+
 ## Out of scope
 
 The MCP server is **read-only**: no ingest, no token handling, no shell execution. Use the `dl-*` CLIs for writes.

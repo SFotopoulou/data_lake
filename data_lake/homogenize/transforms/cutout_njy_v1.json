@@ -1,0 +1,7 @@
+{
+  "transform_id": "cutout_njy_v1",
+  "version": 1,
+  "modality": "cutout",
+  "output_unit": "nJy/pixel",
+  "description": "Scale cutout image stamps to nJy/pixel. Per-survey calibration lives in homogenize/<SURVEY>.json."
+}

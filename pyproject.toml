@@ -64,6 +64,8 @@ dl-build-query-from-master = "data_lake.query_from_master:cli"
 dl-crossmatch = "data_lake.io.crossmatch:cli"
 dl-region = "data_lake.discovery.region_cli:cli"
 dl-gather = "data_lake.discovery.gather_cli:cli"
+dl-homogenize = "data_lake.homogenize.homogenize_cli:cli"
+dl-validate-homogenization = "data_lake.homogenize.validate_cli:cli"
 dl-ingest-cutouts  = "data_lake.ingest.fits_to_zarr:cli"
 dl-ingest-spectra  = "data_lake.ingest.fits_to_spectra_zarr:cli"
 dl-ingest-spectra-batch-desi-coadds = "data_lake.ingest.desi_parallel_ingest:cli"
@@ -84,6 +86,7 @@ dl-extract-catalog = "data_lake.export.catalog_extract:cli"
 dl-pack-tile       = "data_lake.share.pack_tile:cli"
 dl-generate-cutout-fits = "data_lake.cutouts.generate_fits:cli"
 dl-mcp-docs = "data_lake.mcp_server:main"
+dl-mcp-lake = "data_lake.mcp_lake_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

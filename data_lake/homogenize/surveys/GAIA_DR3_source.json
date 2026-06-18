@@ -1,0 +1,36 @@
+{
+  "survey": "GAIA_DR3_source",
+  "version": 1,
+  "recipe_status": "ready",
+  "catalog": {
+    "phot_ab_v1": {
+      "output_system": "AB_mag",
+      "rules": [
+        {
+          "source_column": "phot_g_mean_mag",
+          "target_column": "phot_ab_g",
+          "uncertainty_column": "phot_g_mean_mag_error",
+          "target_uncertainty_column": "phot_ab_g_err",
+          "native_system": "Vega",
+          "transform": {"type": "scale", "factor": 0.001, "note": "mmag to mag"}
+        },
+        {
+          "source_column": "phot_bp_mean_mag",
+          "target_column": "phot_ab_bp",
+          "uncertainty_column": "phot_bp_mean_mag_error",
+          "target_uncertainty_column": "phot_ab_bp_err",
+          "native_system": "Vega",
+          "transform": {"type": "scale", "factor": 0.001}
+        },
+        {
+          "source_column": "phot_rp_mean_mag",
+          "target_column": "phot_ab_rp",
+          "uncertainty_column": "phot_rp_mean_mag_error",
+          "target_uncertainty_column": "phot_ab_rp_err",
+          "native_system": "Vega",
+          "transform": {"type": "scale", "factor": 0.001}
+        }
+      ]
+    }
+  }
+}

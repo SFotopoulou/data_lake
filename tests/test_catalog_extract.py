@@ -128,6 +128,73 @@ class TestExtractFromLake:
         assert result.n_rows == 2
         assert set(pq.read_table(out).column_names) == {"source_id", "ra", "dec"}
 
+    def test_homogenized_product_export(self, tmp_path: Path) -> None:
+        import json
+
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "PROD_AB" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "_source_id": pa.array([1], type=pa.int64()),
+                "ra": pa.array([10.0], type=pa.float64()),
+                "dec": pa.array([0.5], type=pa.float64()),
+                "phot_ab_w1": pa.array([12.699], type=pa.float32()),
+                "_healpix_norder5": pa.array([1], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "PROD_AB" / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": 5,
+                "ra_column": "ra",
+                "dec_column": "dec",
+                "kind": "product",
+                "product_subtype": "homogenized",
+                "provenance": {
+                    "transform_id": "phot_ab_v1",
+                    "transform_version": 1,
+                    "source_survey": "ALLWISE",
+                },
+            })
+        )
+        out = tmp_path / "ml.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["_source_id", "phot_ab_w1"],
+            lake_root=lake,
+            survey="PROD_AB",
+            require_homogenized=True,
+            engine="tiles",
+        )
+        assert result.n_rows == 1
+        sidecar = out.with_name(out.name + ".homogenize_provenance.json")
+        assert sidecar.is_file()
+        prov = json.loads(sidecar.read_text())
+        assert prov["transform_id"] == "phot_ab_v1"
+
+    def test_reject_non_homogenized_when_required(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        native_root = lake / "catalogs" / "NATIVE"
+        native_root.mkdir(parents=True)
+        (native_root / "catalog_info.json").write_text(
+            '{"hats_order": 5, "kind": "ingested"}'
+        )
+        (native_root / "Norder=5" / "Dir=0").mkdir(parents=True)
+        pq.write_table(
+            pa.table({"ra": [1.0], "dec": [1.0]}),
+            lake / "catalogs" / "NATIVE" / "Norder=5" / "Dir=0" / "Npix=1.parquet",
+        )
+        with pytest.raises(ValueError, match="homogenized"):
+            extract_catalog(
+                output=tmp_path / "x.parquet",
+                specs=["ra", "dec"],
+                lake_root=lake,
+                survey="NATIVE",
+                require_homogenized=True,
+                engine="tiles",
+            )
+
     def test_lake_catalog_tiled_output(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         for npix in (1, 2):

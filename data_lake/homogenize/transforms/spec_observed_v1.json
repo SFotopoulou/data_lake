@@ -1,0 +1,7 @@
+{
+  "transform_id": "spec_observed_v1",
+  "version": 1,
+  "modality": "spectra",
+  "output_flux_unit": "erg/s/cm2/Angstrom",
+  "description": "Normalize spectrum flux arrays to a consistent observed-frame unit scale. Per-survey flux_scale specs live in homogenize/<SURVEY>.json."
+}

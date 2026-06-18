@@ -1,0 +1,33 @@
+{
+  "transform_id": "phot_ab_v1",
+  "cases": [
+    {
+      "description": "ALLWISE W1 Vega to AB offset",
+      "survey": "ALLWISE",
+      "source_column": "w1mpro",
+      "target_column": "phot_ab_w1",
+      "input_value": 10.0,
+      "expected_output": 12.699,
+      "tolerance": 0.001
+    },
+    {
+      "description": "ALLWISE W2 Vega to AB offset",
+      "survey": "ALLWISE",
+      "source_column": "w2mpro",
+      "target_column": "phot_ab_w2",
+      "input_value": 9.0,
+      "expected_output": 12.339,
+      "tolerance": 0.001
+    },
+    {
+      "description": "Gaia G mmag to mag scale",
+      "survey": "GAIA_DR3_source",
+      "source_column": "phot_g_mean_mag",
+      "target_column": "phot_ab_g",
+      "input_value": 15000.0,
+      "expected_output": 15.0,
+      "tolerance": 0.0001,
+      "transform_override": {"type": "scale", "factor": 0.001}
+    }
+  ]
+}

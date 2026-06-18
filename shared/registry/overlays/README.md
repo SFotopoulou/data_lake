@@ -20,3 +20,5 @@ Each file maps column names to metadata:
 ```
 
 `homogenized_ab_offset` documents the constant added to Vega magnitudes for AB (see notebook §8).
+
+**Execution** of offsets lives in the per-survey homogenize registry (`shared/registry/homogenize/<SURVEY>.json`), not in overlays. Overlays document native units; transforms apply at `dl-homogenize` time. See [homogenization.md](../../../docs/homogenization.md) and [homogenize/README.md](../homogenize/README.md).

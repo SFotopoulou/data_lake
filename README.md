@@ -42,7 +42,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 | All `dl-*` commands | [cli-reference.md](docs/cli-reference.md) |
 | `lake_config.toml` | [lake-config.md](docs/lake-config.md) |
 | Example notebooks | [notebooks.md](docs/notebooks.md) |
-| MCP access for agents | [mcp.md](docs/mcp.md) |
+| MCP access for agents | [mcp.md](docs/mcp.md), [mcp-lake.md](docs/mcp-lake.md) |
 
 ### Ingest
 
@@ -71,6 +71,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 | Crossmatch and associations | [discovery/crossmatch.md](docs/discovery/crossmatch.md) |
 | Regions, areas, `dl-region` | [discovery/regions-and-areas.md](docs/discovery/regions-and-areas.md) |
 | Gather products (`dl-gather`) | [discovery/gather.md](docs/discovery/gather.md) |
+| Homogenization (`dl-homogenize`) | [homogenization.md](docs/homogenization.md) |
 | Performance tuning | [performance.md](docs/performance.md) |
 | DuckDB ID-list queries | [discovery/duckdb-queries.md](docs/discovery/duckdb-queries.md) |
 

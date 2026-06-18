@@ -116,6 +116,10 @@ class Area:
     def gather(self) -> dict[str, Any] | None:
         return self.data.get("gather")
 
+    @property
+    def homogenize(self) -> dict[str, Any] | None:
+        return self.data.get("homogenize")
+
     def to_dict(self) -> dict[str, Any]:
         return self.data
 
@@ -144,6 +148,21 @@ def load_area(lake_root: Path | str, area_id: str) -> Area:
     with open(path) as fh:
         data = json.load(fh)
     return Area(area_id=data.get("area_id", normalized), data=data, path=path)
+
+
+def resolve_region_ref(
+    lake_root: Path | str,
+    region_spec: dict[str, Any] | None,
+    *,
+    fallback: Region,
+) -> Region:
+    """Resolve an area ``region`` block or ``{"from_area": id}`` reference."""
+    if region_spec is None:
+        return fallback
+    ref = region_spec.get("from_area")
+    if ref is not None:
+        return load_area(lake_root, str(ref)).region
+    return Region.from_dict(region_spec)
 
 
 def save_area(lake_root: Path | str, area: Area, *, overwrite: bool = False) -> Path:
@@ -222,6 +241,24 @@ def validate_area(data: dict[str, Any]) -> list[str]:
         cols = gather.get("columns")
         if cols is not None and not isinstance(cols, dict):
             msgs.append("ERROR: gather 'columns' must be a mapping survey -> [columns]")
+
+    hom = data.get("homogenize")
+    if hom is not None:
+        has_survey = bool(hom.get("survey"))
+        has_product = bool(hom.get("from_product"))
+        if has_survey and has_product:
+            msgs.append("ERROR: homogenize: use survey+region OR from_product, not both")
+        elif not has_survey and not has_product:
+            msgs.append("ERROR: homogenize requires 'survey' or 'from_product'")
+        if not hom.get("transform"):
+            msgs.append("ERROR: homogenize missing 'transform'")
+        if not hom.get("materialize_as"):
+            msgs.append("ERROR: homogenize missing 'materialize_as'")
+        if has_survey and not hom.get("region") and not has_product:
+            msgs.append(
+                "WARN: homogenize with survey but no inline region; "
+                "use CLI selectors or region.from_area"
+            )
     return msgs
 
 

@@ -1,0 +1,45 @@
+{
+  "survey": "ultraVISTA_DR6",
+  "version": 1,
+  "recipe_status": "skeleton",
+  "notes": "ultraVISTA YJHKs (+ NB118); 7 arcsec aperture mags. Confirm native system and AB offsets.",
+  "catalog": {
+    "phot_ab_v1": {
+      "output_system": "AB_mag",
+      "rules": [
+        {
+          "source_column": "Y_APER7",
+          "target_column": "phot_ab_y",
+          "uncertainty_column": "Y_APER7_ERR",
+          "target_uncertainty_column": "phot_ab_y_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set Y-band Vega→AB offset"}
+        },
+        {
+          "source_column": "J_APER7",
+          "target_column": "phot_ab_j",
+          "uncertainty_column": "J_APER7_ERR",
+          "target_uncertainty_column": "phot_ab_j_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set J-band Vega→AB offset"}
+        },
+        {
+          "source_column": "H_APER7",
+          "target_column": "phot_ab_h",
+          "uncertainty_column": "H_APER7_ERR",
+          "target_uncertainty_column": "phot_ab_h_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set H-band Vega→AB offset"}
+        },
+        {
+          "source_column": "KS_APER7",
+          "target_column": "phot_ab_ks",
+          "uncertainty_column": "KS_APER7_ERR",
+          "target_uncertainty_column": "phot_ab_ks_err",
+          "native_system": "Vega",
+          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set Ks-band Vega→AB offset"}
+        }
+      ]
+    }
+  }
+}
