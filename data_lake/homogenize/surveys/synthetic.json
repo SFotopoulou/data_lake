@@ -1,0 +1,21 @@
+{
+  "survey": "synthetic",
+  "version": 1,
+  "spectra": {
+    "spec_observed_v1": {
+      "flux_array": "flux",
+      "ivar_array": "ivar",
+      "transform": {"type": "flux_scale", "factor": 1.0},
+      "wavelength_unit": "Angstrom"
+    }
+  },
+  "cutout": {
+    "cutout_njy_v1": {
+      "image_array": "images",
+      "transform": {"type": "flux_scale", "factor": 1.0},
+      "bands": {
+        "r": {"flux_scale": 1.0, "reference": "test fixture identity scale"}
+      }
+    }
+  }
+}
