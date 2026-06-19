@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-06-19
+
+### Added
+
+- **`dl-area`** — manage `areas/<id>.json`: `set-crossmatch`, `set-gather`, `set-homogenize`, `import`, `validate` (no hand-editing of plan blocks).
+- **MOC export** — `dl-region --export-moc` and **`dl-export-moc`** write IVOA Multi-Order Coverage maps at a user-chosen HEALPix order (`uv sync --extra moc`).
+- **Reference workflow** — `notebooks/14_discovery_workflow.ipynb`, `examples/areas/multi_survey_cone.example.json`, and `docs/discovery/workflow.md`.
+
+### Documentation
+
+- **`docs/discovery/areas-cli.md`** — full `dl-area` command reference; cross-links from workflow, regions, gather, and homogenization guides.
+- MOC export section in regions-and-areas guide.
+
 ## [0.4.2] - 2026-06-18
 
 ### Added

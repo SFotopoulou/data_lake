@@ -1,8 +1,9 @@
 # Regions, areas, and discovery (`dl-region`)
 
 This page covers the spatial **region** selector, metadata-only **areas**, and the
-`dl-region` discovery command. For the join/materialise step see
-[`dl-gather`](gather.md); for matching see [Crossmatch](crossmatch.md).
+`dl-region` discovery command. To attach crossmatch/gather/homogenize plans to an
+area without editing JSON, see [`dl-area`](areas-cli.md). For the join/materialise
+step see [`dl-gather`](gather.md); for matching see [Crossmatch](crossmatch.md).
 
 ## Glossary
 
@@ -50,7 +51,39 @@ dl-region /data/lake --bbox 149.5 150.5 1.8 2.6 --count   # exact catalog counts
 
 # Save an ad-hoc region as a reusable area
 dl-region /data/lake --npix 1002198-1003000 --norder 5 --save-as Wide_Field_47
+
+# Export the region as an IVOA MOC (requires uv sync --extra moc)
+dl-region /data/lake --cone 150.1 2.2 --radius-arcsec 600 \
+  --export-moc /scratch/cone.moc.fits --moc-order 8
 ```
+
+### Export as MOC
+
+Any region selector can be written to an **IVOA Multi-Order Coverage** map
+(HEALPix NESTED, ICRS) for sharing with Aladin, TOPCAT, or TAP services:
+
+```bash
+dl-region /data/lake --from-area MyCone \
+  --export-moc /scratch/my_cone.moc.fits --moc-order 8
+
+# JSON or ASCII (IVOA string) instead of FITS
+dl-region ... --export-moc footprint.json --moc-order 6 --moc-format json
+```
+
+`--moc-order` sets the HEALPix resolution (higher → finer footprint, larger
+files). Re-import with `dl-region --moc footprint.moc.fits`.
+
+**Survey tile footprint** (populated HEALPix tiles from the tile index):
+
+```bash
+dl-export-moc /data/lake --survey SDSS_DR17 --moc-order 5 -o sdss_footprint.fits
+
+# Clip to an area or cone
+dl-export-moc --survey DESI_DR1 --modality spectra \
+  --from-area MyCone --moc-order 8 -o desi_in_cone.moc.fits
+```
+
+Requires the optional **`moc` extra**: `uv sync --extra moc` (`mocpy`).
 
 Output is a `survey × modality` table with **rounded** row estimates
 (`~12k`, `~750M`) by default — fast and index-driven, no tile reads. Pass
@@ -109,14 +142,26 @@ and joined (`dl-gather --from-area`).
 ## End-to-end workflow (cone → crossmatch → gather)
 
 `dl-region --save-as` writes **only the region** (and optional `discover` block).
-It does **not** create `crossmatch_plan` or `gather` — add those by editing
-`areas/<area_id>.json` (there is no separate CLI for plan blocks yet).
+Attach `crossmatch_plan`, `gather`, and `homogenize` with **[`dl-area`](areas-cli.md)**:
+
+```bash
+dl-area set-crossmatch MyCone --base EUCLID_DR1 \
+  --partner DESI_DR1:1.0 --partner ALLWISE:2.0
+dl-area set-gather MyCone --base EUCLID_DR1 \
+  --columns '{"EUCLID_DR1":["ra","dec"],"DESI_DR1":["z"]}' \
+  --materialize-as euclid_native_v1
+dl-area set-homogenize MyCone --from-product euclid_native_v1 \
+  --transform phot_ab_v1 --materialize-as euclid_ab_v1
+```
+
+Or merge from a template: `dl-area import MyCone --from-file plan.json`.
+Full command reference: [areas-cli.md](areas-cli.md).
 
 ```bash
 # 1. Save the sky selection
 dl-region /data/lake --cone 150.1 2.2 --radius-arcsec 600 --save-as MyCone
 
-# 2. Edit areas/MyCone.json — add crossmatch_plan and gather (see example above)
+# 2. Attach plans (dl-area) — see commands above
 
 # 3. Match base × partners inside the cone
 dl-crossmatch /data/lake --from-area MyCone --n-workers 8 --progress

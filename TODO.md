@@ -43,11 +43,12 @@ Run `dl-validate-homogenization --ab-coverage` on your lake for the live list (e
 ## Discovery & areas — UX
 
 - [x] Reference workflow notebook + docs ([`notebooks/14_discovery_workflow.ipynb`](notebooks/14_discovery_workflow.ipynb), [`docs/discovery/workflow.md`](docs/discovery/workflow.md); example area in [`examples/areas/`](examples/areas/))
-- [ ] CLI to attach `crossmatch_plan` and `gather` blocks to areas (today: `dl-region --save-as` then hand-edit `areas/<id>.json` or copy the example area)
+- [x] CLI to attach `crossmatch_plan` and `gather` blocks to areas — **`dl-area`** (`set-crossmatch`, `set-gather`, `set-homogenize`, `import`)
 
 ## Export & ML
 
 - [x] `dl-extract-spectra-subset`: flux calibration (`--flux-scale`, `--apply-survey-calibration`; SDSS/DESI bundled)
+- [x] MOC export: `dl-region --export-moc` and `dl-export-moc` (`--moc-order`; requires `--extra moc`)
 - [ ] `dl-extract-spectra-subset`: support `wavelength_mode != "shared"` (per-source grids; currently `NotImplementedError` in `SpectrumAccessor`)
 - [ ] Promote query-time homogenization (`build_homogenized_view_sql`) — e.g. `dl-homogenize --check-only` view SQL or DuckDB notebook §8 as first-class recipe
 

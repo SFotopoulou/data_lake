@@ -66,7 +66,9 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |
-| `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area ([docs](discovery/regions-and-areas.md)) |
+| `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area, `--export-moc` ([docs](discovery/regions-and-areas.md)) |
+| `dl-area` | Manage `areas/<id>.json`: `list`, `show`, `validate`, `set-crossmatch`, `set-gather`, `set-homogenize`, `import` ([docs](discovery/areas-cli.md)) |
+| `dl-export-moc` | Write survey tile footprint (or region-clipped) as IVOA MOC FITS/JSON/ASCII; `--moc-order` ([docs](discovery/regions-and-areas.md#export-as-moc)) |
 | `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--keep-all`/`--matches-only`, partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
 | **Workflow** | End-to-end region → ML export: [discovery/workflow.md](discovery/workflow.md), [notebook](../notebooks/14_discovery_workflow.ipynb) |
 | `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |

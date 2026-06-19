@@ -1,7 +1,7 @@
 # Example area definitions
 
-Copy a template into your lake's `areas/` directory and edit survey/column names
-to match `dl-describe-lake` / `dl-describe-survey` on your deployment.
+Copy a template into your lake with `dl-area import <id> --from-file <template> --create-region`.
+See [areas-cli.md](../docs/discovery/areas-cli.md).
 
 | File | Purpose |
 |------|---------|

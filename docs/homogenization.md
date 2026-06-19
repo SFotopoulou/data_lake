@@ -92,7 +92,8 @@ dl-homogenize \
   --materialize-as EUCLID_wise_ab_v1
 ```
 
-Run from an area file (uses the top-level `homogenize` block):
+Run from an area file (uses the top-level `homogenize` block — set it with
+[`dl-area set-homogenize`](discovery/areas-cli.md)):
 
 ```bash
 dl-homogenize --from-area Euclid_North
@@ -132,4 +133,4 @@ dl-extract-catalog --lake-root /data/lake \
 [discovery/workflow.md](discovery/workflow.md) and
 [`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb).
 
-See also: [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md).
+See also: [Area plans (`dl-area`)](discovery/areas-cli.md), [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md).

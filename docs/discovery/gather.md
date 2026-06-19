@@ -7,8 +7,10 @@ selection. The result is stored under `catalogs/<name>/` with
 catalog and filterable with `dl-describe-lake --kind product`.
 
 Prerequisite: the partner crossmatch trees already exist (run
-[`dl-crossmatch`](crossmatch.md), e.g. `dl-crossmatch --from-area`). Gather never
-recomputes matches; it reads the precomputed `A_x_B__r<radius>` tiles.
+[`dl-crossmatch`](crossmatch.md), e.g. `dl-crossmatch --from-area`). Define the
+area's `gather` block with [`dl-area set-gather`](areas-cli.md) or hand-edit
+`areas/<id>.json`. Gather never recomputes matches; it reads the precomputed
+`A_x_B__r<radius>` tiles.
 
 ## Quick start
 

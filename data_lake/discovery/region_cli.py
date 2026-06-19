@@ -124,7 +124,19 @@ try:
                   help="Exact catalog counts via Parquet footers (slower than the estimate).")
     @click.option("--save-as", "save_as", default=None,
                   help="Persist this region as areas/<id>.json.")
-    @click.option("--overwrite", is_flag=True, help="Overwrite an existing area on --save-as.")
+    @click.option("--overwrite", is_flag=True,
+                  help="Overwrite an existing area (--save-as) or MOC file (--export-moc).")
+    @click.option("--export-moc", "export_moc", type=click.Path(path_type=Path), default=None,
+                  help="Write the region as an IVOA MOC file (requires --moc-order; needs [moc] extra).")
+    @click.option("--moc-order", type=int, default=None,
+                  help="HEALPix order for --export-moc (NESTED).")
+    @click.option(
+        "--moc-format",
+        type=click.Choice(["fits", "json", "ascii"]),
+        default="fits",
+        show_default=True,
+        help="Serialization format for --export-moc.",
+    )
     @logging_options
     def cli(
         output_root: Path | None,
@@ -141,6 +153,9 @@ try:
         exact: bool,
         save_as: str | None,
         overwrite: bool,
+        export_moc: Path | None,
+        moc_order: int | None,
+        moc_format: str,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -152,8 +167,12 @@ try:
             dl-region --cone 150.1 2.2 --radius-arcsec 600 --modalities catalog,spectra
             dl-region --npix 1002198,1002199 --norder 5 --save-as Wide_Field_47
             dl-region --bbox 149.5 150.5 1.8 2.6 --count
+            dl-region --cone 150.1 2.2 --radius-arcsec 600 \\
+                --export-moc /scratch/cone.moc.fits --moc-order 8
         """
         validate_quiet_verbose(quiet, verbose)
+        if export_moc is not None and moc_order is None:
+            raise click.ClickException("--export-moc requires --moc-order")
         cfg = load_optional_config(config_path)
         configure_cli_logging(
             level=resolve_log_level(quiet=quiet, verbose=verbose,
@@ -213,6 +232,29 @@ try:
             except FileExistsError as exc:
                 raise click.ClickException(str(exc) + " (use --overwrite)")
             click.echo(f"\nSaved area -> {path}")
+
+        if export_moc is not None:
+            from data_lake.discovery.moc_export import export_region_moc
+
+            prov: dict = {"region_type": region.type}
+            if from_area:
+                prov["area_id"] = from_area
+            try:
+                result = export_region_moc(
+                    region,
+                    export_moc,
+                    moc_order=moc_order,  # type: ignore[arg-type]
+                    fmt=moc_format,  # type: ignore[arg-type]
+                    overwrite=overwrite,
+                    provenance=prov,
+                )
+            except (ImportError, ValueError, OSError) as exc:
+                raise click.ClickException(str(exc)) from exc
+            click.echo(
+                f"\nExported MOC ({result.format}, order={result.moc_order}, "
+                f"{result.n_cells:,} cells at order, max_order={result.max_order}) "
+                f"→ {result.output}"
+            )
 
 except ImportError:
     cli = None  # type: ignore[misc, assignment]

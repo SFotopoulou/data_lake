@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "data-lake"
-version = "0.4.2"
+version = "0.4.3"
 description = "Astronomy data lake: wide multi-survey catalogs (Parquet/HATS) + galaxy cutout stacks (Zarr v3)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -63,6 +63,8 @@ dl-refresh-lake-registry = "data_lake.lake_registry:cli_refresh"
 dl-build-query-from-master = "data_lake.query_from_master:cli"
 dl-crossmatch = "data_lake.io.crossmatch:cli"
 dl-region = "data_lake.discovery.region_cli:cli"
+dl-area = "data_lake.discovery.area_cli:cli"
+dl-export-moc = "data_lake.discovery.moc_export_cli:cli"
 dl-gather = "data_lake.discovery.gather_cli:cli"
 dl-homogenize = "data_lake.homogenize.homogenize_cli:cli"
 dl-validate-homogenization = "data_lake.homogenize.validate_cli:cli"

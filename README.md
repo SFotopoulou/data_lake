@@ -70,6 +70,8 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 | Schema registry (`dl-describe-survey`) | [discovery/schema-registry.md](docs/discovery/schema-registry.md) |
 | Crossmatch and associations | [discovery/crossmatch.md](docs/discovery/crossmatch.md) |
 | Regions, areas, `dl-region` | [discovery/regions-and-areas.md](docs/discovery/regions-and-areas.md) |
+| Area plans (`dl-area`) | [discovery/areas-cli.md](docs/discovery/areas-cli.md) |
+| MOC export (`dl-export-moc`) | [regions-and-areas.md § Export as MOC](docs/discovery/regions-and-areas.md#export-as-moc) |
 | Gather products (`dl-gather`) | [discovery/gather.md](docs/discovery/gather.md) |
 | **Reference workflow** (region → ML export) | [discovery/workflow.md](docs/discovery/workflow.md) · [notebook](notebooks/14_discovery_workflow.ipynb) |
 | Homogenization (`dl-homogenize`) | [homogenization.md](docs/homogenization.md) |

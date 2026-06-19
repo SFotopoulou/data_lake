@@ -52,6 +52,6 @@ The catalog and spectrum/cutout layers may use **different** `hats_order` values
 ## Derived products and areas
 
 - **Product catalogs** are derived joined tables produced by [`dl-gather`](../discovery/gather.md). They live under `catalogs/<name>/` like any catalog but `catalog_info.json` has `kind: "product"` plus a `provenance` block (base, partners, radii, selection, multiplicity). Filter them with `dl-describe-lake --kind product`.
-- **Areas** (`areas/<area_id>.json`) are metadata-only: a `region` selector (npix / cone / bbox / MOC) plus optional `crossmatch_plan` and `gather` blocks. They span surveys and modalities and never hold tile data. See [Regions and areas](../discovery/regions-and-areas.md).
+- **Areas** (`areas/<area_id>.json`) are metadata-only: a `region` selector (npix / cone / bbox / MOC) plus optional `crossmatch_plan` and `gather` blocks. They span surveys and modalities and never hold tile data. See [Regions and areas](../discovery/regions-and-areas.md) and [`dl-area`](../discovery/areas-cli.md).
 - **Lifecycle**: live (incrementally ingested) catalogs can be ingested with `dl-ingest-catalog --defer-finalize` (records `lifecycle: "live"`, `finalized: false`), skipping the per-ingest `_metadata` rebuild; run `dl-finalize-catalog` once at the end.
 

@@ -26,7 +26,7 @@ flowchart LR
 | Step | Command | Output |
 |------|---------|--------|
 | 1. Region | `dl-region … --save-as AREA` | `areas/AREA.json` (region only) |
-| 2. Plan | Edit area JSON | `crossmatch_plan`, `gather`, optional `homogenize` |
+| 2. Plan | `dl-area set-crossmatch` / `set-gather` / `set-homogenize` or `dl-area import` | `crossmatch_plan`, `gather`, optional `homogenize` |
 | 3. Crossmatch | `dl-crossmatch --from-area AREA` | `crossmatch/<A>_x_<B>__r<R>/` trees |
 | 4. Gather | `dl-gather --from-area AREA` | `catalogs/<product>/` (`kind: product`) |
 | 5. Homogenize | `dl-homogenize --from-product …` or `--from-area` | `catalogs/<ab_product>/` (`product_subtype: homogenized`) |
@@ -34,8 +34,7 @@ flowchart LR
 | 7. Spectra (optional) | `dl-gather --extract-modalities` or `dl-extract-spectra-subset` | Zarr/HDF5 outside the lake |
 
 **Note:** `dl-region --save-as` writes only the region (and optional `discover`
-block). There is **no CLI yet** to attach `crossmatch_plan` / `gather` — copy
-the example JSON or edit `areas/<id>.json` by hand until the Area CLI ships.
+block). Attach plans with **[`dl-area`](areas-cli.md)** or `dl-area import --from-file`.
 
 ## Step-by-step (CLI)
 
@@ -43,9 +42,20 @@ the example JSON or edit `areas/<id>.json` by hand until the Area CLI ships.
 export DATA_LAKE_CONFIG=/path/to/lake_config.toml
 LAKE=$(python -c "from data_lake.config import LakeConfig; print(LakeConfig.discover().lake.root)")
 
-# 1 — Save sky selection (or copy examples/areas/multi_survey_cone.example.json → $LAKE/areas/)
+# 1 — Save sky selection (or dl-area import --create-region)
 dl-region "$LAKE" --cone 150.1 2.2 --radius-arcsec 600 --save-as multi_survey_cone
-# …then edit areas/multi_survey_cone.json (crossmatch_plan, gather, homogenize)
+
+# 2 — Attach crossmatch + gather + homogenize plans
+dl-area "$LAKE" set-crossmatch multi_survey_cone --base EUCLID_DR1 \
+  --partner DESI_DR1:1.0 --partner ALLWISE:2.0
+dl-area "$LAKE" set-gather multi_survey_cone --base EUCLID_DR1 \
+  --columns '{"EUCLID_DR1":["ra","dec"],"DESI_DR1":["z"],"ALLWISE":["w1mpro"]}' \
+  --materialize-as euclid_north_native_v1
+dl-area "$LAKE" set-homogenize multi_survey_cone --from-product euclid_north_native_v1 \
+  --transform phot_ab_v1 --materialize-as euclid_north_ab_v1
+
+# Or import the bundled example in one step:
+# dl-area "$LAKE" import multi_survey_cone --from-file examples/areas/multi_survey_cone.example.json --create-region
 
 # 2 — Discover coverage (optional)
 dl-region "$LAKE" --from-area multi_survey_cone
@@ -74,6 +84,10 @@ dl-extract-catalog --lake-root "$LAKE" \
 dl-gather "$LAKE" --from-area multi_survey_cone \
   --extract-modalities spectra --output-dir /scratch/euclid_north_spectra \
   --extract-survey DESI_DR1
+
+# Share the sky selection as IVOA MOC (requires: uv sync --extra moc)
+dl-region "$LAKE" --from-area multi_survey_cone \
+  --export-moc /scratch/multi_survey_cone.moc.fits --moc-order 8
 ```
 
 ## Validation checkpoints
@@ -86,6 +100,7 @@ dl-validate-homogenization --ab-coverage   # find missing phot_ab_v1 recipes
 
 ## Related docs
 
+- [Area plans (`dl-area`)](areas-cli.md) — attach crossmatch/gather/homogenize blocks
 - [Regions and areas](regions-and-areas.md) — region selectors, area schema
 - [Crossmatch](crossmatch.md) — match trees and `--from-area`
 - [Gather](gather.md) — column naming, `--extract-modalities`
