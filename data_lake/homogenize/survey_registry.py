@@ -181,7 +181,7 @@ def validate_survey_homogenize(data: dict[str, Any]) -> list[str]:
                 if not rule.get("target_column"):
                     msgs.append(f"ERROR: catalog rule[{i}] missing target_column")
                 t = (rule.get("transform") or {}).get("type")
-                if t not in ("mag_offset", "scale", "identity", "null_if_sentinel"):
+                if t not in ("mag_offset", "scale", "identity", "null_if_sentinel", "flux_to_ab"):
                     msgs.append(f"ERROR: catalog rule[{i}] unknown transform {t!r}")
         elif modality == MODALITY_SPECTRA:
             if not block.get("flux_array") and not any(

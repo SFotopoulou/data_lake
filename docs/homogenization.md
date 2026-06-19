@@ -50,11 +50,21 @@ Output: `catalogs/<materialize-as>/` with `kind: product`, `product_subtype: hom
 
 | Pack | Modality | Purpose |
 |------|----------|---------|
-| `phot_ab_v1` | catalog | Vega/mm mag → AB via offsets and scales |
+| `phot_ab_v1` | catalog | Vega/mm mag → AB via `mag_offset`, `scale`, or `flux_to_ab` (Jy flux) |
 | `spec_observed_v1` | spectra | Observed-frame flux unit normalization (`flux_scale`) |
 | `cutout_njy_v1` | cutout | nJy/pixel calibration via `flux_scale` on image stamps |
 
 Bandpass metadata for FM conditioning: `data_lake/homogenize/bandpass.json`.
+
+### Catalog rule types (`phot_ab_v1`)
+
+| Type | Use when | Example |
+|------|----------|---------|
+| `mag_offset` | Native column is Vega magnitude | `ALLWISE` `w1mpro` + 2.699 |
+| `scale` | Native column needs unit scaling (e.g. mmag) | `GAIA_DR3_source` G band |
+| `flux_to_ab` | Native column is flux in Jy | `UNWISE_W1` `flux` with `zp: 8.906` |
+
+`flux_to_ab` uses `m_AB = -2.5 log10(f_Jy) + zp` with WISE zero points (W1: 8.906, W2: 16.415).
 
 ## Query-time (exploration)
 

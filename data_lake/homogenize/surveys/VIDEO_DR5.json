@@ -1,51 +1,51 @@
 {
   "survey": "VIDEO_DR5",
   "version": 1,
-  "recipe_status": "skeleton",
-  "notes": "VISTA Deep Extragalactic Observations ZYJHKs; Vega PSF mags.",
+  "recipe_status": "ready",
+  "notes": "VIDEO DR5 SExtractor AUTO mags (Vega). Column names Z_MAG_AUTO … KS_MAG_AUTO. AB offsets: WFCAM/VISTA Vega system (Hewett et al. 2006).",
   "catalog": {
     "phot_ab_v1": {
       "output_system": "AB_mag",
       "rules": [
         {
-          "source_column": "ZPSFMAG",
+          "source_column": "Z_MAG_AUTO",
           "target_column": "phot_ab_z",
-          "uncertainty_column": "ZPSFMAGERR",
+          "uncertainty_column": "Z_MAGERR_AUTO",
           "target_uncertainty_column": "phot_ab_z_err",
           "native_system": "Vega",
-          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set Z-band Vega→AB offset"}
+          "transform": {"type": "mag_offset", "delta": 0.521}
         },
         {
-          "source_column": "YPSFMAG",
+          "source_column": "Y_MAG_AUTO",
           "target_column": "phot_ab_y",
-          "uncertainty_column": "YPSFMAGERR",
+          "uncertainty_column": "Y_MAGERR_AUTO",
           "target_uncertainty_column": "phot_ab_y_err",
           "native_system": "Vega",
-          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set Y-band Vega→AB offset"}
+          "transform": {"type": "mag_offset", "delta": 0.634}
         },
         {
-          "source_column": "JPSFMAG",
+          "source_column": "J_MAG_AUTO",
           "target_column": "phot_ab_j",
-          "uncertainty_column": "JPSFMAGERR",
+          "uncertainty_column": "J_MAGERR_AUTO",
           "target_uncertainty_column": "phot_ab_j_err",
           "native_system": "Vega",
-          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set J-band Vega→AB offset"}
+          "transform": {"type": "mag_offset", "delta": 0.938}
         },
         {
-          "source_column": "HPSFMAG",
+          "source_column": "H_MAG_AUTO",
           "target_column": "phot_ab_h",
-          "uncertainty_column": "HPSFMAGERR",
+          "uncertainty_column": "H_MAGERR_AUTO",
           "target_uncertainty_column": "phot_ab_h_err",
           "native_system": "Vega",
-          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set H-band Vega→AB offset"}
+          "transform": {"type": "mag_offset", "delta": 1.392}
         },
         {
-          "source_column": "KSPSFMAG",
+          "source_column": "KS_MAG_AUTO",
           "target_column": "phot_ab_ks",
-          "uncertainty_column": "KSPSFMAGERR",
+          "uncertainty_column": "KS_MAGERR_AUTO",
           "target_uncertainty_column": "phot_ab_ks_err",
           "native_system": "Vega",
-          "transform": {"type": "mag_offset", "delta": 0.0, "note": "SKELETON: set Ks-band Vega→AB offset"}
+          "transform": {"type": "mag_offset", "delta": 1.899}
         }
       ]
     }

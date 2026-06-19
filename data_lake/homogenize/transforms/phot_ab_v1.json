@@ -3,5 +3,5 @@
   "version": 1,
   "modality": "catalog",
   "output_system": "AB_mag",
-  "description": "Catalog photometry to AB magnitudes via per-survey recipes (mag_offset, scale). Rules live only in homogenize/<SURVEY>.json."
+  "description": "Catalog photometry to AB magnitudes via per-survey recipes (mag_offset, scale, flux_to_ab). Rules live only in homogenize/<SURVEY>.json."
 }

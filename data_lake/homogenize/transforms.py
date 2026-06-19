@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from data_lake.schema_registry import ROLE_PHOTOMETRY, get_survey_manifest
 
 _MAG_SENTINELS = (-9999.0, 9999.0, -999.0, 999.0)
+_FLUX_TO_AB_K = 1.0857362047461345  # 2.5 / ln(10)
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,19 @@ def _mag_expr(col: str):
     return pl.when(expr.is_nan()).then(None).otherwise(expr)
 
 
+def _flux_expr(col: str):
+    import polars as pl
+
+    expr = pl.col(col).cast(pl.Float64)
+    for sentinel in _MAG_SENTINELS:
+        expr = pl.when(expr == sentinel).then(None).otherwise(expr)
+    return (
+        pl.when(expr.is_nan() | (expr <= 0))
+        .then(None)
+        .otherwise(expr)
+    )
+
+
 def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
     """Return a new Polars frame with homogenized columns added."""
     import polars as pl
@@ -189,6 +203,10 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
             tgt = src * float(rule.transform["factor"])
         elif ttype == "identity":
             tgt = src
+        elif ttype == "flux_to_ab":
+            flux = _flux_expr(rule.source_column)
+            zp = float(rule.transform["zp"])
+            tgt = pl.when(flux.is_not_null()).then(-2.5 * flux.log10() + zp).otherwise(None)
         else:
             raise ValueError(f"Unsupported catalog transform type {ttype!r}")
 
@@ -208,6 +226,10 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
             u_expr = pl.col(u_src).cast(pl.Float64)
             if ttype == "scale":
                 u_expr = u_expr * float(rule.transform["factor"])
+            elif ttype == "flux_to_ab":
+                flux = _flux_expr(rule.source_column)
+                dflux = pl.col(u_src).cast(pl.Float64)
+                u_expr = pl.when(flux.is_not_null()).then(_FLUX_TO_AB_K * dflux / flux).otherwise(None)
             out = out.with_columns(u_expr.alias(u_tgt))
             lineage[-1]["uncertainty_target"] = u_tgt
 
@@ -237,6 +259,12 @@ def build_homogenized_view_sql(
             expr = f'("{src}" * {float(rule.transform["factor"])}) AS "{tgt}"'
         elif ttype == "identity":
             expr = f'"{src}" AS "{tgt}"'
+        elif ttype == "flux_to_ab":
+            zp = float(rule.transform["zp"])
+            expr = (
+                f'(CASE WHEN "{src}" > 0 THEN -2.5 * log10("{src}") + {zp} '
+                f'ELSE NULL END) AS "{tgt}"'
+            )
         else:
             continue
         lines.append(expr)

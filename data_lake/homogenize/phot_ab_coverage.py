@@ -131,7 +131,7 @@ def _survey_ab_status(
     )
     note = None
     if survey in {"UNWISE_W1", "UNWISE_W2"} and status == "skeleton":
-        note = "native flux columns; needs flux→AB mag transform type"
+        note = "native flux columns; needs flux_to_ab recipe"
     return SurveyAbStatus(
         survey=survey,
         category=category,

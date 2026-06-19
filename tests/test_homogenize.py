@@ -73,6 +73,20 @@ class TestTransforms:
         assert out["phot_ab_w1"][0] == pytest.approx(12.699)
         assert out["phot_ab_w1_err"][0] == pytest.approx(0.05)
 
+    def test_unwise_flux_to_ab(self) -> None:
+        import polars as pl
+
+        from data_lake.homogenize.survey_registry import resolve_catalog_rules
+
+        rules = resolve_catalog_rules(None, "UNWISE_W1", "phot_ab_v1")
+        rule = next(r for r in rules if r.target_column == "phot_ab_w1")
+        df = pl.DataFrame({"flux": [1.0, 0.0, -1.0], "dflux": [0.1, 0.1, 0.1]})
+        out, _ = apply_rules_to_frame(df, [rule])
+        assert out["phot_ab_w1"][0] == pytest.approx(8.906)
+        assert out["phot_ab_w1_err"][0] == pytest.approx(0.1085736, rel=1e-4)
+        assert out["phot_ab_w1"][1] is None
+        assert out["phot_ab_w1"][2] is None
+
     def test_view_sql(self) -> None:
         t = load_transform(None, "phot_ab_v1")
         sql = build_homogenized_view_sql("ALLWISE", t, lake_root=None)

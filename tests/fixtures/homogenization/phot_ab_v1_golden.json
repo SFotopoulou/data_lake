@@ -28,6 +28,15 @@
       "expected_output": 15.0,
       "tolerance": 0.0001,
       "transform_override": {"type": "scale", "factor": 0.001}
+    },
+    {
+      "description": "UnWISE W1 flux (Jy) to AB mag",
+      "survey": "UNWISE_W1",
+      "source_column": "flux",
+      "target_column": "phot_ab_w1",
+      "input_value": 1.0,
+      "expected_output": 8.906,
+      "tolerance": 0.001
     }
   ]
 }

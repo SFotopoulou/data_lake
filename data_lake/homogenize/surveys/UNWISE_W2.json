@@ -1,8 +1,8 @@
 {
   "survey": "UNWISE_W2",
   "version": 1,
-  "recipe_status": "skeleton",
-  "notes": "UnWISE W2 coadd fluxes (Vega Jy). Requires flux→AB mag transform (not mag_offset).",
+  "recipe_status": "ready",
+  "notes": "UnWISE W2 coadd fluxes (Vega Jy). AB mags via WISE All-Sky Release Explanatory Supplement zero points.",
   "catalog": {
     "phot_ab_v1": {
       "output_system": "AB_mag",
@@ -14,9 +14,9 @@
           "target_uncertainty_column": "phot_ab_w2_err",
           "native_system": "Vega_Jy",
           "transform": {
-            "type": "mag_offset",
-            "delta": 0.0,
-            "note": "SKELETON: replace with flux_to_ab using W2 zero-point"
+            "type": "flux_to_ab",
+            "zp": 16.415,
+            "reference": "WISE All-Sky Data Release Explanatory Supplement"
           }
         }
       ]

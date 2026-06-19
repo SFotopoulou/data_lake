@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-19
+
+### Added
+
+- **`flux_to_ab` catalog transform** — convert native flux (Jy) columns to AB magnitudes (`UNWISE_W1`, `UNWISE_W2`).
+- **Ready `phot_ab_v1` recipes** for `VHS_DR3`, `VIDEO_DR5`, `VIKING_DR4`, `ultraVISTA_DR6` (VISTA Vega → AB offsets; VIDEO uses `Z_MAG_AUTO` … `KS_MAG_AUTO` column names).
+
+### Documentation
+
+- Homogenization guide: catalog rule types and `flux_to_ab` zero points.
+
 ## [0.4.0] - 2026-06-18
 
 ### Added
@@ -94,6 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-survey catalog (Parquet/HATS), cutout, and 1-D spectrum (Zarr v3) ingest.
 - Lake registry, crossmatch, validation, and export tooling.
 
+[0.4.1]: https://github.com/SFotopoulou/data_lake/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/SFotopoulou/data_lake/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/SFotopoulou/data_lake/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/SFotopoulou/data_lake/compare/v0.1.0...v0.2.0

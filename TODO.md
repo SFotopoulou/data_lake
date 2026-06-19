@@ -1,27 +1,12 @@
 # Data lake backlog
 
-Last updated: 2026-06-18.
+Last updated: 2026-06-19.
 
 ## Homogenization — recipe content
 
-Catalog photometry recipes ship with the package; many still need real calibration values.
+### Ready catalog recipes (bundled)
 
-### Skeleton `phot_ab_v1` recipes (fill Vega→AB offsets)
-
-These files have `"recipe_status": "skeleton"` and `delta: 0.0` placeholders:
-
-- [ ] `VHS_DR3.json`
-- [ ] `VIDEO_DR5.json`
-- [ ] `VIKING_DR4.json`
-- [ ] `ultraVISTA_DR6.json`
-- [ ] `UNWISE_W1.json`
-- [ ] `UNWISE_W2.json`
-
-Validate with: `dl-validate-homogenization --ab-coverage` (requires lake root / `$DATA_LAKE_CONFIG`).
-
-### Ready catalog recipes (no action unless lake overrides needed)
-
-`ALLWISE`, `2MASS_PSC`, `2MASS_XSC`, `ASSEF18_*`, `GAIA_DR3_source`.
+`ALLWISE`, `2MASS_PSC`, `2MASS_XSC`, `ASSEF18_*`, `GAIA_DR3_source`, `VHS_DR3`, `VIDEO_DR5`, `VIKING_DR4`, `ultraVISTA_DR6`, `UNWISE_W1`, `UNWISE_W2`.
 
 ### Spectra and cutout homogenize recipes
 
@@ -30,6 +15,10 @@ Code supports `--modality spectra|cutout`; only `synthetic.json` has production-
 - [ ] Add `spec_observed_v1` rules for ingested spectrum surveys (e.g. SDSS, DESI)
 - [ ] Add `cutout_njy_v1` rules for ingested cutout surveys
 - [ ] End-to-end test on real lake tiles (not just `tests/test_homogenize.py` fixtures)
+
+### Other ingested catalogs needing `phot_ab_v1`
+
+Run `dl-validate-homogenization --ab-coverage` on your lake for the live list (e.g. `DESI_DR1`, `EUCLID_DR1`, `SDSS_DR17`, …).
 
 ## Discovery & areas — UX
 
