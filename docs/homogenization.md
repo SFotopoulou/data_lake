@@ -128,4 +128,8 @@ dl-extract-catalog --lake-root /data/lake \
 
 `--from-product` implies `product_subtype: homogenized` and writes `extract_provenance.json` (or `*.homogenize_provenance.json` for single-file exports) with `transform_id` and lineage for ML training configs.
 
+**End-to-end workflow** (region → crossmatch → gather → homogenize → export):
+[discovery/workflow.md](discovery/workflow.md) and
+[`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb).
+
 See also: [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md).

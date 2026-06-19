@@ -68,6 +68,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |
 | `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area ([docs](discovery/regions-and-areas.md)) |
 | `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--keep-all`/`--matches-only`, partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
+| **Workflow** | End-to-end region → ML export: [discovery/workflow.md](discovery/workflow.md), [notebook](../notebooks/14_discovery_workflow.ipynb) |
 | `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
 | `dl-crossmatch` | Positional catalog↔catalog match at lake scale; `--from-area`/`--plan` for region-bounded plans (`--match-backend astropy\|rapids`, `--gpu-id`) |
 | `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |

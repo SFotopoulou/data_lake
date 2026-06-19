@@ -13,3 +13,4 @@ See `notebooks/` for worked examples:
 5. **`11_duckdb_catalog_query.ipynb`** — SQL over Parquet catalogs; §9 master table + ID-list joins. Use `dl-describe-survey <name>` to choose columns before building joins.
 6. **`12_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
 7. **`13_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
+8. **`14_discovery_workflow.ipynb`** — End-to-end reference: region → crossmatch → gather → homogenize → ML export ([workflow guide](discovery/workflow.md); template area in `examples/areas/`)

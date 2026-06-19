@@ -151,6 +151,11 @@ export DATA_LAKE_CONFIG=/path/to/mylake/lake_config.toml
 # SpectrumAccessor, dl-extract-spectra-subset, notebooks, validators, …
 ```
 
+**Discovery pipeline:** after ingest, follow
+[`docs/discovery/workflow.md`](discovery/workflow.md) or
+[`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb)
+(region → crossmatch → gather → homogenize → ML export).
+
 Read-only tools never check the ingest token.
 
 

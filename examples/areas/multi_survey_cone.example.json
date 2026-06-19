@@ -1,0 +1,41 @@
+{
+  "area_id": "multi_survey_cone",
+  "schema_version": "1",
+  "notes": "Example area for notebooks/14_discovery_workflow.ipynb. Copy to $LAKE/areas/ and edit survey/column names for your deployment.",
+  "region": {
+    "type": "cone",
+    "ra_deg": 150.1,
+    "dec_deg": 2.2,
+    "radius_arcsec": 600
+  },
+  "discover": {
+    "surveys": "all",
+    "modalities": ["catalog", "spectra", "cutout"]
+  },
+  "crossmatch_plan": {
+    "base_catalog": "EUCLID_DR1",
+    "partners": [
+      { "survey": "DESI_DR1", "radius_arcsec": 1.0 },
+      { "survey": "ALLWISE", "radius_arcsec": 2.0 }
+    ],
+    "reuse_existing": true
+  },
+  "gather": {
+    "base": "EUCLID_DR1",
+    "columns": {
+      "EUCLID_DR1": ["ra", "dec"],
+      "DESI_DR1": ["z"],
+      "ALLWISE": ["w1mpro", "w2mpro"]
+    },
+    "multiplicity": "nearest",
+    "include_sep": true,
+    "keep_all": true,
+    "materialize_as": "euclid_north_native_v1"
+  },
+  "homogenize": {
+    "from_product": "euclid_north_native_v1",
+    "transform": "phot_ab_v1",
+    "materialize_as": "euclid_north_ab_v1",
+    "region": { "from_area": "multi_survey_cone" }
+  }
+}

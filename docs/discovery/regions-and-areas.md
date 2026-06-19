@@ -102,6 +102,10 @@ table short even with many live tiles.
 Each can be saved with `--save-as` and then matched (`dl-crossmatch --from-area`)
 and joined (`dl-gather --from-area`).
 
+> **Worked example:** [`docs/discovery/workflow.md`](workflow.md) and
+> [`notebooks/14_discovery_workflow.ipynb`](../../notebooks/14_discovery_workflow.ipynb)
+> with template [`examples/areas/multi_survey_cone.example.json`](../../examples/areas/multi_survey_cone.example.json).
+
 ## End-to-end workflow (cone → crossmatch → gather)
 
 `dl-region --save-as` writes **only the region** (and optional `discover` block).
@@ -119,7 +123,14 @@ dl-crossmatch /data/lake --from-area MyCone --n-workers 8 --progress
 
 # 4. Materialise the joined product catalog
 dl-gather /data/lake --from-area MyCone
+
+# 5. Homogenize + ML export (see workflow guide)
+dl-homogenize --from-product MyCone_native --transform phot_ab_v1 --materialize-as MyCone_ab
+dl-extract-catalog --from-product MyCone_ab -o /scratch/training.parquet
 ```
+
+Full step-by-step with homogenize and spectra export:
+[workflow.md](workflow.md).
 
 ### `crossmatch_plan` fields
 

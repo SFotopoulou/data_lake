@@ -42,8 +42,8 @@ Run `dl-validate-homogenization --ab-coverage` on your lake for the live list (e
 
 ## Discovery & areas — UX
 
-- [ ] CLI to attach `crossmatch_plan` and `gather` blocks to areas (today: `dl-region --save-as` then hand-edit `areas/<id>.json`)
-- [ ] Reference workflow notebook or example area: region → crossmatch → gather → homogenize → ML extract
+- [x] Reference workflow notebook + docs ([`notebooks/14_discovery_workflow.ipynb`](notebooks/14_discovery_workflow.ipynb), [`docs/discovery/workflow.md`](docs/discovery/workflow.md); example area in [`examples/areas/`](examples/areas/))
+- [ ] CLI to attach `crossmatch_plan` and `gather` blocks to areas (today: `dl-region --save-as` then hand-edit `areas/<id>.json` or copy the example area)
 
 ## Export & ML
 
