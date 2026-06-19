@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-18
+
+### Added
+
+- **Discovery model** — `Region` selectors (npix, cone, bbox, MOC), metadata-only **areas** (`areas/<id>.json`), cached **tile index**, and **base-source selection** for spatial queries.
+- **`dl-region`** — save sky selections as reusable areas; **`dl-gather`** — materialise derived multi-survey product catalogs from crossmatch trees; **`dl-gather --extract-modalities`** — portable spectra/cutout bundles alongside gathered catalogs.
+- **`dl-crossmatch --from-area` / `--plan`** — region-bounded crossmatch execution with gap-fill reuse.
+- **`dl-homogenize`** — opt-in homogenized **product catalogs** (`phot_ab_v1`), **spectra**, and **cutouts** via per-survey recipes under `data_lake/homogenize/surveys/` and lake overrides in `shared/registry/homogenize/`.
+- **`dl-validate-homogenization`** — golden tests, product lint, and `--ab-coverage` reporting for missing photometry recipes.
+- **`dl-mcp-lake`** — read-only MCP explorer (region discovery, provenance, ingest recommendations); **`ingest_advisor`** module for batch sizing hints.
+- **MOC region support** and **deferred-finalize live catalog ingest** (`lifecycle=live`).
+- **`dl-extract-catalog --from-product`** with homogenization provenance sidecars for ML export.
+- **`DATA_LAKE` environment variable** — alternate lake-root discovery alongside `$DATA_LAKE_CONFIG`.
+
+### Performance
+
+- Gather and crossmatch tile iteration optimisations; partner tile cache for repeated region overlap.
+- Parallel catalog index rebuild improvements.
+
+### Fixed
+
+- Arrow type handling in `dl-extract-catalog`; env-based lake root resolution.
+- Area naming resolution and gather product naming edge cases.
+- FITS column names: strip leading/trailing whitespace during catalog ingest and repair.
+
+### Documentation
+
+- Areas, regions, gather, crossmatch, homogenization, and MCP lake guides.
+- On-disk layout updates for crossmatch trees, areas, and product catalogs.
+
 ## [0.3.0] - 2026-06-05
 
 ### Added
@@ -64,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-survey catalog (Parquet/HATS), cutout, and 1-D spectrum (Zarr v3) ingest.
 - Lake registry, crossmatch, validation, and export tooling.
 
+[0.4.0]: https://github.com/SFotopoulou/data_lake/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/SFotopoulou/data_lake/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/SFotopoulou/data_lake/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/SFotopoulou/data_lake/releases/tag/v0.1.0
