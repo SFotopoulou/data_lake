@@ -503,3 +503,64 @@ class TestExtractSubsetToZarr:
         )
         assert result["n_requested"] == 2  # unique
         assert result["n_written"] == 2
+
+
+class TestExtractSubsetFluxCalibration:
+    def test_explicit_flux_scale_zarr(self, synthetic_lake: Path):
+        """flux_scale scales flux and ivar in exported Zarr."""
+        import zarr
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        requested = [101, 103]
+        scale = 0.5
+        out_path = synthetic_lake / "subset_scaled.zarr"
+        result = acc.extract_subset_to_zarr(
+            source_ids=requested,
+            output_zarr=out_path,
+            show_progress=False,
+            flux_scale=scale,
+        )
+        assert result["flux_scale"] == scale
+
+        out_root = zarr.open_group(
+            store=zarr.storage.LocalStore(str(out_path)), mode="r", zarr_format=3,
+        )
+        assert out_root.attrs.get("flux_scale") == scale
+        assert out_root.attrs.get("flux_calibrated") is True
+
+        flux = np.asarray(out_root["flux"][:])
+        ivar = np.asarray(out_root["ivar"][:])
+        for sid in requested:
+            row = result["id_to_row"][sid]
+            np.testing.assert_allclose(flux[row], sid * scale)
+            np.testing.assert_allclose(ivar[row], (1.0 / (sid + 1)) / (scale * scale))
+
+    def test_cli_apply_survey_calibration(self, synthetic_lake: Path, tmp_path: Path):
+        """CLI --flux-scale applies calibration and writes sidecar."""
+        from click.testing import CliRunner
+
+        from data_lake.export.spectra_subset import cli
+
+        ids_file = synthetic_lake / "ids_scaled.txt"
+        ids_file.write_text("101\n103\n")
+
+        runner = CliRunner()
+        out_zarr = synthetic_lake / "cli_scaled.zarr"
+        result = runner.invoke(
+            cli,
+            [
+                "--survey", SURVEY,
+                "--target-list", str(ids_file),
+                "--lake-root", str(synthetic_lake),
+                "--format", "zarr",
+                "--output", str(out_zarr),
+                "--flux-scale", "0.25",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        sidecar = synthetic_lake / "cli_scaled.calibration.json"
+        assert sidecar.is_file()
+        data = json.loads(sidecar.read_text())
+        assert data["flux_scale"] == 0.25

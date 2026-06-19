@@ -57,7 +57,22 @@ dl-extract-spectra-subset ... --format fits --fits-layout per-file \
 # One multi-row FITS catalog (BINTABLE: TARGETID, Z, FLUX, IVAR, MASK + WAVELENGTH HDU)
 dl-extract-spectra-subset ... --format fits --fits-layout catalog \
     --output /scratch/qso_spectra.fits
+
+# Apply bundled SDSS/DESI flux calibration (native 10^-17 → cgs erg/s/cm²/Å)
+dl-extract-spectra-subset ... --survey SDSS_DR17 --apply-survey-calibration \
+    --output /scratch/qso_ab.zarr
+
+# Explicit scale (overrides registry); writes subset.calibration.json by default
+dl-extract-spectra-subset ... --flux-scale 1e-17 --output /scratch/qso_ab.zarr
 ```
+
+**Flux calibration** (optional): multiply extracted flux by a constant factor
+and divide ivar by factor².  Use `--apply-survey-calibration` to load
+`spectra.flux_calibration` from `data_lake/homogenize/surveys/<SURVEY>.json`
+(bundled for `SDSS_DR17`), or `--flux-scale FACTOR` for an explicit value
+(explicit wins).  A sidecar `*.calibration.json` records provenance unless
+`--no-calibration-sidecar` is set.  Zarr/HDF5/Parquet exports also store
+`flux_scale` in group/file metadata when scaling is applied.
 
 `--format` choices: `zarr` (default), `parquet`, `hdf5`, `fits`.  For FITS,
 `--fits-layout` is `per-file` (default) or `catalog`.  All require

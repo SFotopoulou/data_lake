@@ -1,0 +1,13 @@
+{
+  "survey": "SDSS_DR17",
+  "version": 1,
+  "notes": "Spectrum extract calibration only (no catalog homogenize). Native BOSS/spec/spPlate flux in 10^-17 erg/s/cm2/Angstrom.",
+  "spectra": {
+    "flux_calibration": {
+      "native_flux_unit": "1e-17 erg/s/cm2/Angstrom",
+      "output_flux_unit": "erg/s/cm2/Angstrom",
+      "flux_scale": 1e-17,
+      "reference": "SDSS spectroscopic pipeline (BOSS DR17)"
+    }
+  }
+}

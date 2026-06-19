@@ -32,6 +32,13 @@ Example
     # One multi-row FITS catalog (BINTABLE + WAVELENGTH HDU)
     dl-extract-spectra-subset ... --format fits --fits-layout catalog \\
         --output /scratch/qso_spectra.fits
+
+    # Apply bundled SDSS/DESI flux calibration (10^-17 → cgs erg/s/cm2/Angstrom)
+    dl-extract-spectra-subset ... --survey SDSS_DR17 --apply-survey-calibration \\
+        --output /scratch/qso_ab.zarr
+
+    # Explicit scale factor
+    dl-extract-spectra-subset ... --flux-scale 1e-17 --output /scratch/qso_ab.zarr
 """
 
 from __future__ import annotations
@@ -202,6 +209,19 @@ try:
         "--overwrite/--no-overwrite", default=False, show_default=True,
         help="Replace existing output.",
     )
+    @click.option(
+        "--flux-scale", "flux_scale", type=float, default=None,
+        help="Multiply extracted flux by this factor (ivar /= scale²). Overrides registry.",
+    )
+    @click.option(
+        "--apply-survey-calibration/--no-apply-survey-calibration",
+        default=False, show_default=True,
+        help="Apply spectra.flux_calibration from homogenize/surveys/<SURVEY>.json.",
+    )
+    @click.option(
+        "--no-calibration-sidecar", is_flag=True, default=False,
+        help="Do not write *.calibration.json beside the output.",
+    )
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         survey_name: str,
@@ -217,6 +237,9 @@ try:
         missing: str,
         chunks_per_shard: int,
         overwrite: bool,
+        flux_scale: float | None,
+        apply_survey_calibration: bool,
+        no_calibration_sidecar: bool,
         verbose: bool,
     ) -> None:
         """Extract a curated subset of spectra (Zarr, Parquet, HDF5, or FITS)."""
@@ -238,6 +261,30 @@ try:
                     "Either pass it explicitly, set $DATA_LAKE_CONFIG, or use --config."
                 )
             lake_root = cfg.lake.root
+
+        from data_lake.export.spectra_calibration import (
+            resolve_flux_calibration,
+            write_calibration_sidecar,
+        )
+
+        try:
+            calibration = resolve_flux_calibration(
+                lake_root,
+                survey_name,
+                flux_scale=flux_scale,
+                apply_survey_calibration=apply_survey_calibration,
+            )
+        except (LookupError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        scale = calibration.flux_scale if calibration is not None else None
+        if calibration is not None:
+            log.info(
+                "Flux calibration: scale=%g (%s → %s)",
+                calibration.flux_scale,
+                calibration.native_flux_unit or "native",
+                calibration.output_flux_unit or "scaled",
+            )
 
         log.info("Reading source IDs from %s (column=%s) …", target_list, target_id_col)
         source_ids = _read_target_ids(target_list, target_id_col)
@@ -274,9 +321,13 @@ try:
             overwrite=overwrite,
             fits_filename_template=fits_filename_template,
             fits_layout=layout,
+            flux_scale=scale,
         )
 
         out = result.get("output", result.get("output_zarr", output_path))
+        if calibration is not None and not no_calibration_sidecar:
+            sidecar = write_calibration_sidecar(out, calibration)
+            click.echo(f"  calibration → {sidecar}")
         fmt_label = f"{fmt}" + (f", {layout}" if fmt == "fits" else "")
         click.echo(
             f"Wrote {result['n_written']}/{result['n_requested']} spectra "

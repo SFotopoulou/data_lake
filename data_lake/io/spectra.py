@@ -634,6 +634,7 @@ class SpectrumAccessor:
         *,
         show_progress: bool,
         z_map: dict[int, float] | None = None,
+        flux_scale: float | None = None,
     ):
         """Yield per-tile (sorted_sids, flux, ivar, mask, redshift) batches."""
         try:
@@ -676,6 +677,11 @@ class SpectrumAccessor:
             meta_raw = t_root["meta"][sorted_local]
             z_batch = self._redshift_batch_for_sources(sorted_sids, z_map, meta_raw)
 
+            if flux_scale is not None and flux_scale != 1.0:
+                from data_lake.export.spectra_calibration import apply_flux_scale
+
+                flux_batch, ivar_batch = apply_flux_scale(flux_batch, ivar_batch, flux_scale)
+
             yield sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch
 
     def _collect_subset_stacks(
@@ -684,6 +690,7 @@ class SpectrumAccessor:
         *,
         show_progress: bool,
         z_map: dict[int, float] | None = None,
+        flux_scale: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int]]:
         """Read all subset rows into contiguous numpy arrays (catalog FITS / Parquet)."""
         sid_chunks: list[np.ndarray] = []
@@ -695,7 +702,7 @@ class SpectrumAccessor:
         row_offset = 0
 
         for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
-            plan, show_progress=show_progress, z_map=z_map,
+            plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
         ):
             sid_chunks.append(sorted_sids)
             flux_chunks.append(flux_batch)
@@ -725,6 +732,7 @@ class SpectrumAccessor:
         overwrite: bool = False,
         fits_filename_template: str = "spec_{source_id}.fits",
         fits_layout: FitsLayout = "per-file",
+        flux_scale: float | None = None,
     ) -> dict[str, Any]:
         """Extract a subset to Zarr, Parquet, or FITS (per-file or catalog)."""
         if fmt == "zarr":
@@ -735,6 +743,7 @@ class SpectrumAccessor:
                 chunks_per_shard=chunks_per_shard,
                 show_progress=show_progress,
                 overwrite=overwrite,
+                flux_scale=flux_scale,
             )
         if fmt == "parquet":
             return self.extract_subset_to_parquet(
@@ -743,6 +752,7 @@ class SpectrumAccessor:
                 missing=missing,
                 show_progress=show_progress,
                 overwrite=overwrite,
+                flux_scale=flux_scale,
             )
         if fmt == "hdf5":
             return self.extract_subset_to_hdf5(
@@ -751,6 +761,7 @@ class SpectrumAccessor:
                 missing=missing,
                 show_progress=show_progress,
                 overwrite=overwrite,
+                flux_scale=flux_scale,
             )
         if fmt == "fits":
             return self.extract_subset_to_fits(
@@ -761,6 +772,7 @@ class SpectrumAccessor:
                 overwrite=overwrite,
                 filename_template=fits_filename_template,
                 layout=fits_layout,
+                flux_scale=flux_scale,
             )
         raise ValueError(f"unknown format {fmt!r}; use zarr, parquet, hdf5, or fits")
 
@@ -773,6 +785,7 @@ class SpectrumAccessor:
         chunks_per_shard: int = 512,
         show_progress: bool = True,
         overwrite: bool = False,
+        flux_scale: float | None = None,
     ) -> dict[str, Any]:
         """Extract a curated subset of spectra into a single flat Zarr v3 group.
 
@@ -907,12 +920,15 @@ class SpectrumAccessor:
             "extract_created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "schema_version": "1",
         })
+        if flux_scale is not None and flux_scale != 1.0:
+            attrs["flux_scale"] = flux_scale
+            attrs["flux_calibrated"] = True
         out_root.attrs.update(attrs)
 
         id_to_row: dict[int, int] = {}
         write_offset = 0
         for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
-            plan, show_progress=show_progress, z_map=z_map,
+            plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
         ):
             k = len(sorted_sids)
             slc = slice(write_offset, write_offset + k)
@@ -941,6 +957,7 @@ class SpectrumAccessor:
             "output": str(output_zarr),
             "output_zarr": str(output_zarr),
             "format": "zarr",
+            "flux_scale": flux_scale,
         }
 
     def extract_subset_to_parquet(
@@ -951,6 +968,7 @@ class SpectrumAccessor:
         missing: str = "skip",
         show_progress: bool = True,
         overwrite: bool = False,
+        flux_scale: float | None = None,
     ) -> dict[str, Any]:
         """Extract a subset into one Parquet file (one row per spectrum)."""
         import pyarrow as pa
@@ -972,19 +990,23 @@ class SpectrumAccessor:
         mask_pa = pa.uint16() if plan.mask_dtype == np.dtype(np.uint16) else pa.uint8()
         flt_vec = pa.list_(pa.float32())
         mask_vec = pa.list_(mask_pa)
+        meta = {
+            b"source_survey": self.survey_name.encode(),
+            b"wavelength_mode": b"shared",
+            b"wavelength": json.dumps(plan.wavelength.tolist()).encode(),
+            b"wcs_attrs": json.dumps(plan.src_wcs).encode(),
+            b"n_pix": str(n_pix).encode(),
+        }
+        if flux_scale is not None and flux_scale != 1.0:
+            meta[b"flux_scale"] = str(flux_scale).encode()
+            meta[b"flux_calibrated"] = b"true"
         schema = pa.schema([
             ("source_id", pa.int64()),
             ("redshift", pa.float32()),
             ("flux", flt_vec),
             ("ivar", flt_vec),
             ("mask", mask_vec),
-        ]).with_metadata({
-            b"source_survey": self.survey_name.encode(),
-            b"wavelength_mode": b"shared",
-            b"wavelength": json.dumps(plan.wavelength.tolist()).encode(),
-            b"wcs_attrs": json.dumps(plan.src_wcs).encode(),
-            b"n_pix": str(n_pix).encode(),
-        })
+        ]).with_metadata(meta)
 
         id_to_row: dict[int, int] = {}
         row_offset = 0
@@ -993,7 +1015,7 @@ class SpectrumAccessor:
         )
         try:
             for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
-                plan, show_progress=show_progress, z_map=z_map,
+                plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
             ):
                 table = pa.Table.from_arrays(
                     [
@@ -1024,6 +1046,7 @@ class SpectrumAccessor:
             "output": str(output_parquet),
             "output_parquet": str(output_parquet),
             "format": "parquet",
+            "flux_scale": flux_scale,
         }
 
     def extract_subset_to_hdf5(
@@ -1035,6 +1058,7 @@ class SpectrumAccessor:
         show_progress: bool = True,
         overwrite: bool = False,
         compression: str | None = "gzip",
+        flux_scale: float | None = None,
     ) -> dict[str, Any]:
         """Extract a subset into one HDF5 file (stacked arrays, shared wavelength).
 
@@ -1087,6 +1111,9 @@ class SpectrumAccessor:
             )
             f.attrs["schema_version"] = "1"
             f.attrs["wcs_attrs"] = json.dumps(plan.src_wcs)
+            if flux_scale is not None and flux_scale != 1.0:
+                f.attrs["flux_scale"] = flux_scale
+                f.attrs["flux_calibrated"] = True
             f.create_dataset("wavelength", data=plan.wavelength, dtype=np.float64)
 
             flux_ds = f.create_dataset(
@@ -1108,7 +1135,7 @@ class SpectrumAccessor:
             write_offset = 0
             for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in (
                 self._iter_subset_tile_batches(
-                    plan, show_progress=show_progress, z_map=z_map,
+                    plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
                 )
             ):
                 k = len(sorted_sids)
@@ -1134,6 +1161,7 @@ class SpectrumAccessor:
             "output": str(output_hdf5),
             "output_hdf5": str(output_hdf5),
             "format": "hdf5",
+            "flux_scale": flux_scale,
         }
 
     def extract_subset_to_fits(
@@ -1146,6 +1174,7 @@ class SpectrumAccessor:
         overwrite: bool = False,
         filename_template: str = "spec_{source_id}.fits",
         layout: FitsLayout = "per-file",
+        flux_scale: float | None = None,
     ) -> dict[str, Any]:
         """Extract a subset to FITS (one file per spectrum or one catalog file)."""
         if layout == "catalog":
@@ -1155,6 +1184,7 @@ class SpectrumAccessor:
                 missing=missing,
                 show_progress=show_progress,
                 overwrite=overwrite,
+                flux_scale=flux_scale,
             )
         return self._extract_subset_to_fits_per_file(
             source_ids,
@@ -1163,6 +1193,7 @@ class SpectrumAccessor:
             show_progress=show_progress,
             overwrite=overwrite,
             filename_template=filename_template,
+            flux_scale=flux_scale,
         )
 
     def extract_subset_to_fits_catalog(
@@ -1173,6 +1204,7 @@ class SpectrumAccessor:
         missing: str = "skip",
         show_progress: bool = True,
         overwrite: bool = False,
+        flux_scale: float | None = None,
     ) -> dict[str, Any]:
         """Extract a subset into one multi-row FITS catalog (BINTABLE + WAVELENGTH HDU)."""
         from data_lake.export.to_spectrum_fits import write_spectra_catalog_fits
@@ -1183,7 +1215,7 @@ class SpectrumAccessor:
         )
         z_map = self._build_catalog_redshift_map(plan)
         source_id, flux, ivar, mask, redshift, id_to_row = self._collect_subset_stacks(
-            plan, show_progress=show_progress, z_map=z_map,
+            plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
         )
         write_spectra_catalog_fits(
             output_fits,
@@ -1210,6 +1242,7 @@ class SpectrumAccessor:
             "output_fits": str(output_fits),
             "fits_layout": "catalog",
             "format": "fits",
+            "flux_scale": flux_scale,
         }
 
     def _extract_subset_to_fits_per_file(
@@ -1221,6 +1254,7 @@ class SpectrumAccessor:
         show_progress: bool = True,
         overwrite: bool = False,
         filename_template: str = "spec_{source_id}.fits",
+        flux_scale: float | None = None,
     ) -> dict[str, Any]:
         """Extract a subset into one FITS file per spectrum."""
         from astropy.io import fits
@@ -1244,7 +1278,7 @@ class SpectrumAccessor:
         row_offset = 0
 
         for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
-            plan, show_progress=show_progress, z_map=z_map,
+            plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
         ):
             for j, sid in enumerate(sorted_sids.tolist()):
                 meta = {"z": float(z_batch[j])}
@@ -1286,6 +1320,7 @@ class SpectrumAccessor:
             "fits_paths": paths,
             "fits_layout": "per-file",
             "format": "fits",
+            "flux_scale": flux_scale,
         }
 
     def iter_tile(self, npix: int):

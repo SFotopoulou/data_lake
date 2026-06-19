@@ -8,11 +8,31 @@ Last updated: 2026-06-19.
 
 `ALLWISE`, `2MASS_PSC`, `2MASS_XSC`, `ASSEF18_*`, `GAIA_DR3_source`, `VHS_DR3`, `VIDEO_DR5`, `VIKING_DR4`, `ultraVISTA_DR6`, `UNWISE_W1`, `UNWISE_W2`.
 
-### Spectra and cutout homogenize recipes
+### Spectra extract calibration (SDSS, DESI)
 
-Code supports `--modality spectra|cutout`; only `synthetic.json` has production-shaped blocks today.
+Constant flux unit normalization is applied at **extract** time, not via
+`dl-homogenize --modality spectra`.  Per-survey factors live in
+`spectra.flux_calibration` inside `homogenize/surveys/<SURVEY>.json`:
 
-- [ ] Add `spec_observed_v1` rules for ingested spectrum surveys (e.g. SDSS, DESI)
+```json
+"spectra": {
+  "flux_calibration": {
+    "native_flux_unit": "1e-17 erg/s/cm2/Angstrom",
+    "output_flux_unit": "erg/s/cm2/Angstrom",
+    "flux_scale": 1e-17
+  }
+}
+```
+
+Use `dl-extract-spectra-subset --apply-survey-calibration` or `--flux-scale`.
+See [export-and-sharing.md](export-and-sharing.md).
+
+### Spectra and cutout homogenize recipes (zarr engine)
+
+Code supports `--modality spectra|cutout` for tile-level product transforms;
+only `synthetic.json` has production-shaped blocks today.  **Do not** use this
+path for SDSS/DESI constant flux scaling — use extract calibration above.
+
 - [ ] Add `cutout_njy_v1` rules for ingested cutout surveys
 - [ ] End-to-end test on real lake tiles (not just `tests/test_homogenize.py` fixtures)
 
@@ -27,6 +47,7 @@ Run `dl-validate-homogenization --ab-coverage` on your lake for the live list (e
 
 ## Export & ML
 
+- [x] `dl-extract-spectra-subset`: flux calibration (`--flux-scale`, `--apply-survey-calibration`; SDSS/DESI bundled)
 - [ ] `dl-extract-spectra-subset`: support `wavelength_mode != "shared"` (per-source grids; currently `NotImplementedError` in `SpectrumAccessor`)
 - [ ] Promote query-time homogenization (`build_homogenized_view_sql`) — e.g. `dl-homogenize --check-only` view SQL or DuckDB notebook §8 as first-class recipe
 

@@ -1,0 +1,13 @@
+{
+  "survey": "DESI_DR1",
+  "version": 1,
+  "notes": "Spectrum extract calibration only. Native desispec BRZ coadd flux in 10^-17 erg/s/cm2/Angstrom.",
+  "spectra": {
+    "flux_calibration": {
+      "native_flux_unit": "1e-17 erg/s/cm2/Angstrom",
+      "output_flux_unit": "erg/s/cm2/Angstrom",
+      "flux_scale": 1e-17,
+      "reference": "DESI desispec coadd (DR1)"
+    }
+  }
+}

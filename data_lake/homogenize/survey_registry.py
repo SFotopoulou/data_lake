@@ -184,6 +184,11 @@ def validate_survey_homogenize(data: dict[str, Any]) -> list[str]:
                 if t not in ("mag_offset", "scale", "identity", "null_if_sentinel", "flux_to_ab"):
                     msgs.append(f"ERROR: catalog rule[{i}] unknown transform {t!r}")
         elif modality == MODALITY_SPECTRA:
+            if block.get("flux_calibration"):
+                cal = block["flux_calibration"]
+                if not isinstance(cal, dict) or cal.get("flux_scale") is None:
+                    msgs.append("ERROR: spectra.flux_calibration missing flux_scale")
+                continue
             if not block.get("flux_array") and not any(
                 isinstance(v, dict) and v.get("flux_array")
                 for v in block.values()

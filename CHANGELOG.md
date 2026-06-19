@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-06-18
+
+### Added
+
+- **Extract-time spectrum flux calibration** — `dl-extract-spectra-subset` accepts `--flux-scale` and `--apply-survey-calibration`; scales flux and ivar at export and writes a `*.calibration.json` sidecar.
+- **Bundled SDSS/DESI calibration** — `spectra.flux_calibration` in `homogenize/surveys/SDSS_DR17.json` and `DESI_DR1.json` (native 10⁻¹⁷ → cgs erg/s/cm²/Å).
+
+### Documentation
+
+- Export guide: flux calibration flags and provenance sidecars.
+- TODO: extract calibration is the primary path for SDSS/DESI flux units (not `dl-homogenize --modality spectra`).
+
 ## [0.4.1] - 2026-06-19
 
 ### Added
