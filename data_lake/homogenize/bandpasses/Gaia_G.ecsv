@@ -1,0 +1,30 @@
+# %ECSV 1.0
+# ---
+# datatype:
+# - {name: wavelength, unit: Angstrom, datatype: float64, description: Wavelength}
+# - {name: throughput, datatype: float64, description: Normalised total-system response (0-1)}
+# meta:
+#   band: phot_ab_g
+#   system: Vega-as-AB
+#   lambda_eff_um: 0.6735
+#   source: "illustrative — replace with SVO http://svo2.cab.inta-csic.es/theory/fps/ GAIA/GAIA3.G"
+#   description: "Approximate trapezoidal Gaia DR3 G-band response for display only"
+# schema: astropy-2.0
+wavelength throughput
+3300 0.000
+3500 0.020
+3800 0.150
+4200 0.500
+4800 0.820
+5500 0.950
+6000 1.000
+6400 1.000
+6700 0.990
+7000 0.960
+7500 0.870
+8000 0.700
+8500 0.450
+9000 0.200
+9500 0.060
+10000 0.010
+10500 0.000

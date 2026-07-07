@@ -17,6 +17,16 @@ data_lake/
   ml/
     dataset.py           PyTorch Dataset / IterableDataset (cutouts)
     spectrum_dataset.py  PyTorch Dataset / IterableDataset (spectra) + transforms
+  homogenize/
+    bandpass.json        Per-band effective wavelength + FWHM registry (all phot_ab_* bands)
+    bandpass.py          BandpassRegistry: lake-override resolution + ECSV curve loading
+    bandpasses/          Bundled transmission-curve ECSV files (one per band; illustrative)
+    surveys/             Per-survey homogenization recipes (<SURVEY>.json)
+    transforms/          Transform-pack contracts (phot_ab_v1.json, etc.)
+  plot/
+    sed.py               Assemble SEDPoints from a homogenized product catalog row
+    source_figure.py     Two-panel SED + 1D spectrum matplotlib figure (lazy import)
+    plot_cli.py          dl-plot-source CLI entry point
   share/
     pack_tile.py         Per-tile .tar packaging + MANIFEST.json
   export/

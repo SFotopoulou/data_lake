@@ -1,9 +1,56 @@
 {
   "bands": {
-    "phot_ab_w1": {"lambda_eff_um": 3.4, "fwhm_um": 0.75, "system": "AB", "survey_ref": "WISE W1"},
-    "phot_ab_w2": {"lambda_eff_um": 4.6, "fwhm_um": 1.04, "system": "AB", "survey_ref": "WISE W2"},
-    "phot_ab_g": {"lambda_eff_um": 0.677, "fwhm_um": 0.25, "system": "Vega-as-AB", "survey_ref": "Gaia G"},
-    "phot_ab_bp": {"lambda_eff_um": 0.532, "fwhm_um": 0.25, "system": "Vega-as-AB", "survey_ref": "Gaia BP"},
-    "phot_ab_rp": {"lambda_eff_um": 0.797, "fwhm_um": 0.25, "system": "Vega-as-AB", "survey_ref": "Gaia RP"}
+    "phot_ab_w1": {
+      "lambda_eff_um": 3.368, "fwhm_um": 0.662, "system": "AB",
+      "survey_ref": "WISE W1", "curve": "WISE_W1.ecsv"
+    },
+    "phot_ab_w2": {
+      "lambda_eff_um": 4.618, "fwhm_um": 1.042, "system": "AB",
+      "survey_ref": "WISE W2", "curve": "WISE_W2.ecsv"
+    },
+    "phot_ab_w3": {
+      "lambda_eff_um": 12.082, "fwhm_um": 5.509, "system": "AB",
+      "survey_ref": "WISE W3"
+    },
+    "phot_ab_w4": {
+      "lambda_eff_um": 22.194, "fwhm_um": 4.098, "system": "AB",
+      "survey_ref": "WISE W4"
+    },
+    "phot_ab_g": {
+      "lambda_eff_um": 0.6735, "fwhm_um": 0.4434, "system": "Vega-as-AB",
+      "survey_ref": "Gaia G", "curve": "Gaia_G.ecsv"
+    },
+    "phot_ab_bp": {
+      "lambda_eff_um": 0.5320, "fwhm_um": 0.2438, "system": "Vega-as-AB",
+      "survey_ref": "Gaia BP"
+    },
+    "phot_ab_rp": {
+      "lambda_eff_um": 0.7966, "fwhm_um": 0.2939, "system": "Vega-as-AB",
+      "survey_ref": "Gaia RP"
+    },
+    "phot_ab_z": {
+      "lambda_eff_um": 0.8817, "fwhm_um": 0.0999, "system": "AB",
+      "survey_ref": "VISTA Z (VIRCAM)"
+    },
+    "phot_ab_y": {
+      "lambda_eff_um": 1.0211, "fwhm_um": 0.1010, "system": "AB",
+      "survey_ref": "VISTA Y (VIRCAM)"
+    },
+    "phot_ab_j": {
+      "lambda_eff_um": 1.2527, "fwhm_um": 0.1720, "system": "AB",
+      "survey_ref": "2MASS / VISTA J"
+    },
+    "phot_ab_h": {
+      "lambda_eff_um": 1.6433, "fwhm_um": 0.2909, "system": "AB",
+      "survey_ref": "2MASS / VISTA H"
+    },
+    "phot_ab_k": {
+      "lambda_eff_um": 2.1590, "fwhm_um": 0.2621, "system": "AB",
+      "survey_ref": "2MASS Ks (listed as K)"
+    },
+    "phot_ab_ks": {
+      "lambda_eff_um": 2.1510, "fwhm_um": 0.3118, "system": "AB",
+      "survey_ref": "VISTA Ks (VIRCAM)"
+    }
   }
 }

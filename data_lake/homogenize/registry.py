@@ -41,7 +41,14 @@ def load_transform(lake_root: Path | str | None, transform_id: str) -> dict[str,
 
 
 def load_bandpass_metadata() -> dict[str, Any]:
-    path = Path(__file__).resolve().parent / "bandpass.json"
+    """Return the raw bandpass.json content.
+
+    Deprecated shim — prefer ``BandpassRegistry`` from
+    ``data_lake.homogenize.bandpass`` for new code.
+    """
+    from data_lake.homogenize.bandpass import _PKG_BANDPASS_JSON
+
+    path = _PKG_BANDPASS_JSON
     if not path.is_file():
         return {}
     with open(path, encoding="utf-8") as fh:

@@ -1,6 +1,8 @@
 # Data lake backlog
 
-Last updated: 2026-06-19.
+Last updated: 2026-07-06.
+
+**Active sprint (Lake COMO):** [`docs/sprints/como-2026-07.md`](docs/sprints/como-2026-07.md) — MCP snapshot + prioritized backlog.
 
 ## Homogenization — recipe content
 
@@ -33,24 +35,34 @@ Code supports `--modality spectra|cutout` for tile-level product transforms;
 only `synthetic.json` has production-shaped blocks today.  **Do not** use this
 path for SDSS/DESI constant flux scaling — use extract calibration above.
 
-- [ ] Add `cutout_njy_v1` rules for ingested cutout surveys
-- [ ] End-to-end test on real lake tiles (not just `tests/test_homogenize.py` fixtures)
+- [ ] Add `cutout_njy_v1` rules for ingested cutout surveys (no COMO cutouts yet — defer)
+- [ ] End-to-end test on real lake tiles (not just `tests/test_homogenize.py` fixtures) — **COMO sprint C2**
 
 ### Other ingested catalogs needing `phot_ab_v1`
 
-Run `dl-validate-homogenization --ab-coverage` on your lake for the live list (e.g. `DESI_DR1`, `EUCLID_DR1`, `SDSS_DR17`, …).
+Run `dl-validate-homogenization --ab-coverage` on your lake for the live list.
+
+**COMO (2026-07-06):** 24 catalogs missing recipes — sprint priority:
+`EUCLID_DR1`, `DESI_DR1`, `SDSS_DR17` (see sprint doc). Bundled ready:
+`ALLWISE`, `GAIA_DR3_source`, VISTA family, `UNWISE_W1/W2`, `2MASS_*`, `ASSEF18_*`.
 
 ## Discovery & areas — UX
 
 - [x] Reference workflow notebook + docs ([`notebooks/14_discovery_workflow.ipynb`](notebooks/14_discovery_workflow.ipynb), [`docs/discovery/workflow.md`](docs/discovery/workflow.md); example area in [`examples/areas/`](examples/areas/))
 - [x] CLI to attach `crossmatch_plan` and `gather` blocks to areas — **`dl-area`** (`set-crossmatch`, `set-gather`, `set-homogenize`, `import`)
 
+## Visualisation
+
+- [x] `dl-plot-source`: two-panel SED + 1D spectrum figure (`--id`, `--product`, `--spectra-survey`, `-o`); requires `--extra viz` — **v0.5.0**
+- [ ] Replace illustrative bandpass ECSV files with authoritative SVO curves (all 13 `phot_ab_*` bands); add EUCLID/DESI/SDSS optical bands once `phot_ab_v1` recipes exist
+- [ ] `--y-unit fnu|flam` overlay mode: convert SED points to flux density units for direct overlay on the spectrum panel (single axis)
+
 ## Export & ML
 
 - [x] `dl-extract-spectra-subset`: flux calibration (`--flux-scale`, `--apply-survey-calibration`; SDSS/DESI bundled)
 - [x] MOC export: `dl-region --export-moc` and `dl-export-moc` (`--moc-order`; requires `--extra moc`)
-- [ ] `dl-extract-spectra-subset`: support `wavelength_mode != "shared"` (per-source grids; currently `NotImplementedError` in `SpectrumAccessor`)
-- [ ] Promote query-time homogenization (`build_homogenized_view_sql`) — e.g. `dl-homogenize --check-only` view SQL or DuckDB notebook §8 as first-class recipe
+- [ ] `dl-extract-spectra-subset`: support `wavelength_mode != "shared"` — **blocks COMO 2df/6df** (`NotImplementedError` in `SpectrumAccessor`)
+- [ ] Promote query-time homogenization (`build_homogenized_view_sql`) — function exists in `homogenize/transforms.py`; not yet a CLI path (**sprint C3**)
 
 ## Schema registry
 
@@ -58,5 +70,6 @@ Run `dl-validate-homogenization --ab-coverage` on your lake for the live list (e
 
 ## MCP & security
 
-- [ ] Document MCP read-only boundary (no ingest, no job submission) for team deployments
+- [ ] Document MCP read-only boundary for team deployments — **partial:** `docs/mcp-lake.md` § Out of scope; need runbook (**sprint D1**)
+- [ ] Fix MCP `get_area` for legacy `areas/*.area.json` filenames (**sprint C1**)
 - [ ] Future: proper authentication beyond ingest token (`docs/quickstart.md` notes ACLs + token are minimal)

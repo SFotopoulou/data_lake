@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-07
+
+### Added
+
+- **`dl-plot-source`** — two-panel SED + 1D spectrum figure for any source identified by its lake `_source_id`.  Reads photometry from a homogenized product catalog and the spectrum from a Zarr spectra store; shares a log-wavelength x-axis in micron.  Requires `pip install "data-lake[viz]"` (new `viz` optional extra that pulls in `matplotlib>=3.7`).
+- **`BandpassRegistry`** (`data_lake/homogenize/bandpass.py`) — resolves per-band effective wavelength, FWHM, and optional transmission-curve files with lake-override semantics (lake `shared/registry/bandpasses/` beats bundled defaults).
+- **`bandpass.json` extended** — all 13 `phot_ab_*` bands now carry `lambda_eff_um`, `fwhm_um`, and (where available) a `"curve"` filename: WISE W1–W4, Gaia G/BP/RP, VISTA Z/Y/Ks, 2MASS/VISTA J/H, 2MASS K.
+- **`data_lake/homogenize/bandpasses/`** — new folder for per-band transmission-curve ECSV files (`wavelength` Å, `throughput`).  Bundled illustrative curves for WISE W1 and Gaia G; see `bandpasses/README.md` for the format and SVO fetch instructions.
+- **`data_lake/plot/sed.py`** — `assemble_sed()` dynamically discovers `phot_ab_*` columns in a product catalog row, intersects with `BandpassRegistry`, skips NaN/unknown bands, returns `SEDPoints` sorted by wavelength.
+- **`data_lake/plot/source_figure.py`** — `plot_source_sed_spectrum()` renders the two-panel figure; lazy `import matplotlib` with a helpful error when the `viz` extra is missing; optional bandpass shading on a twin axis.
+
+### Documentation
+
+- **`docs/plotting.md`** — usage, ID semantics, bandpass registry, Python API, follow-up roadmap.
+- `docs/cli-reference.md` — new Visualisation section with `dl-plot-source`.
+- `docs/layout/data-on-disk.md` — `shared/registry/bandpasses/` lake-override directory added to layout diagram.
+- `docs/layout/repository.md` — `homogenize/bandpasses/`, `homogenize/bandpass.py`, and `plot/` subpackage listed.
+- `docs/homogenization.md` — cross-link to plotting guide.
+- `README.md` — SED + spectrum plot row in discovery table; `viz` extra in dependencies note.
+
 ## [0.4.3] - 2026-06-19
 
 ### Added

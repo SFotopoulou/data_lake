@@ -1,0 +1,28 @@
+# %ECSV 1.0
+# ---
+# datatype:
+# - {name: wavelength, unit: Angstrom, datatype: float64, description: Wavelength}
+# - {name: throughput, datatype: float64, description: Normalised total-system response (0-1)}
+# meta:
+#   band: phot_ab_w1
+#   system: AB
+#   lambda_eff_um: 3.368
+#   source: "illustrative — replace with SVO http://svo2.cab.inta-csic.es/theory/fps/ WISE/WISE.W1"
+#   description: "Approximate trapezoidal WISE W1 bandpass for display only"
+# schema: astropy-2.0
+wavelength throughput
+27000 0.000
+28000 0.050
+29000 0.250
+30000 0.700
+31000 0.970
+32000 1.000
+33000 1.000
+34000 1.000
+35000 1.000
+36000 0.980
+37000 0.850
+38000 0.480
+39000 0.120
+40000 0.010
+41000 0.000

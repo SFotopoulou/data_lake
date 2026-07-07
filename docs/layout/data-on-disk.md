@@ -19,6 +19,8 @@
     registry/
       surveys.parquet        ← survey × modality index (dl-describe-lake)
       tile_index/            ← cached <survey>.<modality>.json populated-npix lists
+      homogenize/            ← per-survey homogenization recipe overrides (<SURVEY>.json)
+      bandpasses/            ← lake-local bandpass transmission-curve overrides (<file>.ecsv)
   cutouts/
     <survey>/
       Norder=5/Dir=0/Npix=0.zarr/   ← one Zarr group per tile

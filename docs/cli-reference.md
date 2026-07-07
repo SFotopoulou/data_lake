@@ -75,6 +75,12 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-crossmatch` | Positional catalog↔catalog match at lake scale; `--from-area`/`--plan` for region-bounded plans (`--match-backend astropy\|rapids`, `--gpu-id`) |
 | `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |
 
+**Visualisation**
+
+| Command | Purpose |
+|---------|---------|
+| `dl-plot-source` | Two-panel SED + 1D spectrum figure for one source (`--id`, `--product`, `--spectra-survey`, `-o`); requires `--extra viz` ([docs](plotting.md)) |
+
 **Agents (MCP)**
 
 | Command | Purpose |

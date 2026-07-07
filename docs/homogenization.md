@@ -133,4 +133,4 @@ dl-extract-catalog --lake-root /data/lake \
 [discovery/workflow.md](discovery/workflow.md) and
 [`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb).
 
-See also: [Area plans (`dl-area`)](discovery/areas-cli.md), [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md).
+See also: [Area plans (`dl-area`)](discovery/areas-cli.md), [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md), [SED + spectrum plot](plotting.md).

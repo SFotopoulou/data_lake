@@ -75,6 +75,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 | Gather products (`dl-gather`) | [discovery/gather.md](docs/discovery/gather.md) |
 | **Reference workflow** (region → ML export) | [discovery/workflow.md](docs/discovery/workflow.md) · [notebook](notebooks/14_discovery_workflow.ipynb) |
 | Homogenization (`dl-homogenize`) | [homogenization.md](docs/homogenization.md) |
+| SED + spectrum plot (`dl-plot-source`) | [plotting.md](docs/plotting.md) |
 | Performance tuning | [performance.md](docs/performance.md) |
 | DuckDB ID-list queries | [discovery/duckdb-queries.md](docs/discovery/duckdb-queries.md) |
 
@@ -101,7 +102,7 @@ See [design-decisions.md](docs/design-decisions.md) for the full decision tree.
 
 Core: `pyarrow`, `zarr>=3`, `numcodecs`, `duckdb`, `astropy`, `healpy`, `numpy`, `polars`, `torch`, `tqdm`, `click`.
 
-Optional: `desispec` (`uv sync --extra desi`), `fitsio` (`--extra fitsio`), dev/notebooks (`--extra dev`), MCP server (`--extra mcp`).
+Optional: `desispec` (`uv sync --extra desi`), `fitsio` (`--extra fitsio`), dev/notebooks (`--extra dev`), MCP server (`--extra mcp`), visualisation (`--extra viz`, adds `matplotlib`).
 
 Details: [docs/quickstart.md#dependencies](docs/quickstart.md).
 
