@@ -1025,7 +1025,7 @@ array = [
 
 [[package]]
 name = "data-lake"
-version = "0.4.3"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "astropy" },
@@ -1068,6 +1068,9 @@ moc = [
 rapids = [
     { name = "cuml-cu12" },
 ]
+viz = [
+    { name = "matplotlib" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1082,6 +1085,7 @@ requires-dist = [
     { name = "ipykernel", marker = "extra == 'dev'" },
     { name = "jupyterlab", marker = "extra == 'dev'" },
     { name = "matplotlib", marker = "extra == 'dev'" },
+    { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.7" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0" },
     { name = "mocpy", marker = "extra == 'moc'", specifier = ">=0.13" },
     { name = "napari", marker = "extra == 'dev'" },
@@ -1095,7 +1099,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.66" },
     { name = "zarr", specifier = ">=3.0" },
 ]
-provides-extras = ["desi", "fitsio", "dev", "mcp", "moc", "rapids"]
+provides-extras = ["desi", "fitsio", "dev", "mcp", "moc", "viz", "rapids"]
 
 [[package]]
 name = "debugpy"
