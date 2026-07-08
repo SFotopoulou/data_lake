@@ -103,7 +103,7 @@ Written JSON shape (same as hand-edited areas):
 }
 ```
 
-See [Crossmatch — region-bounded plans](crossmatch.md#region-bounded-plans---from-area--plan).
+See [Crossmatch — region-bounded plans](crossmatch.md#region-bounded-plans---from-area---plan).
 
 ### `set-gather`
 

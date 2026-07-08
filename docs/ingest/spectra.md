@@ -372,7 +372,7 @@ for t in tiles[:3]:
 PY
 ```
 
-← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags) · [Validate linkage](#verify-catalog--spectra-linkage)
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags) · [Validate linkage](../validate-and-repair.md#verify-catalog-spectra-linkage)
 
 #### 6dFGS spectra ingest (all VR extensions)
 
@@ -443,7 +443,7 @@ sbatch scripts/slurm_ingest_6df_spectra.sh
 
 Re-submit the same command to resume from checkpoint after timeout/preemption.
 
-← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags) · [Validate linkage](#verify-catalog--spectra-linkage)
+← [1-D readers reference](#1-d-spectrum-readers-reference) · [Catalog vs spectrum flags](#catalog-vs-spectrum-cli-flags) · [Validate linkage](../validate-and-repair.md#verify-catalog-spectra-linkage)
 
 #### GAMA 1-D spectra ingest (stacked PRIMARY)
 

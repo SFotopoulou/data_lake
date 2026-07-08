@@ -1,171 +1,187 @@
-# Quick-start
+# Quick-start: Day-1 journey
 
-Use [`uv`](https://docs.astral.sh/uv/) for all Python environments in this repo.
-It installs from the pinned `uv.lock`, resolves `desispec` and its transitive
-deps correctly, and keeps the env isolated from system Python.
+This guide takes you from a fresh clone to a working lake with your first catalog ingested and queried. Steps are sequential — each one builds on the last.
+
+---
+
+## Step 1 — Install
+
+Use [`uv`](https://docs.astral.sh/uv/) for all Python environments.
 
 ```bash
-# 1. Install uv (one-time, per machine)
+# Install uv (one-time, per machine)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"   # add to your shell rc
 
-# 2. Clone repo and create a Python 3.11 venv inside the project
+# Clone and create a Python 3.11 venv
 git clone https://github.com/SFotopoulou/data_lake.git
 cd data_lake
 uv venv --python 3.11 .venv
 
-# 3. Install from the lockfile (editable package + extras):
-#    desi — DESI ingest (pulls in desispec)
-#    dev  — pytest, Jupyter, matplotlib, napari, …
-uv sync --extra desi --extra dev --extra fitsio
+# Install from the lockfile (editable, with extras):
+#   dev      — pytest, Jupyter, matplotlib, napari, ...
+#   fitsio   — fast FITS reading (recommended for large catalogs)
+#   desi     — DESI coadd ingest (pulls in desispec); add when needed
+uv sync --extra dev --extra fitsio
 
-# 4. Activate the env (or use `uv run` / `.venv/bin/python` without activating)
+# Activate
 source .venv/bin/activate
 ```
 
-To add or bump dependencies, edit `pyproject.toml` and run `uv lock`, then
-`uv sync` again.
+To add or bump dependencies, edit `pyproject.toml` and run `uv lock && uv sync`.
+
+---
+
+## Step 2 — Zero-data smoke test
+
+Verify the installation without any external files:
+
+```bash
+# Unit tests (no external data required)
+pytest
+
+# Self-contained cross-survey demo (synthetic lake, runs in seconds)
+python examples/cross_survey_lsst_desi_euclid/demo.py
+```
+
+Both should finish without errors. If they pass you are ready to create a real lake.
 
 **Jupyter / notebooks:** register the project kernel once:
 
 ```bash
-uv run python -m ipykernel install --user --name=data-lake --display-name "Python (data-lake)"
+python -m ipykernel install --user --name=data-lake --display-name "Python (data-lake)"
 ```
 
-Select **Python (data-lake)** in JupyterLab. All notebooks under `notebooks/`
-assume this environment.
+Then open `notebooks/01_catalog_ingest.ipynb` for a guided walk-through of catalog ingest with synthetic data.
 
-Smoke test before any large ingest:
+---
 
-```bash
-uv run python -m pytest tests/test_desi_ingest.py -v       # unit tests
-uv run python scripts/dry_run_desi_ingest.py               # end-to-end on 3 DESI files
-```
+## Step 3 — Initialise your lake (`dl-init`)
 
-The dry-run script ingests three small DESI coadd files in both
-`--with-resolution` and plain modes, then reads them back to verify shape,
-finiteness, and (for the resolution path) interior row sums ~1.0.
-
-### Create a deployment
-
-A deployment is *your* private instance of the data lake. Use `dl-init`
-to scaffold one:
+A **deployment** is your private lake instance. `dl-init` scaffolds the directory layout and writes a `lake_config.toml`:
 
 ```bash
-dl-init my_lake ~/projects \
-    --description "Personal multi-survey lake" \
-    --root /scratch/my_lake/data \
+dl-init /data/lake \
+    --description "My multi-survey lake" \
     --norder 5 \
     --ingest-token 'your-ingest-secret'
 ```
 
-This creates `~/projects/my_lake/` with:
+This creates:
 
 ```
-my_lake/
+/data/lake/
   lake_config.toml      # name, root, defaults — single source of truth
-  README.md             # auto-generated, deployment-specific
-  .gitignore            # excludes data/, logs/
-  data/                 # actual tiles (lives at --root if you passed one)
-    catalogs/ spectra/ cutouts/ shared/
-  notebooks/  scripts/  # yours to fill in
+  .ingest_token_hash    # SHA-256 of the token (mode 0600, never commit)
+  .gitignore
+  catalogs/ spectra/ cutouts/ shared/
 ```
 
-Point every subsequent CLI at the deployment with a single env var:
+Point all subsequent `dl-*` commands at the deployment:
 
 ```bash
-export DATA_LAKE_CONFIG=~/projects/my_lake/lake_config.toml
+export DATA_LAKE_CONFIG=/data/lake/lake_config.toml
+export LAKE_INGEST_TOKEN='your-ingest-secret'   # operators only
 ```
 
-You can either:
+You can have multiple deployments (`prod`, `staging`, `personal`) and switch between them by exporting a different `DATA_LAKE_CONFIG`.
 
-- `git init` the deployment to version-control your config, notebooks
-  and scripts (but keep `data/` gitignored); or
-- leave it un-tracked — it is just a working directory.
+---
 
-You can have multiple deployments side by side (e.g. `prod`, `staging`,
-`personal`) and switch between them by exporting a different
-`DATA_LAKE_CONFIG`.
+## Step 4 — First catalog ingest
 
-### Roles: analysts vs ingest operators
+**Required flags** for `dl-ingest-catalog`:
+
+| Flag | Purpose |
+|------|---------|
+| `--survey` | Short name used for all lake paths (`catalogs/<SURVEY>/`) — case-sensitive |
+| `--link-id-col` | Source integer ID column to use as `_source_id` (e.g. `TARGETID`, `SOURCE_ID`) |
+| `--ra-col` | Right ascension column name (default `ra`) |
+| `--dec-col` | Declination column name (default `dec`) |
+
+```bash
+dl-ingest-catalog survey.fits \
+  --survey MY_SURVEY \
+  --link-id-col TARGETID \
+  --ra-col RA \
+  --dec-col DEC
+```
+
+The `--link-id-col` value becomes the stable `_source_id` that links catalog rows to spectra and cutout tiles. Pick the column that is already used as a unique integer identifier in your survey (e.g. SDSS `SPECOBJID`, DESI `TARGETID`).
+
+For large surveys or file lists, see [ingest/catalog.md](ingest/catalog.md) and [ingest/batch-and-checkpoints.md](ingest/batch-and-checkpoints.md).
+
+---
+
+## Step 5 — First query
+
+After ingest, verify the lake and run a positional query:
+
+```bash
+# Inspect what is in the lake
+dl-describe-lake --count-total
+
+# Show columns for a survey
+dl-describe-survey MY_SURVEY --modality catalog
+```
+
+Python one-liner (DuckDB-backed):
+
+```python
+from data_lake.io.catalog import CatalogAccessor
+
+cat = CatalogAccessor("/data/lake", "MY_SURVEY")
+df = cat.query("SELECT _source_id, ra, dec FROM catalog LIMIT 10")
+print(df)
+```
+
+---
+
+## Step 6 — Next steps
+
+| You want to… | Go to… |
+|-------------|--------|
+| Ingest spectra (DESI, SDSS, generic FITS) | [ingest/spectra.md](ingest/spectra.md) |
+| Ingest image cutouts | [ingest/cutouts.md](ingest/cutouts.md) |
+| Add a second survey and crossmatch | [discovery/crossmatch.md](discovery/crossmatch.md) |
+| Build a joined product catalog (≥2 surveys) | [discovery/workflow.md](discovery/workflow.md) · [notebook 14](../notebooks/14_discovery_workflow.ipynb) |
+| Homogenize photometry to AB magnitudes | [homogenization.md](homogenization.md) |
+| Export a source subset (spectra → Zarr/FITS) | [export-and-sharing.md](export-and-sharing.md) |
+| Plot SED + spectrum for one source | [plotting.md](plotting.md) |
+| All `dl-*` commands | [cli-reference.md](cli-reference.md) |
+| Troubleshoot | [troubleshooting.md](troubleshooting.md) |
+
+---
+
+## Roles: analysts vs ingest operators
 
 | Role | Install | `DATA_LAKE_CONFIG` | `LAKE_INGEST_TOKEN` | Data path |
 |------|---------|-------------------|---------------------|-----------|
-| **Analyst** | `uv pip install data-lake` (or `uv sync` in a clone) | Shared deployment config | **Not used** | Read-only mount |
+| **Analyst** | `uv sync --extra dev` (or `pip install data-lake`) | Shared deployment config | **Not used** | Read-only mount |
 | **Ingest operator** | Same package | Same or writable deployment | **Required** for `dl-ingest-*` | Read-write |
 
-**Key environment variables:**
+Installing the package grants no ingest rights. Production lakes should rely on **filesystem permissions** (analysts cannot write Zarr tiles) as the primary control.
 
-| Variable | Who sets it | Purpose |
-|----------|-------------|---------|
-| `DATA_LAKE_CONFIG` | Everyone | Path to `lake_config.toml`; read by all `dl-*` commands |
-| `LAKE_INGEST_TOKEN` | Operators | Plaintext ingest token; never commit to git |
-
-Installing the package only provides scripts and the Python API. It does **not**
-grant ingest rights. Anyone with shell access can still call ingest CLIs, but
-production lakes should rely on **filesystem permissions** (analysts cannot write
-Zarr tiles) as the real control.
-
-### Ingest token (rudimentary operator authentication)
-
-Every `dl-ingest-*` run **requires**:
-
-1. A deployment config (`$DATA_LAKE_CONFIG` or `--config`).
-2. A matching **ingest token** (`$LAKE_INGEST_TOKEN` or `--ingest-token`).
-
-The deployment stores only a **SHA-256 hash** in `.ingest_token_hash` (mode
-`0600`, gitignored) next to `lake_config.toml`. Plaintext tokens live in the
-operator environment (Slurm secret, vault) — never in git.
-
-**This is minimal security, not a strong boundary.** The token does not stop
-someone who can (a) install this package, (b) obtain the token, and (c) write
-the data directory from corrupting the lake. It is a lightweight “I am an ingest
-operator” check. **Real protection** is correct Unix/NFS ACLs (read-only lake
-for analysts) and future proper authentication.
-
-**Create a deployment** (operators — token required at init):
-
-```bash
-dl-init mylake ~/projects --ingest-token 'your-secret' --root /scratch/mylake/data
-export DATA_LAKE_CONFIG=~/projects/mylake/lake_config.toml
-```
-
-**Rotate token** on an existing deployment:
+**Rotate the ingest token:**
 
 ```bash
 dl-set-ingest-token --ingest-token 'new-secret'
 ```
 
-**Run ingest** (operators only):
-
-```bash
-export LAKE_INGEST_TOKEN='your-secret'   # prefer env over --ingest-token (ps visibility)
-dl-ingest-spectra-batch-desi-coadds --survey DESI_DR1 --file-list coadds.txt --n-workers 8
-```
-
-**Analysts** point at the shared config and use read APIs only — no token, no
-`dl-init` on the production tree:
-
-```bash
-export DATA_LAKE_CONFIG=/path/to/mylake/lake_config.toml
-# SpectrumAccessor, dl-extract-spectra-subset, notebooks, validators, …
-```
-
-**Discovery pipeline:** after ingest, follow
-[`docs/discovery/workflow.md`](discovery/workflow.md) or
-[`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb)
-(region → crossmatch → gather → homogenize → ML export).
-
-Read-only tools never check the ingest token.
-
-
+---
 
 ## Dependencies
 
+Core: `pyarrow`, `zarr>=3`, `numcodecs`, `duckdb`, `astropy`, `healpy`, `numpy`, `polars`, `torch`, `tqdm`, `click`.
 
-Core: `pyarrow`, `zarr>=3`, `numcodecs`, `duckdb`, `astropy`, `healpy`, `numpy`, `polars`, `torch`, `tqdm`, `click`
+Optional extras:
 
-Catalog queries (`CatalogAccessor.query` and related helpers) return **Polars** DataFrames by default (`fmt="polars"`). Use `fmt="arrow"` or `fmt="astropy"` when you need those types instead.
+| Extra | When to add | How to install |
+|-------|-------------|----------------|
+| `dev` | Development, notebooks, matplotlib | `uv sync --extra dev` |
+| `fitsio` | Fast FITS reading (large catalogs) | `uv sync --extra fitsio` |
+| `desi` | DESI coadd ingest (adds `desispec`) | `uv sync --extra desi` |
+| `mcp` | MCP server for AI agents | `uv sync --extra mcp` |
+| `viz` | SED + spectrum plots (`dl-plot-source`) | `uv sync --extra viz` |
 
-Optional extras (included in `dev`): `napari`, `matplotlib`, `jupyterlab`, `ipykernel` —
-install via `uv sync --extra dev` (or `uv sync --extra desi --extra dev` for full ingest + notebooks).
+Catalog queries (`CatalogAccessor.query`) return **Polars** DataFrames by default (`fmt="polars"`). Use `fmt="arrow"` or `fmt="astropy"` when needed.

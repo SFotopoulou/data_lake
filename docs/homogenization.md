@@ -34,7 +34,7 @@ dl-homogenize \
   --transform phot_ab_v1 \
   --materialize-as ALLWISE_euclid_north_ab_v1
 
-# Dry run: rule resolution only
+# Dry run: rule resolution only (--survey must be set here or in the area's homogenize block)
 dl-homogenize --from-area Euclid_North --check-only
 
 # Or ad-hoc flags with area region:
@@ -42,9 +42,9 @@ dl-homogenize --survey ALLWISE --cone 150.1 2.2 --radius-arcsec 600 \
   --transform phot_ab_v1 --materialize-as tmp --check-only
 ```
 
-Selection selectors (exactly one): `--from-area`, `--cone`, `--bbox`, `--npix` + `--norder`, `--ids`, `--where`.
+Region selectors (at most one required): `--from-area`, `--cone`, `--bbox`, `--npix` + `--norder`, `--ids`, `--where`. When `--from-product` is used (catalog modality only), no region selector is needed — all tiles in the product are processed automatically.
 
-Output: `catalogs/<materialize-as>/` with `kind: product`, `product_subtype: homogenized`, and provenance (`transform_id`, column lineage).
+Output directory depends on modality: `catalogs/<materialize-as>/` (catalog), `spectra/<materialize-as>/` (spectra), `cutouts/<materialize-as>/` (cutout). All outputs carry `kind: product`, `product_subtype: homogenized`, and provenance (`transform_id`, column lineage).
 
 ## Transform packs
 
@@ -101,11 +101,15 @@ dl-homogenize --from-area Euclid_North
 
 ## Spectra and cutouts (Phase F)
 
+Spectra and cutout homogenization requires a `spec_observed_v1` or `cutout_njy_v1` block in the survey recipe. The bundled `SDSS_DR17.json` and `DESI_DR1.json` do **not** yet include these blocks — add a lake-level override in `shared/registry/homogenize/<SURVEY>.json` (see the schema in that directory's `README.md`). The `synthetic` recipe is a working reference.
+
 ```bash
+# After adding spec_observed_v1 block to the survey recipe:
 dl-homogenize --modality spectra --survey SDSS_DR17 \
   --from-area Euclid_North --transform spec_observed_v1 \
   --materialize-as SDSS_DR17_spec_obs_v1
 
+# After adding cutout_njy_v1 block to the survey recipe:
 dl-homogenize --modality cutout --survey DESI_DR1 \
   --cone 150.1 2.2 --radius-arcsec 600 --transform cutout_njy_v1 \
   --materialize-as DESI_DR1_cutout_njy_v1

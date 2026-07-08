@@ -114,12 +114,14 @@ and predicate selections stay tile-scoped (no full-tree scans).
 
 Per-partner `<survey>_sep_arcsec` columns are included unless `--no-sep`.
 
-## Base row policy (`--keep-all` / `--matches-only`)
+## Base row policy (default / `--matches-only`)
 
 | Mode | Semantics |
 |------|-----------|
-| **`--keep-all`** (default) | Every base source in the selection; partner columns are `null` when unmatched. |
+| **default** | Every base source in the selection; partner columns are `null` when unmatched. |
 | **`--matches-only`** | Drop base rows with **no** partner crossmatch (any partner). |
+
+There is no `--keep-all` flag — keeping all base rows is the default behaviour. Pass `--matches-only` to restrict the output to matched sources only.
 
 Filter order: partner joins → `matches_only` (if set) → `--where-joined`.
 

@@ -20,11 +20,11 @@ export PATH="$HOME/.local/bin:$PATH"
 # Project venv
 cd data_lake
 uv venv --python 3.11 .venv
-uv pip install --python .venv/bin/python -e ".[desi,dev]"
+uv sync --extra desi --extra dev --extra fitsio
 source .venv/bin/activate
 ```
 
-Plain `pip install -e ".[desi,dev]"` works too if you prefer.
+Plain `pip install -e ".[desi,dev,fitsio]"` works too if you prefer.
 
 ## Before you open a PR
 

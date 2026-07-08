@@ -3,7 +3,8 @@
 ```
 data_lake/
   ingest/
-    fits_to_parquet.py        FITS/VOTable → HATS-partitioned Parquet
+    fits_to_parquet.py        FITS/VOTable → HATS-partitioned Parquet (dl-ingest-catalog)
+    catalog_parallel_ingest.py  Parallel decode, single-thread writer (dl-ingest-catalog-batch)
     fits_to_zarr.py           FITS cutouts → Zarr v3 sharded stacks
     fits_to_spectra_zarr.py   FITS 1-D spectra → Zarr v3 sharded stacks
     desi_parallel_ingest.py   Multi-process DESI coadd batch ingest
@@ -23,35 +24,42 @@ data_lake/
     bandpasses/          Bundled transmission-curve ECSV files (one per band; illustrative)
     surveys/             Per-survey homogenization recipes (<SURVEY>.json)
     transforms/          Transform-pack contracts (phot_ab_v1.json, etc.)
+    registry.py          load_homogenize_transforms / load_bandpass_metadata helpers
   plot/
     sed.py               Assemble SEDPoints from a homogenized product catalog row
     source_figure.py     Two-panel SED + 1D spectrum matplotlib figure (lazy import)
     plot_cli.py          dl-plot-source CLI entry point
+  discovery/
+    gather.py / gather_cli.py     Product catalog materialisation (dl-gather)
+    areas.py / area_cli.py        Area JSON management (dl-area)
+    engine.py                     Region query engine (dl-region)
+    moc_export.py / moc_export_cli.py  MOC export (dl-export-moc)
+  admin/
+    init_lake.py         dl-init: scaffold a new lake deployment
+    set_ingest_token.py  dl-set-ingest-token
+  bench/
+    __main__.py          Benchmarking entry point
+  cutouts/
+    generate_fits.py     dl-generate-cutout-fits: generate per-object stamps from band images
   share/
     pack_tile.py         Per-tile .tar packaging + MANIFEST.json
   export/
+    catalog_extract.py   dl-extract-catalog: project columns → Parquet / CSV / FITS / VOTable
+    spectra_calibration.py  Flux calibration helpers for spectrum export
+    spectra_subset.py    Curated source-id subset → single flat Zarr group (dl-extract-spectra-subset)
+    spplate_catalog.py   dl-extract-spplate-catalog: specObj-style catalog from spPlate files
     to_fits.py           Zarr cutout → standards-compliant FITS export
     to_spectrum_fits.py  Zarr spectrum → 1-D FITS + BINTABLE export
-    spectra_subset.py    Curated source-id subset → single flat Zarr group
 notebooks/
   01_catalog_ingest.ipynb        02_spectrum_workflow.ipynb
   03_cutout_ingest.ipynb         04_ingestion_report.ipynb
   11_duckdb_catalog_query.ipynb  12_visualization.ipynb
-  13_pytorch_training_loop.ipynb # see "Example notebooks" below
+  13_pytorch_training_loop.ipynb 14_discovery_workflow.ipynb
 examples/
   cross_survey_lsst_desi_euclid/   # synthetic lake + DuckDB join (master + modalities)
-data/                               # committed FITS fixtures for tests and smoke runs
-  389442.fits                       # 2dFGRS spectrum (2 SPECTRUM extensions; SPFILE+FIBRE link)
-  154714.fits / 161216.fits         # additional 2dFGRS spectra
-  g2302140-251235.fits              # 6dFGS target file (VR extensions; stem+OBSID_V+OBSID_R)
-  g1437140-385507.fits / g2259418-254505.fits  # additional 6dFGS files
-  G23_Y7_015_265.fit                # GAMA spectrum (SPECID header key)
-  OzDES-DR2_00001.fits              # OzDES spectrum (filename link)
-  sc_*.fits                         # VIPERS / VUDS / VVDS / VANDELS spectra (filename link)
-  VIPERS_406064719.fits             # VIPERS spectrum
-  wig225415.fits                    # WiggleZ spectrum (filename link — full name incl. ext)
-  spPlate-*.fits                    # SDSS/BOSS spPlate fixtures (2 plates, different n_pix)
-  zCOSMOS_BRIGHT_DR3_*.fits         # zCOSMOS spectrum (filename link)
-  sdss-specobjid.txt                # specObjID sidecar for spPlate tests
+  areas/                            # example area JSON files
+  imaging/ spectroscopy/ photometry/  # survey-specific example scripts
+data/                               # gitignored; populated locally with FITS fixtures for tests
+                                    # (see tests/ for the actual committed test assets)
 ```
 

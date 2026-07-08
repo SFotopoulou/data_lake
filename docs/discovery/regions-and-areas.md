@@ -190,6 +190,6 @@ Full step-by-step with homogenize and spectra export:
 (`dl-crossmatch --plan file.json`) runs on the full base survey with no region
 cut.
 
-See [Crossmatch — region-bounded plans](crossmatch.md#region-bounded-plans---from-area--plan)
+See [Crossmatch — region-bounded plans](crossmatch.md#region-bounded-plans---from-area---plan)
 and [Gather — area JSON](gather.md#area-json-gather-block) for column selection
 and output naming.

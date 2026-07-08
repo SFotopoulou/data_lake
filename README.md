@@ -1,36 +1,38 @@
 # Astronomy Data Lake
 
-A local-first data lake for multi-survey astronomy catalogs, galaxy image cutouts, and 1-D spectra.
+A local-first data lake for multi-survey astronomy catalogs, galaxy image cutouts, and 1-D spectra. Data is stored in [HATS](https://hats.readthedocs.io/en/stable/)-partitioned Parquet (catalogs — HATS = HEALPix Adaptive Tiling Scheme) and sharded Zarr v3 (spectra, cutouts). FITS is the ingest/export format; internal storage is Parquet and Zarr.
 
-- **Wide catalogs** (>1 000 columns): HATS-partitioned Parquet — no FITS column limit, column projection for partial downloads.
-- **Galaxy image cutouts**: sharded Zarr v3 — one file per HEALPix tile, fast ML dataloading, lossless WCS round-trip to FITS.
-- **1-D spectra** (SDSS/BOSS, DESI, generic): sharded Zarr v3 stacks — flux, IVAR, mask, shared or per-source wavelength.
-- FITS is the **ingest/export** interchange format; internal storage is Parquet and Zarr.
+Each survey lives in its own directory under `catalogs/`, `spectra/`, or `cutouts/` — these three directories are the three **modalities**. Every object carries a `_source_id` integer that links its catalog row to its spectrum and cutout tiles across all modalities.
 
-## Quick start
+> **New here?** Start with the zero-data smoke test below, then follow the [Day-1 quickstart](docs/quickstart.md) to initialise your own lake, ingest a catalog, and run your first query.
+
+## Quick start (zero data required)
 
 ```bash
+# 1. Install uv (https://github.com/astral-sh/uv) and clone
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/SFotopoulou/data_lake.git && cd data_lake
-uv venv --python 3.11 .venv && uv sync --extra desi --extra dev --extra fitsio
-source .venv/bin/activate
 
-uv run python -m pytest tests/test_desi_ingest.py -v
-uv run python scripts/dry_run_desi_ingest.py
+# 2. Create the environment and run the test suite
+uv venv --python 3.11 .venv && uv sync --extra dev --extra fitsio
+source .venv/bin/activate
+pytest                                  # all tests; no external data needed
+
+# 3. Run the self-contained cross-survey demo (synthetic lake, no downloads)
+python examples/cross_survey_lsst_desi_euclid/demo.py
 ```
 
-Create a deployment and ingest:
+Once the tests pass, follow [docs/quickstart.md](docs/quickstart.md) to create a real lake and ingest your first survey:
 
 ```bash
-dl-init my_lake /data/lake --ingest-token 'your-secret'
+dl-init /data/lake --ingest-token 'your-secret'
 export DATA_LAKE_CONFIG=/data/lake/lake_config.toml
-export LAKE_INGEST_TOKEN='your-secret'
-
-dl-ingest-catalog survey.fits --survey my_survey --ra-col RA --dec-col DEC --link-id-col TARGETID
+dl-ingest-catalog survey.fits --survey MY_SURVEY \
+  --ra-col RA --dec-col DEC --link-id-col TARGETID
 dl-describe-lake --count-total
 ```
 
-Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.md).
+> **Have DESI coadds?** See [ingest/spectra.md](docs/ingest/spectra.md) for `dl-ingest-spectra-batch-desi-coadds` and the `dry_run_desi_ingest.py` smoke script.
 
 ## Documentation
 
@@ -40,6 +42,7 @@ Full setup, ingest token, and smoke tests: [docs/quickstart.md](docs/quickstart.
 |-------|--------|
 | Install, deployment, ingest token | [quickstart.md](docs/quickstart.md) |
 | All `dl-*` commands | [cli-reference.md](docs/cli-reference.md) |
+| Term definitions (HATS, `_source_id`, modality, …) | [glossary.md](docs/glossary.md) |
 | `lake_config.toml` | [lake-config.md](docs/lake-config.md) |
 | Example notebooks | [notebooks.md](docs/notebooks.md) |
 | MCP access for agents | [mcp.md](docs/mcp.md), [mcp-lake.md](docs/mcp-lake.md) |

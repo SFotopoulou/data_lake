@@ -107,7 +107,7 @@ Currently bundled (illustrative, not authoritative): `WISE_W1.ecsv`, `Gaia_G.ecs
 | `phot_ab_*` column | λ_eff (µm) | FWHM (µm) | Reference |
 |--------------------|------------|-----------|-----------|
 | `phot_ab_bp` | 0.532 | 0.244 | Gaia BP |
-| `phot_ab_g` | 0.674 | 0.443 | Gaia G |
+| `phot_ab_g` | 0.6735 | 0.4434 | Gaia G |
 | `phot_ab_rp` | 0.797 | 0.294 | Gaia RP |
 | `phot_ab_z` | 0.882 | 0.100 | VISTA Z |
 | `phot_ab_y` | 1.021 | 0.101 | VISTA Y |

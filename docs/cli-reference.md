@@ -2,6 +2,8 @@
 
 Every `dl-*` command in one table. Pass `--help` to any command for full flag docs.
 
+All commands that read from or write to a lake honour `--config PATH` (or `$DATA_LAKE_CONFIG`) to supply the lake root and defaults without repeating flags.
+
 **Deploy**
 
 | Command | Purpose |
@@ -13,7 +15,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 
 | Command | Purpose |
 |---------|---------|
-| `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet; `--defer-finalize`/`--lifecycle live` for incremental live surveys |
+| `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet; required: `--survey`, `--link-id-col` (source integer ID column), `--ra-col`, `--dec-col`; `--defer-finalize`/`--lifecycle live` for incremental live surveys |
 | `dl-ingest-catalog-batch` | Parallel decode, single-thread writer (large file lists) |
 | `dl-ingest-catalog-from-list` | Sequential (default) or parallel catalog file-list ingest |
 | `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |
@@ -29,7 +31,7 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-ingest-spectra-batch-desi-coadds` | Multi-process DESI coadd batch |
 | `dl-ingest-spectra-batch-spplate` | Multi-process spPlate batch ingest |
 | `dl-ingest-spectra-from-list` | Spectrum file-list ingest (sequential default; `--n-workers > 1` for parallel decode) |
-| `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles; `--n-workers N` for parallel catalog patch; `--progress` for tqdm bars |
+| `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles; `--kind spectrum\|cutout`, `--n-workers N` for parallel catalog patch; progress bars are on by default (`--no-progress` to disable) |
 
 **Cutout ingest**
 
@@ -66,10 +68,10 @@ Every `dl-*` command in one table. Pass `--help` to any command for full flag do
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |
-| `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area, `--export-moc` ([docs](discovery/regions-and-areas.md)) |
+| `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area, `--export-moc`, `--moc-format fits\|json\|ascii` ([docs](discovery/regions-and-areas.md)) |
 | `dl-area` | Manage `areas/<id>.json`: `list`, `show`, `validate`, `set-crossmatch`, `set-gather`, `set-homogenize`, `import` ([docs](discovery/areas-cli.md)) |
 | `dl-export-moc` | Write survey tile footprint (or region-clipped) as IVOA MOC FITS/JSON/ASCII; `--moc-order` ([docs](discovery/regions-and-areas.md#export-as-moc)) |
-| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--keep-all`/`--matches-only`, partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
+| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--matches-only` (default: keep all base rows), partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
 | **Workflow** | End-to-end region → ML export: [discovery/workflow.md](discovery/workflow.md), [notebook](../notebooks/14_discovery_workflow.ipynb) |
 | `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
 | `dl-crossmatch` | Positional catalog↔catalog match at lake scale; `--from-area`/`--plan` for region-bounded plans (`--match-backend astropy\|rapids`, `--gpu-id`) |

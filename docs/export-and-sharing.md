@@ -19,7 +19,7 @@ from data_lake.io.spectra import SpectrumAccessor
 target_ids = np.asarray(Table.read("zall-pix-iron-qso.fits")["TARGETID"])
 
 lake = "/data/lake"
-survey = "desi_dr1"
+survey = "DESI_DR1"
 cat = CatalogAccessor(lake, survey)   # fast _spectrum_index lookup + catalog Z
 acc = SpectrumAccessor(lake, survey, catalog_accessor=cat)
 result = acc.extract_subset_to_zarr(
@@ -38,7 +38,7 @@ Or the CLI:
 ```bash
 # Default: single flat Zarr group (--with-catalog: fast index + catalog Z for redshift)
 dl-extract-spectra-subset \
-    --survey desi_dr1 \
+    --survey DESI_DR1 \
     --target-list zall-pix-iron-qso.fits \
     --target-id-col TARGETID \
     --format zarr \
@@ -84,7 +84,7 @@ Output layout for **zarr**:
 qso_subset.zarr/
   flux/        (N_written, N_pix) float32 sharded
   ivar/        (N_written, N_pix) float32 sharded
-  mask/        (N_written, N_pix) uint8   sharded
+  mask/        (N_written, N_pix) uint8 or uint16 sharded  (dtype follows source survey)
   wavelength/  (N_pix,)           float64 shared grid
   _source_id/  (N_written,)       int64
   redshift/    (N_written,)       float32  (from catalog ``Z`` when catalog is used)
@@ -120,21 +120,21 @@ catalog patching (no FITS re-ingestion needed):
 # Register console scripts after pulling (once per env):
 uv sync --extra desi --extra dev
 
-dl-rebuild-catalog-indices --survey desi_dr1 --kind spectrum
-dl-rebuild-catalog-indices --survey desi_dr1 --kind cutout   # if cutouts exist
+dl-rebuild-catalog-indices --survey DESI_DR1 --kind spectrum
+dl-rebuild-catalog-indices --survey DESI_DR1 --kind cutout   # if cutouts exist
 
 ``--norder`` defaults to ``hats_order`` in ``catalogs/<survey>/catalog_info.json``.
 Pass ``--norder`` only to override that metadata value.
 
 # Without reinstalling, use the module directly:
-uv run python -m data_lake.ingest.update_catalog_indices --survey desi_dr1 --kind spectrum
+uv run python -m data_lake.ingest.update_catalog_indices --survey DESI_DR1 --kind spectrum
 ```
 
 For manual / Python-API use:
 
 ```python
 from data_lake.ingest.update_catalog_indices import update_index_column
-update_index_column(lake_root="/data/lake", survey_name="sdss_dr17",
+update_index_column(lake_root="/data/lake", survey_name="SDSS_DR17",
                     source_id_to_index=index_map, kind="spectrum")
 ```
 

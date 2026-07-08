@@ -30,7 +30,7 @@ so ``update_index_column`` can patch ``_cutout_index``.
 
 | Purpose | CLI flag | Header keyword(s) | Notes |
 |--------|----------|-------------------|--------|
-| Object ID (join to catalog) | ``--link-id-col`` | e.g. ``TARGETID``, ``NAME`` | **Required** for production. Must match catalog ingest (int64 or hashed label). See [Object identifiers](#object-identifiers---link-id-col). If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index. |
+| Object ID (join to catalog) | ``--link-id-col`` | e.g. ``TARGETID``, ``NAME`` | **Required** for production. Must match catalog ingest (int64 or hashed label). See [Catalog vs spectrum CLI flags](spectra.md#catalog-vs-spectrum-cli-flags) for how IDs are resolved across modalities. If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index. |
 | Sky position (tile routing) | ``--ra-col`` / ``--dec-col`` | e.g. ``TARGET_RA``, ``TARGET_DEC`` | Degrees; fallbacks include ``RA_TARG``/``DEC_TARG``, ``CRVAL1``/``CRVAL2``. Should match catalog coordinates. |
 | Astrometry (export) | — | Standard 2-D WCS | ``CTYPE*``, ``CRVAL*``, ``CRPIX*``, ``CD*_*`` (or CDELT/CROTA); stored in ``wcs/`` for FITS round-trip. |
 | Image data | — | Primary or image HDU | 2-D ``(H,W)`` → one band; 3-D → set ``--band-axis``. Fixed ``(H,W)`` per survey tile after the first file. |

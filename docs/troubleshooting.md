@@ -15,5 +15,5 @@
 | `dl-describe-lake` shows no entries | Registry file missing | `dl-refresh-lake-registry` first |
 | spPlate `_spectrum_index` mismatch | Wrong specObjID layout (DR7 vs DR8+) | Set `--specobj-id-layout auto\|dr7\|dr8plus`; see spPlate section |
 
-For catalog–spectrum linkage issues, see also the [Catalog vs spectrum CLI flags](#catalog-vs-spectrum-cli-flags) and [1-D spectrum readers reference](#1-d-spectrum-readers-reference) sections. For duplicate/resume logic, see [Duplicate / resume flags by command](#duplicate--resume-flags-by-command).
+For catalog–spectrum linkage issues, see [Catalog vs spectrum CLI flags](ingest/spectra.md#catalog-vs-spectrum-cli-flags) and [1-D spectrum readers reference](ingest/spectra.md#1-d-spectrum-readers-reference). For duplicate/resume logic, see [Duplicate / resume flags by command](ingest/batch-and-checkpoints.md#duplicate--resume-flags-by-command).
 

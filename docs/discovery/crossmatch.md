@@ -14,7 +14,7 @@ Shape it for how you query (DuckDB, Polars, ADQL). Typical columns:
 
 | Column | Purpose |
 |--------|--------|
-| Primary `source_id` | int64 key for your “home” survey catalog row (or hash of a string label; see [Object identifiers](#object-identifiers---link-id-col)) |
+| Primary `source_id` | int64 key for your “home” survey catalog row (or hash of a string label; see [Catalog vs spectrum CLI flags](../ingest/spectra.md#catalog-vs-spectrum-cli-flags) for how IDs are resolved) |
 | Partner IDs | e.g. `desi_targetid`, `euclid_source_id` — whatever the other survey stores |
 | `sep_arcsec` | Sky separation from the matcher (optional but good for QA) |
 | `match_rank` / `find` flag | If the matcher can return multiple neighbours, disambiguate |
@@ -52,9 +52,9 @@ Catalog↔spectrum linkage is a **separate workflow**: the catalog row must carr
 the native spectrum key (or ``_spectrum_index`` after ingest), not a positional
 match to Zarr tiles.
 
-**Export columns for matching** — ``dl-extract-catalog`` projects any columns
-from raw catalog files (FITS, VOTable, Parquet, CSV, …) or from an ingested
-lake catalog:
+### Export columns for matching
+
+``dl-extract-catalog`` projects any columns from raw catalog files (FITS, VOTable, Parquet, CSV, …) or from an ingested lake catalog:
 
 ```bash
 # Raw survey catalog → Parquet for STILTS

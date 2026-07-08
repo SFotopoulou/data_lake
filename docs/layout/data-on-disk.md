@@ -9,6 +9,7 @@
       ...
       _metadata             ← Parquet aggregate footer
       catalog_info.json     ← HATS descriptor (kind: ingested|product, lifecycle, finalized)
+      schema_manifest.json  ← column manifest (name, dtype, role) written by dl-describe-survey --rebuild
   crossmatch/                ← top-level modality (was catalogs/crossmatch/)
     <surveyA>_x_<surveyB>__r<radius>/   ← match radius is part of the name
       Norder=5/Dir=0/Npix=0.parquet
@@ -21,6 +22,8 @@
       tile_index/            ← cached <survey>.<modality>.json populated-npix lists
       homogenize/            ← per-survey homogenization recipe overrides (<SURVEY>.json)
       bandpasses/            ← lake-local bandpass transmission-curve overrides (<file>.ecsv)
+      overlays/              ← per-survey column overlay definitions (<SURVEY>.json)
+      transforms/            ← global transform pack definitions (phot_ab_v1.json, etc.)
   cutouts/
     <survey>/
       Norder=5/Dir=0/Npix=0.zarr/   ← one Zarr group per tile
@@ -53,7 +56,7 @@ The catalog and spectrum/cutout layers may use **different** `hats_order` values
 
 ## Derived products and areas
 
-- **Product catalogs** are derived joined tables produced by [`dl-gather`](../discovery/gather.md). They live under `catalogs/<name>/` like any catalog but `catalog_info.json` has `kind: "product"` plus a `provenance` block (base, partners, radii, selection, multiplicity). Filter them with `dl-describe-lake --kind product`.
+- **Product catalogs** are derived tables under `catalogs/<name>/` with `catalog_info.json` having `kind: "product"`. They are produced by [`dl-gather`](../discovery/gather.md) (joined multi-survey wide tables, `product_subtype: joined`) or by [`dl-homogenize`](../../docs/homogenization.md) (standardised photometry, `product_subtype: homogenized`). Filter them with `dl-describe-lake --kind product`.
 - **Areas** (`areas/<area_id>.json`) are metadata-only: a `region` selector (npix / cone / bbox / MOC) plus optional `crossmatch_plan` and `gather` blocks. They span surveys and modalities and never hold tile data. See [Regions and areas](../discovery/regions-and-areas.md) and [`dl-area`](../discovery/areas-cli.md).
 - **Lifecycle**: live (incrementally ingested) catalogs can be ingested with `dl-ingest-catalog --defer-finalize` (records `lifecycle: "live"`, `finalized: false`), skipping the per-ingest `_metadata` rebuild; run `dl-finalize-catalog` once at the end.
 
