@@ -50,21 +50,74 @@ Output directory depends on modality: `catalogs/<materialize-as>/` (catalog), `s
 
 | Pack | Modality | Purpose |
 |------|----------|---------|
-| `phot_ab_v1` | catalog | Vega/mm mag → AB via `mag_offset`, `scale`, or `flux_to_ab` (Jy flux) |
-| `spec_observed_v1` | spectra | Observed-frame flux unit normalization (`flux_scale`) |
+| `phot_ab_v1` | catalog | Photometric unit conversion to AB magnitudes (`mag_offset`, `scale`, `identity`, `null_if_sentinel`, `flux_to_ab`) |
+| `spec_observed_v1` | spectra | Observed-frame flux unit normalisation (`flux_scale`) |
 | `cutout_njy_v1` | cutout | nJy/pixel calibration via `flux_scale` on image stamps |
 
-Bandpass metadata for FM conditioning: `data_lake/homogenize/bandpass.json`.
+Bandpass metadata for SED conditioning: `data_lake/homogenize/bandpass.json`.
 
-### Catalog rule types (`phot_ab_v1`)
+## Rule types reference
 
-| Type | Use when | Example |
-|------|----------|---------|
-| `mag_offset` | Native column is Vega magnitude | `ALLWISE` `w1mpro` + 2.699 |
-| `scale` | Native column needs unit scaling (e.g. mmag) | `GAIA_DR3_source` G band |
-| `flux_to_ab` | Native column is flux in Jy | `UNWISE_W1` `flux` with `zp: 8.906` |
+### Catalog rules (`phot_ab_v1`)
 
-`flux_to_ab` uses `m_AB = -2.5 log10(f_Jy) + zp` with WISE zero points (W1: 8.906, W2: 16.415).
+Each rule operates on one source column and writes one target column. All catalog rules apply **built-in sentinel cleaning** automatically before the formula: values equal to `-9999`, `9999`, `-999`, or `999`, and IEEE NaN, are replaced with `null` before any arithmetic.
+
+| Type | Required params | Behaviour | Uncertainty propagation |
+|------|-----------------|-----------|------------------------|
+| `mag_offset` | `delta` | `target = source + delta` | copied (nulled when source is null) |
+| `scale` | `factor` | `target = source × factor` | `err × factor` |
+| `identity` | — | copy after built-in sentinel clean | copied (nulled when source is null) |
+| `null_if_sentinel` | `values` (optional list) | copy; additionally null values in `values` and NaN | copied (nulled when source or uncertainty is null) |
+| `flux_to_ab` | `zp` | `target = −2.5 log₁₀(source) + zp`; source ≤ 0 → null | `2.5 / ln(10) × dflux / flux` |
+
+**JSON fields used on every rule:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `source_column` | yes | Native column name in the survey tile |
+| `target_column` | yes | Output column name in the homogenized product |
+| `uncertainty_column` | no | Native uncertainty column paired with `source_column` |
+| `target_uncertainty_column` | no | Output uncertainty column; must accompany `uncertainty_column` |
+| `native_system` | no | Metadata only (e.g. `"Vega"`); does not affect computation |
+
+#### `flux_to_ab` — flux units and zero points
+
+The formula `m_AB = −2.5 log₁₀(f) + zp` expects `f` in whatever units the zero point was derived for:
+
+| Flux unit | Zero point (`zp`) | Example survey |
+|-----------|-------------------|----------------|
+| Jy | 8.906 (W1), 16.415 (W2) | `UNWISE_W1` |
+| µJy | 23.9 | EUCLID-style columns |
+
+Use `zp=8.906` for Jy flux; use `zp=23.9` for µJy flux (e.g. EUCLID `flux_vis_2fwhm_aper`). Do **not** mix units and zero points.
+
+#### `null_if_sentinel` — custom sentinel values
+
+Surveys sometimes encode missing data with survey-specific values (e.g. `99.0` for saturated detections) not covered by the built-in set. Use `null_if_sentinel` with an explicit `values` list:
+
+```json
+{
+  "type": "null_if_sentinel",
+  "values": [99.0, -99.0]
+}
+```
+
+An empty or omitted `values` list behaves identically to `identity` (built-in sentinels only).
+
+#### Query-time SQL
+
+`build_homogenized_view_sql` supports all five catalog rule types and generates `CASE WHEN` expressions for sentinel nulling. It does **not** propagate uncertainty columns in SQL — for production use, always materialise with `dl-homogenize` instead.
+
+### Spectra and cutout rules
+
+| Rule type | Used in pack | Parameters | Effect |
+|-----------|-------------|------------|--------|
+| `flux_scale` | `spec_observed_v1`, `cutout_njy_v1` | `factor` | Scales flux by `factor`; ivar by `1/factor²` |
+| `flux_calibration` | survey recipe only | `flux_scale` | Applied at ingest/export time (SDSS/DESI); **not** run by `dl-homogenize` |
+
+For `spec_observed_v1`: the transform block in the survey recipe sets `transform.type = "flux_scale"` and `transform.factor`. For `cutout_njy_v1`: per-band overrides via `bands.<name>.flux_scale` are also supported.
+
+Cross-reference: [Per-survey recipe schema](../shared/registry/homogenize/README.md).
 
 ## Query-time (exploration)
 

@@ -14,3 +14,4 @@ See `notebooks/` for worked examples:
 6. **`12_visualization.ipynb`** — Matplotlib / Napari cutout visualization + DS9 FITS export
 7. **`13_pytorch_training_loop.ipynb`** — PyTorch DataLoader over Zarr cutouts
 8. **`14_discovery_workflow.ipynb`** — End-to-end reference: region → crossmatch → gather → homogenize → ML export ([workflow guide](discovery/workflow.md), [`dl-area`](discovery/areas-cli.md); template in `examples/areas/`)
+9. **`Photoz_estimation.ipynb`** — EUCLID_DR1 photo-z training catalog: bbox → crossmatch → gather → AB homogenize → FITS export with spec-z columns

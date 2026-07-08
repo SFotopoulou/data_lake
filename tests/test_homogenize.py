@@ -87,6 +87,64 @@ class TestTransforms:
         assert out["phot_ab_w1"][1] is None
         assert out["phot_ab_w1"][2] is None
 
+    def test_identity(self) -> None:
+        import polars as pl
+
+        rule = resolve_applicable_rules(
+            {
+                "transform_id": "phot_ab_v1",
+                "rules": [
+                    {
+                        "survey": "TEST",
+                        "source_column": "mag_r",
+                        "target_column": "phot_ab_r",
+                        "transform": {"type": "identity"},
+                    }
+                ],
+            },
+            "TEST",
+            {"mag_r"},
+        ).applied[0]
+        df = pl.DataFrame({"mag_r": [17.5, -9999.0, float("nan"), 9999.0]})
+        out, _ = apply_rules_to_frame(df, [rule])
+        assert out["phot_ab_r"][0] == pytest.approx(17.5)
+        assert out["phot_ab_r"][1] is None
+        assert out["phot_ab_r"][2] is None
+        assert out["phot_ab_r"][3] is None
+
+    def test_null_if_sentinel_custom_values(self) -> None:
+        import polars as pl
+
+        rule = resolve_applicable_rules(
+            {
+                "transform_id": "phot_ab_v1",
+                "rules": [
+                    {
+                        "survey": "TEST",
+                        "source_column": "mag_r",
+                        "target_column": "phot_ab_r",
+                        "uncertainty_column": "mag_r_err",
+                        "target_uncertainty_column": "phot_ab_r_err",
+                        "transform": {"type": "null_if_sentinel", "values": [99.0, -99.0]},
+                    }
+                ],
+            },
+            "TEST",
+            {"mag_r", "mag_r_err"},
+        ).applied[0]
+        df = pl.DataFrame({
+            "mag_r": [17.5, 99.0, -99.0, -9999.0, float("nan")],
+            "mag_r_err": [0.02, 0.02, 0.02, 0.02, 0.02],
+        })
+        out, _ = apply_rules_to_frame(df, [rule])
+        assert out["phot_ab_r"][0] == pytest.approx(17.5)
+        assert out["phot_ab_r"][1] is None   # custom sentinel 99.0
+        assert out["phot_ab_r"][2] is None   # custom sentinel -99.0
+        assert out["phot_ab_r"][3] is None   # built-in -9999
+        assert out["phot_ab_r"][4] is None   # NaN
+        assert out["phot_ab_r_err"][0] == pytest.approx(0.02)
+        assert out["phot_ab_r_err"][1] is None  # uncertainty also nulled
+
     def test_view_sql(self) -> None:
         t = load_transform(None, "phot_ab_v1")
         sql = build_homogenized_view_sql("ALLWISE", t, lake_root=None)

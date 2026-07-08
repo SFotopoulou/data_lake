@@ -160,11 +160,11 @@ def resolve_rules_from_manifest(
     return res
 
 
-def _mag_expr(col: str):
+def _mag_expr(col: str, extra_sentinels: Sequence[float] = ()):
     import polars as pl
 
     expr = pl.col(col).cast(pl.Float64)
-    for sentinel in _MAG_SENTINELS:
+    for sentinel in (*_MAG_SENTINELS, *extra_sentinels):
         expr = pl.when(expr == sentinel).then(None).otherwise(expr)
     return pl.when(expr.is_nan()).then(None).otherwise(expr)
 
@@ -195,13 +195,16 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
     for rule in rules:
         if rule.source_column not in out.columns:
             continue
-        src = _mag_expr(rule.source_column)
         ttype = rule.transform.get("type")
+        extra: list[float] = [float(v) for v in rule.transform.get("values") or []]
+        src = _mag_expr(rule.source_column, extra)
         if ttype == "mag_offset":
             tgt = src + float(rule.transform["delta"])
         elif ttype == "scale":
             tgt = src * float(rule.transform["factor"])
         elif ttype == "identity":
+            tgt = src
+        elif ttype == "null_if_sentinel":
             tgt = src
         elif ttype == "flux_to_ab":
             flux = _flux_expr(rule.source_column)
@@ -223,13 +226,18 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
         u_src = rule.uncertainty_column
         u_tgt = rule.target_uncertainty_column
         if u_src and u_tgt and u_src in out.columns:
-            u_expr = pl.col(u_src).cast(pl.Float64)
             if ttype == "scale":
-                u_expr = u_expr * float(rule.transform["factor"])
+                u_expr = pl.col(u_src).cast(pl.Float64) * float(rule.transform["factor"])
             elif ttype == "flux_to_ab":
                 flux = _flux_expr(rule.source_column)
                 dflux = pl.col(u_src).cast(pl.Float64)
                 u_expr = pl.when(flux.is_not_null()).then(_FLUX_TO_AB_K * dflux / flux).otherwise(None)
+            else:
+                # For mag_offset, identity, null_if_sentinel: copy uncertainty, null
+                # whenever the target was nulled (source sentinel or NaN).
+                u_expr = pl.when(
+                    pl.col(rule.target_column).is_null()
+                ).then(None).otherwise(pl.col(u_src).cast(pl.Float64))
             out = out.with_columns(u_expr.alias(u_tgt))
             lineage[-1]["uncertainty_target"] = u_tgt
 
@@ -259,6 +267,14 @@ def build_homogenized_view_sql(
             expr = f'("{src}" * {float(rule.transform["factor"])}) AS "{tgt}"'
         elif ttype == "identity":
             expr = f'"{src}" AS "{tgt}"'
+        elif ttype == "null_if_sentinel":
+            extra_vals = [float(v) for v in rule.transform.get("values") or []]
+            all_sentinels = [*_MAG_SENTINELS, *extra_vals]
+            not_null = " AND ".join(f'"{src}" <> {v}' for v in all_sentinels)
+            expr = (
+                f'(CASE WHEN "{src}" IS NOT NULL AND ({not_null}) '
+                f'THEN "{src}" ELSE NULL END) AS "{tgt}"'
+            )
         elif ttype == "flux_to_ab":
             zp = float(rule.transform["zp"])
             expr = (

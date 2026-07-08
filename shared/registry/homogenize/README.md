@@ -39,7 +39,54 @@ Catalog homogenization converts native photometry columns to AB magnitudes.
 }
 ```
 
-Transform types: `mag_offset` (Vega → AB), `scale` (unit change), `flux_to_ab` (Jy flux → AB mag).
+### Catalog rule types
+
+All five catalog transform types are supported. Built-in sentinels (`-9999`, `9999`, `-999`, `999`, NaN) are cleaned automatically before any formula.
+
+| Type | Parameters | Use when |
+|------|------------|----------|
+| `mag_offset` | `delta` | Native column is a Vega magnitude; add AB offset |
+| `scale` | `factor` | Native column needs unit scaling (e.g. mmag → mag) |
+| `identity` | — | Pass-through with sentinel clean (rename only) |
+| `null_if_sentinel` | `values` (optional list) | Survey uses non-standard sentinel values (e.g. `99.0`) |
+| `flux_to_ab` | `zp` | Native column is flux; `zp=8.906` for Jy, `zp=23.9` for µJy |
+
+**Pairing uncertainty columns:** set `uncertainty_column` + `target_uncertainty_column` on the same rule entry (not as a separate rule). The engine propagates uncertainty automatically for all types.
+
+```json
+{
+  "source_column": "w1mpro",
+  "target_column": "phot_ab_w1",
+  "uncertainty_column": "w1sigmpro",
+  "target_uncertainty_column": "phot_ab_w1_err",
+  "transform": {"type": "mag_offset", "delta": 2.699},
+  "native_system": "Vega"
+}
+```
+
+**`identity` example** (rename + sentinel clean, no arithmetic):
+
+```json
+{
+  "source_column": "mag_r_auto",
+  "target_column": "phot_ab_r",
+  "uncertainty_column": "magerr_r_auto",
+  "target_uncertainty_column": "phot_ab_r_err",
+  "transform": {"type": "identity"}
+}
+```
+
+**`null_if_sentinel` example** (custom survey sentinels `99.0` and `-99.0`):
+
+```json
+{
+  "source_column": "mag_aper_3",
+  "target_column": "phot_ab_r",
+  "uncertainty_column": "magerr_aper_3",
+  "target_uncertainty_column": "phot_ab_r_err",
+  "transform": {"type": "null_if_sentinel", "values": [99.0, -99.0]}
+}
+```
 
 ## Schema (spectra — two shapes)
 
@@ -98,6 +145,8 @@ For surveys where `dl-homogenize --modality spectra` applies a uniform scale fac
   }
 }
 ```
+
+`flux_scale` is the only Zarr rule type (used by both `spec_observed_v1` and `cutout_njy_v1`). The catalog engine has five rule types (`mag_offset`, `scale`, `identity`, `null_if_sentinel`, `flux_to_ab`).
 
 Transform profile IDs (`phot_ab_v1`, `spec_observed_v1`, `cutout_njy_v1`) match the global transform packs under `data_lake/homogenize/transforms/`. Those packs define semantics only (no per-survey rules). **Per-survey files are the sole source of executable rules**; lake overrides replace bundled defaults.
 
