@@ -16,16 +16,23 @@ from data_lake.io.crossmatch import (
     CrossmatchAccessor,
     CrossmatchTileConfig,
     build_crossmatch,
+    build_column_crossmatch,
+    column_crossmatch_name,
+    column_crossmatch_token,
     crossmatch_root,
     export_crossmatch_flat,
+    find_column_crossmatch_roots,
     iter_populated_tile_npixels,
     load_crossmatch_table,
+    parse_column_crossmatch_dirname,
+    resolve_column_crossmatch_root,
     resolve_crossmatch_settings,
     resolve_crossmatch_sky_columns,
     filter_survey_a_tiles_overlapping_survey_b,
     healpix_pixels_covering_tile,
     survey_b_pixels_for_tile,
     tile_search_cone,
+    validate_match_id,
     _crossmatch_tile_worker,
 )
 from data_lake.io.crossmatch_matchers import rapids_available
@@ -728,3 +735,376 @@ class TestCrossmatchNamingAndReuse:
         # Explicit radius resolves
         with CrossmatchAccessor(lake, "A", "B", radius_arcsec=1.0) as xm:
             assert xm.get_matches(source_id_a=1, fmt="polars").height == 1
+
+
+# ---------------------------------------------------------------------------
+# Column-equality crossmatch tests
+# ---------------------------------------------------------------------------
+
+
+def _write_catalog_tile_with_col(
+    lake: Path,
+    survey: str,
+    *,
+    norder: int,
+    npix: int,
+    source_ids: list[int],
+    ra: list[float],
+    dec: list[float],
+    extra_col: str,
+    extra_values: list,
+) -> None:
+    """Write a catalog tile with an additional match column."""
+    tile_dir = lake / "catalogs" / survey / healpix_dir(norder, npix)
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    hp_col = f"_healpix_norder{norder}"
+    table = pa.table({
+        "_source_id": pa.array(source_ids, type=pa.int64()),
+        "ra": pa.array(ra, type=pa.float64()),
+        "dec": pa.array(dec, type=pa.float64()),
+        hp_col: pa.array([npix] * len(source_ids), type=pa.int64()),
+        "_cutout_index": pa.array([-1] * len(source_ids), type=pa.int64()),
+        "_spectrum_index": pa.array([-1] * len(source_ids), type=pa.int64()),
+        extra_col: pa.array(extra_values),
+    })
+    pq.write_table(table, tile_dir / f"Npix={npix}.parquet")
+    (lake / "catalogs" / survey / "catalog_info.json").write_text(json.dumps({
+        "hats_order": norder,
+        "ra_column": "ra",
+        "dec_column": "dec",
+        "link_id_mode": "sequential",
+        "link_id_column": "_source_id",
+        "total_rows": len(source_ids),
+        "total_columns": len(table.column_names),
+    }))
+
+
+class TestColumnCrossmatchNaming:
+    def test_token_is_stable(self) -> None:
+        t1 = column_crossmatch_token("TARGETID", "TARGETID")
+        t2 = column_crossmatch_token("TARGETID", "TARGETID")
+        assert t1 == t2
+        assert len(t1) == 8
+
+    def test_different_col_pairs_different_tokens(self) -> None:
+        t1 = column_crossmatch_token("col_a", "col_b")
+        t2 = column_crossmatch_token("col_a", "col_c")
+        assert t1 != t2
+
+    def test_column_crossmatch_name_format(self) -> None:
+        name = column_crossmatch_name("EUCLID", "DESI", "tid", "TARGETID", "TARGETID")
+        token = column_crossmatch_token("TARGETID", "TARGETID")
+        assert name == f"EUCLID_x_DESI__col_tid_{token}"
+
+    def test_parse_round_trip(self) -> None:
+        name = column_crossmatch_name("A", "B", "myid", "col1", "col2")
+        parsed = parse_column_crossmatch_dirname(name)
+        assert parsed is not None
+        a, b, mid, tok = parsed
+        assert a == "A"
+        assert b == "B"
+        assert mid == "myid"
+        assert tok == column_crossmatch_token("col1", "col2")
+
+    def test_parse_sky_name_returns_none(self) -> None:
+        assert parse_column_crossmatch_dirname("A_x_B__r1.0") is None
+
+    def test_parse_invalid_returns_none(self) -> None:
+        assert parse_column_crossmatch_dirname("notaname") is None
+
+    def test_validate_match_id_ok(self) -> None:
+        validate_match_id("desi-targetid")
+        validate_match_id("my.col.v1")
+        validate_match_id("abc123")
+
+    def test_validate_match_id_bad(self) -> None:
+        with pytest.raises(ValueError):
+            validate_match_id("")
+        with pytest.raises(ValueError):
+            validate_match_id("bad__id")
+        with pytest.raises(ValueError):
+            validate_match_id("bad_x_id")
+        with pytest.raises(ValueError):
+            validate_match_id("bad id")
+
+
+class TestColumnCrossmatchEngine:
+    def test_basic_equality_join(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1, 2], ra=[ra, ra + 0.01], dec=[dec, dec + 0.01],
+            extra_col="TARGETID", extra_values=[100, 200],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10, 20], ra=[ra, ra + 0.02], dec=[dec, dec + 0.02],
+            extra_col="TARGETID", extra_values=[100, 999],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "tid", "TARGETID", "TARGETID")
+        assert result.n_match_rows == 1
+        assert result.match_mode == "column"
+        assert result.match_id == "tid"
+        assert result.match_col_a == "TARGETID"
+        assert result.match_col_b == "TARGETID"
+        assert result.radius_arcsec == 0.0
+
+        tbl = load_crossmatch_table(result.output_root)
+        assert tbl.num_rows == 1
+        assert tbl["source_id_a"][0].as_py() == 1
+        assert tbl["source_id_b"][0].as_py() == 10
+        assert tbl["sep_arcsec"][0].as_py() == pytest.approx(0.0)
+
+    def test_many_to_many(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        # A source 1 matches two B sources
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[42],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10, 20], ra=[ra, ra + 0.01], dec=[dec, dec + 0.01],
+            extra_col="KEY", extra_values=[42, 42],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "key", "KEY", "KEY")
+        assert result.n_match_rows == 2
+
+        tbl = load_crossmatch_table(result.output_root)
+        assert tbl.num_rows == 2
+        source_ids_b = sorted(tbl["source_id_b"].to_pylist())
+        assert source_ids_b == [10, 20]
+
+    def test_different_column_names(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="ID_A", extra_values=[777],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10], ra=[ra], dec=[dec],
+            extra_col="ID_B", extra_values=[777],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "my_id", "ID_A", "ID_B")
+        assert result.n_match_rows == 1
+
+    def test_null_keys_excluded(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1, 2], ra=[ra, ra + 0.01], dec=[dec, dec + 0.01],
+            extra_col="TARGETID", extra_values=[100, None],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10], ra=[ra], dec=[dec],
+            extra_col="TARGETID", extra_values=[100],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "tid", "TARGETID", "TARGETID")
+        assert result.n_match_rows == 1
+
+    def test_tree_name_contains_match_id(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[1],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[1],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "desi_tid", "KEY", "KEY")
+        assert "__col_desi_tid_" in result.crossmatch_name
+
+    def test_crossmatch_info_written(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[5],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[5],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+        info_path = result.output_root / "crossmatch_info.json"
+        assert info_path.is_file()
+        info = json.loads(info_path.read_text())
+        assert info["match_mode"] == "column"
+        assert info["match_id"] == "myid"
+        assert info["match_col_a"] == "KEY"
+        assert info["match_col_b"] == "KEY"
+        assert info["match_radius_arcsec"] is None
+
+    def test_find_and_resolve_column_root(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[9],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[9],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "testid", "KEY", "KEY")
+        found = find_column_crossmatch_roots(lake, "A", "B")
+        assert len(found) == 1
+        assert found[0][2] == "testid"
+
+        resolved = resolve_column_crossmatch_root(lake, "A", "B", "testid")
+        assert resolved == result.output_root
+
+    def test_reuse_guard_mismatch(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[1],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[1],
+        )
+        build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+
+        # Tamper with the sidecar to simulate a mismatch
+        result = build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+        info_path = result.output_root / "crossmatch_info.json"
+        info = json.loads(info_path.read_text())
+        info["match_col_a"] = "DIFFERENT"
+        info_path.write_text(json.dumps(info))
+
+        with pytest.raises(ValueError, match="different"):
+            build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+        # overwrite bypasses
+        build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY", overwrite=True)
+
+
+class TestColumnCrossmatchCLI:
+    def _setup_lake(self, tmp_path: Path):
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile_with_col(
+            lake, "SRC", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="OBJ_ID", extra_values=[42],
+        )
+        _write_catalog_tile_with_col(
+            lake, "PARTNER", norder=norder, npix=npix,
+            source_ids=[10], ra=[ra], dec=[dec],
+            extra_col="OBJ_ID", extra_values=[42],
+        )
+        return lake, npix
+
+    def test_cli_column_mode(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+        from data_lake.io.crossmatch import cli
+
+        lake, _ = self._setup_lake(tmp_path)
+        result = CliRunner().invoke(cli, [
+            "SRC", "PARTNER", str(lake),
+            "--match-mode", "column",
+            "--match-id", "obj_id",
+            "--match-col-a", "OBJ_ID",
+            "--match-col-b", "OBJ_ID",
+        ])
+        assert result.exit_code == 0, result.output
+        assert "1 association row" in result.output
+        assert "__col_obj_id_" in result.output
+
+    def test_cli_column_mode_rejects_from_area(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+        from data_lake.io.crossmatch import cli
+
+        lake, _ = self._setup_lake(tmp_path)
+        result = CliRunner().invoke(cli, [
+            "SRC", "PARTNER", str(lake),
+            "--match-mode", "column",
+            "--match-id", "obj_id",
+            "--match-col-a", "OBJ_ID",
+            "--match-col-b", "OBJ_ID",
+            "--from-area", "Field1",
+        ])
+        assert result.exit_code != 0
+        assert "column" in result.output.lower()
+
+    def test_cli_column_mode_missing_match_id(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+        from data_lake.io.crossmatch import cli
+
+        lake, _ = self._setup_lake(tmp_path)
+        result = CliRunner().invoke(cli, [
+            "SRC", "PARTNER", str(lake),
+            "--match-mode", "column",
+            "--match-col-a", "OBJ_ID",
+            "--match-col-b", "OBJ_ID",
+        ])
+        assert result.exit_code != 0
+        assert "--match-id" in result.output
+
+    def test_cli_sky_mode_unchanged(self, tmp_path: Path) -> None:
+        """Sky mode still works after adding column-mode flags."""
+        from click.testing import CliRunner
+        from data_lake.io.crossmatch import cli
+
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(lake, "A", norder=norder, npix=npix,
+                            source_ids=[1], ra=[ra], dec=[dec])
+        _write_catalog_tile(lake, "B", norder=norder, npix=npix,
+                            source_ids=[2], ra=[ra + 0.0001], dec=[dec + 0.0001])
+
+        result = CliRunner().invoke(cli, [
+            "A", "B", str(lake), "--radius-arcsec", "1.0",
+        ])
+        assert result.exit_code == 0, result.output
+        assert "__r1.0" in result.output

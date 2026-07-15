@@ -37,6 +37,7 @@ Usage
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -68,7 +69,7 @@ _NPIX_FROM_PATH = re.compile(r"Npix=(\d+)\.parquet$", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class CrossmatchResult:
-    """Summary statistics from :func:`build_crossmatch`."""
+    """Summary statistics from :func:`build_crossmatch` or :func:`build_column_crossmatch`."""
 
     survey_a: str
     survey_b: str
@@ -84,6 +85,10 @@ class CrossmatchResult:
     gpu_id: int = 0
     export_parquet: Path | None = None
     export_fits: Path | None = None
+    match_mode: str = "sky"
+    match_id: str | None = None
+    match_col_a: str | None = None
+    match_col_b: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,29 @@ class CrossmatchTileResult:
 CROSSMATCH_INFO_FILENAME = "crossmatch_info.json"
 
 _RADIUS_FROM_NAME = re.compile(r"__r([0-9]+(?:\.[0-9]+)?)$")
+_COL_FROM_NAME = re.compile(r"__col_([A-Za-z0-9._-]+)_([0-9a-f]{8})$")
+_MATCH_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def column_crossmatch_token(match_col_a: str, match_col_b: str) -> str:
+    """Stable 8-hex-char hash of ``'{match_col_a}|{match_col_b}'``."""
+    raw = f"{match_col_a}|{match_col_b}".encode()
+    return hashlib.blake2b(raw, digest_size=4).hexdigest()
+
+
+def validate_match_id(match_id: str) -> None:
+    """Raise ``ValueError`` when *match_id* is not a safe filesystem/name token."""
+    if not match_id:
+        raise ValueError("--match-id must be non-empty")
+    if not _MATCH_ID_RE.match(match_id):
+        raise ValueError(
+            f"--match-id {match_id!r} contains invalid characters; "
+            "use only [A-Za-z0-9._-]"
+        )
+    if "__" in match_id:
+        raise ValueError(f"--match-id {match_id!r} must not contain '__'")
+    if "_x_" in match_id:
+        raise ValueError(f"--match-id {match_id!r} must not contain '_x_'")
 
 
 def format_match_radius(radius_arcsec: float) -> str:
@@ -244,6 +272,119 @@ def resolve_crossmatch_root(
             f"(r={radii}); pass radius_arcsec to disambiguate."
         )
     return candidates[0][3]
+
+
+def column_crossmatch_name(
+    survey_a: str,
+    survey_b: str,
+    match_id: str,
+    match_col_a: str,
+    match_col_b: str,
+) -> str:
+    """Tree name for a column-equality crossmatch.
+
+    Format: ``{A}_x_{B}__col_{match_id}_{token}`` where *token* is an 8-hex-char
+    hash of the column pair so different column combinations never collide even
+    when they share the same *match_id*.
+    """
+    token = column_crossmatch_token(match_col_a, match_col_b)
+    return f"{survey_a}_x_{survey_b}__col_{match_id}_{token}"
+
+
+def column_crossmatch_root(
+    lake_root: Path | str,
+    survey_a: str,
+    survey_b: str,
+    match_id: str,
+    match_col_a: str,
+    match_col_b: str,
+) -> Path:
+    """Top-level crossmatch root for a column-equality tree."""
+    return (
+        Path(lake_root)
+        / "crossmatch"
+        / column_crossmatch_name(survey_a, survey_b, match_id, match_col_a, match_col_b)
+    )
+
+
+def parse_column_crossmatch_dirname(
+    name: str,
+) -> tuple[str, str, str, str] | None:
+    """Parse ``<A>_x_<B>__col_{match_id}_{token}`` → ``(survey_a, survey_b, match_id, token)``.
+
+    Returns ``None`` when the name does not match the column-crossmatch convention.
+    """
+    m = _COL_FROM_NAME.search(name)
+    if not m:
+        return None
+    match_id, token = m.group(1), m.group(2)
+    stem = name[: m.start()]
+    if "_x_" not in stem:
+        return None
+    survey_a, survey_b = stem.split("_x_", 1)
+    if not survey_a or not survey_b:
+        return None
+    return survey_a, survey_b, match_id, token
+
+
+def find_column_crossmatch_roots(
+    lake_root: Path | str,
+    survey_a: str | None = None,
+    survey_b: str | None = None,
+) -> list[tuple[str, str, str, str, Path]]:
+    """Discover column-crossmatch trees as ``(survey_a, survey_b, match_id, token, path)``.
+
+    Optionally filter by *survey_a* / *survey_b*.  Sorted by name.
+    """
+    root = crossmatch_modality_root(lake_root)
+    out: list[tuple[str, str, str, str, Path]] = []
+    if not root.is_dir():
+        return out
+    for p in sorted(root.iterdir()):
+        if not p.is_dir():
+            continue
+        parsed = parse_column_crossmatch_dirname(p.name)
+        if parsed is None:
+            continue
+        a, b, mid, tok = parsed
+        if survey_a is not None and a != survey_a:
+            continue
+        if survey_b is not None and b != survey_b:
+            continue
+        out.append((a, b, mid, tok, p))
+    return out
+
+
+def resolve_column_crossmatch_root(
+    lake_root: Path | str,
+    survey_a: str,
+    survey_b: str,
+    match_id: str,
+) -> Path:
+    """Resolve a column-crossmatch tree by *survey_a*, *survey_b*, and *match_id*.
+
+    When a single tree exists for the pair + id, it is returned.  An error is
+    raised when zero or multiple trees exist (caller must use explicit column args
+    to generate the exact name).
+    """
+    candidates = [
+        (a, b, mid, tok, p)
+        for a, b, mid, tok, p in find_column_crossmatch_roots(lake_root, survey_a, survey_b)
+        if mid == match_id
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No column crossmatch tree found for {survey_a}_x_{survey_b} "
+            f"with match_id={match_id!r} under {crossmatch_modality_root(lake_root)}"
+        )
+    if len(candidates) > 1:
+        tokens = ", ".join(c[3] for c in candidates)
+        raise ValueError(
+            f"Multiple column crossmatch trees for {survey_a}_x_{survey_b} "
+            f"match_id={match_id!r} (tokens: {tokens}); "
+            "pass --match-col-a and --match-col-b to disambiguate."
+        )
+    return candidates[0][4]
 
 
 def _sky_columns_from_catalog_info(catalog_root: Path) -> tuple[str, str, int]:
@@ -1200,6 +1341,343 @@ def _write_xm_info(
 
 
 # ---------------------------------------------------------------------------
+# Column-equality crossmatch
+# ---------------------------------------------------------------------------
+
+
+def _build_b_index(
+    lake_root: Path,
+    survey_b: str,
+    match_col_b: str,
+    norder_b: int,
+) -> pl.DataFrame:
+    """Load all survey-B tiles into a lookup frame for column matching.
+
+    Returns a Polars DataFrame with columns:
+    ``__match_key_b`` (Utf8), ``source_id_b`` (Int64), ``healpix_npix_b`` (Int64).
+
+    This materialises all of B in memory — document this as a v1 limitation for
+    very large surveys.
+    """
+    catalog_root_b = lake_root / "catalogs" / survey_b
+    hp_col_b = f"_healpix_norder{norder_b}"
+    npixels_b = iter_populated_tile_npixels(catalog_root_b, norder=norder_b)
+    frames: list[pl.DataFrame] = []
+
+    with CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b:
+        id_col_b = acc_b.link_id_column
+        cols_to_load = list({id_col_b, match_col_b, hp_col_b})
+        for npix_b in npixels_b:
+            try:
+                df_b = acc_b.sources_in_tile(npix_b, columns=cols_to_load, fmt="polars")
+            except Exception:
+                continue
+            if df_b.is_empty():
+                continue
+            ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
+            df_b = df_b.select([
+                pl.col(match_col_b).cast(pl.Utf8).alias("__match_key_b"),
+                pl.Series("source_id_b", ids_b),
+                pl.col(hp_col_b).cast(pl.Int64).alias("healpix_npix_b"),
+            ]).filter(pl.col("__match_key_b").is_not_null())
+            if not df_b.is_empty():
+                frames.append(df_b)
+
+    if not frames:
+        return pl.DataFrame({
+            "__match_key_b": pl.Series([], dtype=pl.Utf8),
+            "source_id_b": pl.Series([], dtype=pl.Int64),
+            "healpix_npix_b": pl.Series([], dtype=pl.Int64),
+        })
+    return pl.concat(frames)
+
+
+def _column_crossmatch_one_tile(
+    *,
+    npix_a: int,
+    norder_a: int,
+    match_col_a: str,
+    out_root: Path,
+    acc_a: CatalogAccessor,
+    b_index: pl.DataFrame,
+) -> int:
+    """Match one survey-A tile against the pre-built B index; write Parquet.
+
+    Returns the number of association rows written.
+    """
+    hp_col = f"_healpix_norder{norder_a}"
+    id_col_a = acc_a.link_id_column
+    out_dir = out_root / healpix_dir(norder_a, npix_a)
+    out_file = out_dir / f"Npix={npix_a}.parquet"
+
+    cols_to_load = list({id_col_a, match_col_a})
+    try:
+        df_a = acc_a.sources_in_tile(npix_a, columns=cols_to_load, fmt="polars")
+    except Exception:
+        return 0
+    if df_a.is_empty():
+        return 0
+
+    ids_a = _catalog_ids_to_int64(df_a[id_col_a].to_list())
+    df_a = df_a.select([
+        pl.Series("source_id_a", ids_a),
+        pl.col(match_col_a).cast(pl.Utf8).alias("__match_key_a"),
+    ]).filter(pl.col("__match_key_a").is_not_null())
+
+    if df_a.is_empty():
+        return 0
+
+    joined = df_a.join(b_index, left_on="__match_key_a", right_on="__match_key_b", how="inner")
+    if joined.is_empty():
+        return 0
+
+    n = len(joined)
+    table = pa.table({
+        "source_id_a": joined["source_id_a"].to_arrow().cast(pa.int64()),
+        "source_id_b": joined["source_id_b"].to_arrow().cast(pa.int64()),
+        "sep_arcsec": pa.array(np.zeros(n, dtype=np.float32), type=pa.float32()),
+        hp_col: pa.array(np.full(n, npix_a, dtype=np.int64), type=pa.int64()),
+        CROSSMATCH_HEALPIX_NPIX_B: joined["healpix_npix_b"].to_arrow().cast(pa.int64()),
+    })
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        table,
+        str(out_file),
+        compression="zstd",
+        compression_level=_ZSTD_LEVEL,
+        write_statistics=True,
+    )
+    return n
+
+
+def _validate_column_crossmatch_reuse(
+    out_root: Path,
+    match_id: str,
+    match_col_a: str,
+    match_col_b: str,
+    token: str,
+    *,
+    overwrite: bool,
+) -> None:
+    """Guard against silently mixing column configurations when resuming."""
+    if overwrite:
+        return
+    info_path = out_root / CROSSMATCH_INFO_FILENAME
+    if not info_path.is_file():
+        return
+    try:
+        with open(info_path) as fh:
+            prev = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return
+    mismatches: list[str] = []
+    checks = (
+        ("match_id", match_id),
+        ("match_col_a", match_col_a),
+        ("match_col_b", match_col_b),
+        ("match_token", token),
+    )
+    for key, current in checks:
+        if key in prev and prev[key] is not None and prev[key] != current:
+            mismatches.append(f"{key}: existing={prev[key]!r} requested={current!r}")
+    if mismatches:
+        raise ValueError(
+            f"Existing column crossmatch tree at {out_root} was built with different "
+            f"parameters ({'; '.join(mismatches)}). Re-run with overwrite=True to rebuild."
+        )
+
+
+def _write_column_xm_info(
+    out_root: Path,
+    xm_name: str,
+    survey_a: str,
+    survey_b: str,
+    norder_a: int,
+    norder_b: int,
+    match_id: str,
+    match_col_a: str,
+    match_col_b: str,
+) -> None:
+    token = column_crossmatch_token(match_col_a, match_col_b)
+    info = {
+        "catalog_name": xm_name,
+        "catalog_type": "association",
+        "modality": "crossmatch",
+        "match_mode": "column",
+        "survey_a": survey_a,
+        "survey_b": survey_b,
+        "match_id": match_id,
+        "match_col_a": match_col_a,
+        "match_col_b": match_col_b,
+        "match_token": token,
+        "match_radius_arcsec": None,
+        "hats_order": norder_a,
+        "survey_a_norder": norder_a,
+        "survey_b_norder": norder_b,
+        "schema_version": "1",
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    out_root.mkdir(parents=True, exist_ok=True)
+    with open(out_root / CROSSMATCH_INFO_FILENAME, "w") as fh:
+        json.dump(info, fh, indent=2)
+
+
+def build_column_crossmatch(
+    lake_root: Path | str,
+    survey_a: str,
+    survey_b: str,
+    match_id: str,
+    match_col_a: str,
+    match_col_b: str,
+    overwrite: bool = False,
+    *,
+    norder_a: int | None = None,
+    norder_b: int | None = None,
+    populated_tiles_only: bool = True,
+    show_progress: bool = False,
+    export_parquet: Path | str | None = None,
+    export_fits: Path | str | None = None,
+    restrict_npix: Iterable[int] | None = None,
+) -> CrossmatchResult:
+    """Build a column-equality crossmatch between two surveys.
+
+    Each row in survey A whose *match_col_a* value equals a *match_col_b* value
+    in survey B produces one association row (many-to-many; all combinations are
+    written).  ``sep_arcsec`` is set to ``0.0``.
+
+    The output tree has the same schema as sky crossmatches and is readable by
+    :class:`CrossmatchAccessor`.  ``dl-gather`` integration is deferred to a
+    follow-up (see project docs).
+
+    Parameters
+    ----------
+    lake_root:
+        Data lake root directory.
+    survey_a / survey_b:
+        Survey names.  Survey A defines the HEALPix partition of the output.
+    match_id:
+        Human-readable label embedded in the tree directory name
+        (``[A-Za-z0-9._-]+``; no ``__`` or ``_x_``).
+    match_col_a / match_col_b:
+        Columns to join on.  Both are cast to string before comparison.
+    overwrite:
+        Rebuild tiles that already exist.
+    norder_a / norder_b:
+        HEALPix order overrides (default: ``catalog_info.json``).
+    populated_tiles_only:
+        Iterate only survey-A tiles present on disk.
+    show_progress:
+        Show a tqdm progress bar.
+    export_parquet / export_fits:
+        Optionally consolidate all rows into a flat file after writing tiles.
+    restrict_npix:
+        Limit to a subset of survey-A HEALPix pixels (region restriction).
+
+    Notes
+    -----
+    Survey B is fully loaded into memory once before tile iteration.  For very
+    large surveys (>~500 M rows) this may exhaust RAM; consider pre-filtering B
+    before ingesting or using sky crossmatch with a tiny radius instead.
+    """
+    validate_match_id(match_id)
+    lake_root = Path(lake_root)
+    catalog_root_a = lake_root / "catalogs" / survey_a
+    catalog_root_b = lake_root / "catalogs" / survey_b
+
+    _, _, order_a = _sky_columns_from_catalog_info(catalog_root_a)
+    _, _, order_b = _sky_columns_from_catalog_info(catalog_root_b)
+    norder_a = norder_a if norder_a is not None else order_a
+    norder_b = norder_b if norder_b is not None else order_b
+
+    token = column_crossmatch_token(match_col_a, match_col_b)
+    xm_name = column_crossmatch_name(survey_a, survey_b, match_id, match_col_a, match_col_b)
+    out_root = Path(lake_root) / "crossmatch" / xm_name
+
+    _validate_column_crossmatch_reuse(
+        out_root, match_id, match_col_a, match_col_b, token, overwrite=overwrite
+    )
+
+    if populated_tiles_only:
+        tile_npixels = iter_populated_tile_npixels(catalog_root_a, norder=norder_a)
+    else:
+        import healpy as hp_lib
+        tile_npixels = list(range(hp_lib.nside2npix(hp_lib.order2nside(norder_a))))
+
+    if restrict_npix is not None:
+        restrict_set = {int(p) for p in restrict_npix}
+        tile_npixels = [p for p in tile_npixels if p in restrict_set]
+
+    log.info(
+        "Column crossmatch %s.%s × %s.%s (match_id=%r): loading B index from %d tile(s)",
+        survey_a, match_col_a, survey_b, match_col_b, match_id,
+        len(iter_populated_tile_npixels(catalog_root_b, norder=norder_b)),
+    )
+    b_index = _build_b_index(lake_root, survey_b, match_col_b, norder_b)
+    log.info("B index: %d row(s) after null filter", len(b_index))
+
+    pending, n_match_rows, n_tiles_written = _pending_crossmatch_tiles(
+        tile_npixels, out_root, norder_a, overwrite
+    )
+
+    t0 = time.perf_counter()
+    iterator: Iterable[int] = pending
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm
+            iterator = tqdm(pending, unit="tile", desc=f"{survey_a}×{survey_b}[col]")
+        except ImportError:
+            pass
+
+    with CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a:
+        for npix_a in iterator:
+            n_rows = _column_crossmatch_one_tile(
+                npix_a=npix_a,
+                norder_a=norder_a,
+                match_col_a=match_col_a,
+                out_root=out_root,
+                acc_a=acc_a,
+                b_index=b_index,
+            )
+            if n_rows > 0:
+                n_tiles_written += 1
+                n_match_rows += n_rows
+
+    elapsed = time.perf_counter() - t0
+    log.info(
+        "Column crossmatch %s × %s: %d association row(s) in %d tile(s) in %.1f s",
+        survey_a, survey_b, n_match_rows, n_tiles_written, elapsed,
+    )
+
+    _write_column_xm_info(
+        out_root, xm_name, survey_a, survey_b,
+        norder_a, norder_b, match_id, match_col_a, match_col_b,
+    )
+    parquet_path, fits_path = _export_crossmatch_outputs(
+        out_root, norder_a,
+        export_parquet=export_parquet,
+        export_fits=export_fits,
+    )
+    return CrossmatchResult(
+        survey_a=survey_a,
+        survey_b=survey_b,
+        crossmatch_name=xm_name,
+        output_root=out_root,
+        n_tiles_written=n_tiles_written,
+        n_match_rows=n_match_rows,
+        radius_arcsec=0.0,
+        norder=norder_a,
+        elapsed_s=elapsed,
+        n_workers=1,
+        export_parquet=parquet_path,
+        export_fits=fits_path,
+        match_mode="column",
+        match_id=match_id,
+        match_col_a=match_col_a,
+        match_col_b=match_col_b,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Crossmatch plan execution
 # ---------------------------------------------------------------------------
 
@@ -1495,6 +1973,28 @@ try:
         default=None,
         help="Also write all match rows to a single FITS BINTABLE.",
     )
+    @click.option(
+        "--match-mode",
+        type=click.Choice(["sky", "column"], case_sensitive=False),
+        default="sky",
+        show_default=True,
+        help="Match strategy: sky (nearest-neighbour within radius) or column (equality join).",
+    )
+    @click.option(
+        "--match-id",
+        default=None,
+        help="[column mode] Human-readable label embedded in the tree name (e.g. desi_targetid). Required with --match-mode=column.",
+    )
+    @click.option(
+        "--match-col-a",
+        default=None,
+        help="[column mode] Column in survey A to join on. Required with --match-mode=column.",
+    )
+    @click.option(
+        "--match-col-b",
+        default=None,
+        help="[column mode] Column in survey B to join on. Required with --match-mode=column.",
+    )
     @logging_options
     def cli(
         survey_a: str | None,
@@ -1519,14 +2019,21 @@ try:
         gpu_id: int,
         export_parquet: Path | None,
         export_fits: Path | None,
+        match_mode: str,
+        match_id: str | None,
+        match_col_a: str | None,
+        match_col_b: str | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
-        """Build an in-lake positional cross-match between two ingested catalogs.
+        """Build an in-lake cross-match between two ingested catalogs.
 
-        Output: ``crossmatch/<survey_a>_x_<survey_b>__r<radius>/`` (HATS Parquet).
-        Each survey uses its own RA/Dec columns and Norder from ``catalog_info.json``
-        unless overridden.  Survey A defines the output partition key.
+        Sky mode (default): nearest-neighbour within ``--radius-arcsec``.
+        Output: ``crossmatch/<survey_a>_x_<survey_b>__r<radius>/``.
+
+        Column mode (--match-mode column): equality join on ``--match-col-a`` /
+        ``--match-col-b``.  Output: ``crossmatch/<A>_x_<B>__col_<id>_<token>/``.
+        All matching pairs are written (many-to-many); sep_arcsec is 0.
         """
         validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
@@ -1541,6 +2048,59 @@ try:
             raise click.ClickException("--tiles-per-worker must be >= 1")
         if gpu_id < 0:
             raise click.ClickException("--gpu-id must be >= 0")
+
+        # ---- column mode: dl-crossmatch A B [LAKE] --match-mode column ... ----
+        if match_mode == "column":
+            if from_area is not None or plan_file is not None:
+                raise click.ClickException(
+                    "--match-mode=column cannot be combined with --from-area or --plan "
+                    "(area plan integration is not yet supported for column crossmatch)."
+                )
+            for flag, val in (("--match-id", match_id), ("--match-col-a", match_col_a), ("--match-col-b", match_col_b)):
+                if not val:
+                    raise click.ClickException(f"{flag} is required with --match-mode=column")
+            if not survey_a or not survey_b:
+                raise click.ClickException(
+                    "SURVEY_A and SURVEY_B are required for --match-mode=column."
+                )
+            try:
+                validate_match_id(match_id)  # type: ignore[arg-type]
+            except ValueError as exc:
+                raise click.ClickException(str(exc))
+            lake = require_output_root(output_root, cfg, kind="catalogs")
+            for name, label in ((survey_a, "survey A"), (survey_b, "survey B")):
+                cat_root = lake / "catalogs" / name
+                if not cat_root.is_dir():
+                    raise click.ClickException(f"{label} catalog not found: {cat_root}")
+            try:
+                result = build_column_crossmatch(
+                    lake,
+                    survey_a,
+                    survey_b,
+                    match_id,  # type: ignore[arg-type]
+                    match_col_a,  # type: ignore[arg-type]
+                    match_col_b,  # type: ignore[arg-type]
+                    overwrite=overwrite,
+                    norder_a=norder_a,
+                    norder_b=norder_b,
+                    populated_tiles_only=not all_tiles,
+                    show_progress=show_progress,
+                    export_parquet=export_parquet,
+                    export_fits=export_fits,
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                raise click.ClickException(str(exc))
+            msg = (
+                f"Column crossmatch {result.crossmatch_name}: "
+                f"{result.n_match_rows:,} association row(s) in {result.n_tiles_written:,} tile(s) "
+                f"→ {result.output_root} ({result.elapsed_s:.1f} s)"
+            )
+            if result.export_parquet is not None:
+                msg += f"; parquet → {result.export_parquet}"
+            if result.export_fits is not None:
+                msg += f"; fits → {result.export_fits}"
+            click.echo(msg)
+            return
 
         # ---- plan mode: dl-crossmatch [LAKE] --from-area AREA | --plan FILE ----
         if from_area is not None or plan_file is not None:

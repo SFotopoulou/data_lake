@@ -183,6 +183,33 @@ Lake exports read **one HEALPix tile at a time** (or use DuckDB
 ``COPY`` via ``--engine duckdb`` for a single Parquet file). Prefer
 ``--output-dir`` when you need a portable extract for external tools.
 
+### Column equality match
+
+When two catalogs already share a common identifier column (e.g. `TARGETID`, `SOURCE_ID`) you can build an association tree by **equality join** instead of sky matching.  This is useful for linking pre-matched or spec-z products to photometric catalogs, or for joining on a common observation ID.
+
+```bash
+dl-crossmatch SURVEY_A SURVEY_B /data/lake \
+  --match-mode column \
+  --match-id desi_targetid \
+  --match-col-a TARGETID \
+  --match-col-b TARGETID
+```
+
+`--match-col-a` and `--match-col-b` may have different names in each survey; both are cast to string before comparison.  All matching pairs are written (many-to-many); `sep_arcsec` is set to `0.0`.
+
+**Output tree name:** `{A}_x_{B}__col_{match_id}_{token}` where `{match_id}` is the human-readable label you supply and `{token}` is an 8-hex-char hash of the column pair so different column combinations never collide under the same id.
+
+Example: `crossmatch/EUCLID_DR1_x_DESI_DR1__col_desi_targetid_a1b2c3d4/`
+
+**Same schema as sky trees:** `source_id_a`, `source_id_b`, `sep_arcsec`, `_healpix_norder{N}`, `healpix_npix_b` — readable by `CrossmatchAccessor` and exportable with `--export-parquet` / `--export-fits`.
+
+**Memory:** survey B is loaded entirely into memory once before tile iteration.  For very large surveys (>~500 M rows) consider pre-filtering B to the key column only, or using `--restrict-npix` / `--from-area` (not yet supported in column mode — run on a subset by restricting the B catalog before ingest).
+
+**Limitations in v1:**
+- `--from-area` and `--plan` are not supported with `--match-mode column`; area plan integration is a planned follow-up.
+- `dl-gather` does not yet resolve column trees by `--match-id`; use `--export-parquet` and join manually, or wait for the gather integration.
+- Only single-worker (no `--n-workers`) because the B index is shared in-process.
+
 ### Associations with STILTS
 
 [STILTS](https://www.starlink.ac.uk/stilts/) is useful when you need
