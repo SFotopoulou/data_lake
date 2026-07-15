@@ -1024,6 +1024,124 @@ class TestColumnCrossmatchEngine:
         # overwrite bypasses
         build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY", overwrite=True)
 
+    def test_non_overlapping_tile_produces_no_match(self, tmp_path: Path) -> None:
+        """Key match only in a non-overlapping B tile → no association row (locality)."""
+        import healpy as hp_lib
+        lake = tmp_path / "lake"
+        norder = 3  # low order so pixels are large and far-apart pixels are unambiguous
+
+        ra_a, dec_a = 0.0, 0.0
+        ra_b, dec_b = 180.0, 0.0  # antipodal — guaranteed non-overlapping
+        npix_a = int(assign_healpix(np.array([ra_a]), np.array([dec_a]), norder)[0])
+        npix_b = int(assign_healpix(np.array([ra_b]), np.array([dec_b]), norder)[0])
+        assert npix_a != npix_b
+
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix_a,
+            source_ids=[1], ra=[ra_a], dec=[dec_a],
+            extra_col="KEY", extra_values=[42],
+        )
+        # B tile placed at antipodal position — shares the key value but not the sky region
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix_b,
+            source_ids=[10], ra=[ra_b], dec=[dec_b],
+            extra_col="KEY", extra_values=[42],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "locality", "KEY", "KEY")
+        assert result.n_match_rows == 0, (
+            "Matches in non-overlapping tiles must not be associated under the locality assumption"
+        )
+
+    def test_geometric_neighbour_match_found(self, tmp_path: Path) -> None:
+        """Key match in geometrically overlapping tiles → association row produced."""
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+            extra_col="KEY", extra_values=[99],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[20], ra=[ra + 0.001], dec=[dec + 0.001],
+            extra_col="KEY", extra_values=[99],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "nbr", "KEY", "KEY")
+        assert result.n_match_rows == 1
+        tbl = load_crossmatch_table(result.output_root)
+        assert tbl["healpix_npix_b"][0].as_py() == npix
+
+    def test_half_pixel_pad_includes_neighbour_b_tile(self, tmp_path: Path) -> None:
+        """B source in a neighbour A-pixel is still joined (half-pixel pad)."""
+        import healpy as hp_lib
+
+        lake = tmp_path / "lake"
+        norder = 5
+        nside = hp_lib.order2nside(norder)
+        ra_a, dec_a = 120.0, 45.0
+        npix_a = int(assign_healpix(np.array([ra_a]), np.array([dec_a]), norder)[0])
+
+        neighbours = [
+            int(n) for n in hp_lib.get_all_neighbours(nside, npix_a, nest=True)
+            if n >= 0
+        ]
+        assert neighbours, "expected at least one neighbour pixel"
+        npix_b = neighbours[0]
+        theta, phi = hp_lib.pix2ang(nside, npix_b, nest=True)
+        ra_b = float(np.degrees(phi))
+        dec_b = float(90.0 - np.degrees(theta))
+
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix_a,
+            source_ids=[1], ra=[ra_a], dec=[dec_a],
+            extra_col="KEY", extra_values=[77],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix_b,
+            source_ids=[20], ra=[ra_b], dec=[dec_b],
+            extra_col="KEY", extra_values=[77],
+        )
+
+        result = build_column_crossmatch(lake, "A", "B", "pad", "KEY", "KEY")
+        assert result.n_match_rows == 1
+        tbl = load_crossmatch_table(result.output_root)
+        assert tbl["healpix_npix_b"][0].as_py() == npix_b
+
+    def test_pad_rad_uses_coarser_survey(self) -> None:
+        from data_lake.io.crossmatch import _column_crossmatch_pad_rad
+        import healpy as hp_lib
+
+        nside_fine = hp_lib.order2nside(8)
+        nside_coarse = hp_lib.order2nside(3)
+        pad = _column_crossmatch_pad_rad(nside_fine, nside_coarse)
+        assert pad == pytest.approx(0.5 * float(hp_lib.max_pixrad(nside_coarse)))
+        assert pad > 0.5 * float(hp_lib.max_pixrad(nside_fine))
+
+    def test_n_workers_sequential_equivalence(self, tmp_path: Path) -> None:
+        """n_workers=1 (default) and explicit n_workers=1 both give the same result."""
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile_with_col(
+            lake, "A", norder=norder, npix=npix,
+            source_ids=[1, 2], ra=[ra, ra + 0.01], dec=[dec, dec + 0.01],
+            extra_col="K", extra_values=[1, 2],
+        )
+        _write_catalog_tile_with_col(
+            lake, "B", norder=norder, npix=npix,
+            source_ids=[10, 20], ra=[ra, ra + 0.01], dec=[dec, dec + 0.01],
+            extra_col="K", extra_values=[1, 2],
+        )
+        result = build_column_crossmatch(lake, "A", "B", "wk", "K", "K", n_workers=1)
+        assert result.n_match_rows == 2
+        assert result.n_workers == 1
+
 
 class TestColumnCrossmatchCLI:
     def _setup_lake(self, tmp_path: Path):
@@ -1088,6 +1206,22 @@ class TestColumnCrossmatchCLI:
         ])
         assert result.exit_code != 0
         assert "--match-id" in result.output
+
+    def test_cli_column_mode_with_progress(self, tmp_path: Path) -> None:
+        """--progress flag exits 0 in column mode."""
+        from click.testing import CliRunner
+        from data_lake.io.crossmatch import cli
+
+        lake, _ = self._setup_lake(tmp_path)
+        result = CliRunner().invoke(cli, [
+            "SRC", "PARTNER", str(lake),
+            "--match-mode", "column",
+            "--match-id", "obj_id",
+            "--match-col-a", "OBJ_ID",
+            "--match-col-b", "OBJ_ID",
+            "--progress",
+        ])
+        assert result.exit_code == 0, result.output
 
     def test_cli_sky_mode_unchanged(self, tmp_path: Path) -> None:
         """Sky mode still works after adding column-mode flags."""

@@ -203,12 +203,21 @@ Example: `crossmatch/EUCLID_DR1_x_DESI_DR1__col_desi_targetid_a1b2c3d4/`
 
 **Same schema as sky trees:** `source_id_a`, `source_id_b`, `sep_arcsec`, `_healpix_norder{N}`, `healpix_npix_b` — readable by `CrossmatchAccessor` and exportable with `--export-parquet` / `--export-fits`.
 
-**Memory:** survey B is loaded entirely into memory once before tile iteration.  For very large surveys (>~500 M rows) consider pre-filtering B to the key column only, or using `--restrict-npix` / `--from-area` (not yet supported in column mode — run on a subset by restricting the B catalog before ingest).
+**Spatial-locality assumption:** For each survey-A tile, B tiles are loaded if their HEALPix footprint overlaps that tile **or** its neighbours.  Overlap uses the A-tile geometric extent plus a **half-pixel pad** of the coarser of the two surveys (`0.5 × max_pixrad`), so edge sources and `norder` mismatches still find partner tiles.  Rows whose sky positions lie in completely disjoint regions remain out of scope, even if their key values match.  Per-process LRU reuse of prepared B frames avoids reopening the same B Parquet for adjacent A tiles.
 
-**Limitations in v1:**
+If you know that matched IDs can span arbitrary sky positions, pre-partition both catalogs by the shared key outside the lake before ingesting.
+
+**Performance and progress:** Both `--n-workers` and `--progress` apply to column mode.  With `--progress`, a tqdm bar tracks completed A tiles.  Without it, a log line is emitted every 50 tiles (and every 30 s in parallel mode) with tile count and row count so far.
+
+```bash
+dl-crossmatch A B /data/lake \
+  --match-mode column --match-id tid --match-col-a ID --match-col-b ID \
+  --n-workers 4 --tiles-per-worker 8 --progress
+```
+
+**Limitations:**
 - `--from-area` and `--plan` are not supported with `--match-mode column`; area plan integration is a planned follow-up.
 - `dl-gather` does not yet resolve column trees by `--match-id`; use `--export-parquet` and join manually, or wait for the gather integration.
-- Only single-worker (no `--n-workers`) because the B index is shared in-process.
 
 ### Associations with STILTS
 

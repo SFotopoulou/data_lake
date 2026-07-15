@@ -42,8 +42,9 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
@@ -1344,75 +1345,153 @@ def _write_xm_info(
 # Column-equality crossmatch
 # ---------------------------------------------------------------------------
 
+# Heartbeat cadence: emit a log.info every this many A tiles when not using tqdm.
+_COL_XM_HEARTBEAT_TILES = 50
+# Per-process LRU of prepared survey-B join frames (adjacent A tiles reuse neighbours).
+_COL_XM_B_CACHE_TILES = 64
 
-def _build_b_index(
-    lake_root: Path,
-    survey_b: str,
-    match_col_b: str,
-    norder_b: int,
-) -> pl.DataFrame:
-    """Load all survey-B tiles into a lookup frame for column matching.
 
-    Returns a Polars DataFrame with columns:
-    ``__match_key_b`` (Utf8), ``source_id_b`` (Int64), ``healpix_npix_b`` (Int64).
+def _column_crossmatch_pad_rad(nside_a: int, nside_b: int) -> float:
+    """Half-pixel pad (rad) so A-edge sources see B tiles on neighbouring pixels.
 
-    This materialises all of B in memory — document this as a v1 limitation for
-    very large surveys.
+    Uses half of ``max_pixrad`` of the *coarser* of the two surveys so a
+    resolution mismatch cannot leave a neighbour B tile just outside the disc.
+    Combined with the A-tile extent already folded into
+    :func:`healpix_pixels_covering_tile`, this covers B tiles that fall on A
+    or touch A's neighbours.
     """
-    catalog_root_b = lake_root / "catalogs" / survey_b
-    hp_col_b = f"_healpix_norder{norder_b}"
-    npixels_b = iter_populated_tile_npixels(catalog_root_b, norder=norder_b)
-    frames: list[pl.DataFrame] = []
+    return 0.5 * max(float(hp.max_pixrad(nside_a)), float(hp.max_pixrad(nside_b)))
 
-    with CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b:
-        id_col_b = acc_b.link_id_column
-        cols_to_load = list({id_col_b, match_col_b, hp_col_b})
-        for npix_b in npixels_b:
-            try:
-                df_b = acc_b.sources_in_tile(npix_b, columns=cols_to_load, fmt="polars")
-            except Exception:
-                continue
-            if df_b.is_empty():
-                continue
-            ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
-            df_b = df_b.select([
-                pl.col(match_col_b).cast(pl.Utf8).alias("__match_key_b"),
-                pl.Series("source_id_b", ids_b),
-                pl.col(hp_col_b).cast(pl.Int64).alias("healpix_npix_b"),
-            ]).filter(pl.col("__match_key_b").is_not_null())
-            if not df_b.is_empty():
-                frames.append(df_b)
 
-    if not frames:
+@dataclass
+class _BTileJoinCache:
+    """Bounded LRU of prepared survey-B frames for column-equality joins."""
+
+    max_tiles: int = _COL_XM_B_CACHE_TILES
+    _entries: OrderedDict[int, pl.DataFrame] = field(default_factory=OrderedDict)
+
+    def get(self, npix_b: int) -> pl.DataFrame | None:
+        key = int(npix_b)
+        cached = self._entries.get(key)
+        if cached is not None:
+            self._entries.move_to_end(key)
+        return cached
+
+    def put(self, npix_b: int, df: pl.DataFrame) -> None:
+        key = int(npix_b)
+        if key in self._entries:
+            self._entries.move_to_end(key)
+            self._entries[key] = df
+            return
+        self._entries[key] = df
+        while len(self._entries) > self.max_tiles:
+            self._entries.popitem(last=False)
+
+
+def _prepare_b_join_frame(
+    df_b: pl.DataFrame,
+    *,
+    id_col_b: str,
+    match_col_b: str,
+    hp_col_b: str,
+) -> pl.DataFrame:
+    """Cast match key / IDs for an equality join; drop null keys."""
+    if df_b.is_empty():
         return pl.DataFrame({
             "__match_key_b": pl.Series([], dtype=pl.Utf8),
             "source_id_b": pl.Series([], dtype=pl.Int64),
             "healpix_npix_b": pl.Series([], dtype=pl.Int64),
         })
-    return pl.concat(frames)
+    ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
+    return df_b.select([
+        pl.col(match_col_b).cast(pl.Utf8).alias("__match_key_b"),
+        pl.Series("source_id_b", ids_b),
+        pl.col(hp_col_b).cast(pl.Int64).alias("healpix_npix_b"),
+    ]).filter(pl.col("__match_key_b").is_not_null())
+
+
+def _load_b_join_frames(
+    acc_b: CatalogAccessor,
+    b_pixels: Sequence[int],
+    *,
+    match_col_b: str,
+    hp_col_b: str,
+    cache: _BTileJoinCache | None,
+) -> list[pl.DataFrame]:
+    """Load (and optionally cache) prepared B join frames for *b_pixels*."""
+    id_col_b = acc_b.link_id_column
+    cols_b = list({id_col_b, match_col_b, hp_col_b})
+    frames: list[pl.DataFrame] = []
+    for npix_b in b_pixels:
+        cached = cache.get(npix_b) if cache is not None else None
+        if cached is not None:
+            if not cached.is_empty():
+                frames.append(cached)
+            continue
+        try:
+            df_raw = acc_b.sources_in_tile(npix_b, columns=cols_b, fmt="polars")
+        except Exception:
+            df_raw = pl.DataFrame()
+        prepared = _prepare_b_join_frame(
+            df_raw, id_col_b=id_col_b, match_col_b=match_col_b, hp_col_b=hp_col_b,
+        )
+        if cache is not None:
+            cache.put(npix_b, prepared)
+        if not prepared.is_empty():
+            frames.append(prepared)
+    return frames
+
+
+@dataclass(frozen=True)
+class ColumnCrossmatchTileConfig:
+    """Pickle-friendly config for one or more survey-A tiles (column match workers)."""
+
+    lake_root: str
+    survey_a: str
+    survey_b: str
+    npix_a_list: tuple[int, ...]
+    norder_a: int
+    norder_b: int
+    match_col_a: str
+    match_col_b: str
+    b_populated: tuple[int, ...]
+    out_root: str
 
 
 def _column_crossmatch_one_tile(
     *,
     npix_a: int,
     norder_a: int,
+    norder_b: int,
     match_col_a: str,
+    match_col_b: str,
+    b_populated: set[int],
     out_root: Path,
     acc_a: CatalogAccessor,
-    b_index: pl.DataFrame,
+    acc_b: CatalogAccessor,
+    b_cache: _BTileJoinCache | None = None,
 ) -> int:
-    """Match one survey-A tile against the pre-built B index; write Parquet.
+    """Match one survey-A tile using geometrically covering B tiles; write Parquet.
+
+    B tiles are those whose HEALPix footprint overlaps A tile *npix_a* plus a
+    half-pixel pad (coarser of A/B), so neighbouring tiles are included.
+    Optional *b_cache* avoids re-reading the same B Parquet across adjacent A tiles.
 
     Returns the number of association rows written.
     """
+    nside_a = hp.order2nside(norder_a)
+    nside_b = hp.order2nside(norder_b)
+    pad_rad = _column_crossmatch_pad_rad(nside_a, nside_b)
     hp_col = f"_healpix_norder{norder_a}"
+    hp_col_b = f"_healpix_norder{norder_b}"
     id_col_a = acc_a.link_id_column
     out_dir = out_root / healpix_dir(norder_a, npix_a)
     out_file = out_dir / f"Npix={npix_a}.parquet"
 
-    cols_to_load = list({id_col_a, match_col_a})
+    # -- load A tile --
+    cols_a = list({id_col_a, match_col_a})
     try:
-        df_a = acc_a.sources_in_tile(npix_a, columns=cols_to_load, fmt="polars")
+        df_a = acc_a.sources_in_tile(npix_a, columns=cols_a, fmt="polars")
     except Exception:
         return 0
     if df_a.is_empty():
@@ -1423,11 +1502,30 @@ def _column_crossmatch_one_tile(
         pl.Series("source_id_a", ids_a),
         pl.col(match_col_a).cast(pl.Utf8).alias("__match_key_a"),
     ]).filter(pl.col("__match_key_a").is_not_null())
-
     if df_a.is_empty():
         return 0
 
-    joined = df_a.join(b_index, left_on="__match_key_a", right_on="__match_key_b", how="inner")
+    # -- resolve covering B pixels (A tile extent + half-pixel pad) --
+    b_pixels_candidate = healpix_pixels_covering_tile(
+        nside_a, npix_a, pad_rad, nside_b=nside_b,
+    )
+    b_pixels = [p for p in b_pixels_candidate if p in b_populated]
+    if not b_pixels:
+        return 0
+
+    frames_b = _load_b_join_frames(
+        acc_b, b_pixels,
+        match_col_b=match_col_b,
+        hp_col_b=hp_col_b,
+        cache=b_cache,
+    )
+    if not frames_b:
+        return 0
+
+    b_local = pl.concat(frames_b)
+
+    # -- equality join (many-to-many) --
+    joined = df_a.join(b_local, left_on="__match_key_a", right_on="__match_key_b", how="inner")
     if joined.is_empty():
         return 0
 
@@ -1448,6 +1546,46 @@ def _column_crossmatch_one_tile(
         write_statistics=True,
     )
     return n
+
+
+def _column_crossmatch_tile_worker(
+    config: ColumnCrossmatchTileConfig,
+) -> CrossmatchTileResult:
+    from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
+
+    apply_parallel_worker_logging_after_heavy_imports()
+    try:
+        lake_root = Path(config.lake_root)
+        out_root = Path(config.out_root)
+        b_populated = set(config.b_populated)
+        n_match_rows = 0
+        n_tiles_written = 0
+        b_cache = _BTileJoinCache()
+
+        with (
+            CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a,
+            CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b,
+        ):
+            for npix_a in config.npix_a_list:
+                n_rows = _column_crossmatch_one_tile(
+                    npix_a=npix_a,
+                    norder_a=config.norder_a,
+                    norder_b=config.norder_b,
+                    match_col_a=config.match_col_a,
+                    match_col_b=config.match_col_b,
+                    b_populated=b_populated,
+                    out_root=out_root,
+                    acc_a=acc_a,
+                    acc_b=acc_b,
+                    b_cache=b_cache,
+                )
+                n_match_rows += n_rows
+                if n_rows > 0:
+                    n_tiles_written += 1
+        return CrossmatchTileResult(n_match_rows, n_tiles_written)
+    except Exception as exc:
+        log.exception("Column crossmatch worker failed for tiles %s", config.npix_a_list[:8])
+        return CrossmatchTileResult(0, 0, str(exc))
 
 
 def _validate_column_crossmatch_reuse(
@@ -1535,6 +1673,8 @@ def build_column_crossmatch(
     norder_b: int | None = None,
     populated_tiles_only: bool = True,
     show_progress: bool = False,
+    n_workers: int = 1,
+    tiles_per_worker: int = 1,
     export_parquet: Path | str | None = None,
     export_fits: Path | str | None = None,
     restrict_npix: Iterable[int] | None = None,
@@ -1548,6 +1688,11 @@ def build_column_crossmatch(
     The output tree has the same schema as sky crossmatches and is readable by
     :class:`CrossmatchAccessor`.  ``dl-gather`` integration is deferred to a
     follow-up (see project docs).
+
+    **Spatial-locality assumption:** Only B tiles geometrically overlapping each
+    A tile (plus a half-pixel pad of the coarser survey) are loaded per tile.
+    Matched objects must therefore share a sky neighbourhood (same or adjacent
+    HEALPix pixels).  Cross-sky-region key matches are out of scope by design.
 
     Parameters
     ----------
@@ -1567,17 +1712,15 @@ def build_column_crossmatch(
     populated_tiles_only:
         Iterate only survey-A tiles present on disk.
     show_progress:
-        Show a tqdm progress bar.
+        Show a tqdm progress bar over A tiles.
+    n_workers:
+        Number of parallel worker processes (default: 1, sequential).
+    tiles_per_worker:
+        How many A tiles each worker processes in one batch.
     export_parquet / export_fits:
         Optionally consolidate all rows into a flat file after writing tiles.
     restrict_npix:
         Limit to a subset of survey-A HEALPix pixels (region restriction).
-
-    Notes
-    -----
-    Survey B is fully loaded into memory once before tile iteration.  For very
-    large surveys (>~500 M rows) this may exhaust RAM; consider pre-filtering B
-    before ingesting or using sky crossmatch with a tiny radius instead.
     """
     validate_match_id(match_id)
     lake_root = Path(lake_root)
@@ -1598,7 +1741,7 @@ def build_column_crossmatch(
     )
 
     if populated_tiles_only:
-        tile_npixels = iter_populated_tile_npixels(catalog_root_a, norder=norder_a)
+        tile_npixels: list[int] = iter_populated_tile_npixels(catalog_root_a, norder=norder_a)
     else:
         import healpy as hp_lib
         tile_npixels = list(range(hp_lib.nside2npix(hp_lib.order2nside(norder_a))))
@@ -1607,44 +1750,147 @@ def build_column_crossmatch(
         restrict_set = {int(p) for p in restrict_npix}
         tile_npixels = [p for p in tile_npixels if p in restrict_set]
 
-    log.info(
-        "Column crossmatch %s.%s × %s.%s (match_id=%r): loading B index from %d tile(s)",
-        survey_a, match_col_a, survey_b, match_col_b, match_id,
-        len(iter_populated_tile_npixels(catalog_root_b, norder=norder_b)),
+    # -- enumerate populated B pixels for footprint filter --
+    b_populated_list: list[int] = iter_populated_tile_npixels(catalog_root_b, norder=norder_b)
+    b_populated_set: set[int] = set(b_populated_list)
+    n_b_tiles = len(b_populated_list)
+
+    # -- footprint filter: skip A tiles with no overlapping B footprint --
+    nside_a = hp.order2nside(norder_a)
+    nside_b = hp.order2nside(norder_b)
+    pad_rad = _column_crossmatch_pad_rad(nside_a, nside_b)
+    tile_npixels = filter_survey_a_tiles_overlapping_survey_b(
+        tile_npixels,
+        nside_a=nside_a,
+        nside_b=nside_b,
+        b_populated=b_populated_set,
+        radius_rad=pad_rad,
     )
-    b_index = _build_b_index(lake_root, survey_b, match_col_b, norder_b)
-    log.info("B index: %d row(s) after null filter", len(b_index))
+
+    log.info(
+        "Column crossmatch %s.%s × %s.%s (match_id=%r, tree=%s): "
+        "%d A tile(s) after footprint filter, %d B tile(s) populated",
+        survey_a, match_col_a, survey_b, match_col_b, match_id, xm_name,
+        len(tile_npixels), n_b_tiles,
+    )
 
     pending, n_match_rows, n_tiles_written = _pending_crossmatch_tiles(
         tile_npixels, out_root, norder_a, overwrite
     )
+    n_pending = len(pending)
+    log.info(
+        "%d A tile(s) pending (overwrite=%s, n_workers=%d)",
+        n_pending, overwrite, n_workers,
+    )
 
     t0 = time.perf_counter()
-    iterator: Iterable[int] = pending
-    if show_progress:
-        try:
-            from tqdm.auto import tqdm
-            iterator = tqdm(pending, unit="tile", desc=f"{survey_a}×{survey_b}[col]")
-        except ImportError:
-            pass
+    t_last_log = t0
+    n_done = 0
 
-    with CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a:
-        for npix_a in iterator:
-            n_rows = _column_crossmatch_one_tile(
-                npix_a=npix_a,
+    if n_workers > 1:
+        # -- parallel: distribute tile batches to worker processes --
+        worker_tiles: list[tuple[int, ...]] = []
+        batch_buf: list[int] = []
+        for npix_a in pending:
+            batch_buf.append(npix_a)
+            if len(batch_buf) >= tiles_per_worker:
+                worker_tiles.append(tuple(batch_buf))
+                batch_buf = []
+        if batch_buf:
+            worker_tiles.append(tuple(batch_buf))
+
+        configs = [
+            ColumnCrossmatchTileConfig(
+                lake_root=str(lake_root),
+                survey_a=survey_a,
+                survey_b=survey_b,
+                npix_a_list=tiles,
                 norder_a=norder_a,
+                norder_b=norder_b,
                 match_col_a=match_col_a,
-                out_root=out_root,
-                acc_a=acc_a,
-                b_index=b_index,
+                match_col_b=match_col_b,
+                b_populated=tuple(b_populated_list),
+                out_root=str(out_root),
             )
-            if n_rows > 0:
-                n_tiles_written += 1
-                n_match_rows += n_rows
+            for tiles in worker_tiles
+        ]
+
+        pbar = None
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                pbar = tqdm(total=n_pending, unit="tile", desc=f"{survey_a}×{survey_b}[col]")
+            except ImportError:
+                pass
+
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            future_to_n: dict[Future, int] = {}
+            for cfg in configs:
+                fut = pool.submit(_column_crossmatch_tile_worker, cfg)
+                future_to_n[fut] = len(cfg.npix_a_list)
+            for fut in as_completed(future_to_n):
+                res = fut.result()
+                n_tiles_done = future_to_n[fut]
+                n_match_rows += res.n_match_rows
+                n_tiles_written += res.n_tiles_written
+                n_done += n_tiles_done
+                if pbar is not None:
+                    pbar.update(n_tiles_done)
+                now = time.perf_counter()
+                if not show_progress and (now - t_last_log) >= 30.0:
+                    log.info(
+                        "  … %d/%d A tile(s) done, %d row(s) written so far (%.0f s elapsed)",
+                        n_done, n_pending, n_match_rows, now - t0,
+                    )
+                    t_last_log = now
+
+        if pbar is not None:
+            pbar.close()
+    else:
+        # -- sequential --
+        iterator: Iterable[int] = pending
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                iterator = tqdm(pending, unit="tile", desc=f"{survey_a}×{survey_b}[col]")
+            except ImportError:
+                pass
+
+        with (
+            CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a,
+            CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b,
+        ):
+            b_cache = _BTileJoinCache()
+            for npix_a in iterator:
+                n_rows = _column_crossmatch_one_tile(
+                    npix_a=npix_a,
+                    norder_a=norder_a,
+                    norder_b=norder_b,
+                    match_col_a=match_col_a,
+                    match_col_b=match_col_b,
+                    b_populated=b_populated_set,
+                    out_root=out_root,
+                    acc_a=acc_a,
+                    acc_b=acc_b,
+                    b_cache=b_cache,
+                )
+                if n_rows > 0:
+                    n_tiles_written += 1
+                    n_match_rows += n_rows
+                n_done += 1
+
+                # heartbeat when no progress bar
+                if not show_progress and n_done % _COL_XM_HEARTBEAT_TILES == 0:
+                    now = time.perf_counter()
+                    log.info(
+                        "  … %d/%d A tile(s) done, %d row(s) written so far (%.0f s elapsed)",
+                        n_done, n_pending, n_match_rows, now - t0,
+                    )
+                    t_last_log = now
 
     elapsed = time.perf_counter() - t0
     log.info(
-        "Column crossmatch %s × %s: %d association row(s) in %d tile(s) in %.1f s",
+        "Column crossmatch %s × %s done: %d association row(s) in %d tile(s) in %.1f s",
         survey_a, survey_b, n_match_rows, n_tiles_written, elapsed,
     )
 
@@ -1667,7 +1913,7 @@ def build_column_crossmatch(
         radius_arcsec=0.0,
         norder=norder_a,
         elapsed_s=elapsed,
-        n_workers=1,
+        n_workers=n_workers,
         export_parquet=parquet_path,
         export_fits=fits_path,
         match_mode="column",
@@ -2085,6 +2331,8 @@ try:
                     norder_b=norder_b,
                     populated_tiles_only=not all_tiles,
                     show_progress=show_progress,
+                    n_workers=n_workers,
+                    tiles_per_worker=tiles_per_worker,
                     export_parquet=export_parquet,
                     export_fits=export_fits,
                 )
