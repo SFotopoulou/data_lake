@@ -167,13 +167,18 @@ A plan is the `crossmatch_plan` block of an area (see
 
 ```json
 {"base_catalog": "EUCLID",
- "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0},
-              {"survey": "ALLWISE",  "radius_arcsec": 2.0}],
+ "partners": [
+   {"survey": "ALLWISE", "match_mode": "sky", "radius_arcsec": 2.0},
+   {"survey": "DESI_DR1", "match_mode": "column",
+    "match_id": "desi_tid", "match_col_a": "TARGETID", "match_col_b": "TARGETID"}
+ ],
  "reuse_existing": true}
 ```
 
 Existing tiles are skipped (resume), so re-running after more live tiles arrive
-only fills gaps. See [`dl-gather`](gather.md) to materialise the joined columns.
+only fills gaps. Column partners are written as ``__col_<match_id>_…`` trees;
+``dl-gather --from-area`` resolves them by ``match_id``. See [`dl-gather`](gather.md)
+to materialise the joined columns.
 
 **Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A
 HEALPix tiles per worker process, amortizing DuckDB catalog registration. Try
@@ -216,8 +221,8 @@ dl-crossmatch A B /data/lake \
 ```
 
 **Limitations:**
-- `--from-area` and `--plan` are not supported with `--match-mode column`; area plan integration is a planned follow-up.
-- `dl-gather` does not yet resolve column trees by `--match-id`; use `--export-parquet` and join manually, or wait for the gather integration.
+- Pair-mode ``--match-mode column`` cannot be combined with ``--from-area`` / ``--plan`` on the same invocation (use plan partners instead — see below).
+- When an area plan includes column partners, ``dl-crossmatch --from-area`` and ``dl-gather --from-area`` resolve ``__col_`` trees by ``match_id``.
 
 ### Associations with STILTS
 

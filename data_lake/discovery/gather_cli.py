@@ -38,16 +38,21 @@ log = logging.getLogger(__name__)
 
 
 def _radii_from_area(area: Area) -> dict[str, float]:
-    radii: dict[str, float] = {}
-    plan = area.crossmatch_plan or {}
-    for p in plan.get("partners", []):
-        if p.get("survey") and p.get("radius_arcsec") is not None:
-            radii[p["survey"]] = float(p["radius_arcsec"])
+    from data_lake.discovery.gather import partners_meta_from_crossmatch_plan
+
+    radii, _ = partners_meta_from_crossmatch_plan(area.crossmatch_plan)
     # gather block may also carry explicit radii
     for p in (area.gather or {}).get("partners", []):
         if p.get("survey") and p.get("radius_arcsec") is not None:
             radii[p["survey"]] = float(p["radius_arcsec"])
     return radii
+
+
+def _column_partners_from_area(area: Area) -> dict[str, dict]:
+    from data_lake.discovery.gather import partners_meta_from_crossmatch_plan
+
+    _, column_partners = partners_meta_from_crossmatch_plan(area.crossmatch_plan)
+    return column_partners
 
 
 def _resolve_selection(
@@ -242,8 +247,11 @@ try:
                     raise click.ClickException("gather block missing 'base'")
                 columns = g.get("columns") or {}
                 radii = _radii_from_area(area_obj)
+                column_partners = _column_partners_from_area(area_obj)
                 base_columns = list(columns.get(base, []))
-                partners = partners_from_columns(columns, radii, base)
+                partners = partners_from_columns(
+                    columns, radii, base, column_partners=column_partners,
+                )
                 multiplicity = g.get("multiplicity", multiplicity)
                 if g.get("include_sep") is not None:
                     no_sep = not g["include_sep"]

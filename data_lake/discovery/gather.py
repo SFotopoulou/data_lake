@@ -36,7 +36,11 @@ from data_lake.discovery.region import Region
 from data_lake.discovery.selection import BaseSelection
 from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, healpix_dir
 from data_lake.io.catalog import CatalogAccessor
-from data_lake.io.crossmatch import CROSSMATCH_HEALPIX_NPIX_B, resolve_crossmatch_root
+from data_lake.io.crossmatch import (
+    CROSSMATCH_HEALPIX_NPIX_B,
+    resolve_column_crossmatch_root,
+    resolve_crossmatch_root,
+)
 from data_lake.schema_registry import CATALOG_KIND_PRODUCT, MODALITY_CATALOG
 
 log = logging.getLogger(__name__)
@@ -48,8 +52,12 @@ _ZSTD_LEVEL = 7
 @dataclass
 class PartnerSpec:
     survey: str
-    radius_arcsec: float
+    radius_arcsec: float | None = None
     columns: list[str] = field(default_factory=list)
+    match_mode: str = "sky"
+    match_id: str | None = None
+    match_col_a: str | None = None
+    match_col_b: str | None = None
 
 
 @dataclass
@@ -279,15 +287,35 @@ def gather_product(
         set(selection.source_ids) if selection.source_ids is not None else None
     )
 
-    xm_roots: dict[str, Path] = {
-        p.survey: resolve_crossmatch_root(lake_root, base, p.survey, p.radius_arcsec)
-        for p in partners
-    }
+    xm_roots: dict[str, Path] = {}
+    for p in partners:
+        if p.match_mode == "column":
+            if not p.match_id:
+                raise ValueError(
+                    f"column partner {p.survey!r} missing match_id; "
+                    "set it in crossmatch_plan or PartnerSpec"
+                )
+            root = resolve_column_crossmatch_root(
+                lake_root, base, p.survey, p.match_id,
+            )
+        else:
+            if p.radius_arcsec is None:
+                raise ValueError(
+                    f"sky partner {p.survey!r} missing radius_arcsec"
+                )
+            root = resolve_crossmatch_root(
+                lake_root, base, p.survey, p.radius_arcsec,
+            )
+        xm_roots[p.survey] = root
     for p in partners:
         if not xm_roots[p.survey].is_dir():
+            if p.match_mode == "column":
+                detail = f"match_id={p.match_id!r}"
+            else:
+                detail = f"r={p.radius_arcsec}"
             raise FileNotFoundError(
                 f"crossmatch tree missing for {base} x {p.survey} "
-                f"(r={p.radius_arcsec}); run dl-crossmatch first: {xm_roots[p.survey]}"
+                f"({detail}); run dl-crossmatch first: {xm_roots[p.survey]}"
             )
 
     t0 = time.perf_counter()
@@ -432,7 +460,11 @@ def _write_product_info(
             "partners": [
                 {
                     "survey": p.survey,
+                    "match_mode": p.match_mode,
                     "radius_arcsec": p.radius_arcsec,
+                    "match_id": p.match_id,
+                    "match_col_a": p.match_col_a,
+                    "match_col_b": p.match_col_b,
                     "columns": p.columns,
                 }
                 for p in partners
@@ -574,14 +606,64 @@ def partners_from_columns(
     columns: dict[str, list[str]],
     radii: dict[str, float],
     base: str,
+    *,
+    column_partners: dict[str, dict] | None = None,
 ) -> list[PartnerSpec]:
-    """Build PartnerSpec list from a ``{survey: [cols]}`` mapping (excludes base)."""
+    """Build PartnerSpec list from a ``{survey: [cols]}`` mapping (excludes base).
+
+    *radii* supplies sky partners.  *column_partners* maps survey → column-mode
+    plan fields (``match_id``, ``match_col_a``, ``match_col_b``).  A survey must
+    appear in exactly one of the two maps.
+    """
+    column_partners = column_partners or {}
     specs: list[PartnerSpec] = []
     for survey, cols in columns.items():
         if survey == base:
             continue
+        if survey in column_partners:
+            meta = column_partners[survey]
+            specs.append(PartnerSpec(
+                survey=survey,
+                radius_arcsec=None,
+                columns=list(cols),
+                match_mode="column",
+                match_id=str(meta["match_id"]),
+                match_col_a=str(meta.get("match_col_a", "")),
+                match_col_b=str(meta.get("match_col_b", "")),
+            ))
+            continue
         radius = radii.get(survey)
         if radius is None:
-            raise ValueError(f"no crossmatch radius given for partner {survey!r}")
-        specs.append(PartnerSpec(survey=survey, radius_arcsec=float(radius), columns=list(cols)))
+            raise ValueError(
+                f"no crossmatch radius or column match given for partner {survey!r}"
+            )
+        specs.append(PartnerSpec(
+            survey=survey,
+            radius_arcsec=float(radius),
+            columns=list(cols),
+            match_mode="sky",
+        ))
     return specs
+
+
+def partners_meta_from_crossmatch_plan(
+    plan: dict | None,
+) -> tuple[dict[str, float], dict[str, dict]]:
+    """Split a ``crossmatch_plan`` into sky radii and column-partner metadata."""
+    from data_lake.discovery.area_plan import partner_match_mode
+
+    radii: dict[str, float] = {}
+    column_partners: dict[str, dict] = {}
+    for p in (plan or {}).get("partners", []):
+        survey = p.get("survey")
+        if not survey:
+            continue
+        if partner_match_mode(p) == "column":
+            column_partners[survey] = {
+                "match_id": p.get("match_id"),
+                "match_col_a": p.get("match_col_a"),
+                "match_col_b": p.get("match_col_b"),
+            }
+        elif p.get("radius_arcsec") is not None:
+            radii[survey] = float(p["radius_arcsec"])
+    return radii, column_partners

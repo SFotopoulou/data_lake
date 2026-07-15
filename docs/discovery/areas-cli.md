@@ -80,14 +80,14 @@ Defines the plan consumed by `dl-crossmatch --from-area`.
 ```bash
 dl-area set-crossmatch MyCone \
   --base EUCLID_DR1 \
-  --partner DESI_DR1:1.0 \
-  --partner ALLWISE:2.0
+  --partner ALLWISE:2.0 \
+  --partner DESI_DR1:col:desi_tid:TARGETID:TARGETID
 ```
 
 | Flag | Required | Meaning |
 |------|----------|---------|
 | `--base` | yes | Base catalog survey (HEALPix partitioning for the match). |
-| `--partner` | yes (repeat) | `SURVEY:RADIUS_ARCSEC` — e.g. `DESI_DR1:1.0`. |
+| `--partner` | yes (repeat) | Sky: `SURVEY:RADIUS_ARCSEC`. Column equality: `SURVEY:col:MATCH_ID:COL_A:COL_B`. |
 | `--no-reuse-existing` | no | Set `reuse_existing: false` (rebuild all tiles). |
 
 Written JSON shape (same as hand-edited areas):
@@ -96,12 +96,20 @@ Written JSON shape (same as hand-edited areas):
 "crossmatch_plan": {
   "base_catalog": "EUCLID_DR1",
   "partners": [
-    { "survey": "DESI_DR1", "radius_arcsec": 1.0 },
-    { "survey": "ALLWISE", "radius_arcsec": 2.0 }
+    { "survey": "ALLWISE", "match_mode": "sky", "radius_arcsec": 2.0 },
+    {
+      "survey": "DESI_DR1",
+      "match_mode": "column",
+      "match_id": "desi_tid",
+      "match_col_a": "TARGETID",
+      "match_col_b": "TARGETID"
+    }
   ],
   "reuse_existing": true
 }
 ```
+
+`dl-gather --from-area` resolves sky trees by radius and column trees by `match_id`.
 
 See [Crossmatch — region-bounded plans](crossmatch.md#region-bounded-plans---from-area---plan).
 

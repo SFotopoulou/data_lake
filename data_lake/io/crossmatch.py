@@ -1953,10 +1953,17 @@ def execute_crossmatch_plan(
 ) -> list[CrossmatchResult]:
     """Execute a crossmatch plan (base catalog x N partners), optionally region-bounded.
 
-    The plan mirrors the ``crossmatch_plan`` block of an area::
+    The plan mirrors the ``crossmatch_plan`` block of an area.  Partners may be
+    sky (``radius_arcsec``) or column equality (``match_mode=column`` with
+    ``match_id`` / ``match_col_a`` / ``match_col_b``)::
 
         {"base_catalog": "EUCLID",
-         "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0}, ...],
+         "partners": [
+             {"survey": "ALLWISE", "match_mode": "sky", "radius_arcsec": 2.0},
+             {"survey": "DESI_DR1", "match_mode": "column",
+              "match_id": "desi_tid", "match_col_a": "TARGETID",
+              "match_col_b": "TARGETID"},
+         ],
          "reuse_existing": true}
 
     Existing trees are gap-filled (resume) unless ``overwrite``; when
@@ -1965,6 +1972,8 @@ def execute_crossmatch_plan(
     :class:`data_lake.discovery.region.Region`) restricts survey-A tiles to the
     region resolved at the base catalog order.
     """
+    from data_lake.discovery.area_plan import partner_match_mode
+
     lake_root = Path(lake_root)
     base = plan.get("base_catalog")
     if not base:
@@ -1983,24 +1992,48 @@ def execute_crossmatch_plan(
         survey_b = partner.get("survey")
         if not survey_b:
             raise ValueError("crossmatch_plan partner missing 'survey'")
-        radius = partner.get("radius_arcsec")
-        if radius is None:
-            raise ValueError(
-                f"crossmatch_plan partner {survey_b!r} missing 'radius_arcsec'"
+        mode = partner_match_mode(partner)
+        if mode == "column":
+            match_id = partner.get("match_id")
+            match_col_a = partner.get("match_col_a")
+            match_col_b = partner.get("match_col_b")
+            if not match_id or not match_col_a or not match_col_b:
+                raise ValueError(
+                    f"crossmatch_plan column partner {survey_b!r} requires "
+                    "match_id, match_col_a, and match_col_b"
+                )
+            result = build_column_crossmatch(
+                lake_root,
+                base,
+                survey_b,
+                str(match_id),
+                str(match_col_a),
+                str(match_col_b),
+                overwrite=overwrite,
+                n_workers=n_workers,
+                tiles_per_worker=tiles_per_worker,
+                show_progress=show_progress,
+                restrict_npix=restrict_npix,
             )
-        result = build_crossmatch(
-            lake_root,
-            base,
-            survey_b,
-            radius_arcsec=float(radius),
-            overwrite=overwrite,
-            n_workers=n_workers,
-            tiles_per_worker=tiles_per_worker,
-            match_backend=match_backend,
-            gpu_id=gpu_id,
-            show_progress=show_progress,
-            restrict_npix=restrict_npix,
-        )
+        else:
+            radius = partner.get("radius_arcsec")
+            if radius is None:
+                raise ValueError(
+                    f"crossmatch_plan partner {survey_b!r} missing 'radius_arcsec'"
+                )
+            result = build_crossmatch(
+                lake_root,
+                base,
+                survey_b,
+                radius_arcsec=float(radius),
+                overwrite=overwrite,
+                n_workers=n_workers,
+                tiles_per_worker=tiles_per_worker,
+                match_backend=match_backend,
+                gpu_id=gpu_id,
+                show_progress=show_progress,
+                restrict_npix=restrict_npix,
+            )
         results.append(result)
     return results
 

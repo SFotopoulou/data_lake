@@ -226,9 +226,29 @@ def validate_area(data: dict[str, Any]) -> list[str]:
         for p in plan.get("partners", []):
             if not p.get("survey"):
                 msgs.append("ERROR: crossmatch_plan partner missing 'survey'")
-            if p.get("radius_arcsec") is None:
+                continue
+            mode = p.get("match_mode")
+            if mode is None:
+                mode = "column" if (
+                    p.get("match_id") or p.get("match_col_a") or p.get("match_col_b")
+                ) else "sky"
+            if mode == "column":
+                for key in ("match_id", "match_col_a", "match_col_b"):
+                    if not p.get(key):
+                        msgs.append(
+                            f"ERROR: crossmatch_plan column partner "
+                            f"{p.get('survey')!r} missing '{key}'"
+                        )
+            elif mode == "sky":
+                if p.get("radius_arcsec") is None:
+                    msgs.append(
+                        f"ERROR: crossmatch_plan partner {p.get('survey')!r} "
+                        f"missing 'radius_arcsec' (or use match_mode=column)"
+                    )
+            else:
                 msgs.append(
-                    f"ERROR: crossmatch_plan partner {p.get('survey')!r} missing 'radius_arcsec'"
+                    f"ERROR: crossmatch_plan partner {p.get('survey')!r} "
+                    f"has invalid match_mode {mode!r}"
                 )
 
     gather = data.get("gather")

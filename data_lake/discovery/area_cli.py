@@ -77,7 +77,8 @@ try:
             dl-area list
             dl-area show MyCone
             dl-area set-crossmatch MyCone --base EUCLID_DR1 \\
-                --partner DESI_DR1:1.0 --partner ALLWISE:2.0
+                --partner ALLWISE:2.0 \\
+                --partner DESI_DR1:col:desi_tid:TARGETID:TARGETID
             dl-area set-gather MyCone --base EUCLID_DR1 \\
                 --columns '{"EUCLID_DR1":["ra","dec"],"DESI_DR1":["z"]}' \\
                 --materialize-as euclid_north_native_v1
@@ -139,7 +140,11 @@ try:
                   help="Base catalog survey (defines HEALPix partitioning).")
     @click.option(
         "--partner", "partners", multiple=True, required=True,
-        help="Partner spec SURVEY:RADIUS_ARCSEC (repeatable).",
+        help=(
+            "Partner spec (repeatable). Sky: SURVEY:RADIUS_ARCSEC "
+            "(e.g. ALLWISE:2.0). Column equality: SURVEY:col:MATCH_ID:COL_A:COL_B "
+            "(e.g. DESI_DR1:col:desi_tid:TARGETID:TARGETID)."
+        ),
     )
     @click.option(
         "--no-reuse-existing", is_flag=True,

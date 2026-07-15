@@ -28,18 +28,47 @@ def lake(tmp_path: Path) -> Path:
 
 class TestAreaPlanHelpers:
     def test_parse_partner(self) -> None:
-        assert parse_partner_spec("DESI_DR1:1.0") == ("DESI_DR1", 1.0)
+        assert parse_partner_spec("DESI_DR1:1.0") == {
+            "survey": "DESI_DR1",
+            "match_mode": "sky",
+            "radius_arcsec": 1.0,
+        }
+
+    def test_parse_column_partner(self) -> None:
+        assert parse_partner_spec("DESI_DR1:col:desi_tid:TARGETID:TARGETID") == {
+            "survey": "DESI_DR1",
+            "match_mode": "column",
+            "match_id": "desi_tid",
+            "match_col_a": "TARGETID",
+            "match_col_b": "TARGETID",
+        }
 
     def test_parse_partner_rejects_bad(self) -> None:
-        with pytest.raises(ValueError, match="SURVEY:RADIUS"):
+        with pytest.raises(ValueError, match="SURVEY:RADIUS|SURVEY:col"):
             parse_partner_spec("DESI_DR1")
 
     def test_build_crossmatch_plan(self) -> None:
         plan = build_crossmatch_plan(
-            "EUCLID", [("DESI_DR1", 1.0), ("ALLWISE", 2.0)],
+            "EUCLID",
+            [
+                {"survey": "DESI_DR1", "match_mode": "sky", "radius_arcsec": 1.0},
+                {"survey": "ALLWISE", "match_mode": "sky", "radius_arcsec": 2.0},
+            ],
         )
         assert plan["base_catalog"] == "EUCLID"
         assert len(plan["partners"]) == 2
+
+    def test_build_crossmatch_plan_mixed(self) -> None:
+        plan = build_crossmatch_plan(
+            "EUCLID",
+            [
+                parse_partner_spec("ALLWISE:2.0"),
+                parse_partner_spec("DESI_DR1:col:desi_tid:TARGETID:TARGETID"),
+            ],
+        )
+        assert plan["partners"][0]["match_mode"] == "sky"
+        assert plan["partners"][1]["match_mode"] == "column"
+        assert plan["partners"][1]["match_id"] == "desi_tid"
 
 
 class TestAreaCli:
@@ -52,6 +81,24 @@ class TestAreaCli:
         r2 = runner.invoke(cli, [str(lake), "show", "MyCone"])
         assert r2.exit_code == 0
         assert "cone" in r2.output
+
+    def test_set_crossmatch_column_partner(self, lake: Path) -> None:
+        runner = CliRunner()
+        r = runner.invoke(
+            cli,
+            [
+                str(lake), "set-crossmatch", "MyCone",
+                "--base", "EUCLID_DR1",
+                "--partner", "ALLWISE:2.0",
+                "--partner", "DESI_DR1:col:desi_tid:TARGETID:TARGETID",
+            ],
+        )
+        assert r.exit_code == 0, r.output
+        area = load_area(lake, "MyCone")
+        partners = area.crossmatch_plan["partners"]
+        assert partners[0]["match_mode"] == "sky"
+        assert partners[1]["match_mode"] == "column"
+        assert partners[1]["match_id"] == "desi_tid"
 
     def test_set_crossmatch_and_gather(self, lake: Path) -> None:
         runner = CliRunner()
@@ -111,7 +158,9 @@ class TestAreaCli:
 
     def test_import_merge(self, lake: Path, tmp_path: Path) -> None:
         fragment = {
-            "crossmatch_plan": build_crossmatch_plan("ALLWISE", [("GAIA_DR3_source", 0.5)]),
+            "crossmatch_plan": build_crossmatch_plan(
+                "ALLWISE", [parse_partner_spec("GAIA_DR3_source:0.5")],
+            ),
             "notes": "imported",
         }
         frag_path = tmp_path / "frag.json"

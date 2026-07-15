@@ -9,13 +9,62 @@ from typing import Any
 from data_lake.discovery.areas import Area, load_area, save_area, validate_area
 
 
-def parse_partner_spec(value: str) -> tuple[str, float]:
-    """Parse ``SURVEY:RADIUS_ARCSEC`` (e.g. ``DESI_DR1:1.0``)."""
-    if ":" not in value:
+def parse_partner_spec(value: str) -> dict[str, Any]:
+    """Parse a ``--partner`` value into a crossmatch_plan partner dict.
+
+    Sky (positional)::
+
+        SURVEY:RADIUS_ARCSEC
+        e.g. DESI_DR1:1.0
+
+    Column equality::
+
+        SURVEY:col:MATCH_ID:COL_A:COL_B
+        e.g. DESI_DR1:col:desi_targetid:TARGETID:TARGETID
+
+    Returns a dict suitable for ``crossmatch_plan.partners[]``.
+    """
+    raw = value.strip()
+    if not raw:
+        raise ValueError("empty partner spec")
+
+    parts = raw.split(":")
+    if len(parts) >= 5 and parts[1].lower() == "col":
+        survey = parts[0].strip()
+        match_id = parts[2].strip()
+        match_col_a = parts[3].strip()
+        match_col_b = ":".join(parts[4:]).strip()
+        if not survey:
+            raise ValueError(f"empty survey in column partner spec {value!r}")
+        if not match_id:
+            raise ValueError(f"empty match_id in column partner spec {value!r}")
+        if not match_col_a or not match_col_b:
+            raise ValueError(
+                f"column partner must be SURVEY:col:MATCH_ID:COL_A:COL_B, got {value!r}"
+            )
+        from data_lake.io.crossmatch import validate_match_id
+
+        validate_match_id(match_id)
+        return {
+            "survey": survey,
+            "match_mode": "column",
+            "match_id": match_id,
+            "match_col_a": match_col_a,
+            "match_col_b": match_col_b,
+        }
+
+    if ":" not in raw:
         raise ValueError(
-            f"partner must be SURVEY:RADIUS_ARCSEC, got {value!r}"
+            f"partner must be SURVEY:RADIUS_ARCSEC or "
+            f"SURVEY:col:MATCH_ID:COL_A:COL_B, got {value!r}"
         )
-    survey, radius_s = value.rsplit(":", 1)
+    # Incomplete column form, e.g. SURVEY:col:id (missing columns)
+    if len(parts) >= 2 and parts[1].lower() == "col":
+        raise ValueError(
+            f"column partner must be SURVEY:col:MATCH_ID:COL_A:COL_B, got {value!r}"
+        )
+
+    survey, radius_s = raw.rsplit(":", 1)
     survey = survey.strip()
     if not survey:
         raise ValueError(f"empty survey in partner spec {value!r}")
@@ -23,29 +72,76 @@ def parse_partner_spec(value: str) -> tuple[str, float]:
         radius = float(radius_s.strip())
     except ValueError as exc:
         raise ValueError(
-            f"invalid radius in partner spec {value!r}"
+            f"invalid radius in partner spec {value!r} "
+            f"(expected SURVEY:RADIUS_ARCSEC or SURVEY:col:MATCH_ID:COL_A:COL_B)"
         ) from exc
     if radius <= 0:
         raise ValueError(f"radius must be positive, got {radius}")
-    return survey, radius
+    return {
+        "survey": survey,
+        "match_mode": "sky",
+        "radius_arcsec": radius,
+    }
+
+
+def partner_match_mode(partner: dict[str, Any]) -> str:
+    """Return ``\"sky\"`` or ``\"column\"`` for a plan partner entry."""
+    mode = partner.get("match_mode")
+    if mode in ("sky", "column"):
+        return mode
+    if partner.get("match_id") or partner.get("match_col_a") or partner.get("match_col_b"):
+        return "column"
+    return "sky"
 
 
 def build_crossmatch_plan(
     base_catalog: str,
-    partners: list[tuple[str, float]],
+    partners: list[dict[str, Any]],
     *,
     reuse_existing: bool = True,
 ) -> dict[str, Any]:
     if not base_catalog.strip():
         raise ValueError("base_catalog is required")
     if not partners:
-        raise ValueError("at least one --partner SURVEY:RADIUS_ARCSEC is required")
+        raise ValueError(
+            "at least one --partner SURVEY:RADIUS_ARCSEC or "
+            "SURVEY:col:MATCH_ID:COL_A:COL_B is required"
+        )
+    normalised: list[dict[str, Any]] = []
+    for p in partners:
+        mode = partner_match_mode(p)
+        survey = str(p.get("survey", "")).strip()
+        if not survey:
+            raise ValueError("partner missing 'survey'")
+        if mode == "column":
+            for key in ("match_id", "match_col_a", "match_col_b"):
+                if not p.get(key):
+                    raise ValueError(f"column partner {survey!r} missing {key!r}")
+            from data_lake.io.crossmatch import validate_match_id
+
+            validate_match_id(str(p["match_id"]))
+            normalised.append({
+                "survey": survey,
+                "match_mode": "column",
+                "match_id": str(p["match_id"]),
+                "match_col_a": str(p["match_col_a"]),
+                "match_col_b": str(p["match_col_b"]),
+            })
+        else:
+            radius = p.get("radius_arcsec")
+            if radius is None:
+                raise ValueError(f"sky partner {survey!r} missing 'radius_arcsec'")
+            radius_f = float(radius)
+            if radius_f <= 0:
+                raise ValueError(f"radius must be positive, got {radius_f}")
+            normalised.append({
+                "survey": survey,
+                "match_mode": "sky",
+                "radius_arcsec": radius_f,
+            })
     return {
         "base_catalog": base_catalog.strip(),
-        "partners": [
-            {"survey": survey, "radius_arcsec": radius}
-            for survey, radius in partners
-        ],
+        "partners": normalised,
         "reuse_existing": reuse_existing,
     }
 
