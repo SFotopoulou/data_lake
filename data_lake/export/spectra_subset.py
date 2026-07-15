@@ -145,6 +145,7 @@ try:
     from ..cli_utils import (
         config_option,
         load_optional_config,
+        progress_option,
     )
 
     @click.command("dl-extract-spectra-subset")
@@ -222,6 +223,7 @@ try:
         "--no-calibration-sidecar", is_flag=True, default=False,
         help="Do not write *.calibration.json beside the output.",
     )
+    @progress_option
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         survey_name: str,
@@ -240,6 +242,7 @@ try:
         flux_scale: float | None,
         apply_survey_calibration: bool,
         no_calibration_sidecar: bool,
+        show_progress: bool,
         verbose: bool,
     ) -> None:
         """Extract a curated subset of spectra (Zarr, Parquet, HDF5, or FITS)."""
@@ -317,7 +320,7 @@ try:
             fmt=fmt,
             missing=missing,
             chunks_per_shard=chunks_per_shard,
-            show_progress=True,
+            show_progress=show_progress,
             overwrite=overwrite,
             fits_filename_template=fits_filename_template,
             fits_layout=layout,

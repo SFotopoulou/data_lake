@@ -364,6 +364,7 @@ try:
         configure_cli_logging,
         load_optional_config,
         logging_options,
+        progress_option,
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
@@ -430,6 +431,7 @@ try:
             "Implies --check-only behaviour for column names."
         ),
     )
+    @progress_option
     @logging_options
     def cli(
         output_root: Path | None,
@@ -444,6 +446,7 @@ try:
         check_cutouts: bool,
         normalize_column_names: bool,
         check_padded_columns: bool,
+        show_progress: bool,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -534,7 +537,7 @@ try:
             rebuild_link_id=rebuild_link_id,
             allow_incomplete_link_id=allow_incomplete_link_id,
             normalize_column_names=normalize_column_names,
-            show_progress=not quiet,
+            show_progress=show_progress and not quiet,
         )
         n_ok = n_fail = 0
         for res in results:

@@ -1019,6 +1019,7 @@ try:
         load_optional_config,
         logging_options,
         pick,
+        progress_option,
         require_ingest_permission,
         require_output_root,
         resolve_log_level,
@@ -1102,6 +1103,7 @@ try:
         help="Patch _spectrum_index in the Parquet catalog at end "
              "(skipped silently if no catalog exists for this survey).",
     )
+    @progress_option
     @logging_options
     def cli(
         output_root: Path | None,
@@ -1121,6 +1123,7 @@ try:
         log_file_path: Path | None,
         on_duplicate: str,
         update_catalog: bool,
+        show_progress: bool,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -1200,6 +1203,7 @@ try:
             max_in_flight=max_in_flight,
             max_open_tiles=max_open_tiles,
             files_per_worker=files_per_worker,
+            show_progress=show_progress and not quiet,
         )
 
         click.echo(

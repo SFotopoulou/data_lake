@@ -77,7 +77,7 @@ dl-extract-catalog --lake-root /data/lake --survey zCOSMOS_DR3 \
 
 # 100M+ rows: tiled export (parallel STILTS / bounded memory)
 dl-extract-catalog --lake-root /data/lake --survey GAIA_DR3 \
-  --output-dir /scratch/gaia_sky/ -c source_id -c ra -c dec --progress
+  --output-dir /scratch/gaia_sky/ -c source_id -c ra -c dec
 
 # Large FITS before ingest
 dl-extract-catalog huge_cat.fits -o sky.parquet --streaming \
@@ -89,7 +89,7 @@ dl-extract-catalog --file-list catalog_paths.txt -o all_a.parquet \
 
 # Full gathered product → single FITS (or Parquet/CSV/VOTable)
 dl-extract-catalog --lake-root /data/lake --survey EUCLID_north_joined \
-  --all-columns -o EUCLID_north_joined.fits --format fits --progress
+  --all-columns -o EUCLID_north_joined.fits --format fits
 
 # -o writes one merged file; --output-dir writes a HATS tile tree (Parquet only)
 ```
@@ -102,7 +102,7 @@ tile-by-tile like ingest. Use ``dl-extract-catalog`` only when an external tool
 ```bash
 # Positional catalog↔catalog match at lake scale (survey A defines partition)
 dl-crossmatch SURVEY_A SURVEY_B /data/lake \
-  --radius-arcsec 1.0 --n-workers 8 --progress
+  --radius-arcsec 1.0 --n-workers 8
 
 # Per-survey sky columns / Norder (defaults: each catalog_info.json)
 dl-crossmatch SURVEY_A SURVEY_B /data/lake \
@@ -115,7 +115,7 @@ dl-crossmatch SURVEY_A SURVEY_B /data/lake \
 # GPU sky matching (optional [rapids] extra; same match semantics as default)
 uv sync --extra rapids
 dl-crossmatch DESI_DR1 GAIA_DR3 /data/lake \
-  --radius-arcsec 1.0 --match-backend rapids --gpu-id 0 --n-workers 1 --progress
+  --radius-arcsec 1.0 --match-backend rapids --gpu-id 0 --n-workers 1
 ```
 
 **GPU backend (`--match-backend rapids`)** — uses cuML nearest-neighbour on
@@ -156,7 +156,7 @@ attach `crossmatch_plan` with [`dl-area set-crossmatch`](areas-cli.md) (or
 
 ```bash
 # Run the area's crossmatch_plan, bounded to the area region (reuses + gap-fills)
-dl-crossmatch /data/lake --from-area Euclid_North --n-workers 8 --progress
+dl-crossmatch /data/lake --from-area Euclid_North --n-workers 8
 
 # Or a standalone plan file (no region restriction)
 dl-crossmatch /data/lake --plan plans/euclid_partners.json
@@ -207,12 +207,12 @@ Example: `crossmatch/EUCLID_DR1_x_DESI_DR1__col_desi_targetid_a1b2c3d4/`
 
 If you know that matched IDs can span arbitrary sky positions, pre-partition both catalogs by the shared key outside the lake before ingesting.
 
-**Performance and progress:** Both `--n-workers` and `--progress` apply to column mode.  With `--progress`, a tqdm bar tracks completed A tiles.  Without it, a log line is emitted every 50 tiles (and every 30 s in parallel mode) with tile count and row count so far.
+**Performance and progress:** Progress bars are on by default (`--no-progress` to disable).  `--n-workers` / `--tiles-per-worker` apply to column mode.  When progress is disabled, a log line is emitted every 50 tiles (and every 30 s in parallel mode) with tile count and row count so far.
 
 ```bash
 dl-crossmatch A B /data/lake \
   --match-mode column --match-id tid --match-col-a ID --match-col-b ID \
-  --n-workers 4 --tiles-per-worker 8 --progress
+  --n-workers 4 --tiles-per-worker 8
 ```
 
 **Limitations:**

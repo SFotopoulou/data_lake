@@ -164,7 +164,7 @@ dl-region /data/lake --cone 150.1 2.2 --radius-arcsec 600 --save-as MyCone
 # 2. Attach plans (dl-area) — see commands above
 
 # 3. Match base × partners inside the cone
-dl-crossmatch /data/lake --from-area MyCone --n-workers 8 --progress
+dl-crossmatch /data/lake --from-area MyCone --n-workers 8
 
 # 4. Materialise the joined product catalog
 dl-gather /data/lake --from-area MyCone

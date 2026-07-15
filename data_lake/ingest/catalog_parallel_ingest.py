@@ -525,15 +525,16 @@ try:
     from ..cli_utils import (
         config_option,
         configure_cli_logging,
+        fits_memmap_option,
         ingest_token_option,
         load_optional_config,
         logging_options,
         pick,
+        progress_option,
         require_ingest_permission,
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
-        fits_memmap_option,
     )
     from data_lake.ingest.catalog_cli_options import (
         allow_incomplete_link_id_option,
@@ -601,7 +602,7 @@ try:
         default=None,
     )
     @click.option("--failures-log", type=click.Path(path_type=Path), default=None)
-    @click.option("--no-progress", is_flag=True)
+    @progress_option
     @click.option(
         "--no-skip-completed",
         is_flag=True,
@@ -637,7 +638,7 @@ try:
         partition_by_dir: bool,
         checkpoint: Path | None,
         failures_log: Path | None,
-        no_progress: bool,
+        show_progress: bool,
         no_skip_completed: bool,
         fits_memmap: str,
         log_file: Path | None,
@@ -676,7 +677,7 @@ try:
             compact=compact,
             checkpoint_path=checkpoint or default_ck,
             failures_log=failures_log,
-            show_progress=not no_progress,
+            show_progress=show_progress,
             skip_completed=not no_skip_completed,
             max_in_flight=max_in_flight,
             fits_memmap=fits_memmap.lower(),

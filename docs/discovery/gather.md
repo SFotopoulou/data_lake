@@ -189,7 +189,7 @@ tree (Parquet only).
 
 ```bash
 dl-extract-catalog --survey EDFF-test-01 \
-  --all-columns -o EDFF-test-01.fits --format fits --progress
+  --all-columns -o EDFF-test-01.fits --format fits
 ```
 
 With ``$DATA_LAKE_CONFIG`` set (or ``--config``), ``--lake-root`` is optional when

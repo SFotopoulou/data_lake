@@ -702,6 +702,7 @@ try:
         ingest_token_option,
         load_optional_config,
         logging_options,
+        progress_option,
         require_ingest_permission,
         require_output_root,
         resolve_log_level,
@@ -738,13 +739,7 @@ try:
         help="Parallel worker processes for catalog tile patching. "
              "Default 1 (serial). Use cpu_count()-1 for large surveys.",
     )
-    @click.option(
-        "--progress/--no-progress",
-        "show_progress",
-        default=True,
-        show_default=True,
-        help="Show tqdm progress bars (Zarr scan + catalog patch). On by default.",
-    )
+    @progress_option
     @click.argument("lake_root", type=click.Path(path_type=Path), required=False)
     @config_option
     @ingest_token_option

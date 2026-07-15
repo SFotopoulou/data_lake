@@ -2131,6 +2131,7 @@ try:
         configure_cli_logging,
         load_optional_config,
         logging_options,
+        progress_option,
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
@@ -2178,7 +2179,7 @@ try:
         is_flag=True,
         help="Scan every HEALPix pixel (slow); default is survey-A populated tiles only.",
     )
-    @click.option("--progress", "show_progress", is_flag=True, help="Show tile progress bar.")
+    @progress_option
     @click.option(
         "--n-workers",
         default=1,
@@ -2295,6 +2296,8 @@ try:
         if gpu_id < 0:
             raise click.ClickException("--gpu-id must be >= 0")
 
+        effective_progress = show_progress and not quiet
+
         # ---- column mode: dl-crossmatch A B [LAKE] --match-mode column ... ----
         if match_mode == "column":
             if from_area is not None or plan_file is not None:
@@ -2330,7 +2333,7 @@ try:
                     norder_a=norder_a,
                     norder_b=norder_b,
                     populated_tiles_only=not all_tiles,
-                    show_progress=show_progress,
+                    show_progress=effective_progress,
                     n_workers=n_workers,
                     tiles_per_worker=tiles_per_worker,
                     export_parquet=export_parquet,
@@ -2373,7 +2376,7 @@ try:
                     tiles_per_worker=tiles_per_worker,
                     match_backend=match_backend,  # type: ignore[arg-type]
                     gpu_id=gpu_id,
-                    show_progress=show_progress,
+                    show_progress=effective_progress,
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
@@ -2413,7 +2416,7 @@ try:
             dec_col_b=dec_col_b,
             overwrite=overwrite,
             populated_tiles_only=not all_tiles,
-            show_progress=show_progress,
+            show_progress=effective_progress,
             n_workers=n_workers,
             tiles_per_worker=tiles_per_worker,
             match_backend=match_backend,  # type: ignore[arg-type]

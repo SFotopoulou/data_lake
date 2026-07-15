@@ -539,6 +539,7 @@ try:
         load_optional_config,
         logging_options,
         pick,
+        progress_option,
         require_ingest_permission,
         require_output_root,
         validate_quiet_verbose,
@@ -695,6 +696,7 @@ try:
         show_default=True,
         help="Patch _spectrum_index in the Parquet catalog after ingest.",
     )
+    @progress_option
     @logging_options
     def cli(
         output_root: Path | None,
@@ -720,6 +722,7 @@ try:
         failures_log: Path | None,
         log_file_path: Path | None,
         update_catalog: bool,
+        show_progress: bool,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -812,6 +815,7 @@ try:
             on_length_mismatch=on_length_mismatch,
             max_in_flight=max_in_flight,
             max_open_tiles=max_open_tiles,
+            show_progress=show_progress and not quiet,
         )
 
         click.echo(

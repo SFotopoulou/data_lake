@@ -48,15 +48,15 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-validate-catalog-ingest` | Check Parquet tiles for required columns and schema (`--survey` or `--all`) |
 | `dl-validate-spectra-ingest` | Check Zarr spectrum tiles (`--survey` or `--all`) |
 | `dl-validate-cutout-ingest` | Check Zarr cutout tiles (`--survey` or `--all`) |
-| `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`); `--n-workers N` for parallel Zarr scan; `--progress` for tqdm bars |
+| `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`); `--n-workers N` for parallel Zarr scan; progress on by default (`--no-progress` to disable) |
 | `dl-widen-spectrum-tiles` | Pad narrower `Npix=*.zarr` tiles to survey `n_pix` in `spectrum_info.json` (`--survey` or `--all`) |
 
 **Export and extract**
 
 | Command | Purpose |
 |---------|---------|
-| `dl-extract-spectra-subset` | Export a curated ID list → flat Zarr / Parquet / HDF5 / FITS |
-| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; `--all-columns` for full schema |
+| `dl-extract-spectra-subset` | Export a curated ID list → flat Zarr / Parquet / HDF5 / FITS; progress on by default (`--no-progress` to disable) |
+| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; `--all-columns` for full schema; progress on by default (`--no-progress` to disable) |
 | `dl-extract-spplate-catalog` | Build a specObj-style catalog from spPlate files |
 | `dl-pack-tile` | Package one HEALPix tile as a `.tar` for sharing |
 
@@ -71,10 +71,10 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); rounded counts, `--count` exact, `--save-as` area, `--export-moc`, `--moc-format fits\|json\|ascii` ([docs](discovery/regions-and-areas.md)) |
 | `dl-area` | Manage `areas/<id>.json`: `list`, `show`, `validate`, `set-crossmatch`, `set-gather`, `set-homogenize`, `import` ([docs](discovery/areas-cli.md)) |
 | `dl-export-moc` | Write survey tile footprint (or region-clipped) as IVOA MOC FITS/JSON/ASCII; `--moc-order` ([docs](discovery/regions-and-areas.md#export-as-moc)) |
-| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--matches-only` (default: keep all base rows), partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities` ([docs](discovery/gather.md)) |
+| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--matches-only` (default: keep all base rows), partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities`; progress on by default (`--no-progress`) ([docs](discovery/gather.md)) |
 | **Workflow** | End-to-end region → ML export: [discovery/workflow.md](discovery/workflow.md), [notebook](../notebooks/14_discovery_workflow.ipynb) |
 | `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
-| `dl-crossmatch` | Catalog↔catalog match at lake scale; sky mode (default, `--radius-arcsec`) or column equality (`--match-mode column --match-id ID --match-col-a COL --match-col-b COL`); `--from-area`/`--plan` for region-bounded sky plans |
+| `dl-crossmatch` | Catalog↔catalog match at lake scale; sky mode (default, `--radius-arcsec`) or column equality (`--match-mode column --match-id ID --match-col-a COL --match-col-b COL`); `--from-area`/`--plan` for region-bounded sky plans; progress on by default (`--no-progress`) |
 | `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |
 
 **Visualisation**
@@ -87,7 +87,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-homogenize` | Apply transform registry to a survey+region → homogenized product catalog ([docs](homogenization.md)) |
+| `dl-homogenize` | Apply transform registry to a survey+region → homogenized product catalog; progress on by default (`--no-progress`) ([docs](homogenization.md)) |
 | `dl-validate-homogenization` | Lint transform registry, golden spot checks, homogenized product validation |
 | `dl-mcp-docs` | Stdio MCP server: search docs, describe lake/survey (requires `--extra mcp`) |
 | `dl-mcp-lake` | Stdio MCP server: region discovery, provenance, query builder, QA, ingest advisor ([docs](mcp-lake.md)) |

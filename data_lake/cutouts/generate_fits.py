@@ -278,6 +278,8 @@ def generate_cutout_fits(
 try:
     import click
 
+    from data_lake.cli_utils import progress_option
+
     @click.command("dl-generate-cutout-fits")
     @click.argument("catalog_path", type=click.Path(exists=True, path_type=Path))
     @click.argument("output_dir", type=click.Path(path_type=Path))
@@ -295,7 +297,7 @@ try:
     @click.option("--filename-template", default="cutout_{source_id}.fits", show_default=True)
     @click.option("--max-sources", default=None, type=int)
     @click.option("--skip-existing", is_flag=True)
-    @click.option("--no-progress", is_flag=True)
+    @progress_option
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         catalog_path: Path,
@@ -314,7 +316,7 @@ try:
         filename_template: str,
         max_sources: int | None,
         skip_existing: bool,
-        no_progress: bool,
+        show_progress: bool,
         verbose: bool,
     ) -> None:
         """Cut stamps from band images into per-source FITS for lake ingest."""
@@ -341,7 +343,7 @@ try:
             filename_template=filename_template,
             max_sources=max_sources,
             skip_existing=skip_existing,
-            show_progress=not no_progress,
+            show_progress=show_progress,
         )
         click.echo(
             f"Wrote {result.n_written} cutout FITS to {result.output_dir} "

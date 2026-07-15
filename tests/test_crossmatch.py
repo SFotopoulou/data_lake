@@ -1208,7 +1208,7 @@ class TestColumnCrossmatchCLI:
         assert "--match-id" in result.output
 
     def test_cli_column_mode_with_progress(self, tmp_path: Path) -> None:
-        """--progress flag exits 0 in column mode."""
+        """Default progress (and explicit --no-progress) exit 0 in column mode."""
         from click.testing import CliRunner
         from data_lake.io.crossmatch import cli
 
@@ -1219,9 +1219,19 @@ class TestColumnCrossmatchCLI:
             "--match-id", "obj_id",
             "--match-col-a", "OBJ_ID",
             "--match-col-b", "OBJ_ID",
-            "--progress",
         ])
         assert result.exit_code == 0, result.output
+
+        result_off = CliRunner().invoke(cli, [
+            "SRC", "PARTNER", str(lake),
+            "--match-mode", "column",
+            "--match-id", "obj_id2",
+            "--match-col-a", "OBJ_ID",
+            "--match-col-b", "OBJ_ID",
+            "--no-progress",
+            "--overwrite",
+        ])
+        assert result_off.exit_code == 0, result_off.output
 
     def test_cli_sky_mode_unchanged(self, tmp_path: Path) -> None:
         """Sky mode still works after adding column-mode flags."""

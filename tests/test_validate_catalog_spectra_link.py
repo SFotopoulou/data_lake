@@ -540,7 +540,7 @@ class TestIndexedPathRegression:
         lake, _ = _make_indexed_lake(tmp_path)
         result = CliRunner().invoke(
             cli,
-            ["--survey", SURVEY, "--n-workers", "2", "--progress", str(lake)],
+            ["--survey", SURVEY, "--n-workers", "2", "--no-progress", str(lake)],
         )
         assert result.exit_code == 0, result.output
         assert "OK:" in result.output

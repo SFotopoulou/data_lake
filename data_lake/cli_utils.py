@@ -64,6 +64,17 @@ def fits_memmap_option(f: F) -> F:
     )(f)
 
 
+def progress_option(f: F) -> F:
+    """Add ``--progress/--no-progress`` (progress on by default) to a click command."""
+    return click.option(
+        "--progress/--no-progress",
+        "show_progress",
+        default=True,
+        show_default=True,
+        help="Show tqdm progress bars. On by default; use --no-progress to disable.",
+    )(f)
+
+
 def apply_fits_memmap_env(fits_memmap: str) -> None:
     """Set ``DATA_LAKE_FITS_MEMMAP`` so ``FitsReadPolicy.from_env()`` matches the CLI flag."""
     os.environ["DATA_LAKE_FITS_MEMMAP"] = fits_memmap.strip().lower()

@@ -1069,6 +1069,7 @@ try:
         config_option,
         configure_cli_logging,
         load_optional_config,
+        progress_option,
         require_output_root,
     )
     from .validate_cli import (
@@ -1123,13 +1124,7 @@ try:
         help="Parallel worker processes for Zarr tile validation. "
              "Default 1 (serial). Use cpu_count()-1 for large surveys.",
     )
-    @click.option(
-        "--progress",
-        "show_progress",
-        is_flag=True,
-        default=False,
-        help="Show tqdm progress bars (catalog index scan + Zarr tile validation).",
-    )
+    @progress_option
     def cli(
         output_root: Path | None,
         config_path: Path | None,

@@ -136,15 +136,16 @@ try:
         HeartbeatReporter,
         config_option,
         configure_cli_logging,
+        fits_memmap_option,
         ingest_token_option,
         load_optional_config,
         logging_options,
         pick,
+        progress_option,
         require_ingest_permission,
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
-        fits_memmap_option,
     )
     from data_lake.ingest.fits_to_parquet import ingest_catalog
     from data_lake.ingest.catalog_cli_options import (
@@ -193,7 +194,7 @@ try:
         default=None,
         help="Append-only JSONL for per-file failures.",
     )
-    @click.option("--no-progress", is_flag=True, help="Disable tqdm progress bar.")
+    @progress_option
     @click.option(
         "--no-skip-completed",
         is_flag=True,
@@ -264,7 +265,7 @@ try:
         streaming: bool,
         checkpoint: Path | None,
         failures_log: Path | None,
-        no_progress: bool,
+        show_progress: bool,
         no_skip_completed: bool,
         columns: str | None,
         compact: bool,
@@ -323,7 +324,7 @@ try:
                 compact=compact,
                 checkpoint_path=checkpoint or default_ck,
                 failures_log=failures_log,
-                show_progress=not no_progress,
+                show_progress=show_progress,
                 skip_completed=not no_skip_completed,
                 max_in_flight=max_in_flight,
                 fits_memmap=fits_memmap.lower(),
@@ -359,7 +360,7 @@ try:
             lake_root=lake,
             checkpoint=checkpoint,
             failures_log=failures_log,
-            show_progress=not no_progress,
+            show_progress=show_progress,
             skip_completed=not no_skip_completed,
             ingest_one=one,
             default_checkpoint=default_ck,
@@ -405,7 +406,7 @@ try:
     )
     @click.option("--checkpoint", type=click.Path(path_type=Path), default=None)
     @click.option("--failures-log", type=click.Path(path_type=Path), default=None)
-    @click.option("--no-progress", is_flag=True)
+    @progress_option
     @click.option("--no-skip-completed", is_flag=True)
     @click.option(
         "--update-catalog/--no-update-catalog", default=True, show_default=True,
@@ -469,7 +470,7 @@ try:
         on_duplicate: str,
         checkpoint: Path | None,
         failures_log: Path | None,
-        no_progress: bool,
+        show_progress: bool,
         no_skip_completed: bool,
         update_catalog: bool,
         n_workers: int,
@@ -525,7 +526,7 @@ try:
                 on_duplicate=on_duplicate,  # type: ignore[arg-type]
                 checkpoint_path=checkpoint or default_ck,
                 failures_log=failures_log,
-                show_progress=not no_progress,
+                show_progress=show_progress,
                 skip_completed=not no_skip_completed,
                 max_in_flight=max_in_flight,
                 files_per_worker=files_per_worker,
@@ -570,7 +571,7 @@ try:
             lake_root=lake,
             checkpoint=checkpoint,
             failures_log=failures_log,
-            show_progress=not no_progress,
+            show_progress=show_progress,
             skip_completed=not no_skip_completed,
             ingest_one=one,
             default_checkpoint=default_ck,
@@ -680,7 +681,7 @@ try:
     )
     @click.option("--checkpoint", type=click.Path(path_type=Path), default=None)
     @click.option("--failures-log", type=click.Path(path_type=Path), default=None)
-    @click.option("--no-progress", is_flag=True)
+    @progress_option
     @click.option("--no-skip-completed", is_flag=True)
     @click.option(
         "--update-catalog/--no-update-catalog", default=True, show_default=True,
@@ -749,7 +750,7 @@ try:
         on_length_mismatch: str,
         checkpoint: Path | None,
         failures_log: Path | None,
-        no_progress: bool,
+        show_progress: bool,
         no_skip_completed: bool,
         update_catalog: bool,
         n_workers: int,
@@ -827,7 +828,7 @@ try:
                 decode_config=decode_cfg,
                 checkpoint_path=checkpoint or default_ck,
                 failures_log=failures_log,
-                show_progress=not no_progress,
+                show_progress=show_progress,
                 skip_completed=not no_skip_completed,
                 max_in_flight=max_in_flight,
                 max_open_tiles=max_open_tiles,
@@ -887,7 +888,7 @@ try:
             lake_root=lake,
             checkpoint=checkpoint,
             failures_log=failures_log,
-            show_progress=not no_progress,
+            show_progress=show_progress,
             skip_completed=not no_skip_completed,
             ingest_one=one,
             default_checkpoint=default_ck,

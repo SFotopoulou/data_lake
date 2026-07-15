@@ -32,7 +32,7 @@ dl-area set-homogenize MyCone --from-product euclid_native_v1 \
 
 # 3. Validate, then run downstream commands
 dl-area validate MyCone
-dl-crossmatch --from-area MyCone --progress
+dl-crossmatch --from-area MyCone
 dl-gather --from-area MyCone
 dl-homogenize --from-area MyCone
 ```

@@ -108,6 +108,7 @@ try:
         configure_cli_logging,
         load_optional_config,
         logging_options,
+        progress_option,
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
@@ -165,7 +166,7 @@ try:
     @click.option("--npix", default=None, help="npix list/ranges (needs --norder).")
     @click.option("--norder", "npix_norder", type=int, default=None, help="Order for --npix.")
     @click.option("--overwrite", is_flag=True, help="Overwrite an existing product catalog.")
-    @click.option("--progress", "show_progress", is_flag=True, help="Show tile progress bar.")
+    @progress_option
     @click.option("--extract-modalities", "extract_modalities", default=None,
                   help="Comma list (spectra,cutout) to export for product sources.")
     @click.option("--output-dir", "extract_output_dir", type=click.Path(path_type=Path),
@@ -320,7 +321,7 @@ try:
                 keep_all=keep_all,
                 partner_cache=partner_cache,
                 overwrite=overwrite,
-                show_progress=show_progress,
+                show_progress=show_progress and not quiet,
             )
         except (ValueError, FileNotFoundError, FileExistsError) as exc:
             raise click.ClickException(str(exc))

@@ -53,7 +53,7 @@ catalog Parquet tile in a single pass — the same O(n_zarr + n_catalog) pattern
 ``--n-workers``:
 
 ```bash
-dl-rebuild-catalog-indices --survey SDSS_DR17 --kind spectrum --n-workers 8 --progress
+dl-rebuild-catalog-indices --survey SDSS_DR17 --kind spectrum --n-workers 8
 ```
 
 Use ``--strict`` to treat orphan Zarr rows and unpatched catalog warnings as errors.
@@ -75,7 +75,7 @@ tile).  Parallelise with ``--n-workers``:
 
 ```bash
 # Full validation with 8 parallel Zarr-tile workers + tqdm progress bars
-dl-validate-catalog-spectra-link --survey SDSS_DR17 --n-workers 8 --progress
+dl-validate-catalog-spectra-link --survey SDSS_DR17 --n-workers 8
 
 # Smoke test while waiting for the fix — first 50 tiles, sample 200 rows each
 dl-validate-catalog-spectra-link --survey SDSS_DR17 -q --max-tiles 50 --sample 200

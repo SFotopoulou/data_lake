@@ -61,7 +61,7 @@ dl-area "$LAKE" set-homogenize multi_survey_cone --from-product euclid_north_nat
 dl-region "$LAKE" --from-area multi_survey_cone
 
 # 3 — Positional crossmatch (region-bounded, resumable)
-dl-crossmatch "$LAKE" --from-area multi_survey_cone --n-workers 8 --progress
+dl-crossmatch "$LAKE" --from-area multi_survey_cone --n-workers 8
 
 # 4 — Wide native product
 dl-gather "$LAKE" --from-area multi_survey_cone

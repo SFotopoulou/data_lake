@@ -104,6 +104,7 @@ try:
         configure_cli_logging,
         load_optional_config,
         logging_options,
+        progress_option,
         require_output_root,
         resolve_log_level,
         validate_quiet_verbose,
@@ -148,7 +149,7 @@ try:
     @click.option("--check-only", is_flag=True, help="Validate rules and selection; no writes.")
     @click.option("--overwrite", is_flag=True)
     @click.option("--n-workers", type=int, default=8, show_default=True)
-    @click.option("--progress", "show_progress", is_flag=True)
+    @progress_option
     @logging_options
     def cli(
         output_root: Path | None,
@@ -281,7 +282,7 @@ try:
                     overwrite=overwrite,
                     check_only=check_only,
                     n_workers=n_workers,
-                    show_progress=show_progress,
+                    show_progress=show_progress and not quiet,
                 )
             elif modality == MODALITY_CATALOG:
                 result = homogenize_catalog(
@@ -294,7 +295,7 @@ try:
                     overwrite=overwrite,
                     check_only=check_only,
                     n_workers=n_workers,
-                    show_progress=show_progress,
+                    show_progress=show_progress and not quiet,
                 )
             else:
                 zarr_selection = selection
@@ -320,7 +321,7 @@ try:
                     overwrite=overwrite,
                     check_only=check_only,
                     n_workers=n_workers,
-                    show_progress=show_progress,
+                    show_progress=show_progress and not quiet,
                 )
         except (FileNotFoundError, FileExistsError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc

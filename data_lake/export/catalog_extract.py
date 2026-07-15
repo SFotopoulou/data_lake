@@ -1222,7 +1222,7 @@ def extract_catalog(
 
 import click
 
-from data_lake.cli_utils import config_option, load_optional_config
+from data_lake.cli_utils import config_option, load_optional_config, progress_option
 
 
 @click.command("dl-extract-catalog")
@@ -1320,7 +1320,7 @@ from data_lake.cli_utils import config_option, load_optional_config
     type=int,
     help="Row batch size for --streaming FITS export.",
 )
-@click.option("--progress", "show_progress", is_flag=True, help="Show tile progress bar (lake export).")
+@progress_option
 @click.option("-v", "--verbose", is_flag=True)
 def cli(
     paths: tuple[Path, ...],
