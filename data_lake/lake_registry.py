@@ -160,6 +160,20 @@ def _count_parquet_tiles(survey_root: Path) -> int:
     return sum(1 for _ in survey_root.rglob("Npix=*.parquet"))
 
 
+def _sum_parquet_rows(survey_root: Path) -> int | None:
+    """Sum row counts from Parquet footers (no full column read)."""
+    paths = list(survey_root.rglob("Npix=*.parquet"))
+    if not paths:
+        return 0
+    total = 0
+    try:
+        for path in paths:
+            total += int(pq.read_metadata(str(path)).num_rows)
+    except Exception:
+        return None
+    return total
+
+
 def _count_zarr_tiles(survey_root: Path) -> int:
     return sum(1 for _ in _iter_zarr_tiles(survey_root))
 
@@ -292,6 +306,27 @@ def _format_modality_detail(row: dict[str, Any]) -> str:
         width = row.get("width")
         if n_bands is not None and height is not None and width is not None:
             return f"{n_bands}x{height}x{width}"
+    if modality == MODALITY_CROSSMATCH:
+        mode = row.get("match_mode")
+        mid = row.get("match_id")
+        # Infer column mode from the tree name when match_mode was dropped
+        # (legacy registries / heterogeneous from_pylist schemas).
+        if mode != "column":
+            from data_lake.io.crossmatch import parse_column_crossmatch_dirname
+
+            parsed = parse_column_crossmatch_dirname(str(row.get("survey") or ""))
+            if parsed is not None:
+                mode = "column"
+                if mid is None:
+                    mid = parsed[2]
+            elif not mode:
+                mode = "sky"
+        if mode == "column":
+            return f"col:{mid}" if mid else "col"
+        radius = row.get("match_radius_arcsec")
+        if radius is not None:
+            return f"r={radius}\""
+        return "sky"
     return "—"
 
 
@@ -589,10 +624,24 @@ def _info_registry_row(
 
 def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
     """One row per crossmatch tree under the top-level ``crossmatch/`` modality."""
-    from data_lake.io.crossmatch import find_crossmatch_roots
+    from data_lake.io.crossmatch import (
+        find_column_crossmatch_roots,
+        find_crossmatch_roots,
+    )
 
     rows: list[dict[str, Any]] = []
-    for survey_a, survey_b, radius, root in find_crossmatch_roots(lake_root):
+
+    def _row_from_info(
+        *,
+        root: Path,
+        survey_a: str,
+        survey_b: str,
+        match_mode: str,
+        match_radius_arcsec: float | None,
+        match_id: str | None = None,
+        match_col_a: str | None = None,
+        match_col_b: str | None = None,
+    ) -> dict[str, Any]:
         info: dict[str, Any] = {}
         info_path = root / "crossmatch_info.json"
         if info_path.is_file():
@@ -601,23 +650,79 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
                     info = json.load(fh)
             except (OSError, json.JSONDecodeError):
                 info = {}
+        total_rows = info.get("total_rows")
+        if total_rows is None:
+            total_rows = info.get("n_match_rows")
+        if total_rows is None:
+            total_rows = _sum_parquet_rows(root)
+        n_tiles = info.get("n_tiles")
+        if n_tiles is None:
+            n_tiles = _count_parquet_tiles(root)
+        return {
+            "survey": root.name,
+            "modality": MODALITY_CROSSMATCH,
+            "kind": "crossmatch",
+            "path": str(root.relative_to(lake_root)),
+            "hats_order": info.get("hats_order"),
+            "survey_a": info.get("survey_a", survey_a),
+            "survey_b": info.get("survey_b", survey_b),
+            "match_mode": info.get("match_mode", match_mode),
+            "match_radius_arcsec": info.get(
+                "match_radius_arcsec", match_radius_arcsec
+            ),
+            "match_id": info.get("match_id", match_id),
+            "match_col_a": info.get("match_col_a", match_col_a),
+            "match_col_b": info.get("match_col_b", match_col_b),
+            "match_backend": info.get("match_backend"),
+            "total_rows": total_rows,
+            "n_tiles": n_tiles,
+            "schema_version": info.get("schema_version"),
+            "created_utc": info.get("created_utc"),
+        }
+
+    for survey_a, survey_b, radius, root in find_crossmatch_roots(lake_root):
         rows.append(
-            {
-                "survey": root.name,
-                "modality": MODALITY_CROSSMATCH,
-                "kind": "crossmatch",
-                "path": str(root.relative_to(lake_root)),
-                "hats_order": info.get("hats_order"),
-                "survey_a": survey_a,
-                "survey_b": survey_b,
-                "match_radius_arcsec": info.get("match_radius_arcsec", radius),
-                "match_backend": info.get("match_backend"),
-                "n_tiles": _count_parquet_tiles(root),
-                "schema_version": info.get("schema_version"),
-                "created_utc": info.get("created_utc"),
-            }
+            _row_from_info(
+                root=root,
+                survey_a=survey_a,
+                survey_b=survey_b,
+                match_mode="sky",
+                match_radius_arcsec=radius,
+            )
+        )
+    for survey_a, survey_b, match_id, _token, root in find_column_crossmatch_roots(
+        lake_root
+    ):
+        rows.append(
+            _row_from_info(
+                root=root,
+                survey_a=survey_a,
+                survey_b=survey_b,
+                match_mode="column",
+                match_radius_arcsec=None,
+                match_id=match_id,
+            )
         )
     return rows
+
+
+def _align_registry_row_keys(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pad rows so every dict shares the same keys before ``pa.Table.from_pylist``.
+
+    PyArrow builds the schema from the *first* row only: keys that appear only on
+    later rows (e.g. crossmatch ``match_mode`` / ``match_id`` after catalog rows)
+    are silently dropped. Aligning keys first preserves the full union.
+    """
+    if not rows:
+        return rows
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return [{key: row.get(key) for key in keys} for row in rows]
 
 
 def build_lake_registry_table(lake_root: Path | str) -> pa.Table:
@@ -656,7 +761,7 @@ def build_lake_registry_table(lake_root: Path | str) -> pa.Table:
             }
         )
 
-    return pa.Table.from_pylist(rows)
+    return pa.Table.from_pylist(_align_registry_row_keys(rows))
 
 
 def refresh_lake_registry(lake_root: Path | str) -> Path:
@@ -920,18 +1025,19 @@ def format_lake_registry_table(
                         "    spectrum_sky_meta: — (re-ingest for ra_key/dec_key/ra/dec/source_file)"
                     )
     else:
+        survey_w = max(24, max((len(str(s)) for s in df["survey"].to_list()), default=0))
         header = (
-            f"{'survey':<24} {'modality':<10} {'hats':>4} {'cols':>6} {'rows':>14}  "
+            f"{'survey':<{survey_w}} {'modality':<10} {'hats':>4} {'cols':>6} {'rows':>14}  "
             f"{'sky':<16} {'detail':<18} {'id_col':<12} mf"
         )
-        lines.extend([header, "-" * 108])
+        lines.extend([header, "-" * max(108, len(header))])
         for row in df.iter_rows(named=True):
             rows_s = f"{row['total_rows']:,}" if row.get("total_rows") is not None else "—"
             cols_s = str(row["n_columns"]) if row.get("n_columns") is not None else "—"
             hats_s = str(row["hats_order"]) if row.get("hats_order") is not None else "—"
             manifest = "Y" if row.get("has_schema_manifest") else "."
             lines.append(
-                f"{row['survey']:<24} {row['modality']:<10} {hats_s:>4} {cols_s:>6} "
+                f"{row['survey']:<{survey_w}} {row['modality']:<10} {hats_s:>4} {cols_s:>6} "
                 f"{rows_s:>14}  {_format_sky_columns(row):<16} "
                 f"{_format_modality_detail(row):<18} "
                 f"{str(row.get('link_id_column') or '—'):<12} {manifest}"

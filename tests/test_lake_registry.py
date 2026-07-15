@@ -31,7 +31,7 @@ from data_lake.lake_registry import (
     summarize_registry_row_counts,
     write_master_meta,
 )
-from data_lake.schema_registry import MODALITY_CATALOG, MODALITY_SPECTRA
+from data_lake.schema_registry import MODALITY_CATALOG, MODALITY_CROSSMATCH, MODALITY_SPECTRA
 
 
 def _ingest_mini_catalog(
@@ -264,6 +264,66 @@ def test_summarize_registry_row_counts(tmp_path: Path) -> None:
     assert "By modality:" in text
     assert f"  {MODALITY_CATALOG}" in text
     assert "Total: 12 rows" in text
+
+
+
+def test_registry_crossmatch_total_rows(tmp_path: Path) -> None:
+    """Match counts in crossmatch_info.json surface as registry total_rows."""
+    # Catalog first: exercises from_pylist schema alignment (catalogs precede XM).
+    _ingest_mini_catalog(tmp_path, "SURV_REG")
+    lake = tmp_path / "lake"
+    xm_root = lake / "crossmatch" / "A_x_B__r1"
+    xm_root.mkdir(parents=True)
+    (xm_root / "crossmatch_info.json").write_text(json.dumps({
+        "catalog_name": "A_x_B__r1",
+        "modality": "crossmatch",
+        "match_mode": "sky",
+        "survey_a": "A",
+        "survey_b": "B",
+        "match_radius_arcsec": 1.0,
+        "hats_order": 5,
+        "total_rows": 12345,
+        "n_match_rows": 12345,
+        "n_tiles": 3,
+        "schema_version": "1",
+    }))
+    col_root = lake / "crossmatch" / "A_x_C__col_tid_abcdef01"
+    col_root.mkdir(parents=True)
+    (col_root / "crossmatch_info.json").write_text(json.dumps({
+        "catalog_name": "A_x_C__col_tid_abcdef01",
+        "modality": "crossmatch",
+        "match_mode": "column",
+        "survey_a": "A",
+        "survey_b": "C",
+        "match_id": "tid",
+        "match_col_a": "ID",
+        "match_col_b": "ID",
+        "total_rows": 99,
+        "n_match_rows": 99,
+        "n_tiles": 1,
+        "schema_version": "1",
+    }))
+
+    refresh_lake_registry(lake)
+    table = load_lake_registry(lake)
+    assert "match_mode" in table.schema.names
+    assert "match_id" in table.schema.names
+    rows = {
+        r["survey"]: r
+        for r in table.to_pylist()
+        if r["modality"] == MODALITY_CROSSMATCH
+    }
+    assert rows["A_x_B__r1"]["total_rows"] == 12345
+    assert rows["A_x_C__col_tid_abcdef01"]["total_rows"] == 99
+    assert rows["A_x_C__col_tid_abcdef01"]["match_mode"] == "column"
+    assert rows["A_x_C__col_tid_abcdef01"]["match_id"] == "tid"
+
+    text = format_lake_registry_table(table)
+    assert "12,345" in text
+    assert "99" in text
+    assert "r=1" in text
+    assert "col:tid" in text
+    assert "A_x_C__col_tid_abcdef01" in text
 
 
 def test_describe_lake_count_total_cli(tmp_path: Path) -> None:

@@ -1241,6 +1241,8 @@ def build_crossmatch(
         radius_arcsec,
         match_backend=match_backend,
         gpu_id=gpu_id,
+        n_match_rows=n_match_rows,
+        n_tiles=n_tiles_written,
     )
     parquet_path, fits_path = _export_crossmatch_outputs(
         out_root,
@@ -1316,11 +1318,14 @@ def _write_xm_info(
     *,
     match_backend: MatchBackend = "astropy",
     gpu_id: int = 0,
+    n_match_rows: int = 0,
+    n_tiles: int | None = None,
 ) -> None:
     info = {
         "catalog_name": xm_name,
         "catalog_type": "association",
         "modality": "crossmatch",
+        "match_mode": "sky",
         "survey_a": survey_a,
         "survey_b": survey_b,
         "match_radius_arcsec": radius_arcsec,
@@ -1333,6 +1338,9 @@ def _write_xm_info(
         "survey_a_dec_column": settings.survey_a.dec_col,
         "survey_b_ra_column": settings.survey_b.ra_col,
         "survey_b_dec_column": settings.survey_b.dec_col,
+        "total_rows": int(n_match_rows),
+        "n_match_rows": int(n_match_rows),
+        "n_tiles": n_tiles,
         "schema_version": "1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -1635,6 +1643,9 @@ def _write_column_xm_info(
     match_id: str,
     match_col_a: str,
     match_col_b: str,
+    *,
+    n_match_rows: int = 0,
+    n_tiles: int | None = None,
 ) -> None:
     token = column_crossmatch_token(match_col_a, match_col_b)
     info = {
@@ -1652,6 +1663,9 @@ def _write_column_xm_info(
         "hats_order": norder_a,
         "survey_a_norder": norder_a,
         "survey_b_norder": norder_b,
+        "total_rows": int(n_match_rows),
+        "n_match_rows": int(n_match_rows),
+        "n_tiles": n_tiles,
         "schema_version": "1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -1897,6 +1911,8 @@ def build_column_crossmatch(
     _write_column_xm_info(
         out_root, xm_name, survey_a, survey_b,
         norder_a, norder_b, match_id, match_col_a, match_col_b,
+        n_match_rows=n_match_rows,
+        n_tiles=n_tiles_written,
     )
     parquet_path, fits_path = _export_crossmatch_outputs(
         out_root, norder_a,

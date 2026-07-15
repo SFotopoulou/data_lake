@@ -494,6 +494,9 @@ class TestBuildCrossmatchRapids:
         )
         assert info["match_backend"] == "rapids"
         assert info["gpu_id"] == 0
+        assert info["total_rows"] == 1
+        assert info["n_match_rows"] == 1
+        assert info.get("match_mode", "sky") == "sky"
 
 
 class TestCrossmatchExport:
@@ -970,6 +973,9 @@ class TestColumnCrossmatchEngine:
         assert info["match_col_a"] == "KEY"
         assert info["match_col_b"] == "KEY"
         assert info["match_radius_arcsec"] is None
+        assert info["total_rows"] == 1
+        assert info["n_match_rows"] == 1
+        assert info["n_tiles"] == 1
 
     def test_find_and_resolve_column_root(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
