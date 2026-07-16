@@ -308,21 +308,26 @@ def _format_modality_detail(row: dict[str, Any]) -> str:
             return f"{n_bands}x{height}x{width}"
     if modality == MODALITY_CROSSMATCH:
         mode = row.get("match_mode")
-        mid = row.get("match_id")
+        col_a = row.get("match_col_a")
+        col_b = row.get("match_col_b")
         # Infer column mode from the tree name when match_mode was dropped
-        # (legacy registries / heterogeneous from_pylist schemas).
-        if mode != "column":
+        # (mixed Arrow schemas from heterogeneous from_pylist).
+        if mode != "column" and (not col_a or not col_b):
             from data_lake.io.crossmatch import parse_column_crossmatch_dirname
 
             parsed = parse_column_crossmatch_dirname(str(row.get("survey") or ""))
             if parsed is not None:
                 mode = "column"
-                if mid is None:
-                    mid = parsed[2]
+                if not col_a:
+                    col_a = parsed[2]
+                if not col_b:
+                    col_b = parsed[3]
             elif not mode:
                 mode = "sky"
         if mode == "column":
-            return f"col:{mid}" if mid else "col"
+            if col_a and col_b:
+                return f"col:{col_a}:{col_b}"
+            return "col"
         radius = row.get("match_radius_arcsec")
         if radius is not None:
             return f"r={radius}\""
@@ -638,7 +643,6 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
         survey_b: str,
         match_mode: str,
         match_radius_arcsec: float | None,
-        match_id: str | None = None,
         match_col_a: str | None = None,
         match_col_b: str | None = None,
     ) -> dict[str, Any]:
@@ -670,7 +674,6 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
             "match_radius_arcsec": info.get(
                 "match_radius_arcsec", match_radius_arcsec
             ),
-            "match_id": info.get("match_id", match_id),
             "match_col_a": info.get("match_col_a", match_col_a),
             "match_col_b": info.get("match_col_b", match_col_b),
             "match_backend": info.get("match_backend"),
@@ -690,7 +693,7 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
                 match_radius_arcsec=radius,
             )
         )
-    for survey_a, survey_b, match_id, _token, root in find_column_crossmatch_roots(
+    for survey_a, survey_b, col_a, col_b, root in find_column_crossmatch_roots(
         lake_root
     ):
         rows.append(
@@ -700,7 +703,8 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
                 survey_b=survey_b,
                 match_mode="column",
                 match_radius_arcsec=None,
-                match_id=match_id,
+                match_col_a=col_a,
+                match_col_b=col_b,
             )
         )
     return rows
@@ -710,7 +714,7 @@ def _align_registry_row_keys(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     """Pad rows so every dict shares the same keys before ``pa.Table.from_pylist``.
 
     PyArrow builds the schema from the *first* row only: keys that appear only on
-    later rows (e.g. crossmatch ``match_mode`` / ``match_id`` after catalog rows)
+    later rows (e.g. crossmatch ``match_mode`` / ``match_col_a`` after catalog rows)
     are silently dropped. Aligning keys first preserves the full union.
     """
     if not rows:

@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Column crossmatch tree naming simplified** — tree directories are now `{A}_x_{B}__col_{col_a}__{col_b}` (column names embedded, `__` separator). The previous `--match-id` label and Blake2 hex token are dropped. `dl-crossmatch` no longer requires `--match-id`; partner specs change from `SURVEY:col:MATCH_ID:COL_A:COL_B` to `SURVEY:col:COL_A:COL_B`. `dl-describe-lake` detail now shows `col:COL_A:COL_B` — paste directly into a partner spec. No backwards compatibility with `__col_<id>_<hex>` trees; re-run crossmatch.
+
 ### Fixed
 
-- **`dl-describe-lake` / lake registry** — crossmatch fields (`match_mode`, `match_id`, …) are no longer dropped when catalogs are present (PyArrow `from_pylist` takes the first-row schema). Column trees keep `detail=col:<id>`; survey column width expands for long `__col_` names.
+- **`dl-describe-lake` / lake registry** — crossmatch fields (`match_mode`, `match_col_a`, …) are no longer dropped when catalogs are present (PyArrow `from_pylist` takes the first-row schema). Column trees show `detail=col:<col_a>:<col_b>`; survey column width adapts for long `__col_` names.
 
 ## [0.5.0] - 2026-07-07
 

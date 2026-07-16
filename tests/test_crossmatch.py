@@ -18,7 +18,6 @@ from data_lake.io.crossmatch import (
     build_crossmatch,
     build_column_crossmatch,
     column_crossmatch_name,
-    column_crossmatch_token,
     crossmatch_root,
     export_crossmatch_flat,
     find_column_crossmatch_roots,
@@ -32,7 +31,6 @@ from data_lake.io.crossmatch import (
     healpix_pixels_covering_tile,
     survey_b_pixels_for_tile,
     tile_search_cone,
-    validate_match_id,
     _crossmatch_tile_worker,
 )
 from data_lake.io.crossmatch_matchers import rapids_available
@@ -783,31 +781,23 @@ def _write_catalog_tile_with_col(
 
 
 class TestColumnCrossmatchNaming:
-    def test_token_is_stable(self) -> None:
-        t1 = column_crossmatch_token("TARGETID", "TARGETID")
-        t2 = column_crossmatch_token("TARGETID", "TARGETID")
-        assert t1 == t2
-        assert len(t1) == 8
+    def test_name_format(self) -> None:
+        name = column_crossmatch_name("EUCLID", "DESI", "TARGETID", "TARGETID")
+        assert name == "EUCLID_x_DESI__col_TARGETID__TARGETID"
 
-    def test_different_col_pairs_different_tokens(self) -> None:
-        t1 = column_crossmatch_token("col_a", "col_b")
-        t2 = column_crossmatch_token("col_a", "col_c")
-        assert t1 != t2
-
-    def test_column_crossmatch_name_format(self) -> None:
-        name = column_crossmatch_name("EUCLID", "DESI", "tid", "TARGETID", "TARGETID")
-        token = column_crossmatch_token("TARGETID", "TARGETID")
-        assert name == f"EUCLID_x_DESI__col_tid_{token}"
+    def test_name_different_cols(self) -> None:
+        name = column_crossmatch_name("A", "B", "col1", "col2")
+        assert name == "A_x_B__col_col1__col2"
 
     def test_parse_round_trip(self) -> None:
-        name = column_crossmatch_name("A", "B", "myid", "col1", "col2")
+        name = column_crossmatch_name("A", "B", "col1", "col2")
         parsed = parse_column_crossmatch_dirname(name)
         assert parsed is not None
-        a, b, mid, tok = parsed
+        a, b, col_a, col_b = parsed
         assert a == "A"
         assert b == "B"
-        assert mid == "myid"
-        assert tok == column_crossmatch_token("col1", "col2")
+        assert col_a == "col1"
+        assert col_b == "col2"
 
     def test_parse_sky_name_returns_none(self) -> None:
         assert parse_column_crossmatch_dirname("A_x_B__r1.0") is None
@@ -815,20 +805,24 @@ class TestColumnCrossmatchNaming:
     def test_parse_invalid_returns_none(self) -> None:
         assert parse_column_crossmatch_dirname("notaname") is None
 
-    def test_validate_match_id_ok(self) -> None:
-        validate_match_id("desi-targetid")
-        validate_match_id("my.col.v1")
-        validate_match_id("abc123")
+    def test_validate_match_column_ok(self) -> None:
+        from data_lake.io.crossmatch import validate_match_column
 
-    def test_validate_match_id_bad(self) -> None:
+        validate_match_column("TARGETID", "--match-col-a")
+        validate_match_column("my.col.v1", "--match-col-a")
+        validate_match_column("abc123", "--match-col-a")
+
+    def test_validate_match_column_bad(self) -> None:
+        from data_lake.io.crossmatch import validate_match_column
+
         with pytest.raises(ValueError):
-            validate_match_id("")
+            validate_match_column("", "--match-col-a")
         with pytest.raises(ValueError):
-            validate_match_id("bad__id")
+            validate_match_column("bad__col", "--match-col-a")
         with pytest.raises(ValueError):
-            validate_match_id("bad_x_id")
+            validate_match_column("bad_x_col", "--match-col-a")
         with pytest.raises(ValueError):
-            validate_match_id("bad id")
+            validate_match_column("bad col", "--match-col-a")
 
 
 class TestColumnCrossmatchEngine:
@@ -849,10 +843,9 @@ class TestColumnCrossmatchEngine:
             extra_col="TARGETID", extra_values=[100, 999],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "tid", "TARGETID", "TARGETID")
+        result = build_column_crossmatch(lake, "A", "B", "TARGETID", "TARGETID")
         assert result.n_match_rows == 1
         assert result.match_mode == "column"
-        assert result.match_id == "tid"
         assert result.match_col_a == "TARGETID"
         assert result.match_col_b == "TARGETID"
         assert result.radius_arcsec == 0.0
@@ -881,7 +874,7 @@ class TestColumnCrossmatchEngine:
             extra_col="KEY", extra_values=[42, 42],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "key", "KEY", "KEY")
+        result = build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
         assert result.n_match_rows == 2
 
         tbl = load_crossmatch_table(result.output_root)
@@ -906,7 +899,7 @@ class TestColumnCrossmatchEngine:
             extra_col="ID_B", extra_values=[777],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "my_id", "ID_A", "ID_B")
+        result = build_column_crossmatch(lake, "A", "B", "ID_A", "ID_B")
         assert result.n_match_rows == 1
 
     def test_null_keys_excluded(self, tmp_path: Path) -> None:
@@ -926,10 +919,10 @@ class TestColumnCrossmatchEngine:
             extra_col="TARGETID", extra_values=[100],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "tid", "TARGETID", "TARGETID")
+        result = build_column_crossmatch(lake, "A", "B", "TARGETID", "TARGETID")
         assert result.n_match_rows == 1
 
-    def test_tree_name_contains_match_id(self, tmp_path: Path) -> None:
+    def test_tree_name_contains_column_names(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         norder = 5
         ra, dec = 120.0, 45.0
@@ -945,8 +938,10 @@ class TestColumnCrossmatchEngine:
             extra_col="KEY", extra_values=[1],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "desi_tid", "KEY", "KEY")
-        assert "__col_desi_tid_" in result.crossmatch_name
+        result = build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
+        assert "__col_KEY__KEY" in result.crossmatch_name
+        # no hex token suffix
+        assert not any(result.crossmatch_name.endswith(c) for c in "0123456789abcdef" if len(c) == 1 and result.crossmatch_name[-8:].isalnum())
 
     def test_crossmatch_info_written(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
@@ -964,12 +959,12 @@ class TestColumnCrossmatchEngine:
             extra_col="KEY", extra_values=[5],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+        result = build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
         info_path = result.output_root / "crossmatch_info.json"
         assert info_path.is_file()
         info = json.loads(info_path.read_text())
         assert info["match_mode"] == "column"
-        assert info["match_id"] == "myid"
+        assert "match_id" not in info
         assert info["match_col_a"] == "KEY"
         assert info["match_col_b"] == "KEY"
         assert info["match_radius_arcsec"] is None
@@ -993,12 +988,13 @@ class TestColumnCrossmatchEngine:
             extra_col="KEY", extra_values=[9],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "testid", "KEY", "KEY")
+        result = build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
         found = find_column_crossmatch_roots(lake, "A", "B")
         assert len(found) == 1
-        assert found[0][2] == "testid"
+        col_a, col_b = found[0][2], found[0][3]
+        assert col_a == "KEY" and col_b == "KEY"
 
-        resolved = resolve_column_crossmatch_root(lake, "A", "B", "testid")
+        resolved = resolve_column_crossmatch_root(lake, "A", "B", "KEY", "KEY")
         assert resolved == result.output_root
 
     def test_reuse_guard_mismatch(self, tmp_path: Path) -> None:
@@ -1016,19 +1012,19 @@ class TestColumnCrossmatchEngine:
             source_ids=[10], ra=[ra], dec=[dec],
             extra_col="KEY", extra_values=[1],
         )
-        build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+        build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
 
         # Tamper with the sidecar to simulate a mismatch
-        result = build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+        result = build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
         info_path = result.output_root / "crossmatch_info.json"
         info = json.loads(info_path.read_text())
         info["match_col_a"] = "DIFFERENT"
         info_path.write_text(json.dumps(info))
 
         with pytest.raises(ValueError, match="different"):
-            build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY")
+            build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
         # overwrite bypasses
-        build_column_crossmatch(lake, "A", "B", "myid", "KEY", "KEY", overwrite=True)
+        build_column_crossmatch(lake, "A", "B", "KEY", "KEY", overwrite=True)
 
     def test_non_overlapping_tile_produces_no_match(self, tmp_path: Path) -> None:
         """Key match only in a non-overlapping B tile → no association row (locality)."""
@@ -1077,7 +1073,7 @@ class TestColumnCrossmatchEngine:
             extra_col="KEY", extra_values=[99],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "nbr", "KEY", "KEY")
+        result = build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
         assert result.n_match_rows == 1
         tbl = load_crossmatch_table(result.output_root)
         assert tbl["healpix_npix_b"][0].as_py() == npix
@@ -1113,7 +1109,7 @@ class TestColumnCrossmatchEngine:
             extra_col="KEY", extra_values=[77],
         )
 
-        result = build_column_crossmatch(lake, "A", "B", "pad", "KEY", "KEY")
+        result = build_column_crossmatch(lake, "A", "B", "KEY", "KEY")
         assert result.n_match_rows == 1
         tbl = load_crossmatch_table(result.output_root)
         assert tbl["healpix_npix_b"][0].as_py() == npix_b
@@ -1144,7 +1140,7 @@ class TestColumnCrossmatchEngine:
             source_ids=[10, 20], ra=[ra, ra + 0.01], dec=[dec, dec + 0.01],
             extra_col="K", extra_values=[1, 2],
         )
-        result = build_column_crossmatch(lake, "A", "B", "wk", "K", "K", n_workers=1)
+        result = build_column_crossmatch(lake, "A", "B", "K", "K", n_workers=1)
         assert result.n_match_rows == 2
         assert result.n_workers == 1
 
@@ -1175,13 +1171,12 @@ class TestColumnCrossmatchCLI:
         result = CliRunner().invoke(cli, [
             "SRC", "PARTNER", str(lake),
             "--match-mode", "column",
-            "--match-id", "obj_id",
             "--match-col-a", "OBJ_ID",
             "--match-col-b", "OBJ_ID",
         ])
         assert result.exit_code == 0, result.output
         assert "1 association row" in result.output
-        assert "__col_obj_id_" in result.output
+        assert "__col_OBJ_ID__OBJ_ID" in result.output
 
     def test_cli_column_mode_rejects_from_area(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
@@ -1191,7 +1186,6 @@ class TestColumnCrossmatchCLI:
         result = CliRunner().invoke(cli, [
             "SRC", "PARTNER", str(lake),
             "--match-mode", "column",
-            "--match-id", "obj_id",
             "--match-col-a", "OBJ_ID",
             "--match-col-b", "OBJ_ID",
             "--from-area", "Field1",
@@ -1199,7 +1193,8 @@ class TestColumnCrossmatchCLI:
         assert result.exit_code != 0
         assert "column" in result.output.lower()
 
-    def test_cli_column_mode_missing_match_id(self, tmp_path: Path) -> None:
+    def test_cli_column_mode_missing_col(self, tmp_path: Path) -> None:
+        """--match-col-a and --match-col-b are both required."""
         from click.testing import CliRunner
         from data_lake.io.crossmatch import cli
 
@@ -1208,10 +1203,9 @@ class TestColumnCrossmatchCLI:
             "SRC", "PARTNER", str(lake),
             "--match-mode", "column",
             "--match-col-a", "OBJ_ID",
-            "--match-col-b", "OBJ_ID",
         ])
         assert result.exit_code != 0
-        assert "--match-id" in result.output
+        assert "--match-col-b" in result.output
 
     def test_cli_column_mode_with_progress(self, tmp_path: Path) -> None:
         """Default progress (and explicit --no-progress) exit 0 in column mode."""
@@ -1222,7 +1216,6 @@ class TestColumnCrossmatchCLI:
         result = CliRunner().invoke(cli, [
             "SRC", "PARTNER", str(lake),
             "--match-mode", "column",
-            "--match-id", "obj_id",
             "--match-col-a", "OBJ_ID",
             "--match-col-b", "OBJ_ID",
         ])
@@ -1231,7 +1224,6 @@ class TestColumnCrossmatchCLI:
         result_off = CliRunner().invoke(cli, [
             "SRC", "PARTNER", str(lake),
             "--match-mode", "column",
-            "--match-id", "obj_id2",
             "--match-col-a", "OBJ_ID",
             "--match-col-b", "OBJ_ID",
             "--no-progress",

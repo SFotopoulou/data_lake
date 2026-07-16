@@ -230,10 +230,10 @@ def validate_area(data: dict[str, Any]) -> list[str]:
             mode = p.get("match_mode")
             if mode is None:
                 mode = "column" if (
-                    p.get("match_id") or p.get("match_col_a") or p.get("match_col_b")
+                    p.get("match_col_a") or p.get("match_col_b")
                 ) else "sky"
             if mode == "column":
-                for key in ("match_id", "match_col_a", "match_col_b"):
+                for key in ("match_col_a", "match_col_b"):
                     if not p.get(key):
                         msgs.append(
                             f"ERROR: crossmatch_plan column partner "

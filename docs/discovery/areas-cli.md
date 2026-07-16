@@ -87,7 +87,7 @@ dl-area set-crossmatch MyCone \
 | Flag | Required | Meaning |
 |------|----------|---------|
 | `--base` | yes | Base catalog survey (HEALPix partitioning for the match). |
-| `--partner` | yes (repeat) | Sky: `SURVEY:RADIUS_ARCSEC`. Column equality: `SURVEY:col:MATCH_ID:COL_A:COL_B`. |
+| `--partner` | yes (repeat) | Sky: `SURVEY:RADIUS_ARCSEC`. Column equality: `SURVEY:col:COL_A:COL_B`. |
 | `--no-reuse-existing` | no | Set `reuse_existing: false` (rebuild all tiles). |
 
 Written JSON shape (same as hand-edited areas):
@@ -100,7 +100,6 @@ Written JSON shape (same as hand-edited areas):
     {
       "survey": "DESI_DR1",
       "match_mode": "column",
-      "match_id": "desi_tid",
       "match_col_a": "TARGETID",
       "match_col_b": "TARGETID"
     }
@@ -109,7 +108,7 @@ Written JSON shape (same as hand-edited areas):
 }
 ```
 
-`dl-gather --from-area` resolves sky trees by radius and column trees by `match_id`.
+`dl-gather --from-area` resolves sky trees by radius and column trees by column pair.
 
 See [Crossmatch — region-bounded plans](crossmatch.md#region-bounded-plans---from-area---plan).
 

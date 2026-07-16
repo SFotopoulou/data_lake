@@ -35,10 +35,9 @@ class TestAreaPlanHelpers:
         }
 
     def test_parse_column_partner(self) -> None:
-        assert parse_partner_spec("DESI_DR1:col:desi_tid:TARGETID:TARGETID") == {
+        assert parse_partner_spec("DESI_DR1:col:TARGETID:TARGETID") == {
             "survey": "DESI_DR1",
             "match_mode": "column",
-            "match_id": "desi_tid",
             "match_col_a": "TARGETID",
             "match_col_b": "TARGETID",
         }
@@ -63,12 +62,13 @@ class TestAreaPlanHelpers:
             "EUCLID",
             [
                 parse_partner_spec("ALLWISE:2.0"),
-                parse_partner_spec("DESI_DR1:col:desi_tid:TARGETID:TARGETID"),
+                parse_partner_spec("DESI_DR1:col:TARGETID:TARGETID"),
             ],
         )
         assert plan["partners"][0]["match_mode"] == "sky"
         assert plan["partners"][1]["match_mode"] == "column"
-        assert plan["partners"][1]["match_id"] == "desi_tid"
+        assert plan["partners"][1]["match_col_a"] == "TARGETID"
+        assert plan["partners"][1]["match_col_b"] == "TARGETID"
 
 
 class TestAreaCli:
@@ -90,7 +90,7 @@ class TestAreaCli:
                 str(lake), "set-crossmatch", "MyCone",
                 "--base", "EUCLID_DR1",
                 "--partner", "ALLWISE:2.0",
-                "--partner", "DESI_DR1:col:desi_tid:TARGETID:TARGETID",
+                "--partner", "DESI_DR1:col:TARGETID:TARGETID",
             ],
         )
         assert r.exit_code == 0, r.output
@@ -98,7 +98,8 @@ class TestAreaCli:
         partners = area.crossmatch_plan["partners"]
         assert partners[0]["match_mode"] == "sky"
         assert partners[1]["match_mode"] == "column"
-        assert partners[1]["match_id"] == "desi_tid"
+        assert partners[1]["match_col_a"] == "TARGETID"
+        assert partners[1]["match_col_b"] == "TARGETID"
 
     def test_set_crossmatch_and_gather(self, lake: Path) -> None:
         runner = CliRunner()

@@ -5,7 +5,7 @@
 | `_spectrum_index` all -1 after ingest | `_source_id` mismatch between catalog and spectra (different link key) | Check `--link-id-col` on catalog vs spectrum format; run `dl-validate-catalog-spectra-link --survey NAME` |
 | `_spectrum_index` all -1 after repair | Spectra not ingested yet, or `dl-rebuild-catalog-indices` not run | Run `dl-rebuild-catalog-indices --survey NAME --kind spectrum` |
 | Registry row counts stale | Registry not refreshed since last ingest | `dl-describe-lake --refresh --count-total` |
-| Column crossmatch tree missing / detail shows `sky` | Registry built before the tree existed, or crossmatch fields dropped from registry schema | `dl-describe-lake --refresh`; look for `__col_<match_id>_…` under modality `crossmatch` (`detail` should be `col:<id>`) |
+| Column crossmatch tree missing / detail shows `sky` | Registry built before the tree existed, or crossmatch fields dropped from registry schema | `dl-describe-lake --refresh`; look for `__col_<col_a>__<col_b>` under modality `crossmatch` (`detail` shows `col:<col_a>:<col_b>`) |
 | Batch job killed mid-run, catalog tiles exist but no manifest | `dl-finalize-catalog` not run | `dl-finalize-catalog --survey NAME` then `dl-refresh-lake-registry` |
 | Catalog ingest very slow / tqdm stuck at 0/N | FITS is **packed-vector** (STILTS colfits, `NAXIS2=1`) | Run `dl-check-fits-table-format`; re-export row-normal FITS or Parquet |
 | `Referenced column "dec" not found; Candidate bindings: " dec"` during crossmatch or query | Survey was ingested with padded FITS TTYPE column names before automatic stripping was added | Run `dl-repair-catalog-metadata /data/lake --survey ALLWISE --normalize-column-names` |

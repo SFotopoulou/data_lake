@@ -55,7 +55,6 @@ class PartnerSpec:
     radius_arcsec: float | None = None
     columns: list[str] = field(default_factory=list)
     match_mode: str = "sky"
-    match_id: str | None = None
     match_col_a: str | None = None
     match_col_b: str | None = None
 
@@ -290,13 +289,13 @@ def gather_product(
     xm_roots: dict[str, Path] = {}
     for p in partners:
         if p.match_mode == "column":
-            if not p.match_id:
+            if not p.match_col_a or not p.match_col_b:
                 raise ValueError(
-                    f"column partner {p.survey!r} missing match_id; "
-                    "set it in crossmatch_plan or PartnerSpec"
+                    f"column partner {p.survey!r} missing match_col_a/match_col_b; "
+                    "set them in crossmatch_plan or PartnerSpec"
                 )
             root = resolve_column_crossmatch_root(
-                lake_root, base, p.survey, p.match_id,
+                lake_root, base, p.survey, p.match_col_a, p.match_col_b,
             )
         else:
             if p.radius_arcsec is None:
@@ -310,7 +309,7 @@ def gather_product(
     for p in partners:
         if not xm_roots[p.survey].is_dir():
             if p.match_mode == "column":
-                detail = f"match_id={p.match_id!r}"
+                detail = f"col_a={p.match_col_a!r}, col_b={p.match_col_b!r}"
             else:
                 detail = f"r={p.radius_arcsec}"
             raise FileNotFoundError(
@@ -462,7 +461,6 @@ def _write_product_info(
                     "survey": p.survey,
                     "match_mode": p.match_mode,
                     "radius_arcsec": p.radius_arcsec,
-                    "match_id": p.match_id,
                     "match_col_a": p.match_col_a,
                     "match_col_b": p.match_col_b,
                     "columns": p.columns,
@@ -612,8 +610,8 @@ def partners_from_columns(
     """Build PartnerSpec list from a ``{survey: [cols]}`` mapping (excludes base).
 
     *radii* supplies sky partners.  *column_partners* maps survey → column-mode
-    plan fields (``match_id``, ``match_col_a``, ``match_col_b``).  A survey must
-    appear in exactly one of the two maps.
+    plan fields (``match_col_a``, ``match_col_b``).  A survey must appear in
+    exactly one of the two maps.
     """
     column_partners = column_partners or {}
     specs: list[PartnerSpec] = []
@@ -627,7 +625,6 @@ def partners_from_columns(
                 radius_arcsec=None,
                 columns=list(cols),
                 match_mode="column",
-                match_id=str(meta["match_id"]),
                 match_col_a=str(meta.get("match_col_a", "")),
                 match_col_b=str(meta.get("match_col_b", "")),
             ))
@@ -660,7 +657,6 @@ def partners_meta_from_crossmatch_plan(
             continue
         if partner_match_mode(p) == "column":
             column_partners[survey] = {
-                "match_id": p.get("match_id"),
                 "match_col_a": p.get("match_col_a"),
                 "match_col_b": p.get("match_col_b"),
             }

@@ -19,8 +19,8 @@ def parse_partner_spec(value: str) -> dict[str, Any]:
 
     Column equality::
 
-        SURVEY:col:MATCH_ID:COL_A:COL_B
-        e.g. DESI_DR1:col:desi_targetid:TARGETID:TARGETID
+        SURVEY:col:COL_A:COL_B
+        e.g. DESI_DR1:col:TARGETID:TARGETID
 
     Returns a dict suitable for ``crossmatch_plan.partners[]``.
     """
@@ -29,26 +29,23 @@ def parse_partner_spec(value: str) -> dict[str, Any]:
         raise ValueError("empty partner spec")
 
     parts = raw.split(":")
-    if len(parts) >= 5 and parts[1].lower() == "col":
+    if len(parts) >= 4 and parts[1].lower() == "col":
         survey = parts[0].strip()
-        match_id = parts[2].strip()
-        match_col_a = parts[3].strip()
-        match_col_b = ":".join(parts[4:]).strip()
+        match_col_a = parts[2].strip()
+        match_col_b = ":".join(parts[3:]).strip()
         if not survey:
             raise ValueError(f"empty survey in column partner spec {value!r}")
-        if not match_id:
-            raise ValueError(f"empty match_id in column partner spec {value!r}")
         if not match_col_a or not match_col_b:
             raise ValueError(
-                f"column partner must be SURVEY:col:MATCH_ID:COL_A:COL_B, got {value!r}"
+                f"column partner must be SURVEY:col:COL_A:COL_B, got {value!r}"
             )
-        from data_lake.io.crossmatch import validate_match_id
+        from data_lake.io.crossmatch import validate_match_column
 
-        validate_match_id(match_id)
+        validate_match_column(match_col_a, "--match-col-a")
+        validate_match_column(match_col_b, "--match-col-b")
         return {
             "survey": survey,
             "match_mode": "column",
-            "match_id": match_id,
             "match_col_a": match_col_a,
             "match_col_b": match_col_b,
         }
@@ -56,12 +53,12 @@ def parse_partner_spec(value: str) -> dict[str, Any]:
     if ":" not in raw:
         raise ValueError(
             f"partner must be SURVEY:RADIUS_ARCSEC or "
-            f"SURVEY:col:MATCH_ID:COL_A:COL_B, got {value!r}"
+            f"SURVEY:col:COL_A:COL_B, got {value!r}"
         )
-    # Incomplete column form, e.g. SURVEY:col:id (missing columns)
+    # Incomplete column form, e.g. SURVEY:col (missing columns)
     if len(parts) >= 2 and parts[1].lower() == "col":
         raise ValueError(
-            f"column partner must be SURVEY:col:MATCH_ID:COL_A:COL_B, got {value!r}"
+            f"column partner must be SURVEY:col:COL_A:COL_B, got {value!r}"
         )
 
     survey, radius_s = raw.rsplit(":", 1)
@@ -73,7 +70,7 @@ def parse_partner_spec(value: str) -> dict[str, Any]:
     except ValueError as exc:
         raise ValueError(
             f"invalid radius in partner spec {value!r} "
-            f"(expected SURVEY:RADIUS_ARCSEC or SURVEY:col:MATCH_ID:COL_A:COL_B)"
+            f"(expected SURVEY:RADIUS_ARCSEC or SURVEY:col:COL_A:COL_B)"
         ) from exc
     if radius <= 0:
         raise ValueError(f"radius must be positive, got {radius}")
@@ -89,7 +86,7 @@ def partner_match_mode(partner: dict[str, Any]) -> str:
     mode = partner.get("match_mode")
     if mode in ("sky", "column"):
         return mode
-    if partner.get("match_id") or partner.get("match_col_a") or partner.get("match_col_b"):
+    if partner.get("match_col_a") or partner.get("match_col_b"):
         return "column"
     return "sky"
 
@@ -105,7 +102,7 @@ def build_crossmatch_plan(
     if not partners:
         raise ValueError(
             "at least one --partner SURVEY:RADIUS_ARCSEC or "
-            "SURVEY:col:MATCH_ID:COL_A:COL_B is required"
+            "SURVEY:col:COL_A:COL_B is required"
         )
     normalised: list[dict[str, Any]] = []
     for p in partners:
@@ -114,16 +111,16 @@ def build_crossmatch_plan(
         if not survey:
             raise ValueError("partner missing 'survey'")
         if mode == "column":
-            for key in ("match_id", "match_col_a", "match_col_b"):
+            for key in ("match_col_a", "match_col_b"):
                 if not p.get(key):
                     raise ValueError(f"column partner {survey!r} missing {key!r}")
-            from data_lake.io.crossmatch import validate_match_id
+            from data_lake.io.crossmatch import validate_match_column
 
-            validate_match_id(str(p["match_id"]))
+            validate_match_column(str(p["match_col_a"]), "--match-col-a")
+            validate_match_column(str(p["match_col_b"]), "--match-col-b")
             normalised.append({
                 "survey": survey,
                 "match_mode": "column",
-                "match_id": str(p["match_id"]),
                 "match_col_a": str(p["match_col_a"]),
                 "match_col_b": str(p["match_col_b"]),
             })

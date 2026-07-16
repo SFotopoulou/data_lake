@@ -170,14 +170,14 @@ A plan is the `crossmatch_plan` block of an area (see
  "partners": [
    {"survey": "ALLWISE", "match_mode": "sky", "radius_arcsec": 2.0},
    {"survey": "DESI_DR1", "match_mode": "column",
-    "match_id": "desi_tid", "match_col_a": "TARGETID", "match_col_b": "TARGETID"}
+    "match_col_a": "TARGETID", "match_col_b": "TARGETID"}
  ],
  "reuse_existing": true}
 ```
 
 Existing tiles are skipped (resume), so re-running after more live tiles arrive
-only fills gaps. Column partners are written as ``__col_<match_id>_…`` trees;
-``dl-gather --from-area`` resolves them by ``match_id``. See [`dl-gather`](gather.md)
+only fills gaps. Column partners are written as ``__col_<col_a>__<col_b>`` trees;
+``dl-gather --from-area`` resolves them by the column pair. See [`dl-gather`](gather.md)
 to materialise the joined columns.
 
 **Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A
@@ -195,16 +195,17 @@ When two catalogs already share a common identifier column (e.g. `TARGETID`, `SO
 ```bash
 dl-crossmatch SURVEY_A SURVEY_B /data/lake \
   --match-mode column \
-  --match-id desi_targetid \
   --match-col-a TARGETID \
   --match-col-b TARGETID
 ```
 
 `--match-col-a` and `--match-col-b` may have different names in each survey; both are cast to string before comparison.  All matching pairs are written (many-to-many); `sep_arcsec` is set to `0.0`.
 
-**Output tree name:** `{A}_x_{B}__col_{match_id}_{token}` where `{match_id}` is the human-readable label you supply and `{token}` is an 8-hex-char hash of the column pair so different column combinations never collide under the same id.
+**Output tree name:** `{A}_x_{B}__col_{col_a}__{col_b}` — the column names are directly embedded in the path, so `dl-describe-lake` shows exactly what you need to reconstruct the partner spec.
 
-Example: `crossmatch/EUCLID_DR1_x_DESI_DR1__col_desi_targetid_a1b2c3d4/`
+Example: `crossmatch/EUCLID_DR1_x_DESI_DR1__col_TARGETID__TARGETID/`
+
+**Reading from `dl-describe-lake`:** The `detail` column shows `col:COL_A:COL_B`. To use a column tree as a `dl-gather` partner, pass `SURVEY:col:COL_A:COL_B`, copying the values directly from the describe output.
 
 **Same schema as sky trees:** `source_id_a`, `source_id_b`, `sep_arcsec`, `_healpix_norder{N}`, `healpix_npix_b` — readable by `CrossmatchAccessor` and exportable with `--export-parquet` / `--export-fits`.
 
@@ -216,13 +217,13 @@ If you know that matched IDs can span arbitrary sky positions, pre-partition bot
 
 ```bash
 dl-crossmatch A B /data/lake \
-  --match-mode column --match-id tid --match-col-a ID --match-col-b ID \
+  --match-mode column --match-col-a ID --match-col-b ID \
   --n-workers 4 --tiles-per-worker 8
 ```
 
 **Limitations:**
 - Pair-mode ``--match-mode column`` cannot be combined with ``--from-area`` / ``--plan`` on the same invocation (use plan partners instead — see below).
-- When an area plan includes column partners, ``dl-crossmatch --from-area`` and ``dl-gather --from-area`` resolve ``__col_`` trees by ``match_id``.
+- When an area plan includes column partners, ``dl-crossmatch --from-area`` and ``dl-gather --from-area`` resolve ``__col_`` trees by column pair.
 
 ### Associations with STILTS
 
