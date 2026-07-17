@@ -78,7 +78,35 @@ Each rule operates on one source column and writes one target column. All catalo
 | `target_column` | yes | Output column name in the homogenized product |
 | `uncertainty_column` | no | Native uncertainty column paired with `source_column` |
 | `target_uncertainty_column` | no | Output uncertainty column; must accompany `uncertainty_column` |
-| `native_system` | no | Metadata only (e.g. `"Vega"`); does not affect computation |
+| `uncertainty_transform` | no | Explicit transform for the uncertainty column (same `type` vocabulary as `transform`). When omitted, the engine auto-propagates from the value `transform` type (see uncertainty table above) |
+| `native_system` | no | Metadata only (e.g. `"Vega"`, `"uJy"`); does not affect computation |
+| `transform` | yes | Object with `type` and type-specific parameters |
+
+#### Explicit `uncertainty_transform`
+
+By default, uncertainty is derived from the value `transform` type (see table above). To override that — for example when native errors are in millimag while magnitudes are already in mag — set `uncertainty_transform` on the same rule:
+
+```json
+{
+  "source_column": "phot_g_mean_mag",
+  "target_column": "phot_ab_g",
+  "uncertainty_column": "phot_g_mean_mag_error",
+  "target_uncertainty_column": "phot_ab_g_err",
+  "transform": {"type": "identity"},
+  "uncertainty_transform": {"type": "scale", "factor": 0.001}
+}
+```
+
+Supported `uncertainty_transform` types are the same as value transforms:
+
+| Type | Behaviour on uncertainty |
+|------|--------------------------|
+| `scale` | `err × factor` |
+| `mag_offset` | `err + delta` |
+| `identity` / `null_if_sentinel` | copy, nulled when the value target is null |
+| `flux_to_ab` | `2.5 / ln(10) × dflux / flux` using `source_column` as flux (`zp` unused for the error) |
+
+Requires both `uncertainty_column` and `target_uncertainty_column`.
 
 #### `flux_to_ab` — flux units and zero points
 

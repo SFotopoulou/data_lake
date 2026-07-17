@@ -83,6 +83,7 @@ def resolve_rules_for_product(
                         else None
                     ),
                     target_uncertainty_column=rule.target_uncertainty_column,
+                    uncertainty_transform=rule.uncertainty_transform,
                     native_system=rule.native_system,
                 )
             )

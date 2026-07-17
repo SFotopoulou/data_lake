@@ -51,7 +51,7 @@ All five catalog transform types are supported. Built-in sentinels (`-9999`, `99
 | `null_if_sentinel` | `values` (optional list) | Survey uses non-standard sentinel values (e.g. `99.0`) |
 | `flux_to_ab` | `zp` | Native column is flux; `zp=8.906` for Jy, `zp=23.9` for µJy |
 
-**Pairing uncertainty columns:** set `uncertainty_column` + `target_uncertainty_column` on the same rule entry (not as a separate rule). The engine propagates uncertainty automatically for all types.
+**Pairing uncertainty columns:** set `uncertainty_column` + `target_uncertainty_column` on the same rule entry (not as a separate rule). By default the engine auto-propagates uncertainty from the value `transform` type. Override with an explicit `uncertainty_transform` (same `type` vocabulary) when the error needs a different formula than the value.
 
 ```json
 {
@@ -61,6 +61,19 @@ All five catalog transform types are supported. Built-in sentinels (`-9999`, `99
   "target_uncertainty_column": "phot_ab_w1_err",
   "transform": {"type": "mag_offset", "delta": 2.699},
   "native_system": "Vega"
+}
+```
+
+**Explicit uncertainty transform** (e.g. mmag errors → mag while values pass through):
+
+```json
+{
+  "source_column": "phot_g_mean_mag",
+  "target_column": "phot_ab_g",
+  "uncertainty_column": "phot_g_mean_mag_error",
+  "target_uncertainty_column": "phot_ab_g_err",
+  "transform": {"type": "identity"},
+  "uncertainty_transform": {"type": "scale", "factor": 0.001}
 }
 ```
 

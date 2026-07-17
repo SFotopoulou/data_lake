@@ -11,6 +11,16 @@ _MAG_SENTINELS = (-9999.0, 9999.0, -999.0, 999.0)
 _FLUX_TO_AB_K = 1.0857362047461345  # 2.5 / ln(10)
 
 
+# Catalog transform types shared by value and uncertainty rules.
+CATALOG_TRANSFORM_TYPES = frozenset({
+    "mag_offset",
+    "scale",
+    "identity",
+    "null_if_sentinel",
+    "flux_to_ab",
+})
+
+
 @dataclass(frozen=True)
 class TransformRule:
     survey: str
@@ -19,10 +29,12 @@ class TransformRule:
     transform: dict[str, Any]
     uncertainty_column: str | None = None
     target_uncertainty_column: str | None = None
+    uncertainty_transform: dict[str, Any] | None = None
     native_system: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TransformRule:
+        u_xf = data.get("uncertainty_transform")
         return cls(
             survey=str(data["survey"]),
             source_column=str(data["source_column"]),
@@ -30,6 +42,7 @@ class TransformRule:
             transform=dict(data["transform"]),
             uncertainty_column=data.get("uncertainty_column"),
             target_uncertainty_column=data.get("target_uncertainty_column"),
+            uncertainty_transform=dict(u_xf) if isinstance(u_xf, dict) else None,
             native_system=data.get("native_system"),
         )
 
@@ -182,6 +195,101 @@ def _flux_expr(col: str):
     )
 
 
+def _apply_value_transform(
+    *,
+    source_column: str,
+    transform: dict[str, Any],
+):
+    """Build a Polars expression for a catalog value transform."""
+    import polars as pl
+
+    ttype = transform.get("type")
+    extra: list[float] = [float(v) for v in transform.get("values") or []]
+    src = _mag_expr(source_column, extra)
+    if ttype == "mag_offset":
+        return src + float(transform["delta"])
+    if ttype == "scale":
+        return src * float(transform["factor"])
+    if ttype == "identity":
+        return src
+    if ttype == "null_if_sentinel":
+        return src
+    if ttype == "flux_to_ab":
+        flux = _flux_expr(source_column)
+        zp = float(transform["zp"])
+        return pl.when(flux.is_not_null()).then(-2.5 * flux.log10() + zp).otherwise(None)
+    raise ValueError(f"Unsupported catalog transform type {ttype!r}")
+
+
+def _apply_uncertainty_transform(
+    *,
+    uncertainty_column: str,
+    source_column: str,
+    target_column: str,
+    transform: dict[str, Any],
+):
+    """Build a Polars expression for an explicit uncertainty transform.
+
+    Supported types match value transforms.  ``flux_to_ab`` means flux→mag
+    error propagation using *source_column* as the flux and *uncertainty_column*
+    as ``dflux`` (``zp`` is unused for the error).
+    """
+    import polars as pl
+
+    ttype = transform.get("type")
+    if ttype == "scale":
+        return pl.col(uncertainty_column).cast(pl.Float64) * float(transform["factor"])
+    if ttype == "mag_offset":
+        # Additive offset on an uncertainty is unusual but allowed for parity.
+        return pl.col(uncertainty_column).cast(pl.Float64) + float(transform["delta"])
+    if ttype in ("identity", "null_if_sentinel"):
+        return (
+            pl.when(pl.col(target_column).is_null())
+            .then(None)
+            .otherwise(pl.col(uncertainty_column).cast(pl.Float64))
+        )
+    if ttype == "flux_to_ab":
+        flux = _flux_expr(source_column)
+        dflux = pl.col(uncertainty_column).cast(pl.Float64)
+        return (
+            pl.when(flux.is_not_null())
+            .then(_FLUX_TO_AB_K * dflux / flux)
+            .otherwise(None)
+        )
+    raise ValueError(f"Unsupported uncertainty transform type {ttype!r}")
+
+
+def _default_uncertainty_expr(
+    *,
+    uncertainty_column: str,
+    source_column: str,
+    target_column: str,
+    value_transform: dict[str, Any],
+):
+    """Auto-propagate uncertainty from the value transform type (legacy default)."""
+    import polars as pl
+
+    ttype = value_transform.get("type")
+    if ttype == "scale":
+        return pl.col(uncertainty_column).cast(pl.Float64) * float(
+            value_transform["factor"]
+        )
+    if ttype == "flux_to_ab":
+        flux = _flux_expr(source_column)
+        dflux = pl.col(uncertainty_column).cast(pl.Float64)
+        return (
+            pl.when(flux.is_not_null())
+            .then(_FLUX_TO_AB_K * dflux / flux)
+            .otherwise(None)
+        )
+    # mag_offset, identity, null_if_sentinel: copy, null when target nulled
+    return (
+        pl.when(pl.col(target_column).is_null())
+        .then(None)
+        .otherwise(pl.col(uncertainty_column).cast(pl.Float64))
+    )
+
+
 def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
     """Return a new Polars frame with homogenized columns added."""
     import polars as pl
@@ -195,51 +303,40 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
     for rule in rules:
         if rule.source_column not in out.columns:
             continue
-        ttype = rule.transform.get("type")
-        extra: list[float] = [float(v) for v in rule.transform.get("values") or []]
-        src = _mag_expr(rule.source_column, extra)
-        if ttype == "mag_offset":
-            tgt = src + float(rule.transform["delta"])
-        elif ttype == "scale":
-            tgt = src * float(rule.transform["factor"])
-        elif ttype == "identity":
-            tgt = src
-        elif ttype == "null_if_sentinel":
-            tgt = src
-        elif ttype == "flux_to_ab":
-            flux = _flux_expr(rule.source_column)
-            zp = float(rule.transform["zp"])
-            tgt = pl.when(flux.is_not_null()).then(-2.5 * flux.log10() + zp).otherwise(None)
-        else:
-            raise ValueError(f"Unsupported catalog transform type {ttype!r}")
-
-        out = out.with_columns(tgt.alias(rule.target_column))
-        lineage.append(
-            {
-                "target": rule.target_column,
-                "source": rule.source_column,
-                "survey": rule.survey,
-                "transform": rule.transform,
-            }
+        tgt = _apply_value_transform(
+            source_column=rule.source_column,
+            transform=rule.transform,
         )
+        out = out.with_columns(tgt.alias(rule.target_column))
+        entry: dict[str, Any] = {
+            "target": rule.target_column,
+            "source": rule.source_column,
+            "survey": rule.survey,
+            "transform": rule.transform,
+        }
 
         u_src = rule.uncertainty_column
         u_tgt = rule.target_uncertainty_column
         if u_src and u_tgt and u_src in out.columns:
-            if ttype == "scale":
-                u_expr = pl.col(u_src).cast(pl.Float64) * float(rule.transform["factor"])
-            elif ttype == "flux_to_ab":
-                flux = _flux_expr(rule.source_column)
-                dflux = pl.col(u_src).cast(pl.Float64)
-                u_expr = pl.when(flux.is_not_null()).then(_FLUX_TO_AB_K * dflux / flux).otherwise(None)
+            if rule.uncertainty_transform is not None:
+                u_expr = _apply_uncertainty_transform(
+                    uncertainty_column=u_src,
+                    source_column=rule.source_column,
+                    target_column=rule.target_column,
+                    transform=rule.uncertainty_transform,
+                )
+                entry["uncertainty_transform"] = rule.uncertainty_transform
             else:
-                # For mag_offset, identity, null_if_sentinel: copy uncertainty, null
-                # whenever the target was nulled (source sentinel or NaN).
-                u_expr = pl.when(
-                    pl.col(rule.target_column).is_null()
-                ).then(None).otherwise(pl.col(u_src).cast(pl.Float64))
+                u_expr = _default_uncertainty_expr(
+                    uncertainty_column=u_src,
+                    source_column=rule.source_column,
+                    target_column=rule.target_column,
+                    value_transform=rule.transform,
+                )
             out = out.with_columns(u_expr.alias(u_tgt))
-            lineage[-1]["uncertainty_target"] = u_tgt
+            entry["uncertainty_target"] = u_tgt
+
+        lineage.append(entry)
 
     return out, lineage
 

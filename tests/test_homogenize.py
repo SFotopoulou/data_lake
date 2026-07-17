@@ -145,6 +145,83 @@ class TestTransforms:
         assert out["phot_ab_r_err"][0] == pytest.approx(0.02)
         assert out["phot_ab_r_err"][1] is None  # uncertainty also nulled
 
+    def test_explicit_uncertainty_transform_scale(self) -> None:
+        """uncertainty_transform overrides the default auto-propagation."""
+        import polars as pl
+
+        rule = resolve_applicable_rules(
+            {
+                "transform_id": "phot_ab_v1",
+                "rules": [
+                    {
+                        "survey": "TEST",
+                        "source_column": "mag_r",
+                        "target_column": "phot_ab_r",
+                        "uncertainty_column": "mag_r_err",
+                        "target_uncertainty_column": "phot_ab_r_err",
+                        # value transform is identity (would default-copy err),
+                        # but uncertainty is explicitly scaled
+                        "transform": {"type": "identity"},
+                        "uncertainty_transform": {"type": "scale", "factor": 0.001},
+                    }
+                ],
+            },
+            "TEST",
+            {"mag_r", "mag_r_err"},
+        ).applied[0]
+        df = pl.DataFrame({"mag_r": [17.5], "mag_r_err": [20.0]})
+        out, lin = apply_rules_to_frame(df, [rule])
+        assert out["phot_ab_r"][0] == pytest.approx(17.5)
+        assert out["phot_ab_r_err"][0] == pytest.approx(0.02)
+        assert lin[0]["uncertainty_transform"]["type"] == "scale"
+
+    def test_explicit_uncertainty_transform_flux_to_ab(self) -> None:
+        """Explicit flux_to_ab uncertainty transform uses flux-error propagation."""
+        import polars as pl
+
+        rule = resolve_applicable_rules(
+            {
+                "transform_id": "phot_ab_v1",
+                "rules": [
+                    {
+                        "survey": "TEST",
+                        "source_column": "flux",
+                        "target_column": "phot_ab_w1",
+                        "uncertainty_column": "dflux",
+                        "target_uncertainty_column": "phot_ab_w1_err",
+                        "transform": {"type": "flux_to_ab", "zp": 8.906},
+                        "uncertainty_transform": {"type": "flux_to_ab"},
+                    }
+                ],
+            },
+            "TEST",
+            {"flux", "dflux"},
+        ).applied[0]
+        df = pl.DataFrame({"flux": [1.0], "dflux": [0.1]})
+        out, _ = apply_rules_to_frame(df, [rule])
+        assert out["phot_ab_w1"][0] == pytest.approx(8.906)
+        assert out["phot_ab_w1_err"][0] == pytest.approx(0.1085736, rel=1e-4)
+
+    def test_validate_uncertainty_transform_requires_columns(self) -> None:
+        from data_lake.homogenize.survey_registry import validate_survey_homogenize
+
+        msgs = validate_survey_homogenize({
+            "survey": "TEST",
+            "catalog": {
+                "phot_ab_v1": {
+                    "rules": [
+                        {
+                            "source_column": "mag_r",
+                            "target_column": "phot_ab_r",
+                            "transform": {"type": "identity"},
+                            "uncertainty_transform": {"type": "scale", "factor": 2.0},
+                        }
+                    ]
+                }
+            },
+        })
+        assert any("uncertainty_transform requires" in m for m in msgs)
+
     def test_view_sql(self) -> None:
         t = load_transform(None, "phot_ab_v1")
         sql = build_homogenized_view_sql("ALLWISE", t, lake_root=None)

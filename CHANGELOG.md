@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`uncertainty_transform` on catalog homogenize rules** — optional per-rule transform for uncertainty columns (same types as value transforms: `scale`, `mag_offset`, `identity`, `null_if_sentinel`, `flux_to_ab`). When omitted, auto-propagation from the value `transform` type is unchanged.
+
 ### Changed
 
 - **Column crossmatch tree naming simplified** — tree directories are now `{A}_x_{B}__col_{col_a}__{col_b}` (column names embedded, `__` separator). The previous `--match-id` label and Blake2 hex token are dropped. `dl-crossmatch` no longer requires `--match-id`; partner specs change from `SURVEY:col:MATCH_ID:COL_A:COL_B` to `SURVEY:col:COL_A:COL_B`. `dl-describe-lake` detail now shows `col:COL_A:COL_B` — paste directly into a partner spec. No backwards compatibility with `__col_<id>_<hex>` trees; re-run crossmatch.
