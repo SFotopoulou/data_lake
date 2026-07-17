@@ -24,10 +24,11 @@ from data_lake.homogenize.transforms import (
 )
 from data_lake.ingest.fits_to_parquet import (
     LAKE_JOIN_ID_COLUMN,
+    canonical_arrow_type,
     finalize_catalog_survey,
     healpix_dir,
+    normalize_catalog_table_types,
 )
-from data_lake.io.catalog import CatalogAccessor
 from data_lake.schema_registry import (
     CATALOG_KIND_PRODUCT,
     MODALITY_CATALOG,
@@ -38,6 +39,119 @@ log = logging.getLogger(__name__)
 
 _MAX_WORKERS = 64
 _ZSTD_LEVEL = 3
+
+
+def _storage_type(dtype: pa.DataType) -> pa.DataType:
+    """Canonical Parquet storage type; promote null-only columns to float64."""
+    if pa.types.is_null(dtype):
+        return pa.float64()
+    return canonical_arrow_type(dtype)
+
+
+def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Add missing columns as typed nulls and cast so every tile shares *schema*."""
+    import pyarrow.compute as pc
+
+    arrays: list[pa.Array] = []
+    for field in schema:
+        if field.name not in table.schema.names:
+            arrays.append(pa.nulls(table.num_rows, type=field.type))
+            continue
+        col = table.column(field.name).combine_chunks()
+        if col.type.equals(field.type):
+            arrays.append(col)
+        elif pa.types.is_null(col.type):
+            arrays.append(pa.nulls(len(col), type=field.type))
+        else:
+            arrays.append(pc.cast(col, field.type, safe=False))
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def _homogenize_target_fields(rules: Sequence[TransformRule]) -> list[pa.Field]:
+    """Homogenized photometry columns are always float64 (null when rule skipped)."""
+    fields: list[pa.Field] = []
+    seen: set[str] = set()
+    for rule in rules:
+        for name in (rule.target_column, rule.target_uncertainty_column):
+            if name and name not in seen:
+                fields.append(pa.field(name, pa.float64()))
+                seen.add(name)
+    return fields
+
+
+def build_homogenize_catalog_schema(
+    *,
+    norder: int,
+    ra_col: str,
+    dec_col: str,
+    rules: Sequence[TransformRule],
+    passthrough: Sequence[str] = (),
+) -> pa.Schema:
+    """Canonical schema for ``homogenize_catalog`` output tiles."""
+    fields: list[pa.Field] = [
+        pa.field(LAKE_JOIN_ID_COLUMN, pa.int64()),
+        pa.field(ra_col, pa.float64()),
+        pa.field(dec_col, pa.float64()),
+        pa.field(f"_healpix_norder{norder}", pa.int64()),
+    ]
+    seen = {f.name for f in fields}
+    for col in passthrough:
+        if col not in seen:
+            fields.append(pa.field(col, pa.float64()))
+            seen.add(col)
+    for field in _homogenize_target_fields(rules):
+        if field.name not in seen:
+            fields.append(field)
+            seen.add(field.name)
+    return pa.schema(fields)
+
+
+def build_homogenize_product_schema(
+    source_schema: pa.Schema,
+    rules: Sequence[TransformRule],
+) -> pa.Schema:
+    """Canonical schema for ``homogenize_product``: source columns + AB targets."""
+    fields: list[pa.Field] = [
+        pa.field(f.name, _storage_type(f.type), nullable=True)
+        for f in source_schema
+    ]
+    seen = {f.name for f in fields}
+    for field in _homogenize_target_fields(rules):
+        if field.name not in seen:
+            fields.append(field)
+            seen.add(field.name)
+    for rule in rules:
+        for name in (rule.source_column, rule.uncertainty_column):
+            if name and name not in seen:
+                fields.append(pa.field(name, pa.float64()))
+                seen.add(name)
+    return pa.schema(fields)
+
+
+def union_product_tile_schema(catalog_root: Path) -> pa.Schema:
+    """Union column names/types across product tiles (handles sparse gather)."""
+    from data_lake.ingest.fits_to_parquet import _canonical_merge_types
+
+    catalog_root = Path(catalog_root)
+    types: dict[str, pa.DataType] = {}
+    order: list[str] = []
+    for path in sorted(catalog_root.rglob("Npix=*.parquet")):
+        sch = pq.read_schema(str(path))
+        for field in sch:
+            if field.name not in types:
+                types[field.name] = _storage_type(field.type)
+                order.append(field.name)
+            else:
+                types[field.name] = _canonical_merge_types(types[field.name], field.type)
+    if not order:
+        raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
+    return pa.schema([pa.field(n, types[n], nullable=True) for n in order])
+
+
+def prepare_homogenize_tile(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Align and normalize a homogenized tile before Parquet write."""
+    aligned = _align_table_to_schema(table, schema)
+    return normalize_catalog_table_types(aligned)
 
 
 @dataclass
@@ -240,6 +354,13 @@ def homogenize_catalog(
 
     passthrough_cols = list(passthrough or [])
     rules = resolution.applied
+    out_schema = build_homogenize_catalog_schema(
+        norder=norder,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        rules=rules,
+        passthrough=passthrough_cols,
+    )
     t0 = time.perf_counter()
     n_rows = 0
     n_tiles = 0
@@ -295,6 +416,7 @@ def homogenize_catalog(
     for n, table, lin in results:
         if table is None or n == 0:
             continue
+        table = prepare_homogenize_tile(table, out_schema)
         npix_val = int(table.column(f"_healpix_norder{norder}")[0].as_py())
         tile_dir = out_root / healpix_dir(norder, npix_val)
         tile_dir.mkdir(parents=True, exist_ok=True)
@@ -373,10 +495,11 @@ def homogenize_product(
 
     source_info = _read_source_info(lake_root, from_product)
     provenance = source_info.get("provenance") or {}
-    with CatalogAccessor(lake_root, from_product) as acc:
-        available = set(acc.query("SELECT * FROM catalog LIMIT 0", fmt="arrow").column_names)
-        ra_col = str(source_info.get("ra_column") or "ra")
-        dec_col = str(source_info.get("dec_column") or "dec")
+    product_root = lake_root / "catalogs" / from_product
+    source_schema = union_product_tile_schema(product_root)
+    available = set(source_schema.names)
+    ra_col = str(source_info.get("ra_column") or "ra")
+    dec_col = str(source_info.get("dec_column") or "dec")
 
     resolution = resolve_rules_for_product(
         lake_root, transform, provenance, available, columns=columns,
@@ -410,6 +533,7 @@ def homogenize_product(
         )
 
     rules = resolution.applied
+    out_schema = build_homogenize_product_schema(source_schema, rules)
     t0 = time.perf_counter()
     n_rows = 0
     n_tiles = 0
@@ -464,6 +588,7 @@ def homogenize_product(
     for n, table, lin in results:
         if table is None or n == 0:
             continue
+        table = prepare_homogenize_tile(table, out_schema)
         npix_val = int(table.column(f"_healpix_norder{norder}")[0].as_py())
         tile_dir = out_root / healpix_dir(norder, npix_val)
         tile_dir.mkdir(parents=True, exist_ok=True)

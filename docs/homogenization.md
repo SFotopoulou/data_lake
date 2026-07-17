@@ -214,6 +214,8 @@ dl-extract-catalog --lake-root /data/lake \
 
 `--from-product` implies `product_subtype: homogenized` and writes `extract_provenance.json` (or `*.homogenize_provenance.json` for single-file exports) with `transform_id` and lineage for ML training configs.
 
+**Sparse gather tiles:** when a partner band is missing on some HEALPix tiles, homogenized targets are still written (as null) so every tile shares one Parquet schema. Re-run with `--overwrite` if an older product failed finalize with `AppendRowGroups requires equal schemas`.
+
 **End-to-end workflow** (region → crossmatch → gather → homogenize → export):
 [discovery/workflow.md](discovery/workflow.md) and
 [`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb).

@@ -245,7 +245,7 @@ def _append_null_partner(out, partner: PartnerSpec, sep_name: str, include_sep: 
     import polars as pl
 
     additions = [
-        pl.lit(None).alias(_prefixed(partner.survey, c))
+        pl.lit(None, dtype=pl.Float64).alias(_prefixed(partner.survey, c))
         for c in partner.columns
     ]
     if include_sep:

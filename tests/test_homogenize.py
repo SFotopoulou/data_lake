@@ -409,6 +409,135 @@ class TestHomogenizeProduct:
         )
         assert info["provenance"]["source_product"] == "EUCLID_wise_native"
 
+    def test_from_product_sparse_columns_finalize_metadata(self, tmp_path: Path) -> None:
+        """Tiles missing partner photometry still share one schema after homogenize."""
+        from data_lake.discovery.selection import selection_from_all_tiles
+        from data_lake.homogenize.engine import homogenize_product
+
+        lake = tmp_path / "lake"
+        norder = 5
+        product = "EUCLID_wise_native"
+        hp = f"_healpix_norder{norder}"
+        root = lake / "catalogs" / product
+
+        # Tile with partner photometry
+        rich_dir = root / healpix_dir(norder, 0)
+        rich_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([1], type=pa.int64()),
+                "ra": pa.array([120.0], type=pa.float64()),
+                "dec": pa.array([45.0], type=pa.float64()),
+                hp: pa.array([0], type=pa.int64()),
+                "ALLWISE_w1mpro": pa.array([10.0], type=pa.float64()),
+                "ALLWISE_w1sigmpro": pa.array([0.05], type=pa.float64()),
+            }),
+            rich_dir / "Npix=0.parquet",
+        )
+        # Tile without partner columns (sparse gather)
+        sparse_dir = root / healpix_dir(norder, 10_500)
+        sparse_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([2], type=pa.int64()),
+                "ra": pa.array([121.0], type=pa.float64()),
+                "dec": pa.array([46.0], type=pa.float64()),
+                hp: pa.array([10_500], type=pa.int64()),
+            }),
+            sparse_dir / "Npix=10500.parquet",
+        )
+        (root / "catalog_info.json").write_text(json.dumps({
+            "hats_order": norder,
+            "ra_column": "ra",
+            "dec_column": "dec",
+            "link_id_column": LAKE_JOIN_ID_COLUMN,
+            "kind": "product",
+            "provenance": {
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "ALLWISE", "columns": ["w1mpro", "w1sigmpro"]}],
+            },
+        }))
+        ti.write_tile_index(lake, product, "catalog")
+
+        sel = selection_from_all_tiles(lake, product)
+        result = homogenize_product(
+            lake, product, "phot_ab_v1", sel,
+            materialize_as="EUCLID_wise_ab_sparse",
+        )
+        assert result.n_rows == 2
+        out_root = lake / "catalogs" / "EUCLID_wise_ab_sparse"
+        assert (out_root / "_metadata").is_file()
+        tiles = sorted(out_root.rglob("Npix=*.parquet"))
+        assert len(tiles) == 2
+        schemas = [pq.read_schema(str(p)) for p in tiles]
+        assert schemas[0].equals(schemas[1])
+        assert "phot_ab_w1" in schemas[0].names
+        assert "phot_ab_w1_err" in schemas[0].names
+        assert schemas[0].field("phot_ab_w1").type == pa.float64()
+
+    def test_from_product_null_vs_float_partner_column(self, tmp_path: Path) -> None:
+        """null-typed partner columns unify to float64 across tiles."""
+        from data_lake.discovery.selection import selection_from_all_tiles
+        from data_lake.homogenize.engine import homogenize_product
+
+        lake = tmp_path / "lake"
+        norder = 5
+        product = "EUCLID_wise_native"
+        hp = f"_healpix_norder{norder}"
+        root = lake / "catalogs" / product
+
+        typed_dir = root / healpix_dir(norder, 0)
+        typed_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([1], type=pa.int64()),
+                "ra": pa.array([120.0], type=pa.float64()),
+                "dec": pa.array([45.0], type=pa.float64()),
+                hp: pa.array([0], type=pa.int64()),
+                "ALLWISE_w1mpro": pa.array([10.0], type=pa.float64()),
+                "ALLWISE_w1sigmpro": pa.array([0.05], type=pa.float64()),
+            }),
+            typed_dir / "Npix=0.parquet",
+        )
+        null_dir = root / healpix_dir(norder, 10_500)
+        null_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([2], type=pa.int64()),
+                "ra": pa.array([121.0], type=pa.float64()),
+                "dec": pa.array([46.0], type=pa.float64()),
+                hp: pa.array([10_500], type=pa.int64()),
+                "ALLWISE_w1mpro": pa.array([None], type=pa.null()),
+                "ALLWISE_w1sigmpro": pa.array([None], type=pa.null()),
+            }),
+            null_dir / "Npix=10500.parquet",
+        )
+        (root / "catalog_info.json").write_text(json.dumps({
+            "hats_order": norder,
+            "ra_column": "ra",
+            "dec_column": "dec",
+            "link_id_column": LAKE_JOIN_ID_COLUMN,
+            "kind": "product",
+            "provenance": {
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "ALLWISE", "columns": ["w1mpro", "w1sigmpro"]}],
+            },
+        }))
+        ti.write_tile_index(lake, product, "catalog")
+
+        sel = selection_from_all_tiles(lake, product)
+        result = homogenize_product(
+            lake, product, "phot_ab_v1", sel,
+            materialize_as="EUCLID_wise_ab_null",
+        )
+        assert result.n_rows == 2
+        out_root = lake / "catalogs" / "EUCLID_wise_ab_null"
+        assert (out_root / "_metadata").is_file()
+        for path in out_root.rglob("Npix=*.parquet"):
+            sch = pq.read_schema(str(path))
+            assert sch.field("ALLWISE_w1mpro").type == pa.float64()
+            assert sch.field("phot_ab_w1").type == pa.float64()
+
 
 class TestValidateHomogenization:
     def test_golden_phot_ab(self) -> None:

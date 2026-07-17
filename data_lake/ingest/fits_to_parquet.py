@@ -1556,6 +1556,10 @@ def canonical_arrow_type(dtype: pa.DataType) -> pa.DataType:
 
 def _canonical_merge_types(existing: pa.DataType, incoming: pa.DataType) -> pa.DataType:
     """Pick one Arrow type for append when two files disagree (e.g. float32 vs float64)."""
+    if pa.types.is_null(existing):
+        return _storage_or_canonical(incoming)
+    if pa.types.is_null(incoming):
+        return _storage_or_canonical(existing)
     if existing.equals(incoming):
         return canonical_arrow_type(existing)
     ce, ci = canonical_arrow_type(existing), canonical_arrow_type(incoming)
@@ -1568,6 +1572,13 @@ def _canonical_merge_types(existing: pa.DataType, incoming: pa.DataType) -> pa.D
     ) and (pa.types.is_integer(incoming) or pa.types.is_unsigned_integer(incoming)):
         return pa.int64()
     return ce
+
+
+def _storage_or_canonical(dtype: pa.DataType) -> pa.DataType:
+    """Promote null to float64; otherwise apply catalog canonical numeric types."""
+    if pa.types.is_null(dtype):
+        return pa.float64()
+    return canonical_arrow_type(dtype)
 
 
 def normalize_catalog_table_types(table: pa.Table) -> pa.Table:

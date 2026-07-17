@@ -844,6 +844,14 @@ class TestParquetTileIntegrity:
 class TestNumericTypeNormalization:
     """AllWISE/GALEX: same column as float32 in one file and float64 in another."""
 
+    def test_canonical_merge_types_null_promotes_to_float64(self) -> None:
+        from data_lake.ingest.fits_to_parquet import _canonical_merge_types
+
+        assert _canonical_merge_types(pa.null(), pa.float64()) == pa.float64()
+        assert _canonical_merge_types(pa.float64(), pa.null()) == pa.float64()
+        assert _canonical_merge_types(pa.null(), pa.float32()) == pa.float64()
+        assert _canonical_merge_types(pa.null(), pa.null()) == pa.float64()
+
     def test_append_float32_then_float64_same_column(self, tmp_path: Path) -> None:
         from data_lake.ingest.fits_to_parquet import ingest_catalog
 
