@@ -75,10 +75,12 @@ and divide ivar by factor².  Use `--apply-survey-calibration` to load
 `flux_scale` in group/file metadata when scaling is applied.
 
 `--format` choices: `zarr` (default), `parquet`, `hdf5`, `fits`.  For FITS,
-`--fits-layout` is `per-file` (default) or `catalog`.  All require
-`wavelength_mode="shared"` in the source survey.
+`--fits-layout` is `per-file` (default) or `catalog`.  All formats support
+both `wavelength_mode="shared"` and `wavelength_mode="per_source"` surveys,
+except FITS catalog layout, which requires a shared wavelength grid (use
+`--fits-layout per-file` for per-source surveys such as 2dF/6dF).
 
-Output layout for **zarr**:
+Output layout for **zarr** (shared wavelength):
 
 ```
 qso_subset.zarr/
@@ -89,6 +91,23 @@ qso_subset.zarr/
   _source_id/  (N_written,)       int64
   redshift/    (N_written,)       float32  (from catalog ``Z`` when catalog is used)
 ```
+
+Output layout for **zarr** (per-source wavelength, e.g. 2dF/6dF):
+
+```
+2df_subset.zarr/
+  flux/        (N_written, N_pix) float32 sharded
+  ivar/        (N_written, N_pix) float32 sharded
+  mask/        (N_written, N_pix) uint8 or uint16 sharded
+  wavelength/  (N_written, N_pix) float32 sharded  ← one row per source
+  _source_id/  (N_written,)       int64
+  redshift/    (N_written,)       float32
+```
+
+`N_pix` is the maximum pixel count across all tiles in the subset; shorter
+rows are right-padded with `nan` (flux), `0` (ivar/mask/wavelength).  The
+group attr `wavelength_mode` is `"per_source"`.  Parquet exports add a
+`wavelength` list column with the same per-row content.
 
 Rows are written in HEALPix-tile-traversal order for fast contiguous
 writes; the returned `id_to_row` mapping lets you reorder if needed.

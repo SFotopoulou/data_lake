@@ -55,6 +55,15 @@ SOURCES = [
     (202, 210.1, -10.1, 1.20),
 ]
 
+# Per-source wavelength survey constants
+PS_SURVEY = "ps_synthetic"
+PS_SOURCES = [
+    (301, 30.0,  +5.0, 0.31),
+    (302, 30.1,  +5.1, 0.32),
+    (401, 210.0, -10.0, 1.41),
+    (402, 210.1, -10.1, 1.42),
+]
+
 
 def _make_record(sid: int, ra: float, dec: float, z: float) -> SpectrumRecord:
     """Build a synthetic record whose flux/ivar/mask encode its source_id.
@@ -154,6 +163,85 @@ def _ingest_synthetic_lake(lake_root: Path) -> dict[int, int]:
 @pytest.fixture
 def synthetic_lake(tmp_path: Path):
     _ingest_synthetic_lake(tmp_path)
+    return tmp_path
+
+
+def _ingest_per_source_synthetic_lake(lake_root: Path) -> None:
+    """Populate a per_source wavelength survey for round-trip tests.
+
+    Each source receives a distinct wavelength grid (base grid shifted by
+    ``source_id``), so verifying round-trip fidelity requires per-row matching.
+    """
+    from data_lake.ingest.zarr_ids import zarr_join_array
+
+    base_wave = np.linspace(3600.0, 9800.0, N_PIX)
+    wcs_attrs = {
+        "ctype": "WAVE",
+        "crval": float(base_wave[0]),
+        "cdelt": float(base_wave[1] - base_wave[0]),
+        "crpix": 1.0,
+        "unit": "Angstrom",
+        "air_or_vacuum": "vacuum",
+        "n_pix": N_PIX,
+        "wavelength_mode": "per_source",
+    }
+
+    tile_groups: dict[int, list] = {}
+    for sid, ra, dec, z in PS_SOURCES:
+        pix = int(assign_healpix(np.array([ra]), np.array([dec]), NORDER)[0])
+        tile_groups.setdefault(pix, []).append((sid, ra, dec, z))
+
+    survey_root = lake_root / "spectra" / PS_SURVEY
+    for npix, recs in tile_groups.items():
+        tile_dir = survey_root / healpix_dir(NORDER, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        tile_path = tile_dir / f"Npix={npix}.zarr"
+
+        root = _open_or_create_spectrum_tile(
+            tile_path, N_PIX, "per_source", np.dtype(np.uint8), wcs_attrs,
+        )
+
+        flux_stack = np.stack([
+            np.full(N_PIX, sid, dtype=np.float32) for sid, *_ in recs
+        ])
+        ivar_stack = np.stack([
+            np.full(N_PIX, 1.0 / (sid + 1), dtype=np.float32) for sid, *_ in recs
+        ])
+        mask_stack = np.stack([
+            np.full(N_PIX, sid % 7, dtype=np.uint8) for sid, *_ in recs
+        ])
+        # Each source gets a unique wavelength: base grid + source_id offset.
+        wave_stack = np.stack([
+            (base_wave + sid).astype(np.float32) for sid, *_ in recs
+        ])
+        sids_arr = np.array([sid for sid, *_ in recs], dtype=np.int64)
+        meta_buf = np.frombuffer(
+            b"".join(
+                _meta_to_bytes({
+                    "z": z, "z_err": 0.001, "snr": 10.0,
+                    "exptime": 1000.0, "R": 3000.0, "instr": "TEST",
+                })
+                for _, _, _, z in recs
+            ),
+            dtype="|V" + str(_META_DTYPE.itemsize),
+        )
+
+        root["flux"].append(flux_stack)
+        root["ivar"].append(ivar_stack)
+        root["mask"].append(mask_stack)
+        root["wavelength"].append(wave_stack)
+        zarr_join_array(root).append(sids_arr)
+        root["meta"].append(meta_buf)
+
+    _write_spectrum_info(
+        survey_root, PS_SURVEY, NORDER, N_PIX,
+        "per_source", "uint8", wcs_attrs,
+    )
+
+
+@pytest.fixture
+def per_source_lake(tmp_path: Path):
+    _ingest_per_source_synthetic_lake(tmp_path)
     return tmp_path
 
 
@@ -278,25 +366,75 @@ class TestExtractSubsetToZarr:
                 show_progress=False,
             )
 
-    def test_per_source_wavelength_rejected(self, tmp_path: Path):
-        """The current implementation supports shared wavelength only."""
+    def test_extract_subset_zarr_per_source(self, per_source_lake: Path):
+        """Zarr extract of a per_source survey round-trips wavelength per row."""
+        import zarr
+
         from data_lake.io.spectra import SpectrumAccessor
 
-        survey_root = tmp_path / "spectra" / "per_source_survey"
-        survey_root.mkdir(parents=True)
-        # Minimal spectrum_info.json with per_source mode; no tiles needed
-        # because the guard fires before any tile is opened.
-        (survey_root / "spectrum_info.json").write_text(json.dumps({
-            "survey_name": "per_source_survey",
-            "hats_order": NORDER,
-            "n_pix": N_PIX,
-            "wavelength_mode": "per_source",
-        }))
-        acc = SpectrumAccessor(tmp_path, "per_source_survey")
-        with pytest.raises(NotImplementedError, match="wavelength_mode='shared'"):
-            acc.extract_subset_to_zarr(
-                source_ids=[1, 2, 3],
-                output_zarr=tmp_path / "noop.zarr",
+        acc = SpectrumAccessor(per_source_lake, PS_SURVEY)
+        requested = [sid for sid, *_ in PS_SOURCES]
+        out = per_source_lake / "ps_subset.zarr"
+        result = acc.extract_subset_to_zarr(
+            source_ids=requested, output_zarr=out, show_progress=False,
+        )
+        assert result["n_written"] == len(requested)
+        assert result["missing_ids"] == []
+
+        out_root = zarr.open_group(
+            store=zarr.storage.LocalStore(str(out)), mode="r", zarr_format=3,
+        )
+        assert out_root.attrs["wavelength_mode"] == "per_source"
+        wave_arr = np.asarray(out_root["wavelength"][:])
+        assert wave_arr.ndim == 2
+        assert wave_arr.shape == (len(requested), N_PIX)
+        flux_arr = np.asarray(out_root["flux"][:])
+
+        id_to_row = result["id_to_row"]
+        for sid, *_ in PS_SOURCES:
+            row = id_to_row[sid]
+            np.testing.assert_allclose(flux_arr[row], sid, err_msg=f"flux mismatch for {sid}")
+            # Each source has a unique wavelength offset (wave + sid); verify first pixel.
+            expected_wave0 = float(np.linspace(3600.0, 9800.0, N_PIX)[0]) + sid
+            assert abs(float(wave_arr[row, 0]) - expected_wave0) < 1e-3, (
+                f"wavelength mismatch for {sid}"
+            )
+
+    def test_extract_subset_parquet_per_source(self, per_source_lake: Path):
+        """Parquet extract adds a per-row wavelength list column."""
+        import pyarrow.parquet as pq
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(per_source_lake, PS_SURVEY)
+        requested = [sid for sid, *_ in PS_SOURCES]
+        out = per_source_lake / "ps_subset.parquet"
+        result = acc.extract_subset_to_parquet(
+            source_ids=requested, output_parquet=out, show_progress=False,
+        )
+        assert result["n_written"] == len(requested)
+
+        tbl = pq.read_table(str(out))
+        assert "wavelength" in tbl.schema.names
+        meta = tbl.schema.metadata
+        assert meta[b"wavelength_mode"] == b"per_source"
+
+        id_to_row = result["id_to_row"]
+        for sid, *_ in PS_SOURCES:
+            row = id_to_row[sid]
+            wave_row = np.asarray(tbl.column("wavelength")[row].as_py(), dtype=np.float32)
+            expected_wave0 = float(np.linspace(3600.0, 9800.0, N_PIX)[0]) + sid
+            assert abs(float(wave_row[0]) - expected_wave0) < 1e-3
+
+    def test_fits_catalog_per_source_rejected(self, per_source_lake: Path):
+        """FITS catalog layout must raise ValueError for per_source surveys."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(per_source_lake, PS_SURVEY)
+        with pytest.raises(ValueError, match="per-file"):
+            acc.extract_subset_to_fits_catalog(
+                source_ids=[sid for sid, *_ in PS_SOURCES],
+                output_fits=per_source_lake / "noop.fits",
                 show_progress=False,
             )
 

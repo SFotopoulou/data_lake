@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-20
+
+### Added
+
+- **Per-source wavelength support in `dl-extract-spectra-subset`** — surveys ingested with `wavelength_mode="per_source"` (2dF, 6dF, SDSS spPlate) can now be subset-extracted to Zarr, Parquet, HDF5, and FITS (per-file layout). Zarr output stores `wavelength` as `(N_written, N_pix) float32` with `wavelength_mode="per_source"` in attrs; Parquet adds a per-row `wavelength` list column. Cross-tile width differences are handled by padding shorter tiles to the maximum `N_pix` with `nan`/`0`. FITS catalog layout raises a `ValueError` with a clear message directing users to `--fits-layout per-file`.
+
+### Fixed
+
+- `SpectrumAccessor._iter_subset_tile_batches` now delegates to `SpectrumTileStore.get_spectra` for both shared and per-source reads, removing duplicate orthogonal-selection code and the hard-coded shared-only path.
+
 ## [0.6.0] - 2026-07-20
 
 ### Changed

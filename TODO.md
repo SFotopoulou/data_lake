@@ -61,7 +61,7 @@ Run `dl-validate-homogenization --ab-coverage` on your lake for the live list.
 
 - [x] `dl-extract-spectra-subset`: flux calibration (`--flux-scale`, `--apply-survey-calibration`; SDSS/DESI bundled)
 - [x] MOC export: `dl-region --export-moc` and `dl-export-moc` (`--moc-order`; requires `--extra moc`)
-- [ ] `dl-extract-spectra-subset`: support `wavelength_mode != "shared"` — **blocks COMO 2df/6df** (`NotImplementedError` in `SpectrumAccessor`)
+- [x] `dl-extract-spectra-subset`: support `wavelength_mode != "shared"` — **blocks COMO 2df/6df** (`NotImplementedError` in `SpectrumAccessor`)
 - [ ] Promote query-time homogenization (`build_homogenized_view_sql`) — function exists in `homogenize/transforms.py`; not yet a CLI path (**sprint C3**)
 
 ## Schema registry

@@ -151,7 +151,8 @@ class _SubsetExtractionPlan:
     n_requested: int
     n_written: int
     n_pix: int
-    wavelength: np.ndarray
+    wavelength_mode: str  # "shared" | "per_source"
+    wavelength: np.ndarray | None  # 1-D shared grid, or None for per_source
     flux_dtype: Any
     ivar_dtype: Any
     mask_dtype: Any
@@ -514,16 +515,11 @@ class SpectrumAccessor:
         missing: str = "skip",
         show_progress: bool = True,
     ) -> _SubsetExtractionPlan:
-        """Resolve source IDs to tile locations; validate shared-wavelength survey."""
+        """Resolve source IDs to tile locations and capture wavelength layout."""
         if missing not in ("skip", "error"):
             raise ValueError(f"missing must be 'skip' or 'error', got {missing!r}")
 
         wave_mode = str(self._info.get("wavelength_mode", "shared"))
-        if wave_mode != "shared":
-            raise NotImplementedError(
-                f"Subset extract supports wavelength_mode='shared' only "
-                f"(survey {self.survey_name!r} uses {wave_mode!r})."
-            )
 
         requested = np.asarray(source_ids, dtype=np.int64).ravel()
         if requested.size == 0:
@@ -561,11 +557,35 @@ class SpectrumAccessor:
         if n_written == 0:
             raise ValueError("None of the requested source_ids were found in the lake.")
 
+        # Scan all tiles to find the maximum n_pix (per_source tiles can differ after widen).
         first_npix = next(iter(by_tile))
         first_store = self._get_tile_store(first_npix)
         first_root = first_store._open()
+        flux_dtype = first_root["flux"].dtype
+        ivar_dtype = first_root["ivar"].dtype
+        mask_dtype = first_root["mask"].dtype
+        src_wcs = dict(first_store.wcs_attrs)
+
         n_pix = int(first_root["flux"].shape[1])
-        wavelength = np.asarray(first_root["wavelength"][:], dtype=np.float64)
+        for npix in by_tile:
+            if npix == first_npix:
+                continue
+            t_root = self._get_tile_store(npix)._open()
+            tile_n_pix = int(t_root["flux"].shape[1])
+            if wave_mode == "shared" and tile_n_pix != n_pix:
+                raise ValueError(
+                    f"Tile {npix} has N_pix={tile_n_pix} but tile {first_npix} has "
+                    f"N_pix={n_pix}; non-uniform wavelength grid is not supported for "
+                    f"wavelength_mode='shared'."
+                )
+            n_pix = max(n_pix, tile_n_pix)
+
+        if wave_mode == "shared":
+            wavelength: np.ndarray | None = np.asarray(
+                first_root["wavelength"][:], dtype=np.float64
+            )
+        else:
+            wavelength = None
 
         return _SubsetExtractionPlan(
             by_tile=by_tile,
@@ -573,11 +593,12 @@ class SpectrumAccessor:
             n_requested=n_requested,
             n_written=n_written,
             n_pix=n_pix,
+            wavelength_mode=wave_mode,
             wavelength=wavelength,
-            flux_dtype=first_root["flux"].dtype,
-            ivar_dtype=first_root["ivar"].dtype,
-            mask_dtype=first_root["mask"].dtype,
-            src_wcs=dict(first_store.wcs_attrs),
+            flux_dtype=flux_dtype,
+            ivar_dtype=ivar_dtype,
+            mask_dtype=mask_dtype,
+            src_wcs=src_wcs,
         )
 
     @staticmethod
@@ -615,18 +636,38 @@ class SpectrumAccessor:
     def _redshift_batch_for_sources(
         sorted_sids: np.ndarray,
         z_map: dict[int, float] | None,
-        meta_raw,
+        meta_seq,
     ) -> np.ndarray:
-        """Per-row redshift: catalog map when provided, else spectrum tile meta."""
+        """Per-row redshift: catalog map when provided, else spectrum tile meta.
+
+        ``meta_seq`` may be a list of already-decoded dicts (from ``get_spectra``) or
+        a raw zarr array of structured byte buffers decoded via ``_decode_meta``.
+        """
         if z_map is not None:
             return np.array(
                 [z_map.get(int(s), np.nan) for s in sorted_sids.tolist()],
                 dtype=np.float32,
             )
         z_batch = np.empty(len(sorted_sids), dtype=np.float32)
-        for i, raw in enumerate(meta_raw):
-            z_batch[i] = _decode_meta(raw).get("z", np.nan)
+        for i, item in enumerate(meta_seq):
+            if isinstance(item, dict):
+                z_batch[i] = float(item.get("z", np.nan))
+            else:
+                z_batch[i] = _decode_meta(item).get("z", np.nan)
         return z_batch
+
+    @staticmethod
+    def _pad_to_n_pix(
+        arr: np.ndarray,
+        n_pix: int,
+        pad_value: float,
+    ) -> np.ndarray:
+        """Right-pad a 2-D ``(N, tile_n_pix)`` array to ``(N, n_pix)``."""
+        tile_n_pix = arr.shape[1]
+        if tile_n_pix == n_pix:
+            return arr
+        pad_width = n_pix - tile_n_pix
+        return np.pad(arr, ((0, 0), (0, pad_width)), constant_values=pad_value)
 
     def _iter_subset_tile_batches(
         self,
@@ -636,12 +677,18 @@ class SpectrumAccessor:
         z_map: dict[int, float] | None = None,
         flux_scale: float | None = None,
     ):
-        """Yield per-tile (sorted_sids, flux, ivar, mask, redshift) batches."""
+        """Yield per-tile (sorted_sids, flux, ivar, mask, wave_batch|None, redshift) batches.
+
+        ``wave_batch`` is ``(batch, plan.n_pix) float32`` for per_source surveys and
+        ``None`` for shared surveys (callers use ``plan.wavelength`` for the grid).
+        """
         try:
             from tqdm.auto import tqdm
         except ImportError:
             def tqdm(x, **_kw):
                 return x
+
+        per_source = plan.wavelength_mode == "per_source"
 
         for npix, items in tqdm(
             plan.by_tile.items(),
@@ -657,32 +704,50 @@ class SpectrumAccessor:
             sorted_sids = sids[order]
 
             t_store = self._get_tile_store(npix)
-            t_root = t_store._open()
-            if int(t_root["flux"].shape[1]) != plan.n_pix:
+            # get_spectra handles shared/per_source wavelength internally.
+            flux_batch, ivar_batch, mask_batch, wave_or_1d, meta_list, _res = (
+                t_store.get_spectra(sorted_local)
+            )
+
+            # For shared surveys verify grid width consistency (already enforced by
+            # _plan_subset_extraction, but guard against concurrent tile widen).
+            if not per_source and flux_batch.shape[1] != plan.n_pix:
                 raise ValueError(
-                    f"Tile {npix} has N_pix={t_root['flux'].shape[1]} but expected "
-                    f"{plan.n_pix}; non-uniform wavelength grid is not supported."
+                    f"Tile {npix} has N_pix={flux_batch.shape[1]} but expected "
+                    f"{plan.n_pix}; non-uniform wavelength grid is not supported "
+                    f"for wavelength_mode='shared'."
                 )
 
-            flux_batch = t_root["flux"].get_orthogonal_selection(
-                (sorted_local, slice(None))
-            )
-            ivar_batch = t_root["ivar"].get_orthogonal_selection(
-                (sorted_local, slice(None))
-            )
-            mask_batch = t_root["mask"].get_orthogonal_selection(
-                (sorted_local, slice(None))
-            )
+            # Pad to plan.n_pix when this tile is narrower (per_source cross-tile).
+            if per_source:
+                flux_batch = self._pad_to_n_pix(
+                    np.asarray(flux_batch, dtype=np.float32), plan.n_pix, np.nan
+                )
+                ivar_batch = self._pad_to_n_pix(
+                    np.asarray(ivar_batch, dtype=np.float32), plan.n_pix, 0.0
+                )
+                mask_batch = self._pad_to_n_pix(
+                    np.asarray(mask_batch), plan.n_pix, 0
+                )
+                wave_batch: np.ndarray | None = self._pad_to_n_pix(
+                    np.asarray(wave_or_1d, dtype=np.float32), plan.n_pix, 0.0
+                )
+            else:
+                flux_batch = np.asarray(flux_batch, dtype=np.float32)
+                ivar_batch = np.asarray(ivar_batch, dtype=np.float32)
+                mask_batch = np.asarray(mask_batch)
+                wave_batch = None
 
-            meta_raw = t_root["meta"][sorted_local]
-            z_batch = self._redshift_batch_for_sources(sorted_sids, z_map, meta_raw)
+            z_batch = self._redshift_batch_for_sources(
+                sorted_sids, z_map, meta_list,
+            )
 
             if flux_scale is not None and flux_scale != 1.0:
                 from data_lake.export.spectra_calibration import apply_flux_scale
 
                 flux_batch, ivar_batch = apply_flux_scale(flux_batch, ivar_batch, flux_scale)
 
-            yield sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch
+            yield sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch
 
     def _collect_subset_stacks(
         self,
@@ -701,7 +766,7 @@ class SpectrumAccessor:
         id_to_row: dict[int, int] = {}
         row_offset = 0
 
-        for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+        for sorted_sids, flux_batch, ivar_batch, mask_batch, _wave_batch, z_batch in self._iter_subset_tile_batches(
             plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
         ):
             sid_chunks.append(sorted_sids)
@@ -858,8 +923,8 @@ class SpectrumAccessor:
         n_pix = plan.n_pix
         n_requested = plan.n_requested
         missing_ids = plan.missing_ids
-        wavelength = plan.wavelength
         src_wcs = plan.src_wcs
+        per_source = plan.wavelength_mode == "per_source"
 
         # --- Create destination Zarr ---
         store = zarr.storage.LocalStore(str(output_zarr))
@@ -886,9 +951,16 @@ class SpectrumAccessor:
         _arr2d("flux", plan.flux_dtype, np.nan)
         _arr2d("ivar", plan.ivar_dtype, 0.0)
         _arr2d("mask", plan.mask_dtype, 0)
-        out_root.create_array(
-            "wavelength", shape=(n_pix,), chunks=(n_pix,), dtype=np.float64, fill_value=0.0,
-        )
+
+        if per_source:
+            # Per-source: wavelength stored as (N_written, N_pix) float32.
+            _arr2d("wavelength", np.float32, 0.0)
+        else:
+            out_root.create_array(
+                "wavelength", shape=(n_pix,), chunks=(n_pix,), dtype=np.float64, fill_value=0.0,
+            )
+            out_root["wavelength"][:] = plan.wavelength
+
         from data_lake.ingest.zarr_ids import create_zarr_join_array
 
         create_zarr_join_array(
@@ -906,13 +978,11 @@ class SpectrumAccessor:
             fill_value=np.nan,
         )
 
-        out_root["wavelength"][:] = wavelength
-
         attrs: dict[str, Any] = dict(src_wcs)
         attrs.update({
             "source_survey": self.survey_name,
             "source_lake_root": str(self.lake_root),
-            "wavelength_mode": "shared",
+            "wavelength_mode": plan.wavelength_mode,
             "n_sources": n_written,
             "n_pix": n_pix,
             "n_requested": n_requested,
@@ -927,7 +997,7 @@ class SpectrumAccessor:
 
         id_to_row: dict[int, int] = {}
         write_offset = 0
-        for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+        for sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch in self._iter_subset_tile_batches(
             plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
         ):
             k = len(sorted_sids)
@@ -935,6 +1005,8 @@ class SpectrumAccessor:
             out_root["flux"][slc, :] = flux_batch
             out_root["ivar"][slc, :] = ivar_batch
             out_root["mask"][slc, :] = mask_batch
+            if per_source and wave_batch is not None:
+                out_root["wavelength"][slc, :] = wave_batch
             from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN
 
             out_root[LAKE_JOIN_ID_COLUMN][slc] = sorted_sids
@@ -987,26 +1059,32 @@ class SpectrumAccessor:
         )
         z_map = self._build_catalog_redshift_map(plan)
         n_pix = plan.n_pix
+        per_source = plan.wavelength_mode == "per_source"
         mask_pa = pa.uint16() if plan.mask_dtype == np.dtype(np.uint16) else pa.uint8()
         flt_vec = pa.list_(pa.float32())
         mask_vec = pa.list_(mask_pa)
-        meta = {
+        meta: dict[bytes, bytes] = {
             b"source_survey": self.survey_name.encode(),
-            b"wavelength_mode": b"shared",
-            b"wavelength": json.dumps(plan.wavelength.tolist()).encode(),
+            b"wavelength_mode": plan.wavelength_mode.encode(),
             b"wcs_attrs": json.dumps(plan.src_wcs).encode(),
             b"n_pix": str(n_pix).encode(),
         }
+        if not per_source:
+            meta[b"wavelength"] = json.dumps(plan.wavelength.tolist()).encode()  # type: ignore[union-attr]
         if flux_scale is not None and flux_scale != 1.0:
             meta[b"flux_scale"] = str(flux_scale).encode()
             meta[b"flux_calibrated"] = b"true"
-        schema = pa.schema([
+
+        fields = [
             ("source_id", pa.int64()),
             ("redshift", pa.float32()),
             ("flux", flt_vec),
             ("ivar", flt_vec),
             ("mask", mask_vec),
-        ]).with_metadata(meta)
+        ]
+        if per_source:
+            fields.append(("wavelength", flt_vec))
+        schema = pa.schema(fields).with_metadata(meta)
 
         id_to_row: dict[int, int] = {}
         row_offset = 0
@@ -1014,19 +1092,19 @@ class SpectrumAccessor:
             str(output_parquet), schema, compression="zstd", compression_level=3,
         )
         try:
-            for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+            for sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch in self._iter_subset_tile_batches(
                 plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
             ):
-                table = pa.Table.from_arrays(
-                    [
-                        pa.array(sorted_sids, type=pa.int64()),
-                        pa.array(z_batch, type=pa.float32()),
-                        pa.array(flux_batch.tolist(), type=flt_vec),
-                        pa.array(ivar_batch.tolist(), type=flt_vec),
-                        pa.array(mask_batch.tolist(), type=mask_vec),
-                    ],
-                    schema=schema,
-                )
+                arrays = [
+                    pa.array(sorted_sids, type=pa.int64()),
+                    pa.array(z_batch, type=pa.float32()),
+                    pa.array(flux_batch.tolist(), type=flt_vec),
+                    pa.array(ivar_batch.tolist(), type=flt_vec),
+                    pa.array(mask_batch.tolist(), type=mask_vec),
+                ]
+                if per_source and wave_batch is not None:
+                    arrays.append(pa.array(wave_batch.tolist(), type=flt_vec))
+                table = pa.Table.from_arrays(arrays, schema=schema)
                 writer.write_table(table)
                 for j, sid in enumerate(sorted_sids.tolist()):
                     id_to_row[int(sid)] = row_offset + j
@@ -1089,6 +1167,7 @@ class SpectrumAccessor:
         z_map = self._build_catalog_redshift_map(plan)
         n_written = plan.n_written
         n_pix = plan.n_pix
+        per_source = plan.wavelength_mode == "per_source"
         dset_kw: dict[str, Any] = {}
         if compression:
             dset_kw = {
@@ -1101,7 +1180,7 @@ class SpectrumAccessor:
         with h5py.File(output_hdf5, "w") as f:
             f.attrs["source_survey"] = self.survey_name
             f.attrs["source_lake_root"] = str(self.lake_root)
-            f.attrs["wavelength_mode"] = "shared"
+            f.attrs["wavelength_mode"] = plan.wavelength_mode
             f.attrs["n_sources"] = n_written
             f.attrs["n_pix"] = n_pix
             f.attrs["n_requested"] = plan.n_requested
@@ -1114,7 +1193,14 @@ class SpectrumAccessor:
             if flux_scale is not None and flux_scale != 1.0:
                 f.attrs["flux_scale"] = flux_scale
                 f.attrs["flux_calibrated"] = True
-            f.create_dataset("wavelength", data=plan.wavelength, dtype=np.float64)
+
+            if per_source:
+                wave_ds = f.create_dataset(
+                    "wavelength", shape=(n_written, n_pix), dtype=np.float32, **dset_kw,
+                )
+            else:
+                f.create_dataset("wavelength", data=plan.wavelength, dtype=np.float64)
+                wave_ds = None
 
             flux_ds = f.create_dataset(
                 "flux", shape=(n_written, n_pix), dtype=plan.flux_dtype, **dset_kw,
@@ -1133,7 +1219,7 @@ class SpectrumAccessor:
             z_ds = f.create_dataset("redshift", shape=(n_written,), dtype=np.float32)
 
             write_offset = 0
-            for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in (
+            for sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch in (
                 self._iter_subset_tile_batches(
                     plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
                 )
@@ -1143,6 +1229,8 @@ class SpectrumAccessor:
                 flux_ds[slc, :] = flux_batch
                 ivar_ds[slc, :] = ivar_batch
                 mask_ds[slc, :] = mask_batch
+                if per_source and wave_ds is not None and wave_batch is not None:
+                    wave_ds[slc, :] = wave_batch
                 sid_ds[slc] = sorted_sids
                 z_ds[slc] = z_batch
                 for j, sid in enumerate(sorted_sids.tolist()):
@@ -1206,13 +1294,23 @@ class SpectrumAccessor:
         overwrite: bool = False,
         flux_scale: float | None = None,
     ) -> dict[str, Any]:
-        """Extract a subset into one multi-row FITS catalog (BINTABLE + WAVELENGTH HDU)."""
+        """Extract a subset into one multi-row FITS catalog (BINTABLE + WAVELENGTH HDU).
+
+        Requires ``wavelength_mode='shared'``; use ``--fits-layout per-file`` for
+        per-source wavelength surveys.
+        """
         from data_lake.export.to_spectrum_fits import write_spectra_catalog_fits
 
         output_fits = Path(output_fits)
         plan = self._plan_subset_extraction(
             source_ids, missing=missing, show_progress=show_progress,
         )
+        if plan.wavelength_mode != "shared":
+            raise ValueError(
+                f"FITS catalog layout requires wavelength_mode='shared' "
+                f"(survey {self.survey_name!r} uses {plan.wavelength_mode!r}). "
+                "Use --fits-layout per-file instead."
+            )
         z_map = self._build_catalog_redshift_map(plan)
         source_id, flux, ivar, mask, redshift, id_to_row = self._collect_subset_stacks(
             plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
@@ -1223,7 +1321,7 @@ class SpectrumAccessor:
             flux=flux,
             ivar=ivar,
             mask=mask,
-            wavelength=plan.wavelength,
+            wavelength=plan.wavelength,  # type: ignore[arg-type]  # shared mode guarantees non-None
             redshift=redshift,
             wcs_attrs=plan.src_wcs,
             survey=self.survey_name,
@@ -1272,22 +1370,27 @@ class SpectrumAccessor:
             source_ids, missing=missing, show_progress=show_progress,
         )
         z_map = self._build_catalog_redshift_map(plan)
-        wave = plan.wavelength
+        shared_wave = plan.wavelength  # None for per_source surveys
         id_to_row: dict[int, int] = {}
         paths: list[str] = []
         row_offset = 0
 
-        for sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch in self._iter_subset_tile_batches(
+        for sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch in self._iter_subset_tile_batches(
             plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
         ):
             for j, sid in enumerate(sorted_sids.tolist()):
                 meta = {"z": float(z_batch[j])}
+                row_wave = (
+                    np.asarray(wave_batch[j], dtype=np.float64)
+                    if wave_batch is not None
+                    else shared_wave
+                )
                 sp = Spectrum(
                     source_id=int(sid),
                     flux=np.asarray(flux_batch[j], dtype=np.float32),
                     ivar=np.asarray(ivar_batch[j], dtype=np.float32),
                     mask=np.asarray(mask_batch[j], dtype=plan.mask_dtype),
-                    wavelength=wave,
+                    wavelength=row_wave,
                     meta=meta,
                     wcs_attrs=plan.src_wcs,
                 )
