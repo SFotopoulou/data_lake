@@ -657,8 +657,17 @@ def format_manifest_table(
         f"HEALPix order: {manifest.get('hats_order')}  columns: {manifest.get('n_columns')}",
     ]
     if modality == MODALITY_CATALOG:
+        link_id_mode = manifest.get("link_id_mode") or ""
+        if link_id_mode.startswith("column:"):
+            native_col = link_id_mode.split(":", 1)[1]
+            join_suffix = f" (from {native_col})"
+        elif link_id_mode and link_id_mode != "sequential":
+            join_suffix = f" [{link_id_mode}]"
+        else:
+            join_suffix = ""
         lines.append(
-            f"rows: {manifest.get('total_rows')}  join: {manifest.get('link_id_column')!r}  "
+            f"rows: {manifest.get('total_rows')}  "
+            f"join: {manifest.get('link_id_column')!r}{join_suffix}  "
             f"sky: {manifest.get('ra_column')!r}, {manifest.get('dec_column')!r}  "
             f"redshift: {manifest.get('redshift_column')!r}"
         )

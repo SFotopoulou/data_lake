@@ -66,10 +66,9 @@ Run `dl-validate-homogenization --ab-coverage` on your lake for the live list.
 
 ## Schema registry
 
-- [ ] Column overlays for surveys beyond `ALLWISE.catalog.json` (`shared/registry/overlays/`)
+- [x] Column overlays for surveys beyond `ALLWISE.catalog.json` (`shared/registry/overlays/`)
 
 ## MCP & security
 
 - [ ] Document MCP read-only boundary for team deployments — **partial:** `docs/mcp-lake.md` § Out of scope; need runbook (**sprint D1**)
 - [ ] Fix MCP `get_area` for legacy `areas/*.area.json` filenames (**sprint C1**)
-- [ ] Future: proper authentication beyond ingest token (`docs/quickstart.md` notes ACLs + token are minimal)
