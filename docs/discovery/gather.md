@@ -2,7 +2,7 @@
 
 `dl-gather` materialises a **derived product catalog** by joining a base catalog
 to one or more partners **via existing crossmatch trees**, restricted to a
-selection. The result is stored under `catalogs/<name>/` with
+selection. The result is stored under `products/<name>/` with
 `catalog_info.json` `kind: "product"` and full provenance — queryable like any
 catalog and filterable with `dl-describe-lake --kind product`.
 
@@ -56,7 +56,7 @@ as the CLI `--columns` JSON):
 |-------|----------|---------|
 | `base` | yes | Base catalog; defines the row set and HEALPix tiling. |
 | `columns` | yes | `{survey: [col, …]}`. Every survey except `base` is joined as a partner. |
-| `materialize_as` | yes | Product name under `catalogs/<name>/`. Overridden by CLI `--materialize-as` when set. |
+| `materialize_as` | yes | Product name (written to `products/<name>/`). Overridden by CLI `--materialize-as` when set. |
 | `multiplicity` | no | `nearest` (default) or `all`. |
 | `include_sep` | no | Default `true`; set `false` to omit `<survey>_sep_arcsec` columns. |
 | `keep_all` | no | Default `true`; set `false` for matches-only (same as `--matches-only`). |
@@ -87,7 +87,7 @@ Only columns listed under each survey are read and written; surveys omitted from
 
 **CLI overrides:** explicit flags take precedence over the area file (same as
 other `dl-*` commands). For example, `--materialize-as MyProduct` writes to
-`catalogs/MyProduct/` even when the area has a different `gather.materialize_as`.
+`products/MyProduct/` even when the area has a different `gather.materialize_as`.
 At the start of a run, `dl-gather` prints the resolved area file path (when using
 `--from-area`), product name, base survey, partner count, and tile count.
 

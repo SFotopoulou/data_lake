@@ -128,7 +128,7 @@ dl-area set-gather MyCone \
 |------|---------|---------|
 | `--base` | — | Base catalog; defines row set and tiling. |
 | `--columns` | — | JSON `{survey: [native_col, …]}`. Use `dl-describe-survey` for names. |
-| `--materialize-as` | — | Product name under `catalogs/`. |
+| `--materialize-as` | — | Product name (written to `products/<name>/`). |
 | `--multiplicity` | `nearest` | `nearest` or `all` (fan-out matches). |
 | `--matches-only` | off | Set `keep_all: false`. |
 | `--no-sep` | off | Omit `<survey>_sep_arcsec` columns. |

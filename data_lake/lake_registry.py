@@ -371,11 +371,17 @@ def guess_master_meta(
     lake_root = Path(lake_root)
     columns = read_parquet_column_names(master_parquet)
 
+    from data_lake.schema_registry import CATALOGS_LAYER, PRODUCTS_LAYER
     manifests: dict[str, dict[str, Any]] = {}
-    for survey, root in iter_catalog_surveys(lake_root / "catalogs"):
-        m = _load_catalog_manifest_or_none(root, survey)
-        if m is not None:
-            manifests[survey] = m
+    seen: set[str] = set()
+    for layer in (CATALOGS_LAYER, PRODUCTS_LAYER):
+        for survey, root in iter_catalog_surveys(lake_root / layer):
+            if survey in seen:
+                continue
+            seen.add(survey)
+            m = _load_catalog_manifest_or_none(root, survey)
+            if m is not None:
+                manifests[survey] = m
 
     partners: list[dict[str, str]] = []
     used_surveys: set[str] = set()
@@ -731,12 +737,17 @@ def _align_registry_row_keys(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def build_lake_registry_table(lake_root: Path | str) -> pa.Table:
     """Scan the lake and build registry rows for all discovered surveys."""
+    from data_lake.schema_registry import CATALOGS_LAYER, PRODUCTS_LAYER
     lake_root = Path(lake_root)
     rows: list[dict[str, Any]] = []
 
-    catalogs_root = lake_root / "catalogs"
-    for survey, root in iter_catalog_surveys(catalogs_root):
+    seen_catalogs: set[str] = set()
+    for survey, root in iter_catalog_surveys(lake_root / CATALOGS_LAYER):
+        seen_catalogs.add(survey)
         rows.append(_catalog_registry_row(lake_root, survey, root))
+    for survey, root in iter_catalog_surveys(lake_root / PRODUCTS_LAYER):
+        if survey not in seen_catalogs:
+            rows.append(_catalog_registry_row(lake_root, survey, root))
 
     for survey, root in iter_modality_surveys(lake_root / "spectra", "spectrum_info.json"):
         row = _info_registry_row(lake_root, survey, root, MODALITY_SPECTRA, "spectrum_info.json")

@@ -246,13 +246,13 @@ class TestHomogenizeCatalog:
         )
         assert result.n_rows == 2
         info = json.loads(
-            (lake / "catalogs" / "ALLWISE_ab_test" / "catalog_info.json").read_text()
+            (lake / "products" / "ALLWISE_ab_test" / "catalog_info.json").read_text()
         )
         assert info["product_subtype"] == PRODUCT_SUBTYPE_HOMOGENIZED
         assert info["provenance"]["transform_id"] == "phot_ab_v1"
 
         tile = pq.read_table(
-            lake / "catalogs" / "ALLWISE_ab_test" / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
+            lake / "products" / "ALLWISE_ab_test" / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
         )
         assert "phot_ab_w1" in tile.column_names
         assert tile.column("phot_ab_w1")[0].as_py() == pytest.approx(12.699)
@@ -273,7 +273,7 @@ class TestHomogenizeCatalog:
         )
         assert result.check_only
         assert result.resolution["n_applied"] >= 1
-        assert not (lake / "catalogs" / "ALLWISE_ab_check").exists()
+        assert not (lake / "products" / "ALLWISE_ab_check").exists()
 
 
 def _write_minimal_lake_config(lake: Path) -> Path:
@@ -323,7 +323,7 @@ class TestHomogenizeCli:
 
         result = CliRunner().invoke(cli, ["--from-area", "WiseCone"])
         assert result.exit_code == 0, result.output
-        assert (lake / "catalogs" / "ALLWISE_from_config").is_dir()
+        assert (lake / "products" / "ALLWISE_from_config").is_dir()
 
     def test_from_area_homogenize_block(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
@@ -350,7 +350,7 @@ class TestHomogenizeCli:
 
         result = CliRunner().invoke(cli, [str(lake), "--from-area", "WiseCone"])
         assert result.exit_code == 0, result.output
-        assert (lake / "catalogs" / "ALLWISE_from_area").is_dir()
+        assert (lake / "products" / "ALLWISE_from_area").is_dir()
 
 
 def _write_gather_like_product(lake: Path, norder: int, npix: int, w1: float) -> None:
@@ -405,7 +405,7 @@ class TestHomogenizeProduct:
             df = acc.query("SELECT phot_ab_w1 FROM catalog", fmt="polars")
         assert df["phot_ab_w1"][0] == pytest.approx(12.699)
         info = json.loads(
-            (lake / "catalogs" / "EUCLID_wise_ab" / "catalog_info.json").read_text()
+            (lake / "products" / "EUCLID_wise_ab" / "catalog_info.json").read_text()
         )
         assert info["provenance"]["source_product"] == "EUCLID_wise_native"
 
@@ -465,7 +465,7 @@ class TestHomogenizeProduct:
             materialize_as="EUCLID_wise_ab_sparse",
         )
         assert result.n_rows == 2
-        out_root = lake / "catalogs" / "EUCLID_wise_ab_sparse"
+        out_root = lake / "products" / "EUCLID_wise_ab_sparse"
         assert (out_root / "_metadata").is_file()
         tiles = sorted(out_root.rglob("Npix=*.parquet"))
         assert len(tiles) == 2
@@ -531,7 +531,7 @@ class TestHomogenizeProduct:
             materialize_as="EUCLID_wise_ab_null",
         )
         assert result.n_rows == 2
-        out_root = lake / "catalogs" / "EUCLID_wise_ab_null"
+        out_root = lake / "products" / "EUCLID_wise_ab_null"
         assert (out_root / "_metadata").is_file()
         for path in out_root.rglob("Npix=*.parquet"):
             sch = pq.read_schema(str(path))

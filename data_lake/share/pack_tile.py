@@ -109,9 +109,9 @@ def pack_tile(
             prefix = f"tile_{norder}_{npix}"
 
             # ---- Catalog Parquet file ----
-            parquet_file = (
-                lake_root / "catalogs" / survey / tile_dir_fragment / f"Npix={npix}.parquet"
-            )
+            from data_lake.schema_registry import resolve_catalog_root
+            survey_root = resolve_catalog_root(lake_root, survey)
+            parquet_file = survey_root / tile_dir_fragment / f"Npix={npix}.parquet"
             if parquet_file.exists():
                 arcname = f"{prefix}/catalog/{survey}/{tile_dir_fragment}/Npix={npix}.parquet"
                 tar.add(parquet_file, arcname=arcname)
@@ -120,7 +120,7 @@ def pack_tile(
                 log.warning("Parquet tile not found for survey=%s npix=%d", survey, npix)
 
             # ---- catalog_info.json ----
-            cat_info = lake_root / "catalogs" / survey / "catalog_info.json"
+            cat_info = survey_root / "catalog_info.json"
             if cat_info.exists():
                 tar.add(cat_info, arcname=f"{prefix}/catalog/{survey}/catalog_info.json")
 
@@ -183,10 +183,11 @@ def pack_tiles_batch(
     Pack multiple tiles.  If ``npix_list`` is None, discovers all tiles that
     exist for the first survey listed in ``surveys``.
     """
+    from data_lake.schema_registry import resolve_catalog_root
     lake_root = Path(lake_root)
     if npix_list is None:
         survey = surveys[0]
-        catalog_norder_dir = lake_root / "catalogs" / survey / f"Norder={norder}"
+        catalog_norder_dir = resolve_catalog_root(lake_root, survey) / f"Norder={norder}"
         npix_list = [
             int(p.stem.split("=")[-1])
             for p in catalog_norder_dir.rglob("Npix=*.parquet")

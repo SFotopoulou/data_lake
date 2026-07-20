@@ -392,9 +392,10 @@ def resolve_crossmatch_settings(
     norder_b: int | None = None,
 ) -> CrossmatchSettings:
     """Resolve per-survey RA/Dec columns and HEALPix order from catalog_info.json."""
+    from data_lake.schema_registry import resolve_catalog_root
     root = Path(lake_root)
-    ra_a, dec_a, order_a = _sky_columns_from_catalog_info(root / "catalogs" / survey_a)
-    ra_b, dec_b, order_b = _sky_columns_from_catalog_info(root / "catalogs" / survey_b)
+    ra_a, dec_a, order_a = _sky_columns_from_catalog_info(resolve_catalog_root(root, survey_a))
+    ra_b, dec_b, order_b = _sky_columns_from_catalog_info(resolve_catalog_root(root, survey_b))
 
     settings = CrossmatchSettings(
         survey_a=CrossmatchSurveySettings(
@@ -1016,8 +1017,9 @@ def build_crossmatch(
     out_root = crossmatch_root(lake_root, survey_a, survey_b, radius_arcsec)
     _validate_crossmatch_reuse(out_root, settings, match_backend, overwrite=overwrite)
 
-    catalog_root_a = lake_root / "catalogs" / survey_a
-    catalog_root_b = lake_root / "catalogs" / survey_b
+    from data_lake.schema_registry import resolve_catalog_root
+    catalog_root_a = resolve_catalog_root(lake_root, survey_a)
+    catalog_root_b = resolve_catalog_root(lake_root, survey_b)
     radius_rad = np.radians(radius_arcsec / 3600.0)
     nside_a = hp.order2nside(norder_a)
     nside_b = hp.order2nside(norder_b)
@@ -1699,11 +1701,12 @@ def build_column_crossmatch(
     restrict_npix:
         Limit to a subset of survey-A HEALPix pixels (region restriction).
     """
+    from data_lake.schema_registry import resolve_catalog_root
     validate_match_column(match_col_a, "--match-col-a")
     validate_match_column(match_col_b, "--match-col-b")
     lake_root = Path(lake_root)
-    catalog_root_a = lake_root / "catalogs" / survey_a
-    catalog_root_b = lake_root / "catalogs" / survey_b
+    catalog_root_a = resolve_catalog_root(lake_root, survey_a)
+    catalog_root_b = resolve_catalog_root(lake_root, survey_b)
 
     _, _, order_a = _sky_columns_from_catalog_info(catalog_root_a)
     _, _, order_b = _sky_columns_from_catalog_info(catalog_root_b)
@@ -1907,7 +1910,8 @@ def build_column_crossmatch(
 
 
 def _base_catalog_norder(lake_root: Path, survey: str) -> int:
-    info_path = Path(lake_root) / "catalogs" / survey / "catalog_info.json"
+    from data_lake.schema_registry import resolve_catalog_root
+    info_path = resolve_catalog_root(lake_root, survey) / "catalog_info.json"
     if info_path.is_file():
         try:
             with open(info_path) as fh:
@@ -2319,9 +2323,10 @@ try:
                 validate_match_column(match_col_b, "--match-col-b")  # type: ignore[arg-type]
             except ValueError as exc:
                 raise click.ClickException(str(exc))
+            from data_lake.schema_registry import resolve_catalog_root as _rcr
             lake = require_output_root(output_root, cfg, kind="catalogs")
             for name, label in ((survey_a, "survey A"), (survey_b, "survey B")):
-                cat_root = lake / "catalogs" / name
+                cat_root = _rcr(lake, name)
                 if not cat_root.is_dir():
                     raise click.ClickException(f"{label} catalog not found: {cat_root}")
             try:
@@ -2398,10 +2403,11 @@ try:
             raise click.ClickException(
                 "SURVEY_A and SURVEY_B are required (or use --from-area / --plan)."
             )
+        from data_lake.schema_registry import resolve_catalog_root as _rcr
         lake = require_output_root(output_root, cfg, kind="catalogs")
 
         for name, label in ((survey_a, "survey A"), (survey_b, "survey B")):
-            cat_root = lake / "catalogs" / name
+            cat_root = _rcr(lake, name)
             if not cat_root.is_dir():
                 raise click.ClickException(f"{label} catalog not found: {cat_root}")
 

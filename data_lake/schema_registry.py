@@ -50,6 +50,10 @@ CATALOG_KIND_INGESTED = "ingested"
 CATALOG_KIND_PRODUCT = "product"
 PRODUCT_SUBTYPE_HOMOGENIZED = "homogenized"
 
+# On-disk layer names.
+CATALOGS_LAYER = "catalogs"
+PRODUCTS_LAYER = "products"
+
 # Per-source Zarr meta scalars for FITS sky provenance (see fits_to_spectra_zarr._META_DTYPE).
 SPECTRUM_SKY_META_FIELDS: tuple[str, ...] = (
     "ra_key",
@@ -292,10 +296,48 @@ def write_catalog_schema_manifest(
     return out_path
 
 
+def resolve_catalog_root(lake_root: Path | str, name: str) -> Path:
+    """Return the on-disk root for a named catalog or product.
+
+    Ingested surveys live under ``catalogs/<name>``.  Derived products (gather,
+    homogenize) live under ``products/<name>``.  This resolver returns
+    ``catalogs/<name>`` when that directory exists, otherwise ``products/<name>``.
+    All read-side code should call this instead of hard-coding ``catalogs/``.
+    """
+    root = Path(lake_root)
+    catalogs_path = root / CATALOGS_LAYER / name
+    if catalogs_path.exists():
+        return catalogs_path
+    return root / PRODUCTS_LAYER / name
+
+
+def catalog_write_root(lake_root: Path | str, name: str) -> Path:
+    """Return the on-disk write root for a *derived* catalog product (``products/<name>``).
+
+    Raises ``FileExistsError`` if an ingested survey of the same name already
+    exists under ``catalogs/<name>``, which would create ambiguity for the resolver.
+    """
+    root = Path(lake_root)
+    ingested_path = root / CATALOGS_LAYER / name
+    if ingested_path.exists():
+        raise FileExistsError(
+            f"An ingested survey already exists at {ingested_path}. "
+            f"Choose a different name for the product."
+        )
+    return root / PRODUCTS_LAYER / name
+
+
 def survey_layer_root(lake_root: Path | str, survey: str, modality: str) -> Path:
-    """Return ``catalogs|spectra|cutouts``/<survey> path."""
+    """Return the on-disk root for a survey/product in a given modality.
+
+    For ``MODALITY_CATALOG`` the resolver checks ``catalogs/`` first, then
+    ``products/`` (so both ingested surveys and derived products are found).
+    Spectra and cutouts are unchanged (always under their dedicated layer dir).
+    """
     if modality not in _LAYER_DIRS:
         raise ValueError(f"Unknown modality {modality!r}; use catalog, spectra, cutout.")
+    if modality == MODALITY_CATALOG:
+        return resolve_catalog_root(lake_root, survey)
     return Path(lake_root) / _LAYER_DIRS[modality] / survey
 
 

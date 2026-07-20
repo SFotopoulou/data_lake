@@ -285,9 +285,13 @@ def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
 
 
 def _lake_catalog_root(lake_root: Path | str, survey: str) -> Path:
-    root = Path(lake_root) / "catalogs" / survey
+    from data_lake.schema_registry import resolve_catalog_root
+    root = resolve_catalog_root(lake_root, survey)
     if not root.is_dir():
-        raise FileNotFoundError(f"Catalog not found: {root}")
+        raise FileNotFoundError(
+            f"Catalog not found: {root} "
+            f"(checked catalogs/{survey} and products/{survey})"
+        )
     return root
 
 

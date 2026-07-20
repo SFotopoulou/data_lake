@@ -31,6 +31,7 @@ from data_lake.ingest.fits_to_parquet import (
     resolve_redshift_column,
     resolve_link_id_column,
 )
+from data_lake.schema_registry import resolve_catalog_root
 
 log = logging.getLogger(__name__)
 
@@ -97,9 +98,12 @@ class CatalogAccessor:
     ) -> None:
         self.lake_root = Path(lake_root)
         self.survey_name = survey_name
-        self._catalog_root = self.lake_root / "catalogs" / survey_name
+        self._catalog_root = resolve_catalog_root(self.lake_root, survey_name)
         if not self._catalog_root.exists():
-            raise FileNotFoundError(f"Catalog not found: {self._catalog_root}")
+            raise FileNotFoundError(
+                f"Catalog not found: {self._catalog_root} "
+                f"(checked catalogs/{survey_name} and products/{survey_name})"
+            )
 
         self._info = self._load_info()
         self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))

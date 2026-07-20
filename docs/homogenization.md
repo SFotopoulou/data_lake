@@ -44,7 +44,7 @@ dl-homogenize --survey ALLWISE --cone 150.1 2.2 --radius-arcsec 600 \
 
 Region selectors (at most one required): `--from-area`, `--cone`, `--bbox`, `--npix` + `--norder`, `--ids`, `--where`. When `--from-product` is used (catalog modality only), no region selector is needed — all tiles in the product are processed automatically.
 
-Output directory depends on modality: `catalogs/<materialize-as>/` (catalog), `spectra/<materialize-as>/` (spectra), `cutouts/<materialize-as>/` (cutout). All outputs carry `kind: product`, `product_subtype: homogenized`, and provenance (`transform_id`, column lineage).
+Output directory depends on modality: `products/<materialize-as>/` (catalog), `spectra/<materialize-as>/` (spectra), `cutouts/<materialize-as>/` (cutout). All outputs carry `kind: product`, `product_subtype: homogenized`, and provenance (`transform_id`, column lineage).
 
 ## Transform packs
 

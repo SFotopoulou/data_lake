@@ -20,7 +20,7 @@ Creates::
         README.md
         .gitignore
         data/
-            catalogs/  spectra/  cutouts/  shared/
+            catalogs/  products/  spectra/  cutouts/  shared/
         notebooks/
         scripts/
 """
@@ -65,8 +65,8 @@ The library code lives elsewhere; this folder holds the *config*,
   lake_config.toml      # single source of truth for this deployment
   README.md             # this file
   .gitignore            # excludes data/, logs/
-  data/                 # actual tiles (gitignored)
-    catalogs/  spectra/  cutouts/  shared/
+    data/                 # actual tiles (gitignored)
+    catalogs/  products/  spectra/  cutouts/  shared/
   notebooks/            # your notebooks
   scripts/              # your scripts (cron jobs, batch wrappers)
 ```
@@ -182,6 +182,7 @@ def init_lake(
     # Build sub-trees
     for sub in (
         data_root / "catalogs",
+        data_root / "products",
         data_root / "spectra",
         data_root / "cutouts",
         data_root / "shared",

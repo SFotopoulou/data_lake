@@ -222,6 +222,44 @@ def test_spectra_schema_manifest_sky_meta_fields(tmp_path: Path) -> None:
     assert "meta.source_file" in meta_text
 
 
+class TestCatalogResolver:
+    """Tests for resolve_catalog_root / catalog_write_root."""
+
+    def test_resolve_prefers_catalogs_when_both_exist(self, tmp_path: Path) -> None:
+        from data_lake.schema_registry import resolve_catalog_root
+
+        (tmp_path / "catalogs" / "SURVEY").mkdir(parents=True)
+        (tmp_path / "products" / "SURVEY").mkdir(parents=True)
+        result = resolve_catalog_root(tmp_path, "SURVEY")
+        assert result == tmp_path / "catalogs" / "SURVEY"
+
+    def test_resolve_falls_back_to_products(self, tmp_path: Path) -> None:
+        from data_lake.schema_registry import resolve_catalog_root
+
+        (tmp_path / "products" / "MY_PROD").mkdir(parents=True)
+        result = resolve_catalog_root(tmp_path, "MY_PROD")
+        assert result == tmp_path / "products" / "MY_PROD"
+
+    def test_resolve_returns_products_path_when_nothing_exists(self, tmp_path: Path) -> None:
+        from data_lake.schema_registry import resolve_catalog_root
+
+        result = resolve_catalog_root(tmp_path, "NONEXISTENT")
+        assert result == tmp_path / "products" / "NONEXISTENT"
+
+    def test_catalog_write_root_returns_products(self, tmp_path: Path) -> None:
+        from data_lake.schema_registry import catalog_write_root
+
+        result = catalog_write_root(tmp_path, "MY_PROD")
+        assert result == tmp_path / "products" / "MY_PROD"
+
+    def test_catalog_write_root_raises_when_ingested_exists(self, tmp_path: Path) -> None:
+        from data_lake.schema_registry import catalog_write_root
+
+        (tmp_path / "catalogs" / "CONFLICT").mkdir(parents=True)
+        with pytest.raises(FileExistsError, match="ingested survey already exists"):
+            catalog_write_root(tmp_path, "CONFLICT")
+
+
 def test_column_overlay_merge(tmp_path: Path) -> None:
     overlay_dir = tmp_path / "lake" / "shared" / "registry" / "overlays"
     overlay_dir.mkdir(parents=True)

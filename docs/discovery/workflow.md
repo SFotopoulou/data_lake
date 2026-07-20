@@ -28,8 +28,8 @@ flowchart LR
 | 1. Region | `dl-region … --save-as AREA` | `areas/AREA.json` (region only) |
 | 2. Plan | `dl-area set-crossmatch` / `set-gather` / `set-homogenize` or `dl-area import` | `crossmatch_plan`, `gather`, optional `homogenize` |
 | 3. Crossmatch | `dl-crossmatch --from-area AREA` | `crossmatch/<A>_x_<B>__r<R>/` trees |
-| 4. Gather | `dl-gather --from-area AREA` | `catalogs/<product>/` (`kind: product`) |
-| 5. Homogenize | `dl-homogenize --from-product …` or `--from-area` | `catalogs/<ab_product>/` (`product_subtype: homogenized`) |
+| 4. Gather | `dl-gather --from-area AREA` | `products/<product>/` (`kind: product`) |
+| 5. Homogenize | `dl-homogenize --from-product …` or `--from-area` | `products/<ab_product>/` (`product_subtype: homogenized`) |
 | 6. ML export | `dl-extract-catalog --from-product …` | Parquet/FITS + provenance sidecar |
 | 7. Spectra (optional) | `dl-gather --extract-modalities` or `dl-extract-spectra-subset` | Zarr/HDF5 outside the lake |
 

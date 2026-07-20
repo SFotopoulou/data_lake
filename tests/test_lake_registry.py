@@ -456,6 +456,44 @@ def test_describe_lake_pair_surveys_cli(tmp_path: Path) -> None:
     assert any(p["survey"] == "PAIR_CLI" for p in payload["pairing"])
 
 
+def test_registry_scans_products_directory(tmp_path: Path) -> None:
+    """Products under products/<name>/ appear in the registry with kind=product."""
+    import json
+
+    from data_lake.lake_registry import build_lake_registry_table
+    from data_lake.schema_registry import CATALOG_KIND_PRODUCT
+
+    lake = tmp_path / "lake"
+    # Ingested survey under catalogs/
+    cat_dir = lake / "catalogs" / "WISE"
+    cat_dir.mkdir(parents=True)
+    (cat_dir / "catalog_info.json").write_text(json.dumps({
+        "hats_order": 5,
+        "kind": "ingested",
+        "ra_column": "ra",
+        "dec_column": "dec",
+    }))
+
+    # Derived product under products/
+    prod_dir = lake / "products" / "EUCLID_wise_ab"
+    prod_dir.mkdir(parents=True)
+    (prod_dir / "catalog_info.json").write_text(json.dumps({
+        "hats_order": 5,
+        "kind": "product",
+        "product_subtype": "homogenized",
+        "ra_column": "ra",
+        "dec_column": "dec",
+    }))
+
+    table = build_lake_registry_table(lake)
+    surveys = dict(zip(table["survey"].to_pylist(), table["path"].to_pylist()))
+    assert "WISE" in surveys
+    assert "EUCLID_wise_ab" in surveys
+    assert surveys["EUCLID_wise_ab"].startswith("products/")
+    kinds = dict(zip(table["survey"].to_pylist(), table["kind"].to_pylist()))
+    assert kinds["EUCLID_wise_ab"] == CATALOG_KIND_PRODUCT
+
+
 def test_describe_lake_version_flag() -> None:
     import tomllib
     from click.testing import CliRunner

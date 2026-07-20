@@ -272,9 +272,10 @@ def gather_product(
     """Materialise a derived product catalog joining base x partners over a selection."""
     if multiplicity not in ("nearest", "all"):
         raise ValueError("multiplicity must be 'nearest' or 'all'")
+    from data_lake.schema_registry import catalog_write_root
     lake_root = Path(lake_root)
     partners = list(partners)
-    out_root = lake_root / "catalogs" / materialize_as
+    out_root = catalog_write_root(lake_root, materialize_as)
     if out_root.exists() and not overwrite:
         raise FileExistsError(
             f"product catalog already exists: {out_root} (use overwrite=True)"
@@ -416,7 +417,8 @@ def gather_product(
 
 
 def _base_catalog_info(lake_root: Path, base: str) -> dict[str, Any]:
-    info_path = lake_root / "catalogs" / base / "catalog_info.json"
+    from data_lake.schema_registry import resolve_catalog_root
+    info_path = resolve_catalog_root(lake_root, base) / "catalog_info.json"
     if not info_path.is_file():
         return {}
     with open(info_path) as fh:
@@ -546,9 +548,10 @@ def extract_modalities_for_product(
     ``output_dir`` and never duplicated in-lake. ``survey`` defaults to the
     product's base catalog.
     """
+    from data_lake.schema_registry import resolve_catalog_root
     lake_root = Path(lake_root)
     output_dir = Path(output_dir)
-    info_path = lake_root / "catalogs" / product / "catalog_info.json"
+    info_path = resolve_catalog_root(lake_root, product) / "catalog_info.json"
     base_survey = survey
     if base_survey is None:
         try:

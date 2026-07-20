@@ -7,18 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **`uncertainty_transform` on catalog homogenize rules** — optional per-rule transform for uncertainty columns (same types as value transforms: `scale`, `mag_offset`, `identity`, `null_if_sentinel`, `flux_to_ab`). When omitted, auto-propagation from the value `transform` type is unchanged.
+## [0.6.0] - 2026-07-20
 
 ### Changed
 
-- **Column crossmatch tree naming simplified** — tree directories are now `{A}_x_{B}__col_{col_a}__{col_b}` (column names embedded, `__` separator). The previous `--match-id` label and Blake2 hex token are dropped. `dl-crossmatch` no longer requires `--match-id`; partner specs change from `SURVEY:col:MATCH_ID:COL_A:COL_B` to `SURVEY:col:COL_A:COL_B`. `dl-describe-lake` detail now shows `col:COL_A:COL_B` — paste directly into a partner spec. No backwards compatibility with `__col_<id>_<hex>` trees; re-run crossmatch.
+- **Breaking on-disk layout: derived products move to `products/`** — `dl-gather` and `dl-homogenize` now write catalog products to `<lake_root>/products/<name>/` instead of `catalogs/<name>/`. No migration is provided; re-run `dl-gather` and `dl-homogenize --overwrite` to regenerate under the new location. Ingested surveys stay in `catalogs/` and are unaffected.
+- **Name resolver** — all read-side code (`CatalogAccessor`, `CatalogExtractor`, tile index, homogenize engine, crossmatch, MCP server, pack-tile, query-from-master, validate-homogenization) now calls `resolve_catalog_root(lake_root, name)`, which checks `catalogs/<name>` first and falls back to `products/<name>`. References by name continue to work transparently.
+- **Collision guard** — `dl-gather` and `dl-homogenize` refuse to write a product if a same-named ingested survey already exists under `catalogs/`, preventing resolver ambiguity.
+- **Lake registry scans both trees** — `dl-describe-lake --refresh` and `build_lake_registry_table` now iterate both `catalogs/` and `products/`, so products appear with `kind=product` and `path` starting with `products/`.
+- **`dl-init` creates `products/`** — new lake deployments include a `products/` subdirectory alongside `catalogs/`, `spectra/`, `cutouts/`, and `shared/`.
+- `[paths]` section of `lake_config.toml` now includes a `products` key (default: `"products"`); existing configs without the key continue to work via the default.
+
+### Added
+
+- **`resolve_catalog_root` / `catalog_write_root`** in `data_lake/schema_registry.py` — central path-resolution helpers; use these instead of hard-coding `lake_root / "catalogs" / name` in any new code.
+- **`CATALOGS_LAYER` / `PRODUCTS_LAYER`** constants in `schema_registry.py`.
 
 ### Fixed
 
 - **`dl-homogenize --from-product` schema mismatch** — tiles with missing partner photometry (or null-typed partner columns) no longer fail finalize with `AppendRowGroups requires equal schemas`. Output tiles are aligned to a canonical schema before write; gather null partner padding uses `Float64`.
 - **`dl-describe-lake` / lake registry** — crossmatch fields (`match_mode`, `match_col_a`, …) are no longer dropped when catalogs are present (PyArrow `from_pylist` takes the first-row schema). Column trees show `detail=col:<col_a>:<col_b>`; survey column width adapts for long `__col_` names.
+
+### Added (carried forward from Unreleased)
+
+- **`uncertainty_transform` on catalog homogenize rules** — optional per-rule transform for uncertainty columns (same types as value transforms: `scale`, `mag_offset`, `identity`, `null_if_sentinel`, `flux_to_ab`). When omitted, auto-propagation from the value `transform` type is unchanged.
+- **Column crossmatch tree naming simplified** — tree directories are now `{A}_x_{B}__col_{col_a}__{col_b}` (column names embedded, `__` separator). The previous `--match-id` label and Blake2 hex token are dropped. `dl-crossmatch` no longer requires `--match-id`; partner specs change from `SURVEY:col:MATCH_ID:COL_A:COL_B` to `SURVEY:col:COL_A:COL_B`. `dl-describe-lake` detail now shows `col:COL_A:COL_B` — paste directly into a partner spec. No backwards compatibility with `__col_<id>_<hex>` trees; re-run crossmatch.
 
 ## [0.5.0] - 2026-07-07
 

@@ -3,6 +3,7 @@
 | Symptom | Likely cause | Action |
 |---------|--------------|--------|
 | `dl-homogenize --from-product` fails with `AppendRowGroups requires equal schemas` | Sparse gather tiles had different columns/dtypes; older homogenize wrote unequal Parquet schemas | Upgrade and re-run `dl-homogenize … --overwrite`; sparse partner bands become null AB columns with a shared schema |
+| Products written to `catalogs/` instead of `products/` | Lake was initialised or products were generated before v0.6.0 | No migration provided; re-run `dl-gather`/`dl-homogenize --overwrite` to regenerate under `products/`. Products under `catalogs/` are still readable (resolver checks `catalogs/` first). |
 | `_spectrum_index` all -1 after ingest | `_source_id` mismatch between catalog and spectra (different link key) | Check `--link-id-col` on catalog vs spectrum format; run `dl-validate-catalog-spectra-link --survey NAME` |
 | `_spectrum_index` all -1 after repair | Spectra not ingested yet, or `dl-rebuild-catalog-indices` not run | Run `dl-rebuild-catalog-indices --survey NAME --kind spectrum` |
 | Registry row counts stale | Registry not refreshed since last ingest | `dl-describe-lake --refresh --count-total` |

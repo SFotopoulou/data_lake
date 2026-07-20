@@ -33,6 +33,7 @@ from data_lake.schema_registry import (
     CATALOG_KIND_PRODUCT,
     MODALITY_CATALOG,
     PRODUCT_SUBTYPE_HOMOGENIZED,
+    resolve_catalog_root,
 )
 
 log = logging.getLogger(__name__)
@@ -168,9 +169,13 @@ class HomogenizeResult:
 
 
 def _read_source_info(lake_root: Path, survey: str) -> dict[str, Any]:
-    path = lake_root / "catalogs" / survey / "catalog_info.json"
+    catalog_root = resolve_catalog_root(lake_root, survey)
+    path = catalog_root / "catalog_info.json"
     if not path.is_file():
-        raise FileNotFoundError(f"No catalog at catalogs/{survey}/")
+        raise FileNotFoundError(
+            f"No catalog_info.json for {survey!r} "
+            f"(checked catalogs/{survey}/ and products/{survey}/)"
+        )
     return json.loads(path.read_text())
 
 
@@ -190,7 +195,7 @@ def _homogenize_tile(
     import polars as pl
 
     tile_path = (
-        lake_root / "catalogs" / source_catalog / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
+        resolve_catalog_root(lake_root, source_catalog) / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
     )
     if not tile_path.is_file():
         return 0, None, []
@@ -329,11 +334,12 @@ def homogenize_catalog(
     source_info = _read_source_info(lake_root, survey)
     ra_col = str(source_info.get("ra_column", "ra"))
     dec_col = str(source_info.get("dec_column", "dec"))
+    from data_lake.schema_registry import catalog_write_root
     norder = selection.norder
     npix_list = sorted(selection.npix)
     selection_ids = set(selection.source_ids) if selection.source_ids is not None else None
 
-    out_root = lake_root / "catalogs" / materialize_as
+    out_root = catalog_write_root(lake_root, materialize_as)
     if out_root.exists() and not overwrite and not check_only:
         raise FileExistsError(
             f"product catalog already exists: {out_root} (use --overwrite)"
@@ -495,7 +501,7 @@ def homogenize_product(
 
     source_info = _read_source_info(lake_root, from_product)
     provenance = source_info.get("provenance") or {}
-    product_root = lake_root / "catalogs" / from_product
+    product_root = resolve_catalog_root(lake_root, from_product)
     source_schema = union_product_tile_schema(product_root)
     available = set(source_schema.names)
     ra_col = str(source_info.get("ra_column") or "ra")
@@ -510,10 +516,11 @@ def homogenize_product(
             f"{resolution.to_dict()}"
         )
 
+    from data_lake.schema_registry import catalog_write_root as _cwr
     norder = selection.norder
     npix_list = sorted(selection.npix)
     selection_ids = set(selection.source_ids) if selection.source_ids is not None else None
-    out_root = lake_root / "catalogs" / materialize_as
+    out_root = _cwr(lake_root, materialize_as)
     if out_root.exists() and not overwrite and not check_only:
         raise FileExistsError(
             f"product catalog already exists: {out_root} (use --overwrite)"

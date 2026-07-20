@@ -99,10 +99,14 @@ def build_catalog_view_ddl(
     view_name: str | None = None,
 ) -> str:
     """``CREATE OR REPLACE VIEW`` for one HATS-partitioned catalog."""
+    from data_lake.schema_registry import resolve_catalog_root
     lake_root = Path(lake_root)
-    catalog_root = lake_root / "catalogs" / survey
+    catalog_root = resolve_catalog_root(lake_root, survey)
     if not catalog_root.is_dir():
-        raise FileNotFoundError(f"Catalog not found: {catalog_root}")
+        raise FileNotFoundError(
+            f"Catalog not found: {catalog_root} "
+            f"(checked catalogs/{survey} and products/{survey})"
+        )
 
     if norder is None:
         info_path = catalog_root / "catalog_info.json"
@@ -237,10 +241,12 @@ def build_select_from_master(
 
     if validate_columns:
         for survey, cols in columns.items():
-            manifest_path = lake_root / "catalogs" / survey / "schema_manifest.json"
+            from data_lake.schema_registry import resolve_catalog_root
+            survey_root = resolve_catalog_root(lake_root, survey)
+            manifest_path = survey_root / "schema_manifest.json"
             if not manifest_path.is_file():
                 continue
-            manifest = load_catalog_schema_manifest(lake_root / "catalogs" / survey)
+            manifest = load_catalog_schema_manifest(survey_root)
             known = {c["name"] for c in manifest.get("columns", [])}
             for col in cols:
                 if col not in known:

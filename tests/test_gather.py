@@ -73,10 +73,10 @@ class TestGatherProduct:
             materialize_as="EUCLID_desi",
         )
         assert result.n_rows == 2
-        assert (joined_lake / "catalogs" / "EUCLID_desi" / "catalog_info.json").is_file()
+        assert (joined_lake / "products" / "EUCLID_desi" / "catalog_info.json").is_file()
 
         info = json.loads(
-            (joined_lake / "catalogs" / "EUCLID_desi" / "catalog_info.json").read_text()
+            (joined_lake / "products" / "EUCLID_desi" / "catalog_info.json").read_text()
         )
         assert info["kind"] == "product"
         assert info["provenance"]["base_catalog"] == "EUCLID"
@@ -330,7 +330,7 @@ class TestGatherCli:
         assert "areas/WideField.json" in result.output
         assert "Gather EUCLID_desi_area:" in result.output
         assert "EUCLID_desi_area" in result.output
-        assert (joined_lake / "catalogs" / "EUCLID_desi_area" / "catalog_info.json").is_file()
+        assert (joined_lake / "products" / "EUCLID_desi_area" / "catalog_info.json").is_file()
 
     def test_cli_materialize_as_overrides_area(self, joined_lake: Path) -> None:
         from click.testing import CliRunner
@@ -368,5 +368,5 @@ class TestGatherCli:
         assert "Gather cli_wins:" in result.output
         assert "cli_wins" in result.output
         assert "from_area_json" not in result.output
-        assert (joined_lake / "catalogs" / "cli_wins" / "catalog_info.json").is_file()
-        assert not (joined_lake / "catalogs" / "from_area_json").exists()
+        assert (joined_lake / "products" / "cli_wins" / "catalog_info.json").is_file()
+        assert not (joined_lake / "products" / "from_area_json").exists()

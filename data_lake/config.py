@@ -91,6 +91,7 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "paths": {
         "catalogs": "catalogs",
+        "products": "products",
         "spectra":  "spectra",
         "cutouts":  "cutouts",
         "shared":   "shared",
@@ -133,6 +134,7 @@ class _Defaults:
 @dataclass(slots=True)
 class _Paths:
     catalogs: str = "catalogs"
+    products: str = "products"
     spectra:  str = "spectra"
     cutouts:  str = "cutouts"
     shared:   str = "shared"
@@ -169,6 +171,10 @@ class LakeConfig:
     @property
     def catalogs_root(self) -> Path:
         return self.lake.root / self.paths.catalogs
+
+    @property
+    def products_root(self) -> Path:
+        return self.lake.root / self.paths.products
 
     @property
     def spectra_root(self) -> Path:
@@ -337,6 +343,7 @@ class LakeConfig:
             "",
             "[paths]",
             f'catalogs = {_q(self.paths.catalogs)}',
+            f'products = {_q(self.paths.products)}',
             f'spectra  = {_q(self.paths.spectra)}',
             f'cutouts  = {_q(self.paths.cutouts)}',
             f'shared   = {_q(self.paths.shared)}',

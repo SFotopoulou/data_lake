@@ -129,7 +129,7 @@ try:
     @click.option("--radii", "radii_json", default=None,
                   help='JSON {survey: radius_arcsec} for partner crossmatch trees.')
     @click.option("--materialize-as", "materialize_as", default=None,
-                  help="Product catalog name under catalogs/.")
+                  help="Product catalog name (written to products/<name>/).")
     @click.option("--multiplicity", type=click.Choice(["nearest", "all"]),
                   default="nearest", show_default=True,
                   help="nearest match per source (default) or all matches (fan-out).")
@@ -311,7 +311,7 @@ try:
                 npix=npix,
                 npix_norder=npix_norder,
             )
-            out_path = lake / "catalogs" / materialize_as
+            out_path = lake / "products" / materialize_as
             click.echo(
                 f"Gather {materialize_as}: base={base}, {len(partners)} partner(s), "
                 f"{len(selection.npix)} tile(s) → {out_path}/"

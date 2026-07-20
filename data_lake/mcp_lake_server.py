@@ -22,6 +22,7 @@ from data_lake.schema_registry import (
     MODALITY_CATALOG,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
+    resolve_catalog_root,
 )
 
 _DEFAULT_MODALITIES = (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT)
@@ -181,14 +182,17 @@ def tool_describe_product(
     from data_lake.io.crossmatch import find_crossmatch_roots
 
     root = resolve_lake_root(lake_root)
-    catalog_root = root / "catalogs" / name
+    catalog_root = resolve_catalog_root(root, name)
     info_path = catalog_root / "catalog_info.json"
     if not info_path.is_file():
-        raise FileNotFoundError(f"No catalog at catalogs/{name}/")
+        raise FileNotFoundError(
+            f"No catalog_info.json for {name!r} "
+            f"(checked catalogs/{name} and products/{name})"
+        )
     with open(info_path) as fh:
         info = json.load(fh)
     if info.get("kind") != CATALOG_KIND_PRODUCT:
-        raise ValueError(f"catalogs/{name} is not a product (kind={info.get('kind')!r})")
+        raise ValueError(f"{catalog_root.name} is not a product (kind={info.get('kind')!r})")
 
     provenance = info.get("provenance") or {}
     base = provenance.get("base_catalog") or provenance.get("base")

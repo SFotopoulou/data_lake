@@ -125,7 +125,7 @@ try:
     )
     @click.option(
         "--materialize-as", "materialize_as", default=None,
-        help="Output product name under catalogs/, spectra/, or cutouts/.",
+        help="Output product name (catalog products written to products/<name>/).",
     )
     @click.option(
         "--columns", default=None,

@@ -202,8 +202,9 @@ def validate_homogenized_catalog_product(
     max_tiles: int = 3,
 ) -> ValidationReport:
     """Validate a homogenized catalog product's metadata and sample values."""
+    from data_lake.schema_registry import resolve_catalog_root
     rep = ValidationReport()
-    root = Path(lake_root) / "catalogs" / product
+    root = resolve_catalog_root(Path(lake_root), product)
     info_path = root / "catalog_info.json"
     if not info_path.is_file():
         rep.errors.append(f"missing catalog_info.json for product {product!r}")

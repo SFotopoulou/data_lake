@@ -20,9 +20,12 @@ from pathlib import Path
 from typing import Iterator
 
 from data_lake.schema_registry import (
+    CATALOGS_LAYER,
     MODALITY_CATALOG,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
+    PRODUCTS_LAYER,
+    resolve_catalog_root,
 )
 
 log = logging.getLogger(__name__)
@@ -47,6 +50,8 @@ def modality_layer_dir(modality: str) -> str:
 
 
 def survey_root_for(lake_root: Path | str, survey: str, modality: str) -> Path:
+    if modality == MODALITY_CATALOG:
+        return resolve_catalog_root(lake_root, survey)
     return Path(lake_root) / modality_layer_dir(modality) / survey
 
 
@@ -139,16 +144,33 @@ def survey_npix(
 
 
 def iter_surveys_in_modality(lake_root: Path | str, modality: str) -> Iterator[str]:
-    """Yield survey names present in a modality layer (directories with tiles/info)."""
-    layer = Path(lake_root) / modality_layer_dir(modality)
-    if not layer.is_dir():
-        return
+    """Yield survey/product names present in a modality layer.
+
+    For ``MODALITY_CATALOG`` both ``catalogs/`` and ``products/`` are scanned
+    so that derived products are discovered alongside ingested surveys.
+    """
+    root = Path(lake_root)
     info_name = _MODALITY_CONFIG[modality][1]
-    for p in sorted(layer.iterdir()):
-        if not p.is_dir() or p.name == "crossmatch":
-            continue
-        if (p / info_name).is_file() or any(p.glob("Norder=*")):
-            yield p.name
+
+    def _iter_layer(layer: Path) -> Iterator[str]:
+        if not layer.is_dir():
+            return
+        for p in sorted(layer.iterdir()):
+            if not p.is_dir() or p.name == "crossmatch":
+                continue
+            if (p / info_name).is_file() or any(p.glob("Norder=*")):
+                yield p.name
+
+    if modality == MODALITY_CATALOG:
+        seen: set[str] = set()
+        for name in _iter_layer(root / CATALOGS_LAYER):
+            seen.add(name)
+            yield name
+        for name in _iter_layer(root / PRODUCTS_LAYER):
+            if name not in seen:
+                yield name
+    else:
+        yield from _iter_layer(root / modality_layer_dir(modality))
 
 
 def refresh_tile_indices(

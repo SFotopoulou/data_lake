@@ -60,6 +60,7 @@ examples/
   areas/                            # example area JSON files
   imaging/ spectroscopy/ photometry/  # survey-specific example scripts
 data/                               # gitignored; populated locally with FITS fixtures for tests
+                                    # (lake data lives under catalogs/, products/, spectra/, cutouts/)
                                     # (see tests/ for the actual committed test assets)
 ```
 
