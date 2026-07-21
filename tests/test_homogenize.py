@@ -200,6 +200,45 @@ class TestTransforms:
         assert isinstance(lin[0]["transform"], list)
         assert [s["type"] for s in lin[0]["transform"]] == ["scale", "flux_to_ab"]
 
+    def test_inverse_transform(self) -> None:
+        import polars as pl
+
+        rule = TransformRule.from_dict({
+            "survey": "FAKE",
+            "source_column": "x",
+            "target_column": "inv_x",
+            "uncertainty_column": "dx",
+            "target_uncertainty_column": "inv_x_err",
+            "transform": {"type": "inverse"},
+        })
+        df = pl.DataFrame({"x": [2.0, 0.0, -4.0], "dx": [0.1, 0.1, 0.2]})
+        out, _ = apply_rules_to_frame(df, [rule])
+        assert out["inv_x"][0] == pytest.approx(0.5)
+        assert out["inv_x"][1] is None
+        assert out["inv_x"][2] == pytest.approx(-0.25)
+        # No auto uncertainty for inverse — error is copied (nulled when target null).
+        assert out["inv_x_err"][0] == pytest.approx(0.1)
+        assert out["inv_x_err"][1] is None
+        assert out["inv_x_err"][2] == pytest.approx(0.2)
+
+    def test_inverse_uncertainty_transform_is_reciprocal(self) -> None:
+        """Explicit uncertainty_transform inverse takes 1/err, not |err|/x²."""
+        import polars as pl
+
+        rule = TransformRule.from_dict({
+            "survey": "FAKE",
+            "source_column": "x",
+            "target_column": "inv_x",
+            "uncertainty_column": "dx",
+            "target_uncertainty_column": "inv_dx",
+            "transform": {"type": "inverse"},
+            "uncertainty_transform": {"type": "inverse"},
+        })
+        df = pl.DataFrame({"x": [2.0], "dx": [0.25]})
+        out, _ = apply_rules_to_frame(df, [rule])
+        assert out["inv_x"][0] == pytest.approx(0.5)
+        assert out["inv_dx"][0] == pytest.approx(4.0)
+
     def test_explicit_uncertainty_transform_flux_to_ab(self) -> None:
         """Explicit flux_to_ab uncertainty transform uses flux-error propagation."""
         import polars as pl

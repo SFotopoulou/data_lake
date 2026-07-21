@@ -69,6 +69,7 @@ Each rule operates on one source column and writes one target column. All catalo
 | `identity` | — | copy after built-in sentinel clean | copied (nulled when source is null) |
 | `null_if_sentinel` | `values` (optional list) | copy; additionally null values in `values` and NaN | copied (nulled when source or uncertainty is null) |
 | `flux_to_ab` | `zp` | `target = −2.5 log₁₀(source) + zp`; source ≤ 0 → null | `2.5 / ln(10) × dflux / flux` |
+| `inverse` | — | `target = 1 / source`; source = 0 → null | no auto (copy err; use `uncertainty_transform: inverse` for `1/err`) |
 
 **JSON fields used on every rule:**
 
@@ -124,6 +125,7 @@ Supported `uncertainty_transform` types are the same as value transforms:
 | `mag_offset` | `err + delta` |
 | `identity` / `null_if_sentinel` | copy, nulled when the value target is null |
 | `flux_to_ab` | `2.5 / ln(10) × dflux / flux` using `source_column` as flux (`zp` unused for the error) |
+| `inverse` | `1 / err` (reciprocal of the uncertainty column; zero → null) |
 
 Requires both `uncertainty_column` and `target_uncertainty_column`.
 
@@ -153,7 +155,7 @@ An empty or omitted `values` list behaves identically to `identity` (built-in se
 
 #### Query-time SQL
 
-`build_homogenized_view_sql` supports all five catalog rule types and generates `CASE WHEN` expressions for sentinel nulling. It does **not** propagate uncertainty columns in SQL — for production use, always materialise with `dl-homogenize` instead.
+`build_homogenized_view_sql` supports all catalog rule types and generates `CASE WHEN` expressions for sentinel nulling. It does **not** propagate uncertainty columns in SQL — for production use, always materialise with `dl-homogenize` instead.
 
 ### Spectra and cutout rules
 

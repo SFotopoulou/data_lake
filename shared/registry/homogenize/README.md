@@ -50,6 +50,7 @@ All five catalog transform types are supported. Built-in sentinels (`-9999`, `99
 | `identity` | — | Pass-through with sentinel clean (rename only) |
 | `null_if_sentinel` | `values` (optional list) | Survey uses non-standard sentinel values (e.g. `99.0`) |
 | `flux_to_ab` | `zp` | Native column is flux; `zp=8.906` for Jy, `zp=23.9` for µJy |
+| `inverse` | — | Reciprocal: `1 / source` (zero → null). No auto uncertainty — pair with `uncertainty_transform: {type: inverse}` for `1/err` if needed. |
 
 **Pairing uncertainty columns:** set `uncertainty_column` + `target_uncertainty_column` on the same rule entry (not as a separate rule). By default the engine auto-propagates uncertainty from the value `transform` type. Override with an explicit `uncertainty_transform` (same `type` vocabulary) when the error needs a different formula than the value.
 

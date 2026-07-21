@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`dl-homogenize --from-product` float vs string** — product schema union prefers string/binary over float when tiles disagree, so already-gathered products with legacy float64 null pads can homogenize without re-gathering.
 - **`dl-extract-catalog` FITS string columns** — nullable Arrow strings are written as fixed-width unicode (null → `""`) so Astropy no longer raises `unsupported object types or mixed types`. Schema unify also prefers string over float for legacy gather pads.
 - **Homogenize transform chains** — catalog recipe `transform` / `uncertainty_transform` may be a single object (unchanged) or a non-empty list of steps applied left-to-right (e.g. `scale` then `flux_to_ab`).
+- **`inverse` catalog transform** — `target = 1 / source` (null when source is 0); no auto uncertainty propagation (optional `uncertainty_transform: {type: inverse}` for `1/err`).
 
 ## [0.6.1] - 2026-07-20
 

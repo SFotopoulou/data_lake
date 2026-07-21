@@ -21,6 +21,7 @@ CATALOG_TRANSFORM_TYPES = frozenset({
     "identity",
     "null_if_sentinel",
     "flux_to_ab",
+    "inverse",
 })
 
 
@@ -280,6 +281,12 @@ def _apply_value_transform(
         flux = _flux_expr(source_column)
         zp = float(transform["zp"])
         return pl.when(flux.is_not_null()).then(-2.5 * flux.log10() + zp).otherwise(None)
+    if ttype == "inverse":
+        return (
+            pl.when(src.is_not_null() & (src != 0))
+            .then(1.0 / src)
+            .otherwise(None)
+        )
     raise ValueError(f"Unsupported catalog transform type {ttype!r}")
 
 
@@ -307,6 +314,12 @@ def _apply_value_step_on_expr(src, transform: dict[str, Any]):
             .otherwise(src)
         )
         return pl.when(flux.is_not_null()).then(-2.5 * flux.log10() + zp).otherwise(None)
+    if ttype == "inverse":
+        return (
+            pl.when(src.is_not_null() & (src != 0))
+            .then(1.0 / src)
+            .otherwise(None)
+        )
     raise ValueError(f"Unsupported catalog transform type {ttype!r}")
 
 
@@ -360,6 +373,13 @@ def _apply_uncertainty_transform(
             .then(_FLUX_TO_AB_K * err / flux)
             .otherwise(None)
         )
+    if ttype == "inverse":
+        # Reciprocal of the uncertainty column (or current err expr in a chain).
+        return (
+            pl.when(err.is_not_null() & (err != 0))
+            .then(1.0 / err)
+            .otherwise(None)
+        )
     raise ValueError(f"Unsupported uncertainty transform type {ttype!r}")
 
 
@@ -371,31 +391,50 @@ def _apply_uncertainty_transform_chain(
     steps: Sequence[dict[str, Any]],
     value_steps: Sequence[dict[str, Any]],
 ):
-    """Apply uncertainty steps; track scaled flux for mid-chain ``flux_to_ab``."""
+    """Apply uncertainty steps; track intermediate value for ``flux_to_ab`` / ``inverse``."""
     import polars as pl
 
     err = pl.col(uncertainty_column).cast(pl.Float64)
-    # Reconstruct flux through value steps preceding each uncertainty flux_to_ab.
+    # Intermediate value for inverse; flux track for flux_to_ab.
+    value = _mag_expr(source_column)
     flux = _flux_expr(source_column)
     for step in value_steps:
         ttype = step.get("type")
         if ttype == "scale":
-            flux = flux * float(step["factor"])
+            factor = float(step["factor"])
+            value = value * factor
+            flux = flux * factor
+        elif ttype == "mag_offset":
+            value = value + float(step["delta"])
+        elif ttype == "inverse":
+            value = (
+                pl.when(value.is_not_null() & (value != 0))
+                .then(1.0 / value)
+                .otherwise(None)
+            )
         elif ttype == "flux_to_ab":
-            # After mag conversion, further flux_to_ab on uncertainty uses last flux.
             break
 
     for step in steps:
+        ttype = step.get("type")
         err = _apply_uncertainty_transform(
             uncertainty_column=uncertainty_column,
             source_column=source_column,
             target_column=target_column,
             transform=step,
             err_expr=err,
-            flux_expr=flux,
+            flux_expr=flux if ttype == "flux_to_ab" else value,
         )
-        if step.get("type") == "scale":
-            flux = flux * float(step["factor"])
+        if ttype == "scale":
+            factor = float(step["factor"])
+            value = value * factor
+            flux = flux * factor
+        elif ttype == "inverse":
+            value = (
+                pl.when(value.is_not_null() & (value != 0))
+                .then(1.0 / value)
+                .otherwise(None)
+            )
     return err
 
 
@@ -426,7 +465,9 @@ def _default_uncertainty_expr(
             .then(_FLUX_TO_AB_K * dflux / flux)
             .otherwise(None)
         )
-    # mag_offset, identity, null_if_sentinel: copy, null when target nulled
+    # mag_offset, identity, null_if_sentinel, inverse: copy, null when target nulled
+    # (inverse does not auto-propagate; use uncertainty_transform: {type: inverse}
+    #  to take the reciprocal of the uncertainty column itself.)
     return (
         pl.when(pl.col(target_column).is_null())
         .then(None)
@@ -444,12 +485,15 @@ def _default_uncertainty_from_value_chain(
     """Compose auto uncertainty propagation across a value-transform chain.
 
     ``scale`` multiplies the error; ``flux_to_ab`` converts using the flux after
-    any preceding scales; ``mag_offset`` / ``identity`` / ``null_if_sentinel``
-    leave the error unchanged (nulled when the value target is null).
+    any preceding scales; ``inverse`` does **not** auto-propagate (error is
+    copied; set ``uncertainty_transform: {type: inverse}`` to take ``1/err``);
+    ``mag_offset`` / ``identity`` / ``null_if_sentinel`` leave the error unchanged
+    (nulled when the value target is null).
     """
     import polars as pl
 
     err = pl.col(uncertainty_column).cast(pl.Float64)
+    value = _mag_expr(source_column)
     flux = _flux_expr(source_column)
     saw_flux_to_ab = False
     for step in value_steps:
@@ -457,8 +501,18 @@ def _default_uncertainty_from_value_chain(
         if ttype == "scale":
             factor = float(step["factor"])
             err = err * factor
+            value = value * factor
             if not saw_flux_to_ab:
                 flux = flux * factor
+        elif ttype == "mag_offset":
+            value = value + float(step["delta"])
+        elif ttype == "inverse":
+            # No auto uncertainty change for inverse — only track value for later steps.
+            value = (
+                pl.when(value.is_not_null() & (value != 0))
+                .then(1.0 / value)
+                .otherwise(None)
+            )
         elif ttype == "flux_to_ab":
             err = (
                 pl.when(flux.is_not_null())
@@ -466,7 +520,7 @@ def _default_uncertainty_from_value_chain(
                 .otherwise(None)
             )
             saw_flux_to_ab = True
-        elif ttype in ("mag_offset", "identity", "null_if_sentinel"):
+        elif ttype in ("identity", "null_if_sentinel"):
             continue
         else:
             raise ValueError(f"Unsupported catalog transform type {ttype!r}")
@@ -575,6 +629,11 @@ def _sql_expr_for_value_steps(src: str, steps: Sequence[dict[str, Any]]) -> str:
             zp = float(step["zp"])
             expr = (
                 f"(CASE WHEN {expr} > 0 THEN -2.5 * log10({expr}) + {zp} ELSE NULL END)"
+            )
+        elif ttype == "inverse":
+            expr = (
+                f"(CASE WHEN {expr} IS NOT NULL AND {expr} <> 0 "
+                f"THEN 1.0 / ({expr}) ELSE NULL END)"
             )
         else:
             raise ValueError(f"Unsupported catalog transform type {ttype!r}")
