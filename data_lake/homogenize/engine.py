@@ -135,6 +135,23 @@ def build_homogenize_product_schema(
     return pa.schema(fields)
 
 
+def _merge_product_column_types(existing: pa.DataType, incoming: pa.DataType) -> pa.DataType:
+    """Merge tile dtypes for a gather product without premature null→float64.
+
+    Ingest's ``_canonical_merge_types(null, null)`` returns float64, which locks
+    passthrough string columns (e.g. ``SDSS_DR17_CLASS``) when several all-null
+    tiles are scanned before a typed tile. Keep null until a concrete type wins;
+    remaining nulls are promoted in ``union_product_tile_schema``.
+    """
+    from data_lake.ingest.fits_to_parquet import _canonical_merge_types
+
+    if pa.types.is_null(existing):
+        return incoming
+    if pa.types.is_null(incoming):
+        return existing
+    return _canonical_merge_types(existing, incoming)
+
+
 def union_product_tile_schema(catalog_root: Path) -> pa.Schema:
     """Union column names/types across product tiles (handles sparse gather).
 
@@ -143,8 +160,6 @@ def union_product_tile_schema(catalog_root: Path) -> pa.Schema:
     string/int column is locked into float64 and ``pc.cast`` fails with
     ``Failed to parse string`` on a column that is not in the recipe.
     """
-    from data_lake.ingest.fits_to_parquet import _canonical_merge_types
-
     catalog_root = Path(catalog_root)
     types: dict[str, pa.DataType] = {}
     order: list[str] = []
@@ -152,11 +167,12 @@ def union_product_tile_schema(catalog_root: Path) -> pa.Schema:
         sch = pq.read_schema(str(path))
         for field in sch:
             if field.name not in types:
-                # Keep null as null so a later concrete dtype can win.
                 types[field.name] = field.type
                 order.append(field.name)
             else:
-                types[field.name] = _canonical_merge_types(types[field.name], field.type)
+                types[field.name] = _merge_product_column_types(
+                    types[field.name], field.type,
+                )
     if not order:
         raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
     # Remaining all-null columns → float64 (photometry partner convention).
