@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from data_lake.schema_registry import ROLE_PHOTOMETRY, get_survey_manifest
+
+log = logging.getLogger(__name__)
 
 _MAG_SENTINELS = (-9999.0, 9999.0, -999.0, 999.0)
 _FLUX_TO_AB_K = 1.0857362047461345  # 2.5 / ln(10)
@@ -302,6 +305,16 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
 
     for rule in rules:
         if rule.source_column not in out.columns:
+            continue
+        src_dtype = out.schema[rule.source_column]
+        if not (src_dtype.is_numeric() or src_dtype == pl.Null):
+            log.warning(
+                "Skipping homogenize rule %r → %r: source column dtype %s is not "
+                "numeric (product column name collision with a non-photometric field).",
+                rule.source_column,
+                rule.target_column,
+                src_dtype,
+            )
             continue
         tgt = _apply_value_transform(
             source_column=rule.source_column,

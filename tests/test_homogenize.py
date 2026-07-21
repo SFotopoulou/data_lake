@@ -17,6 +17,7 @@ from data_lake.discovery.selection import selection_from_region
 from data_lake.homogenize.engine import homogenize_catalog
 from data_lake.homogenize.registry import load_transform, validate_transform_schema
 from data_lake.homogenize.transforms import (
+    TransformRule,
     apply_rules_to_frame,
     build_homogenized_view_sql,
     resolve_applicable_rules,
@@ -201,6 +202,22 @@ class TestTransforms:
         out, _ = apply_rules_to_frame(df, [rule])
         assert out["phot_ab_w1"][0] == pytest.approx(8.906)
         assert out["phot_ab_w1_err"][0] == pytest.approx(0.1085736, rel=1e-4)
+
+    def test_string_source_column_skipped_not_raised(self) -> None:
+        """Rule whose source column is a string in the product must be skipped, not crash."""
+        import polars as pl
+
+        rule = TransformRule(
+            survey="FAKE",
+            source_column="w1mpro",
+            target_column="phot_ab_w1",
+            transform={"type": "identity"},
+        )
+        # Product has w1mpro stored as String (name collision, not a photometric column)
+        df = pl.DataFrame({"w1mpro": ["AB", "CD"], "other": [1.0, 2.0]})
+        out, lineage = apply_rules_to_frame(df, [rule])
+        assert "phot_ab_w1" not in out.columns
+        assert lineage == []
 
     def test_validate_uncertainty_transform_requires_columns(self) -> None:
         from data_lake.homogenize.survey_registry import validate_survey_homogenize
