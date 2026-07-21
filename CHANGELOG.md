@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dl-gather` unmatched partner padding** — null-padded partner columns now use the partner catalog's real Arrow/Polars dtypes (string, int, float, …) instead of hard-coded `Float64`. Fixes schema conflicts such as `SDSS_DR17_CLASS` (`large_string` on matched tiles vs float on unmatched).
+- **`dl-homogenize --from-product` float vs string** — product schema union prefers string/binary over float when tiles disagree, so already-gathered products with legacy float64 null pads can homogenize without re-gathering.
+
 ## [0.6.1] - 2026-07-20
 
 ### Added
@@ -35,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`dl-homogenize --from-product` schema mismatch** — tiles with missing partner photometry (or null-typed partner columns) no longer fail finalize with `AppendRowGroups requires equal schemas`. Output tiles are aligned to a canonical schema before write; gather null partner padding uses `Float64`.
+- **`dl-homogenize --from-product` schema mismatch** — tiles with missing partner photometry (or null-typed partner columns) no longer fail finalize with `AppendRowGroups requires equal schemas`. Output tiles are aligned to a canonical schema before write.
 - **`dl-describe-lake` / lake registry** — crossmatch fields (`match_mode`, `match_col_a`, …) are no longer dropped when catalogs are present (PyArrow `from_pylist` takes the first-row schema). Column trees show `detail=col:<col_a>:<col_b>`; survey column width adapts for long `__col_` names.
 
 ### Added (carried forward from Unreleased)

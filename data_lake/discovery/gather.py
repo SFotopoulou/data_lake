@@ -152,6 +152,38 @@ def _fetch_partner_catalog(
     )
 
 
+def _partner_column_arrow_types(
+    pacc: CatalogAccessor,
+    columns: Sequence[str],
+) -> dict[str, pa.DataType]:
+    """Map partner native column names → Arrow types from the catalog schema."""
+    schema = pacc.schema
+    by_name = {f.name: f.type for f in schema}
+    out: dict[str, pa.DataType] = {}
+    for col in columns:
+        if col in by_name:
+            out[col] = by_name[col]
+            continue
+        try:
+            resolved = pacc.resolve_column(col)
+        except KeyError:
+            continue
+        if resolved in by_name:
+            out[col] = by_name[resolved]
+    return out
+
+
+def _null_lit_for_column(name: str, arrow_type: pa.DataType | None):
+    """Typed null literal matching *arrow_type*; ``pl.Null`` when type unknown."""
+    import polars as pl
+
+    if arrow_type is None:
+        return pl.lit(None, dtype=pl.Null).alias(name)
+    # Derive Polars dtype via an empty Arrow array so large_string / lists map correctly.
+    empty = pl.from_arrow(pa.table({name: pa.nulls(0, type=arrow_type)}))
+    return pl.lit(None, dtype=empty.schema[name]).alias(name)
+
+
 def _gather_one_tile(
     npix: int,
     *,
@@ -190,13 +222,19 @@ def _gather_one_tile(
             / f"Npix={npix}.parquet"
         )
         sep_name = f"{partner.survey}_sep_arcsec"
+        pacc = partner_acc[partner.survey]
+        col_types = _partner_column_arrow_types(pacc, partner.columns)
         if not xm_tile.is_file():
-            out = _append_null_partner(out, partner, sep_name, include_sep)
+            out = _append_null_partner(
+                out, partner, sep_name, include_sep, column_types=col_types,
+            )
             continue
         matches = pl.from_arrow(pq.read_table(str(xm_tile)))
         matches = matches.filter(pl.col("source_id_a").is_in(base_ids))
         if matches.is_empty():
-            out = _append_null_partner(out, partner, sep_name, include_sep)
+            out = _append_null_partner(
+                out, partner, sep_name, include_sep, column_types=col_types,
+            )
             continue
         if multiplicity == "nearest":
             matches = (
@@ -204,7 +242,6 @@ def _gather_one_tile(
                 .unique(subset=["source_id_a"], keep="first")
             )
 
-        pacc = partner_acc[partner.survey]
         pcols = partner.columns or []
         pid = pacc.link_id_column
         fetch_cols = [pid] + [c for c in pcols if c != pid]
@@ -241,11 +278,25 @@ def _gather_one_tile(
     return out
 
 
-def _append_null_partner(out, partner: PartnerSpec, sep_name: str, include_sep: bool):
+def _append_null_partner(
+    out,
+    partner: PartnerSpec,
+    sep_name: str,
+    include_sep: bool,
+    *,
+    column_types: dict[str, pa.DataType] | None = None,
+):
+    """Pad partner columns with typed nulls when a tile has no matches.
+
+    *column_types* maps native partner column names to Arrow types from the
+    partner catalog schema. Missing entries fall back to ``pl.Null`` (not
+    Float64) so string/int partner fields are not corrupted.
+    """
     import polars as pl
 
+    types = column_types or {}
     additions = [
-        pl.lit(None, dtype=pl.Float64).alias(_prefixed(partner.survey, c))
+        _null_lit_for_column(_prefixed(partner.survey, c), types.get(c))
         for c in partner.columns
     ]
     if include_sep:

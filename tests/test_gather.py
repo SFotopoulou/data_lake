@@ -218,6 +218,69 @@ class TestGatherProduct:
         assert matched_result.n_rows == 1
         with CatalogAccessor(lake, "matched_only") as acc:
             df = acc.query("SELECT * FROM catalog", fmt="polars")
+        assert df["_source_id"].to_list() == [1]
+
+    def test_unmatched_tile_preserves_partner_string_dtype(self, tmp_path: Path) -> None:
+        """Null-pad unmatched tiles with partner schema dtypes (not Float64)."""
+        from data_lake.discovery import tile_index as ti
+
+        lake = tmp_path / "lake"
+        norder = 5
+        ra, dec = 120.0, 45.0
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        _write_catalog_tile(
+            lake, "EUCLID", norder=norder, npix=npix,
+            source_ids=[1], ra=[ra], dec=[dec],
+        )
+        partner_dir = lake / "catalogs" / "SDSS_DR17" / healpix_dir(norder, npix)
+        partner_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([501], type=pa.int64()),
+                "ra": pa.array([ra + 0.00001], type=pa.float64()),
+                "dec": pa.array([dec + 0.00001], type=pa.float64()),
+                f"_healpix_norder{norder}": pa.array([npix], type=pa.int64()),
+                "CLASS": pa.array(["STAR  "], type=pa.large_string()),
+            }),
+            partner_dir / f"Npix={npix}.parquet",
+        )
+        (lake / "catalogs" / "SDSS_DR17" / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": norder,
+                "ra_column": "ra",
+                "dec_column": "dec",
+                "link_id_mode": "sequential",
+                "link_id_column": LAKE_JOIN_ID_COLUMN,
+                "total_rows": 1,
+            })
+        )
+        build_crossmatch(lake, "EUCLID", "SDSS_DR17", radius_arcsec=2.0)
+        # Force unmatched path: remove the crossmatch tile so gather pads nulls.
+        xm_tile = next((lake / "crossmatch").rglob(f"Npix={npix}.parquet"))
+        xm_tile.unlink()
+
+        ti.write_tile_index(lake, "EUCLID", "catalog")
+        sel = selection_from_region(lake, "EUCLID", Region.cone(ra, dec, 60.0))
+        result = gather_product(
+            lake, "EUCLID",
+            [PartnerSpec("SDSS_DR17", 2.0, ["CLASS"])],
+            sel,
+            base_columns=["ra", "dec"],
+            materialize_as="EUCLID_sdss_pad",
+            keep_all=True,
+        )
+        assert result.n_rows == 1
+        out_tile = next(
+            (lake / "products" / "EUCLID_sdss_pad").rglob("Npix=*.parquet")
+        )
+        class_type = pq.read_schema(str(out_tile)).field("SDSS_DR17_CLASS").type
+        assert not pa.types.is_floating(class_type), class_type
+        assert (
+            pa.types.is_string(class_type)
+            or pa.types.is_large_string(class_type)
+            or pa.types.is_null(class_type)
+        ), class_type
+
     def test_partner_fetch_batches_npix_per_tile(self, joined_lake: Path, monkeypatch) -> None:
         """One batched DuckDB read per partner per base tile (not per partner Npix)."""
         calls: list[tuple] = []

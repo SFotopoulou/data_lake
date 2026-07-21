@@ -142,12 +142,28 @@ def _merge_product_column_types(existing: pa.DataType, incoming: pa.DataType) ->
     passthrough string columns (e.g. ``SDSS_DR17_CLASS``) when several all-null
     tiles are scanned before a typed tile. Keep null until a concrete type wins;
     remaining nulls are promoted in ``union_product_tile_schema``.
+
+    Older gather pads also wrote unmatched string partners as float64 nulls.
+    Prefer string/binary over float so those products can still homogenize.
     """
     from data_lake.ingest.fits_to_parquet import _canonical_merge_types
 
     if pa.types.is_null(existing):
         return incoming
     if pa.types.is_null(incoming):
+        return existing
+
+    def _is_text(t: pa.DataType) -> bool:
+        return (
+            pa.types.is_string(t)
+            or pa.types.is_large_string(t)
+            or pa.types.is_binary(t)
+            or pa.types.is_large_binary(t)
+        )
+
+    if pa.types.is_floating(existing) and _is_text(incoming):
+        return incoming
+    if _is_text(existing) and pa.types.is_floating(incoming):
         return existing
     return _canonical_merge_types(existing, incoming)
 

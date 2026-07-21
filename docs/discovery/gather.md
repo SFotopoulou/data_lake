@@ -121,6 +121,11 @@ Per-partner `<survey>_sep_arcsec` columns are included unless `--no-sep`.
 | **default** | Every base source in the selection; partner columns are `null` when unmatched. |
 | **`--matches-only`** | Drop base rows with **no** partner crossmatch (any partner). |
 
+Unmatched partner columns (missing crossmatch tile or no matches in that base
+tile) are padded with typed nulls taken from the **partner catalog schema** —
+string columns stay string, floats stay float — so product tiles share one
+schema across matched and unmatched tiles.
+
 There is no `--keep-all` flag — keeping all base rows is the default behaviour. Pass `--matches-only` to restrict the output to matched sources only.
 
 Filter order: partner joins → `matches_only` (if set) → `--where-joined`.

@@ -629,6 +629,79 @@ class TestHomogenizeProduct:
             ftype = out.schema.field("SDSS_DR17_CLASS").type
             assert pa.types.is_string(ftype) or pa.types.is_large_string(ftype)
 
+    def test_from_product_float64_pad_vs_large_string(self, tmp_path: Path) -> None:
+        """Legacy gather float64 null pads must lose to large_string on union."""
+        from data_lake.discovery.selection import selection_from_all_tiles
+        from data_lake.homogenize.engine import homogenize_product, union_product_tile_schema
+
+        lake = tmp_path / "lake"
+        norder = 5
+        product = "EUCLID_sdss_legacy"
+        hp = f"_healpix_norder{norder}"
+        root = lake / "catalogs" / product
+
+        float_dir = root / healpix_dir(norder, 0)
+        float_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([1], type=pa.int64()),
+                "ra": pa.array([120.0], type=pa.float64()),
+                "dec": pa.array([45.0], type=pa.float64()),
+                hp: pa.array([0], type=pa.int64()),
+                "ALLWISE_w1mpro": pa.array([10.0], type=pa.float64()),
+                "ALLWISE_w1sigmpro": pa.array([0.05], type=pa.float64()),
+                # Pre-fix gather pad: unmatched string col as float64 nulls
+                "SDSS_DR17_CLASS": pa.array([None], type=pa.float64()),
+            }),
+            float_dir / "Npix=0.parquet",
+        )
+        str_dir = root / healpix_dir(norder, 10_500)
+        str_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([2], type=pa.int64()),
+                "ra": pa.array([121.0], type=pa.float64()),
+                "dec": pa.array([46.0], type=pa.float64()),
+                hp: pa.array([10_500], type=pa.int64()),
+                "ALLWISE_w1mpro": pa.array([11.0], type=pa.float64()),
+                "ALLWISE_w1sigmpro": pa.array([0.06], type=pa.float64()),
+                "SDSS_DR17_CLASS": pa.array(["STAR  "], type=pa.large_string()),
+            }),
+            str_dir / "Npix=10500.parquet",
+        )
+        (root / "catalog_info.json").write_text(json.dumps({
+            "hats_order": norder,
+            "ra_column": "ra",
+            "dec_column": "dec",
+            "link_id_column": LAKE_JOIN_ID_COLUMN,
+            "kind": "product",
+            "provenance": {
+                "base_catalog": "EUCLID",
+                "partners": [
+                    {"survey": "ALLWISE", "columns": ["w1mpro", "w1sigmpro"]},
+                    {"survey": "SDSS_DR17", "columns": ["CLASS"]},
+                ],
+            },
+        }))
+        ti.write_tile_index(lake, product, "catalog")
+
+        sch = union_product_tile_schema(root)
+        ftype = sch.field("SDSS_DR17_CLASS").type
+        assert pa.types.is_string(ftype) or pa.types.is_large_string(ftype), ftype
+
+        sel = selection_from_all_tiles(lake, product)
+        result = homogenize_product(
+            lake, product, "phot_ab_v1", sel,
+            materialize_as="EUCLID_sdss_legacy_ab",
+        )
+        assert result.n_rows == 2
+        for path in (lake / "products" / "EUCLID_sdss_legacy_ab").rglob("Npix=*.parquet"):
+            out = pq.read_table(path)
+            col = out.column("SDSS_DR17_CLASS")
+            assert pa.types.is_string(col.type) or pa.types.is_large_string(col.type)
+            if path.name == "Npix=10500.parquet":
+                assert col[0].as_py().strip() == "STAR"
+
 
 class TestValidateHomogenization:
     def test_golden_phot_ab(self) -> None:
