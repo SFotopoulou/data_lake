@@ -323,7 +323,7 @@ try:
                     n_workers=n_workers,
                     show_progress=show_progress and not quiet,
                 )
-        except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        except (FileNotFoundError, FileExistsError, ValueError, TypeError) as exc:
             raise click.ClickException(str(exc)) from exc
 
         if check_only:

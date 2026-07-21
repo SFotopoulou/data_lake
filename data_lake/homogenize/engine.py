@@ -64,7 +64,13 @@ def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
         elif pa.types.is_null(col.type):
             arrays.append(pa.nulls(len(col), type=field.type))
         else:
-            arrays.append(pc.cast(col, field.type, safe=False))
+            try:
+                arrays.append(pc.cast(col, field.type, safe=False))
+            except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+                raise TypeError(
+                    f"Cannot cast column {field.name!r} from {col.type} to "
+                    f"{field.type}: {exc}"
+                ) from exc
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
@@ -130,7 +136,13 @@ def build_homogenize_product_schema(
 
 
 def union_product_tile_schema(catalog_root: Path) -> pa.Schema:
-    """Union column names/types across product tiles (handles sparse gather)."""
+    """Union column names/types across product tiles (handles sparse gather).
+
+    Null-typed columns (all-unmatched partner fields in some tiles) must not be
+    promoted to float64 until every tile has been seen — otherwise a later
+    string/int column is locked into float64 and ``pc.cast`` fails with
+    ``Failed to parse string`` on a column that is not in the recipe.
+    """
     from data_lake.ingest.fits_to_parquet import _canonical_merge_types
 
     catalog_root = Path(catalog_root)
@@ -140,13 +152,17 @@ def union_product_tile_schema(catalog_root: Path) -> pa.Schema:
         sch = pq.read_schema(str(path))
         for field in sch:
             if field.name not in types:
-                types[field.name] = _storage_type(field.type)
+                # Keep null as null so a later concrete dtype can win.
+                types[field.name] = field.type
                 order.append(field.name)
             else:
                 types[field.name] = _canonical_merge_types(types[field.name], field.type)
     if not order:
         raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
-    return pa.schema([pa.field(n, types[n], nullable=True) for n in order])
+    # Remaining all-null columns → float64 (photometry partner convention).
+    return pa.schema(
+        [pa.field(n, _storage_type(types[n]), nullable=True) for n in order]
+    )
 
 
 def prepare_homogenize_tile(table: pa.Table, schema: pa.Schema) -> pa.Table:

@@ -555,6 +555,75 @@ class TestHomogenizeProduct:
             assert sch.field("ALLWISE_w1mpro").type == pa.float64()
             assert sch.field("phot_ab_w1").type == pa.float64()
 
+    def test_from_product_null_string_before_typed_string(self, tmp_path: Path) -> None:
+        """Passthrough string cols: null-typed early tile must not lock float64."""
+        from data_lake.discovery.selection import selection_from_all_tiles
+        from data_lake.homogenize.engine import homogenize_product, union_product_tile_schema
+
+        lake = tmp_path / "lake"
+        norder = 5
+        product = "EUCLID_desi_native"
+        hp = f"_healpix_norder{norder}"
+        root = lake / "catalogs" / product
+
+        # Lower Npix path is scanned first by union_product_tile_schema.
+        null_dir = root / healpix_dir(norder, 0)
+        null_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([1], type=pa.int64()),
+                "ra": pa.array([120.0], type=pa.float64()),
+                "dec": pa.array([45.0], type=pa.float64()),
+                hp: pa.array([0], type=pa.int64()),
+                "ALLWISE_w1mpro": pa.array([10.0], type=pa.float64()),
+                "ALLWISE_w1sigmpro": pa.array([0.05], type=pa.float64()),
+                "DESI_DR1_SPECTYPE": pa.array([None], type=pa.null()),
+            }),
+            null_dir / "Npix=0.parquet",
+        )
+        typed_dir = root / healpix_dir(norder, 10_500)
+        typed_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                LAKE_JOIN_ID_COLUMN: pa.array([2], type=pa.int64()),
+                "ra": pa.array([121.0], type=pa.float64()),
+                "dec": pa.array([46.0], type=pa.float64()),
+                hp: pa.array([10_500], type=pa.int64()),
+                "ALLWISE_w1mpro": pa.array([11.0], type=pa.float64()),
+                "ALLWISE_w1sigmpro": pa.array([0.06], type=pa.float64()),
+                "DESI_DR1_SPECTYPE": pa.array(["GALAXY"], type=pa.string()),
+            }),
+            typed_dir / "Npix=10500.parquet",
+        )
+        (root / "catalog_info.json").write_text(json.dumps({
+            "hats_order": norder,
+            "ra_column": "ra",
+            "dec_column": "dec",
+            "link_id_column": LAKE_JOIN_ID_COLUMN,
+            "kind": "product",
+            "provenance": {
+                "base_catalog": "EUCLID",
+                "partners": [
+                    {"survey": "ALLWISE", "columns": ["w1mpro", "w1sigmpro"]},
+                    {"survey": "DESI_DR1", "columns": ["SPECTYPE"]},
+                ],
+            },
+        }))
+        ti.write_tile_index(lake, product, "catalog")
+
+        sch = union_product_tile_schema(root)
+        assert sch.field("DESI_DR1_SPECTYPE").type == pa.string()
+
+        sel = selection_from_all_tiles(lake, product)
+        result = homogenize_product(
+            lake, product, "phot_ab_v1", sel,
+            materialize_as="EUCLID_desi_ab",
+        )
+        assert result.n_rows == 2
+        for path in (lake / "products" / "EUCLID_desi_ab").rglob("Npix=*.parquet"):
+            out = pq.read_table(path)
+            assert out.schema.field("DESI_DR1_SPECTYPE").type == pa.string()
+
 
 class TestValidateHomogenization:
     def test_golden_phot_ab(self) -> None:
