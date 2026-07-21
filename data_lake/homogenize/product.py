@@ -76,14 +76,14 @@ def resolve_rules_for_product(
                     survey=rule.survey,
                     source_column=prod_col,
                     target_column=rule.target_column,
-                    transform=rule.transform,
+                    transform_steps=rule.transform_steps,
                     uncertainty_column=(
                         product_column_name(base, survey, rule.uncertainty_column)
                         if rule.uncertainty_column
                         else None
                     ),
                     target_uncertainty_column=rule.target_uncertainty_column,
-                    uncertainty_transform=rule.uncertainty_transform,
+                    uncertainty_transform_steps=rule.uncertainty_transform_steps,
                     native_system=rule.native_system,
                 )
             )

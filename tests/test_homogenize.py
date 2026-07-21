@@ -176,6 +176,30 @@ class TestTransforms:
         assert out["phot_ab_r_err"][0] == pytest.approx(0.02)
         assert lin[0]["uncertainty_transform"]["type"] == "scale"
 
+    def test_chained_scale_then_flux_to_ab(self) -> None:
+        """transform may be a list of steps applied left-to-right."""
+        import polars as pl
+
+        rule = TransformRule.from_dict({
+            "survey": "FAKE",
+            "source_column": "flux",
+            "target_column": "phot_ab_x",
+            "uncertainty_column": "dflux",
+            "target_uncertainty_column": "phot_ab_x_err",
+            "transform": [
+                {"type": "scale", "factor": 0.001},
+                {"type": "flux_to_ab", "zp": 8.906},
+            ],
+        })
+        # flux=1000 → scale to 1.0 Jy → AB = -2.5*log10(1)+8.906 = 8.906
+        df = pl.DataFrame({"flux": [1000.0], "dflux": [100.0]})
+        out, lin = apply_rules_to_frame(df, [rule])
+        assert out["phot_ab_x"][0] == pytest.approx(8.906)
+        # err: 100*0.001=0.1; then K*0.1/1.0
+        assert out["phot_ab_x_err"][0] == pytest.approx(0.1085736, rel=1e-4)
+        assert isinstance(lin[0]["transform"], list)
+        assert [s["type"] for s in lin[0]["transform"]] == ["scale", "flux_to_ab"]
+
     def test_explicit_uncertainty_transform_flux_to_ab(self) -> None:
         """Explicit flux_to_ab uncertainty transform uses flux-error propagation."""
         import polars as pl
@@ -211,7 +235,7 @@ class TestTransforms:
             survey="FAKE",
             source_column="w1mpro",
             target_column="phot_ab_w1",
-            transform={"type": "identity"},
+            transform_steps=({"type": "identity"},),
         )
         # Product has w1mpro stored as String (name collision, not a photometric column)
         df = pl.DataFrame({"w1mpro": ["AB", "CD"], "other": [1.0, 2.0]})

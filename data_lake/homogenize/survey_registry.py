@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from data_lake.homogenize.registry import load_transform
-from data_lake.homogenize.transforms import CATALOG_TRANSFORM_TYPES, TransformRule
+from data_lake.homogenize.transforms import (
+    TransformRule,
+    normalize_transform_steps,
+    validate_transform_steps,
+)
 from data_lake.schema_registry import MODALITY_CATALOG, MODALITY_CUTOUT, MODALITY_SPECTRA
 
 _PKG_SURVEYS = Path(__file__).resolve().parent / "surveys"
@@ -185,47 +189,35 @@ def validate_survey_homogenize(data: dict[str, Any]) -> list[str]:
                     msgs.append(f"ERROR: catalog rule[{i}] missing source_column")
                 if not rule.get("target_column"):
                     msgs.append(f"ERROR: catalog rule[{i}] missing target_column")
-                t = (rule.get("transform") or {}).get("type")
-                if t not in CATALOG_TRANSFORM_TYPES:
-                    msgs.append(f"ERROR: catalog rule[{i}] unknown transform {t!r}")
-                if t == "null_if_sentinel":
-                    vals = (rule.get("transform") or {}).get("values")
-                    if vals is not None and not isinstance(vals, list):
-                        msgs.append(f"ERROR: catalog rule[{i}] null_if_sentinel.values must be a list")
+                try:
+                    v_steps = normalize_transform_steps(rule.get("transform"))
+                except (ValueError, TypeError) as exc:
+                    msgs.append(f"ERROR: catalog rule[{i}] transform: {exc}")
+                    v_steps = []
+                msgs.extend(
+                    validate_transform_steps(v_steps, label=f"catalog rule[{i}] transform")
+                )
                 u_xf = rule.get("uncertainty_transform")
                 if u_xf is not None:
-                    if not isinstance(u_xf, dict):
+                    try:
+                        u_steps = normalize_transform_steps(u_xf)
+                    except (ValueError, TypeError) as exc:
                         msgs.append(
-                            f"ERROR: catalog rule[{i}] uncertainty_transform must be an object"
+                            f"ERROR: catalog rule[{i}] uncertainty_transform: {exc}"
                         )
-                    else:
-                        ut = u_xf.get("type")
-                        if ut not in CATALOG_TRANSFORM_TYPES:
-                            msgs.append(
-                                f"ERROR: catalog rule[{i}] unknown uncertainty_transform {ut!r}"
-                            )
-                        if (rule.get("uncertainty_column") is None) or (
-                            rule.get("target_uncertainty_column") is None
-                        ):
-                            msgs.append(
-                                f"ERROR: catalog rule[{i}] uncertainty_transform requires "
-                                "uncertainty_column and target_uncertainty_column"
-                            )
-                        if ut == "scale" and u_xf.get("factor") is None:
-                            msgs.append(
-                                f"ERROR: catalog rule[{i}] uncertainty_transform scale needs factor"
-                            )
-                        if ut == "mag_offset" and u_xf.get("delta") is None:
-                            msgs.append(
-                                f"ERROR: catalog rule[{i}] uncertainty_transform mag_offset needs delta"
-                            )
-                        if ut == "null_if_sentinel":
-                            vals = u_xf.get("values")
-                            if vals is not None and not isinstance(vals, list):
-                                msgs.append(
-                                    f"ERROR: catalog rule[{i}] "
-                                    "uncertainty_transform null_if_sentinel.values must be a list"
-                                )
+                        u_steps = []
+                    msgs.extend(
+                        validate_transform_steps(
+                            u_steps, label=f"catalog rule[{i}] uncertainty_transform"
+                        )
+                    )
+                    if (rule.get("uncertainty_column") is None) or (
+                        rule.get("target_uncertainty_column") is None
+                    ):
+                        msgs.append(
+                            f"ERROR: catalog rule[{i}] uncertainty_transform requires "
+                            "uncertainty_column and target_uncertainty_column"
+                        )
         elif modality == MODALITY_SPECTRA:
             if block.get("flux_calibration"):
                 cal = block["flux_calibration"]

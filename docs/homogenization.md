@@ -80,7 +80,26 @@ Each rule operates on one source column and writes one target column. All catalo
 | `target_uncertainty_column` | no | Output uncertainty column; must accompany `uncertainty_column` |
 | `uncertainty_transform` | no | Explicit transform for the uncertainty column (same `type` vocabulary as `transform`). When omitted, the engine auto-propagates from the value `transform` type (see uncertainty table above) |
 | `native_system` | no | Metadata only (e.g. `"Vega"`, `"uJy"`); does not affect computation |
-| `transform` | yes | Object with `type` and type-specific parameters |
+| `transform` | yes | Object with `type` and type-specific parameters, **or** a non-empty list of such objects applied left-to-right (chain) |
+
+#### Chained transforms
+
+A single rule may apply several value steps in order by giving `transform` as a list:
+
+```json
+{
+  "source_column": "flux_ujy",
+  "target_column": "phot_ab_x",
+  "uncertainty_column": "flux_ujy_err",
+  "target_uncertainty_column": "phot_ab_x_err",
+  "transform": [
+    {"type": "scale", "factor": 1e-6},
+    {"type": "flux_to_ab", "zp": 8.906}
+  ]
+}
+```
+
+Steps run left-to-right on the intermediate value. Built-in sentinel cleaning applies on the first step (from the native column). `uncertainty_transform` may also be a list; when omitted, auto-propagation composes across the value chain (`scale` multiplies the error; `flux_to_ab` uses the flux after preceding scales).
 
 #### Explicit `uncertainty_transform`
 

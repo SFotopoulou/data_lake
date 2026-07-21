@@ -174,10 +174,12 @@ def validate_golden_transform(
             "survey": rules[0].survey,
             "source_column": rules[0].source_column,
             "target_column": rules[0].target_column,
-            "transform": dict(rules[0].transform),
+            "transform": list(rules[0].transform_steps),
             "uncertainty_column": rules[0].uncertainty_column,
             "target_uncertainty_column": rules[0].target_uncertainty_column,
         }
+        if rules[0].uncertainty_transform_steps is not None:
+            raw["uncertainty_transform"] = list(rules[0].uncertainty_transform_steps)
         if case.get("transform_override"):
             raw["transform"] = case["transform_override"]
         rule = TransformRule.from_dict(raw)

@@ -53,6 +53,8 @@ All five catalog transform types are supported. Built-in sentinels (`-9999`, `99
 
 **Pairing uncertainty columns:** set `uncertainty_column` + `target_uncertainty_column` on the same rule entry (not as a separate rule). By default the engine auto-propagates uncertainty from the value `transform` type. Override with an explicit `uncertainty_transform` (same `type` vocabulary) when the error needs a different formula than the value.
 
+`transform` and `uncertainty_transform` may each be a **single object** or a **non-empty list of steps** applied left-to-right (e.g. `scale` then `flux_to_ab`).
+
 ```json
 {
   "source_column": "w1mpro",

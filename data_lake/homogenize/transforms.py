@@ -29,25 +29,83 @@ class TransformRule:
     survey: str
     source_column: str
     target_column: str
-    transform: dict[str, Any]
+    transform_steps: tuple[dict[str, Any], ...]
     uncertainty_column: str | None = None
     target_uncertainty_column: str | None = None
-    uncertainty_transform: dict[str, Any] | None = None
+    uncertainty_transform_steps: tuple[dict[str, Any], ...] | None = None
     native_system: str | None = None
+
+    @property
+    def transform(self) -> dict[str, Any]:
+        """First (or only) value-transform step — backward-compatible accessor."""
+        return self.transform_steps[0]
+
+    @property
+    def uncertainty_transform(self) -> dict[str, Any] | None:
+        """First uncertainty step, or None when unset."""
+        if not self.uncertainty_transform_steps:
+            return None
+        return self.uncertainty_transform_steps[0]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TransformRule:
-        u_xf = data.get("uncertainty_transform")
         return cls(
             survey=str(data["survey"]),
             source_column=str(data["source_column"]),
             target_column=str(data["target_column"]),
-            transform=dict(data["transform"]),
+            transform_steps=tuple(normalize_transform_steps(data["transform"])),
             uncertainty_column=data.get("uncertainty_column"),
             target_uncertainty_column=data.get("target_uncertainty_column"),
-            uncertainty_transform=dict(u_xf) if isinstance(u_xf, dict) else None,
+            uncertainty_transform_steps=(
+                tuple(normalize_transform_steps(data["uncertainty_transform"]))
+                if data.get("uncertainty_transform") is not None
+                else None
+            ),
             native_system=data.get("native_system"),
         )
+
+
+def normalize_transform_steps(raw: Any) -> list[dict[str, Any]]:
+    """Accept a single transform object or a non-empty list of steps."""
+    if isinstance(raw, dict):
+        return [dict(raw)]
+    if isinstance(raw, (list, tuple)):
+        if not raw:
+            raise ValueError("transform chain must be a non-empty list")
+        steps: list[dict[str, Any]] = []
+        for i, step in enumerate(raw):
+            if not isinstance(step, dict):
+                raise ValueError(f"transform step[{i}] must be an object, got {type(step).__name__}")
+            steps.append(dict(step))
+        return steps
+    raise ValueError(
+        f"transform must be an object or list of objects, got {type(raw).__name__}"
+    )
+
+
+def validate_transform_steps(steps: Sequence[dict[str, Any]], *, label: str) -> list[str]:
+    """Return ERROR messages for one transform chain (value or uncertainty)."""
+    msgs: list[str] = []
+    if not steps:
+        msgs.append(f"ERROR: {label} chain is empty")
+        return msgs
+    for i, step in enumerate(steps):
+        t = step.get("type")
+        prefix = f"ERROR: {label}" if len(steps) == 1 else f"ERROR: {label} step[{i}]"
+        if t not in CATALOG_TRANSFORM_TYPES:
+            msgs.append(f"{prefix} unknown transform {t!r}")
+            continue
+        if t == "scale" and step.get("factor") is None:
+            msgs.append(f"{prefix} scale needs factor")
+        if t == "mag_offset" and step.get("delta") is None:
+            msgs.append(f"{prefix} mag_offset needs delta")
+        if t == "flux_to_ab" and step.get("zp") is None:
+            msgs.append(f"{prefix} flux_to_ab needs zp")
+        if t == "null_if_sentinel":
+            vals = step.get("values")
+            if vals is not None and not isinstance(vals, list):
+                msgs.append(f"{prefix} null_if_sentinel.values must be a list")
+    return msgs
 
 
 @dataclass
@@ -64,6 +122,7 @@ class RuleResolution:
                     "source": r.source_column,
                     "target": r.target_column,
                     "type": r.transform.get("type"),
+                    "types": [s.get("type") for s in r.transform_steps],
                 }
                 for r in self.applied
             ],
@@ -203,7 +262,7 @@ def _apply_value_transform(
     source_column: str,
     transform: dict[str, Any],
 ):
-    """Build a Polars expression for a catalog value transform."""
+    """Build a Polars expression for a single catalog value transform on a column."""
     import polars as pl
 
     ttype = transform.get("type")
@@ -224,42 +283,120 @@ def _apply_value_transform(
     raise ValueError(f"Unsupported catalog transform type {ttype!r}")
 
 
+def _apply_value_step_on_expr(src, transform: dict[str, Any]):
+    """Apply one value-transform step to an existing Polars expression."""
+    import polars as pl
+
+    ttype = transform.get("type")
+    if ttype == "mag_offset":
+        return src + float(transform["delta"])
+    if ttype == "scale":
+        return src * float(transform["factor"])
+    if ttype == "identity":
+        return src
+    if ttype == "null_if_sentinel":
+        expr = src
+        for sentinel in [float(v) for v in transform.get("values") or []]:
+            expr = pl.when(expr == sentinel).then(None).otherwise(expr)
+        return pl.when(expr.is_nan()).then(None).otherwise(expr)
+    if ttype == "flux_to_ab":
+        zp = float(transform["zp"])
+        flux = (
+            pl.when(src.is_nan() | (src <= 0))
+            .then(None)
+            .otherwise(src)
+        )
+        return pl.when(flux.is_not_null()).then(-2.5 * flux.log10() + zp).otherwise(None)
+    raise ValueError(f"Unsupported catalog transform type {ttype!r}")
+
+
+def _apply_value_transform_chain(
+    *,
+    source_column: str,
+    steps: Sequence[dict[str, Any]],
+):
+    """Apply one or more value-transform steps left-to-right."""
+    if not steps:
+        raise ValueError("value transform chain is empty")
+    expr = _apply_value_transform(source_column=source_column, transform=steps[0])
+    for step in steps[1:]:
+        expr = _apply_value_step_on_expr(expr, step)
+    return expr
+
+
 def _apply_uncertainty_transform(
     *,
     uncertainty_column: str,
     source_column: str,
     target_column: str,
     transform: dict[str, Any],
+    err_expr=None,
+    flux_expr=None,
 ):
-    """Build a Polars expression for an explicit uncertainty transform.
+    """Build a Polars expression for an explicit uncertainty transform step.
 
     Supported types match value transforms.  ``flux_to_ab`` means flux→mag
-    error propagation using *source_column* as the flux and *uncertainty_column*
-    as ``dflux`` (``zp`` is unused for the error).
+    error propagation using *flux_expr* (or *source_column*) as the flux and
+    *err_expr* / *uncertainty_column* as ``dflux`` (``zp`` is unused for the error).
     """
     import polars as pl
 
     ttype = transform.get("type")
+    err = err_expr if err_expr is not None else pl.col(uncertainty_column).cast(pl.Float64)
     if ttype == "scale":
-        return pl.col(uncertainty_column).cast(pl.Float64) * float(transform["factor"])
+        return err * float(transform["factor"])
     if ttype == "mag_offset":
-        # Additive offset on an uncertainty is unusual but allowed for parity.
-        return pl.col(uncertainty_column).cast(pl.Float64) + float(transform["delta"])
+        return err + float(transform["delta"])
     if ttype in ("identity", "null_if_sentinel"):
         return (
             pl.when(pl.col(target_column).is_null())
             .then(None)
-            .otherwise(pl.col(uncertainty_column).cast(pl.Float64))
+            .otherwise(err)
         )
     if ttype == "flux_to_ab":
-        flux = _flux_expr(source_column)
-        dflux = pl.col(uncertainty_column).cast(pl.Float64)
+        flux = flux_expr if flux_expr is not None else _flux_expr(source_column)
         return (
             pl.when(flux.is_not_null())
-            .then(_FLUX_TO_AB_K * dflux / flux)
+            .then(_FLUX_TO_AB_K * err / flux)
             .otherwise(None)
         )
     raise ValueError(f"Unsupported uncertainty transform type {ttype!r}")
+
+
+def _apply_uncertainty_transform_chain(
+    *,
+    uncertainty_column: str,
+    source_column: str,
+    target_column: str,
+    steps: Sequence[dict[str, Any]],
+    value_steps: Sequence[dict[str, Any]],
+):
+    """Apply uncertainty steps; track scaled flux for mid-chain ``flux_to_ab``."""
+    import polars as pl
+
+    err = pl.col(uncertainty_column).cast(pl.Float64)
+    # Reconstruct flux through value steps preceding each uncertainty flux_to_ab.
+    flux = _flux_expr(source_column)
+    for step in value_steps:
+        ttype = step.get("type")
+        if ttype == "scale":
+            flux = flux * float(step["factor"])
+        elif ttype == "flux_to_ab":
+            # After mag conversion, further flux_to_ab on uncertainty uses last flux.
+            break
+
+    for step in steps:
+        err = _apply_uncertainty_transform(
+            uncertainty_column=uncertainty_column,
+            source_column=source_column,
+            target_column=target_column,
+            transform=step,
+            err_expr=err,
+            flux_expr=flux,
+        )
+        if step.get("type") == "scale":
+            flux = flux * float(step["factor"])
+    return err
 
 
 def _default_uncertainty_expr(
@@ -269,7 +406,11 @@ def _default_uncertainty_expr(
     target_column: str,
     value_transform: dict[str, Any],
 ):
-    """Auto-propagate uncertainty from the value transform type (legacy default)."""
+    """Auto-propagate uncertainty from a single value transform type (legacy).
+
+    Note: value ``mag_offset`` does **not** add ``delta`` to the error — that
+    only happens for an explicit ``uncertainty_transform`` of type ``mag_offset``.
+    """
     import polars as pl
 
     ttype = value_transform.get("type")
@@ -290,6 +431,49 @@ def _default_uncertainty_expr(
         pl.when(pl.col(target_column).is_null())
         .then(None)
         .otherwise(pl.col(uncertainty_column).cast(pl.Float64))
+    )
+
+
+def _default_uncertainty_from_value_chain(
+    *,
+    uncertainty_column: str,
+    source_column: str,
+    target_column: str,
+    value_steps: Sequence[dict[str, Any]],
+):
+    """Compose auto uncertainty propagation across a value-transform chain.
+
+    ``scale`` multiplies the error; ``flux_to_ab`` converts using the flux after
+    any preceding scales; ``mag_offset`` / ``identity`` / ``null_if_sentinel``
+    leave the error unchanged (nulled when the value target is null).
+    """
+    import polars as pl
+
+    err = pl.col(uncertainty_column).cast(pl.Float64)
+    flux = _flux_expr(source_column)
+    saw_flux_to_ab = False
+    for step in value_steps:
+        ttype = step.get("type")
+        if ttype == "scale":
+            factor = float(step["factor"])
+            err = err * factor
+            if not saw_flux_to_ab:
+                flux = flux * factor
+        elif ttype == "flux_to_ab":
+            err = (
+                pl.when(flux.is_not_null())
+                .then(_FLUX_TO_AB_K * err / flux)
+                .otherwise(None)
+            )
+            saw_flux_to_ab = True
+        elif ttype in ("mag_offset", "identity", "null_if_sentinel"):
+            continue
+        else:
+            raise ValueError(f"Unsupported catalog transform type {ttype!r}")
+    return (
+        pl.when(pl.col(target_column).is_null())
+        .then(None)
+        .otherwise(err)
     )
 
 
@@ -316,35 +500,51 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
                 src_dtype,
             )
             continue
-        tgt = _apply_value_transform(
+        tgt = _apply_value_transform_chain(
             source_column=rule.source_column,
-            transform=rule.transform,
+            steps=rule.transform_steps,
         )
         out = out.with_columns(tgt.alias(rule.target_column))
         entry: dict[str, Any] = {
             "target": rule.target_column,
             "source": rule.source_column,
             "survey": rule.survey,
-            "transform": rule.transform,
+            "transform": (
+                list(rule.transform_steps)
+                if len(rule.transform_steps) > 1
+                else rule.transform
+            ),
         }
 
         u_src = rule.uncertainty_column
         u_tgt = rule.target_uncertainty_column
         if u_src and u_tgt and u_src in out.columns:
-            if rule.uncertainty_transform is not None:
-                u_expr = _apply_uncertainty_transform(
+            if rule.uncertainty_transform_steps is not None:
+                u_expr = _apply_uncertainty_transform_chain(
                     uncertainty_column=u_src,
                     source_column=rule.source_column,
                     target_column=rule.target_column,
-                    transform=rule.uncertainty_transform,
+                    steps=rule.uncertainty_transform_steps,
+                    value_steps=rule.transform_steps,
                 )
-                entry["uncertainty_transform"] = rule.uncertainty_transform
-            else:
+                entry["uncertainty_transform"] = (
+                    list(rule.uncertainty_transform_steps)
+                    if len(rule.uncertainty_transform_steps) > 1
+                    else rule.uncertainty_transform
+                )
+            elif len(rule.transform_steps) == 1:
                 u_expr = _default_uncertainty_expr(
                     uncertainty_column=u_src,
                     source_column=rule.source_column,
                     target_column=rule.target_column,
                     value_transform=rule.transform,
+                )
+            else:
+                u_expr = _default_uncertainty_from_value_chain(
+                    uncertainty_column=u_src,
+                    source_column=rule.source_column,
+                    target_column=rule.target_column,
+                    value_steps=rule.transform_steps,
                 )
             out = out.with_columns(u_expr.alias(u_tgt))
             entry["uncertainty_target"] = u_tgt
@@ -352,6 +552,33 @@ def apply_rules_to_frame(df, rules: Sequence[TransformRule]):
         lineage.append(entry)
 
     return out, lineage
+
+
+def _sql_expr_for_value_steps(src: str, steps: Sequence[dict[str, Any]]) -> str:
+    """Nest DuckDB SQL for a value-transform chain starting from column *src*."""
+    expr = f'"{src}"'
+    for i, step in enumerate(steps):
+        ttype = step.get("type")
+        if ttype == "mag_offset":
+            expr = f"({expr} + {float(step['delta'])})"
+        elif ttype == "scale":
+            expr = f"({expr} * {float(step['factor'])})"
+        elif ttype == "identity":
+            continue
+        elif ttype == "null_if_sentinel":
+            extra_vals = [float(v) for v in step.get("values") or []]
+            all_sentinels = [*_MAG_SENTINELS, *extra_vals] if i == 0 else extra_vals
+            if all_sentinels:
+                not_null = " AND ".join(f"{expr} <> {v}" for v in all_sentinels)
+                expr = f"(CASE WHEN {expr} IS NOT NULL AND ({not_null}) THEN {expr} ELSE NULL END)"
+        elif ttype == "flux_to_ab":
+            zp = float(step["zp"])
+            expr = (
+                f"(CASE WHEN {expr} > 0 THEN -2.5 * log10({expr}) + {zp} ELSE NULL END)"
+            )
+        else:
+            raise ValueError(f"Unsupported catalog transform type {ttype!r}")
+    return expr
 
 
 def build_homogenized_view_sql(
@@ -368,32 +595,11 @@ def build_homogenized_view_sql(
     rules = resolve_catalog_rules(lake_root, survey, transform_id)
     lines: list[str] = []
     for rule in rules:
-        src = rule.source_column
-        tgt = rule.target_column
-        ttype = rule.transform.get("type")
-        if ttype == "mag_offset":
-            expr = f'("{src}" + {float(rule.transform["delta"])}) AS "{tgt}"'
-        elif ttype == "scale":
-            expr = f'("{src}" * {float(rule.transform["factor"])}) AS "{tgt}"'
-        elif ttype == "identity":
-            expr = f'"{src}" AS "{tgt}"'
-        elif ttype == "null_if_sentinel":
-            extra_vals = [float(v) for v in rule.transform.get("values") or []]
-            all_sentinels = [*_MAG_SENTINELS, *extra_vals]
-            not_null = " AND ".join(f'"{src}" <> {v}' for v in all_sentinels)
-            expr = (
-                f'(CASE WHEN "{src}" IS NOT NULL AND ({not_null}) '
-                f'THEN "{src}" ELSE NULL END) AS "{tgt}"'
-            )
-        elif ttype == "flux_to_ab":
-            zp = float(rule.transform["zp"])
-            expr = (
-                f'(CASE WHEN "{src}" > 0 THEN -2.5 * log10("{src}") + {zp} '
-                f'ELSE NULL END) AS "{tgt}"'
-            )
-        else:
+        try:
+            inner = _sql_expr_for_value_steps(rule.source_column, rule.transform_steps)
+        except ValueError:
             continue
-        lines.append(expr)
+        lines.append(f'{inner} AS "{rule.target_column}"')
     if not lines:
         return f"SELECT * FROM {catalog_view}"
     extra = ",\n  ".join(lines)
