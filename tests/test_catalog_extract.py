@@ -56,6 +56,10 @@ class TestColumnSpecs:
         assert _promote_arrow_type(pa.null(), pa.float64()) == pa.float64()
         assert _promote_arrow_type(pa.float64(), pa.null()) == pa.float64()
 
+    def test_promote_float_vs_string_prefers_string(self) -> None:
+        assert _promote_arrow_type(pa.float64(), pa.large_string()) == pa.large_string()
+        assert _promote_arrow_type(pa.string(), pa.float64()) == pa.string()
+
 
 class TestExtractFromFile:
     def test_select_columns(self, tmp_path: Path) -> None:
@@ -314,6 +318,85 @@ class TestExtractFromLake:
         with fits.open(out) as hdul:
             tbl = Table(hdul[1].data)
         assert int(tbl["TARGETID"][0]) == 42
+
+    def test_lake_fits_nullable_string_column(self, tmp_path: Path) -> None:
+        """Nullable Arrow strings must export to FITS without mixed object dtypes."""
+        from astropy.io import fits
+        from astropy.table import Table
+
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "S" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "id": pa.array([1, 2], type=pa.int64()),
+                "CLASS": pa.array(["STAR  ", None], type=pa.large_string()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "S" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 2}',
+        )
+        out = tmp_path / "class.fits"
+        result = extract_catalog(
+            output=out,
+            specs=["id", "CLASS"],
+            lake_root=lake,
+            survey="S",
+            engine="tiles",
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        with fits.open(out) as hdul:
+            tbl = Table(hdul[1].data)
+        assert str(tbl["CLASS"][0]).strip() == "STAR"
+        assert str(tbl["CLASS"][1]).strip() == ""
+
+    def test_lake_fits_float_pad_and_string_tiles(self, tmp_path: Path) -> None:
+        """Legacy float64 null pads + string tiles unify to string for FITS."""
+        from astropy.io import fits
+        from astropy.table import Table
+        from data_lake.ingest.fits_to_parquet import healpix_dir
+
+        lake = tmp_path / "lake"
+        root = lake / "catalogs" / "S"
+        d0 = root / healpix_dir(5, 0)
+        d0.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "id": pa.array([1], type=pa.int64()),
+                "CLASS": pa.array([None], type=pa.float64()),
+            }),
+            d0 / "Npix=0.parquet",
+        )
+        d1 = root / healpix_dir(5, 10_500)
+        d1.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "id": pa.array([2], type=pa.int64()),
+                "CLASS": pa.array(["STAR  "], type=pa.large_string()),
+            }),
+            d1 / "Npix=10500.parquet",
+        )
+        (root / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 2}',
+        )
+        out = tmp_path / "mixed.fits"
+        result = extract_catalog(
+            output=out,
+            specs=["id", "CLASS"],
+            lake_root=lake,
+            survey="S",
+            engine="tiles",
+        )
+        assert result.n_rows == 2
+        with fits.open(out) as hdul:
+            tbl = Table(hdul[1].data)
+        classes = {int(r["id"]): str(r["CLASS"]).strip() for r in tbl}
+        assert classes[1] == ""
+        assert classes[2] == "STAR"
 
     def test_lake_all_columns_parquet(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"

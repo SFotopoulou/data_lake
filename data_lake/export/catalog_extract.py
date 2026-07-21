@@ -229,10 +229,27 @@ def _canonicalize_column_types(table: pa.Table) -> pa.Table:
 
 
 def _promote_arrow_type(a: pa.DataType, b: pa.DataType) -> pa.DataType:
-    """Pick the wider of two Arrow types (e.g. null + float64 → float64)."""
+    """Pick the wider of two Arrow types (e.g. null + float64 → float64).
+
+    Prefer string/binary over float so legacy gather pads (float64 nulls for
+    unmatched string partners) do not lock a text column as double.
+    """
     if a.equals(b) or pa.types.is_null(a):
         return b
     if pa.types.is_null(b):
+        return a
+
+    def _is_text(t: pa.DataType) -> bool:
+        return (
+            pa.types.is_string(t)
+            or pa.types.is_large_string(t)
+            or pa.types.is_binary(t)
+            or pa.types.is_large_binary(t)
+        )
+
+    if pa.types.is_floating(a) and _is_text(b):
+        return b
+    if _is_text(a) and pa.types.is_floating(b):
         return a
     if pa.types.is_floating(a) or pa.types.is_floating(b):
         if pa.types.is_floating(a) and pa.types.is_floating(b):
@@ -705,12 +722,22 @@ def _write_chunks_to_parquet(
 
 
 def _arrow_table_to_astropy(table: pa.Table):
+    """Convert Arrow → astropy Table with FITS-safe string columns.
+
+    Nullable Arrow strings become NumPy ``object`` arrays (``None`` + ``<U…>``)
+    via ``to_numpy``, which Astropy FITS rejects as mixed object types. Fill
+    nulls with empty strings and materialise a fixed-width unicode ndarray.
+    """
     from astropy.table import Table
 
     astropy_tbl = Table()
     for name in table.schema.names:
         col = table.column(name).combine_chunks()
-        if pa.types.is_nested(col.type):
+        if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
+            values = ["" if v is None else str(v) for v in col.to_pylist()]
+            width = max((len(v) for v in values), default=1)
+            astropy_tbl[name] = np.asarray(values, dtype=f"<U{max(width, 1)}")
+        elif pa.types.is_nested(col.type):
             astropy_tbl[name] = col.to_pylist()
         else:
             try:

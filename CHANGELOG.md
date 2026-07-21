@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`dl-gather` unmatched partner padding** — null-padded partner columns now use the partner catalog's real Arrow/Polars dtypes (string, int, float, …) instead of hard-coded `Float64`. Fixes schema conflicts such as `SDSS_DR17_CLASS` (`large_string` on matched tiles vs float on unmatched).
 - **`dl-homogenize --from-product` float vs string** — product schema union prefers string/binary over float when tiles disagree, so already-gathered products with legacy float64 null pads can homogenize without re-gathering.
+- **`dl-extract-catalog` FITS string columns** — nullable Arrow strings are written as fixed-width unicode (null → `""`) so Astropy no longer raises `unsupported object types or mixed types`. Schema unify also prefers string over float for legacy gather pads.
 
 ## [0.6.1] - 2026-07-20
 
