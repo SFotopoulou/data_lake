@@ -268,12 +268,23 @@ def test_summarize_registry_row_counts(tmp_path: Path) -> None:
 
 
 def test_registry_crossmatch_total_rows(tmp_path: Path) -> None:
-    """Match counts in crossmatch_info.json surface as registry total_rows."""
-    # Catalog first: exercises from_pylist schema alignment (catalogs precede XM).
+    """Crossmatch registry totals come from on-disk Parquet, not the sidecar."""
+    from data_lake.ingest.fits_to_parquet import healpix_dir
+
     _ingest_mini_catalog(tmp_path, "SURV_REG")
     lake = tmp_path / "lake"
     xm_root = lake / "crossmatch" / "A_x_B__r1"
-    xm_root.mkdir(parents=True)
+    # Two tiles: 2 + 3 rows; sidecar lies with a smaller total_rows.
+    for npix, n_rows in ((100, 2), (200, 3)):
+        tile_dir = xm_root / healpix_dir(5, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                "source_id_a": pa.array(list(range(n_rows)), type=pa.int64()),
+                "source_id_b": pa.array(list(range(n_rows)), type=pa.int64()),
+            }),
+            tile_dir / f"Npix={npix}.parquet",
+        )
     (xm_root / "crossmatch_info.json").write_text(json.dumps({
         "catalog_name": "A_x_B__r1",
         "modality": "crossmatch",
@@ -282,13 +293,21 @@ def test_registry_crossmatch_total_rows(tmp_path: Path) -> None:
         "survey_b": "B",
         "match_radius_arcsec": 1.0,
         "hats_order": 5,
-        "total_rows": 12345,
-        "n_match_rows": 12345,
-        "n_tiles": 3,
+        "total_rows": 1,
+        "n_match_rows": 1,
+        "n_tiles": 1,
         "schema_version": "1",
     }))
     col_root = lake / "crossmatch" / "A_x_C__col_ID__ID"
-    col_root.mkdir(parents=True)
+    col_tile = col_root / healpix_dir(5, 10)
+    col_tile.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table({
+            "source_id_a": pa.array([1, 2, 3], type=pa.int64()),
+            "source_id_b": pa.array([4, 5, 6], type=pa.int64()),
+        }),
+        col_tile / "Npix=10.parquet",
+    )
     (col_root / "crossmatch_info.json").write_text(json.dumps({
         "catalog_name": "A_x_C__col_ID__ID",
         "modality": "crossmatch",
@@ -297,8 +316,9 @@ def test_registry_crossmatch_total_rows(tmp_path: Path) -> None:
         "survey_b": "C",
         "match_col_a": "ID",
         "match_col_b": "ID",
-        "total_rows": 99,
-        "n_match_rows": 99,
+        "hats_order": 5,
+        "total_rows": 1,
+        "n_match_rows": 1,
         "n_tiles": 1,
         "schema_version": "1",
     }))
@@ -312,17 +332,82 @@ def test_registry_crossmatch_total_rows(tmp_path: Path) -> None:
         for r in table.to_pylist()
         if r["modality"] == MODALITY_CROSSMATCH
     }
-    assert rows["A_x_B__r1"]["total_rows"] == 12345
-    assert rows["A_x_C__col_ID__ID"]["total_rows"] == 99
+    assert rows["A_x_B__r1"]["total_rows"] == 5
+    assert rows["A_x_B__r1"]["n_tiles"] == 2
+    assert rows["A_x_C__col_ID__ID"]["total_rows"] == 3
     assert rows["A_x_C__col_ID__ID"]["match_mode"] == "column"
     assert rows["A_x_C__col_ID__ID"]["match_col_a"] == "ID"
 
     text = format_lake_registry_table(table)
-    assert "12,345" in text
-    assert "99" in text
+    assert "5" in text
+    assert "3" in text
     assert "r=1" in text
     assert "col:ID:ID" in text
     assert "A_x_C__col_ID__ID" in text
+
+
+def test_describe_lake_from_area_scopes_crossmatch(tmp_path: Path) -> None:
+    """--from-area sums only crossmatch tiles whose Npix intersects the area."""
+    from click.testing import CliRunner
+
+    from data_lake.discovery.areas import make_area, save_area
+    from data_lake.discovery.region import Region
+    from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+    from data_lake.lake_registry import cli_describe_lake
+
+    lake = tmp_path / "lake"
+    norder = 5
+    ra_in, dec_in = 120.0, 45.0
+    ra_out, dec_out = 10.0, 0.0
+    npix_in = int(assign_healpix(np.array([ra_in]), np.array([dec_in]), norder)[0])
+    npix_out = int(assign_healpix(np.array([ra_out]), np.array([dec_out]), norder)[0])
+    assert npix_in != npix_out
+
+    xm_root = lake / "crossmatch" / "A_x_B__r1.0"
+    for npix, n_rows in ((npix_in, 4), (npix_out, 7)):
+        tile_dir = xm_root / healpix_dir(norder, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({
+                "source_id_a": pa.array(list(range(n_rows)), type=pa.int64()),
+                "source_id_b": pa.array(list(range(n_rows)), type=pa.int64()),
+            }),
+            tile_dir / f"Npix={npix}.parquet",
+        )
+    (xm_root / "crossmatch_info.json").write_text(json.dumps({
+        "match_mode": "sky",
+        "survey_a": "A",
+        "survey_b": "B",
+        "match_radius_arcsec": 1.0,
+        "hats_order": norder,
+        "total_rows": 999,
+        "n_tiles": 99,
+    }))
+
+    _ingest_mini_catalog(tmp_path, "CAT_KEEP")
+    area = make_area("InField", Region.cone(ra_in, dec_in, 30.0))
+    save_area(lake, area)
+
+    refresh_lake_registry(lake)
+    assert cli_describe_lake is not None
+    result = CliRunner().invoke(
+        cli_describe_lake,
+        [str(lake), "--from-area", "InField", "--modality", "crossmatch", "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["area"]["area_id"] == "InField"
+    assert payload["area"]["n_crossmatch_rows"] == 4
+    assert payload["entries"][0]["total_rows"] == 4
+    assert payload["entries"][0]["n_tiles"] == 1
+
+    # Without --from-area, full tree from disk.
+    full = CliRunner().invoke(
+        cli_describe_lake, [str(lake), "--modality", "crossmatch", "--json"]
+    )
+    assert full.exit_code == 0, full.output
+    full_payload = json.loads(full.output)
+    assert full_payload["entries"][0]["total_rows"] == 11
 
 
 def test_describe_lake_count_total_cli(tmp_path: Path) -> None:

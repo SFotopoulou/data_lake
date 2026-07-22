@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -660,14 +661,10 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
                     info = json.load(fh)
             except (OSError, json.JSONDecodeError):
                 info = {}
-        total_rows = info.get("total_rows")
-        if total_rows is None:
-            total_rows = info.get("n_match_rows")
-        if total_rows is None:
-            total_rows = _sum_parquet_rows(root)
-        n_tiles = info.get("n_tiles")
-        if n_tiles is None:
-            n_tiles = _count_parquet_tiles(root)
+        # Prefer on-disk Parquet footers so a region-bounded re-run that shrank
+        # crossmatch_info.json cannot hide matches still present on disk.
+        total_rows = _sum_parquet_rows(root)
+        n_tiles = _count_parquet_tiles(root)
         return {
             "survey": root.name,
             "modality": MODALITY_CROSSMATCH,
@@ -714,6 +711,88 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
             )
         )
     return rows
+
+
+_NPIX_PARQUET_RE = re.compile(r"Npix=(\d+)\.parquet$")
+
+
+def sum_crossmatch_rows_in_npix(
+    catalog_root: Path | str,
+    npix: set[int] | frozenset[int],
+) -> tuple[int, int]:
+    """Sum match rows / tiles whose ``Npix=`` is in *npix* (survey-A partition).
+
+    Returns ``(total_rows, n_tiles)``.
+    """
+    catalog_root = Path(catalog_root)
+    total = 0
+    n_tiles = 0
+    for path in catalog_root.rglob("Npix=*.parquet"):
+        m = _NPIX_PARQUET_RE.search(path.name)
+        if m is None:
+            continue
+        if int(m.group(1)) not in npix:
+            continue
+        total += int(pq.read_metadata(str(path)).num_rows)
+        n_tiles += 1
+    return total, n_tiles
+
+
+def apply_area_scope_to_crossmatch_rows(
+    lake_root: Path | str,
+    rows: list[dict[str, Any]],
+    area_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Restrict crossmatch registry rows to tiles overlapping *area_id*.
+
+    Non-crossmatch rows are returned unchanged. Crossmatch ``total_rows`` /
+    ``n_tiles`` become area-scoped Parquet footer sums.
+
+    Returns ``(updated_rows, area_summary)`` where *area_summary* has
+    ``area_id``, ``n_crossmatch_rows``, ``n_crossmatch_trees``.
+    """
+    from data_lake.discovery.areas import load_area
+
+    lake_root = Path(lake_root)
+    area = load_area(lake_root, area_id)
+    out: list[dict[str, Any]] = []
+    area_rows = 0
+    area_trees = 0
+    for row in rows:
+        if row.get("kind") != "crossmatch" and row.get("modality") != MODALITY_CROSSMATCH:
+            out.append(row)
+            continue
+        rel = row.get("path")
+        if not rel:
+            out.append(row)
+            continue
+        root = lake_root / str(rel)
+        norder = row.get("hats_order")
+        if norder is None:
+            info_path = root / "crossmatch_info.json"
+            if info_path.is_file():
+                try:
+                    with open(info_path) as fh:
+                        info = json.load(fh)
+                    norder = info.get("survey_a_norder") or info.get("hats_order")
+                except (OSError, json.JSONDecodeError):
+                    norder = None
+        if norder is None:
+            norder = 5
+        npix = area.region.to_npix(int(norder))
+        scoped_rows, scoped_tiles = sum_crossmatch_rows_in_npix(root, npix)
+        updated = dict(row)
+        updated["total_rows"] = scoped_rows
+        updated["n_tiles"] = scoped_tiles
+        out.append(updated)
+        area_rows += scoped_rows
+        area_trees += 1
+    summary = {
+        "area_id": area_id,
+        "n_crossmatch_rows": area_rows,
+        "n_crossmatch_trees": area_trees,
+    }
+    return out, summary
 
 
 def _align_registry_row_keys(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -991,6 +1070,7 @@ def format_lake_registry_table(
     count_total: bool = False,
     verbose: bool = False,
     pair_surveys: bool = False,
+    area_summary: dict[str, Any] | None = None,
 ) -> str:
     import polars as pl
 
@@ -1062,6 +1142,12 @@ def format_lake_registry_table(
         sep = "-" * (len(lines[0]) if lines else 90)
         lines.append(sep)
         lines.append(format_registry_count_footer(summarize_registry_row_counts(table)))
+    if area_summary is not None:
+        lines.append(
+            f"area {area_summary['area_id']}: "
+            f"{area_summary['n_crossmatch_rows']:,} crossmatch row(s) across "
+            f"{area_summary['n_crossmatch_trees']} tree(s)"
+        )
     if pair_surveys:
         lines.append(format_registry_pair_footer(table))
     return "\n".join(lines)
@@ -1188,6 +1274,16 @@ try:
         is_flag=True,
         help="Footer: catalog vs spectra hats_order per survey name.",
     )
+    @click.option(
+        "--from-area",
+        "from_area",
+        default=None,
+        metavar="AREA_ID",
+        help=(
+            "Restrict crossmatch row/tile counts to tiles whose Npix intersects "
+            "this area (catalog/spectra/cutout rows unchanged)."
+        ),
+    )
     def cli_describe_lake(
         output_root: Path | None,
         config_path: Path | None,
@@ -1199,6 +1295,7 @@ try:
         as_json: bool,
         verbose: bool,
         pair_surveys: bool,
+        from_area: str | None,
     ) -> None:
         """List surveys and modalities on disk (registry index)."""
         lake_root = _resolve_lake_root(output_root, config_path)
@@ -1206,6 +1303,15 @@ try:
             refresh_lake_registry(lake_root)
         table = filter_lake_registry_table(load_lake_registry(lake_root), modality)
         table = filter_registry_by_kind(table, kind)
+        area_summary: dict[str, Any] | None = None
+        if from_area is not None:
+            scoped_rows, area_summary = apply_area_scope_to_crossmatch_rows(
+                lake_root, table.to_pylist(), from_area
+            )
+            if scoped_rows:
+                table = pa.Table.from_pylist(_align_registry_row_keys(scoped_rows))
+            else:
+                table = table.slice(0, 0)
         summary = summarize_registry_row_counts(table) if count_total else None
         if as_json:
             payload: dict[str, Any] = {"entries": table.to_pylist()}
@@ -1217,6 +1323,8 @@ try:
                 from data_lake.discovery.areas import iter_areas
 
                 payload["areas"] = [a.data for a in iter_areas(lake_root)]
+            if area_summary is not None:
+                payload["area"] = area_summary
             click.echo(json.dumps(payload, indent=2, default=str))
         else:
             click.echo(
@@ -1225,6 +1333,7 @@ try:
                     count_total=count_total,
                     verbose=verbose,
                     pair_surveys=pair_surveys,
+                    area_summary=area_summary,
                 ),
             )
             if show_areas:

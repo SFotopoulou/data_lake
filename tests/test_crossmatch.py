@@ -718,6 +718,81 @@ class TestCrossmatchNamingAndReuse:
         assert "EUCLID_x_DESI_DR1__r1.0" in result.output
         assert crossmatch_root(lake, "EUCLID", "DESI_DR1", 1.0).is_dir()
 
+    def test_cli_from_area_rejects_overwrite(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.discovery.areas import make_area, save_area
+        from data_lake.discovery.region import Region
+        from data_lake.io.crossmatch import cli
+
+        lake, ra, dec, _npix = self._two_partner_lake(tmp_path)
+        area = make_area(
+            "Field1",
+            Region.cone(ra, dec, 60.0),
+            crossmatch_plan={
+                "base_catalog": "EUCLID",
+                "partners": [{"survey": "DESI_DR1", "radius_arcsec": 1.0}],
+            },
+        )
+        save_area(lake, area)
+        result = CliRunner().invoke(
+            cli, [str(lake), "--from-area", "Field1", "--overwrite"]
+        )
+        assert result.exit_code != 0
+        assert "--overwrite" in result.output and "--from-area" in result.output
+
+    def test_from_area_preserves_outside_tiles_and_full_info(self, tmp_path: Path) -> None:
+        """Full-sky tree then --from-area: outside tiles remain; info = full recount."""
+        from click.testing import CliRunner
+
+        from data_lake.discovery.areas import make_area, save_area
+        from data_lake.discovery.region import Region
+        from data_lake.io.crossmatch import cli, recount_crossmatch_tree
+
+        lake = tmp_path / "lake"
+        norder = 5
+        ra1, dec1 = 120.0, 45.0
+        ra2, dec2 = 10.0, 0.0
+        npix1 = int(assign_healpix(np.array([ra1]), np.array([dec1]), norder)[0])
+        npix2 = int(assign_healpix(np.array([ra2]), np.array([dec2]), norder)[0])
+        assert npix1 != npix2
+
+        for survey, sid_base in (("A", 1), ("B", 100)):
+            _write_catalog_tile(
+                lake, survey, norder=norder, npix=npix1,
+                source_ids=[sid_base], ra=[ra1], dec=[dec1],
+            )
+            _write_catalog_tile(
+                lake, survey, norder=norder, npix=npix2,
+                source_ids=[sid_base + 1], ra=[ra2], dec=[dec2],
+            )
+
+        full = build_crossmatch(lake, "A", "B", radius_arcsec=1.0)
+        root = crossmatch_root(lake, "A", "B", 1.0)
+        outside_tile = root / healpix_dir(norder, npix2) / f"Npix={npix2}.parquet"
+        assert outside_tile.is_file()
+        full_rows, full_tiles = recount_crossmatch_tree(root)
+        assert full.tree_total_rows == full_rows
+        assert full_rows >= 2
+
+        area = make_area(
+            "NearField",
+            Region.cone(ra1, dec1, 30.0),
+            crossmatch_plan={
+                "base_catalog": "A",
+                "partners": [{"survey": "B", "radius_arcsec": 1.0}],
+            },
+        )
+        save_area(lake, area)
+        result = CliRunner().invoke(cli, [str(lake), "--from-area", "NearField"])
+        assert result.exit_code == 0, result.output
+        assert outside_tile.is_file()
+        info = json.loads((root / "crossmatch_info.json").read_text())
+        disk_rows, disk_tiles = recount_crossmatch_tree(root)
+        assert info["total_rows"] == disk_rows == full_rows
+        assert info["n_tiles"] == disk_tiles == full_tiles
+        assert "tree on disk" in result.output.lower() or str(disk_rows) in result.output
+
     def test_accessor_autodiscovers_single_radius(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"
         norder = 5

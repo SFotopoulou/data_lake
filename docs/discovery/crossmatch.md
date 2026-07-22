@@ -36,7 +36,7 @@ with a formal `catalogs/<survey>/` ingest), or a dedicated tree under
 
 Recommended steps (fastest to slowest):
 
-1. **Registry summary** — `dl-refresh-lake-registry` then `dl-describe-lake --count-total` gives a survey × modality table with per-modality and grand-total row counts in seconds, without rescanning any tile.
+1. **Registry summary** — `dl-refresh-lake-registry` then `dl-describe-lake --count-total` gives a survey × modality table with per-modality and grand-total row counts. Catalog/spectra counts come from sidecars recorded at ingest; crossmatch counts are summed from Parquet footers.
 2. **Survey column manifest** — `dl-describe-survey <name>` for column names, dtypes, and roles.
 3. **Deployment tree notebook** — `notebooks/04_ingestion_report.ipynb` walks the full deployment and plots per-survey statistics.
 4. **Ad-hoc SQL** — `duckdb` / `polars` over `read_parquet('.../catalogs/<survey>/**/*.parquet')` or each survey’s `catalog_info.json` when you need custom filters.
@@ -155,10 +155,10 @@ attach `crossmatch_plan` with [`dl-area set-crossmatch`](areas-cli.md) (or
 `dl-area import`). See [End-to-end workflow](regions-and-areas.md#end-to-end-workflow-cone--crossmatch--gather).
 
 ```bash
-# Run the area's crossmatch_plan, bounded to the area region (reuses + gap-fills)
+# Run the area's crossmatch_plan, bounded to the area region (gap-fill only)
 dl-crossmatch /data/lake --from-area Euclid_North --n-workers 8
 
-# Or a standalone plan file (no region restriction)
+# Or a standalone plan file (no region restriction; --overwrite allowed)
 dl-crossmatch /data/lake --plan plans/euclid_partners.json
 ```
 
@@ -175,10 +175,24 @@ A plan is the `crossmatch_plan` block of an area (see
  "reuse_existing": true}
 ```
 
+**`--from-area` is gap-fill only.** Existing Parquet tiles (including those
+outside the area) are never deleted or rewritten. `--overwrite` cannot be
+combined with `--from-area` (full-sky pair mode `dl-crossmatch A B --overwrite`
+remains allowed). The plan field `reuse_existing` is effectively always on for
+region-bounded runs (existing tiles are skipped). After every run,
+`crossmatch_info.json` `total_rows` / `n_tiles` are rewritten from a **full
+on-disk recount**, so a region-bounded re-run cannot shrink the sidecar below
+what is still on disk. The CLI prints both this-run match rows and the tree
+total after recount.
+
 Existing tiles are skipped (resume), so re-running after more live tiles arrive
 only fills gaps. Column partners are written as ``__col_<col_a>__<col_b>`` trees;
 ``dl-gather --from-area`` resolves them by the column pair. See [`dl-gather`](gather.md)
 to materialise the joined columns.
+
+Inventory: `dl-describe-lake` (and `--refresh`) always counts crossmatch rows
+from Parquet footers. Use `dl-describe-lake --from-area AREA` to report
+match counts restricted to that area's tiles (other modalities unchanged).
 
 **Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A
 HEALPix tiles per worker process, amortizing DuckDB catalog registration. Try

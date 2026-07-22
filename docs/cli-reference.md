@@ -64,7 +64,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--kind ingested\|product\|crossmatch`, `--areas`, `--refresh`, `--verbose`, `--pair-surveys` |
+| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--kind ingested\|product\|crossmatch`, `--from-area`, `--areas`, `--refresh`, `--verbose`, `--pair-surveys` |
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |

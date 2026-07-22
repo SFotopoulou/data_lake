@@ -88,6 +88,9 @@ class CrossmatchResult:
     match_mode: str = "sky"
     match_col_a: str | None = None
     match_col_b: str | None = None
+    # Full on-disk tree totals after info rewrite (may exceed this-run stats).
+    tree_total_rows: int | None = None
+    tree_n_tiles: int | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,23 @@ CROSSMATCH_INFO_FILENAME = "crossmatch_info.json"
 _RADIUS_FROM_NAME = re.compile(r"__r([0-9]+(?:\.[0-9]+)?)$")
 _COL_FROM_NAME = re.compile(r"__col_([A-Za-z0-9._-]+)__([A-Za-z0-9._-]+)$")
 _MATCH_COL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_NPIX_FROM_PATH = re.compile(r"Npix=(\d+)\.parquet$")
+
+
+def recount_crossmatch_tree(out_root: Path | str) -> tuple[int, int]:
+    """Sum match rows and tile files under a crossmatch tree (Parquet footers).
+
+    Returns ``(total_rows, n_tiles)``. Used so region-bounded re-runs never shrink
+    ``crossmatch_info.json`` to the current area scope.
+    """
+    out_root = Path(out_root)
+    paths = list(out_root.rglob("Npix=*.parquet"))
+    if not paths:
+        return 0, 0
+    total = 0
+    for path in paths:
+        total += int(pq.read_metadata(str(path)).num_rows)
+    return total, len(paths)
 
 
 def validate_match_column(col: str, flag: str = "--match-col-a/b") -> None:
@@ -1212,7 +1232,7 @@ def build_crossmatch(
         elapsed,
     )
 
-    _write_xm_info(
+    tree_rows, tree_tiles = _write_xm_info(
         out_root,
         xm_name,
         survey_a,
@@ -1224,6 +1244,12 @@ def build_crossmatch(
         n_match_rows=n_match_rows,
         n_tiles=n_tiles_written,
     )
+    if tree_rows != n_match_rows or tree_tiles != n_tiles_written:
+        log.info(
+            "Cross-match tree totals on disk: %d match row(s) in %d tile(s)",
+            tree_rows,
+            tree_tiles,
+        )
     parquet_path, fits_path = _export_crossmatch_outputs(
         out_root,
         norder_a,
@@ -1245,6 +1271,8 @@ def build_crossmatch(
         gpu_id=gpu_id,
         export_parquet=parquet_path,
         export_fits=fits_path,
+        tree_total_rows=tree_rows,
+        tree_n_tiles=tree_tiles,
     )
 
 
@@ -1300,7 +1328,17 @@ def _write_xm_info(
     gpu_id: int = 0,
     n_match_rows: int = 0,
     n_tiles: int | None = None,
-) -> None:
+) -> tuple[int, int]:
+    """Write ``crossmatch_info.json`` with **full-tree** row/tile counts from disk.
+
+    *n_match_rows* / *n_tiles* are ignored for stored totals (kept for call-site
+    compatibility); values always come from :func:`recount_crossmatch_tree` so a
+    region-bounded re-run cannot shrink the sidecar below tiles already on disk.
+
+    Returns ``(tree_total_rows, tree_n_tiles)``.
+    """
+    del n_match_rows, n_tiles  # scoped run stats must not overwrite full-tree totals
+    tree_rows, tree_tiles = recount_crossmatch_tree(out_root)
     info = {
         "catalog_name": xm_name,
         "catalog_type": "association",
@@ -1318,15 +1356,16 @@ def _write_xm_info(
         "survey_a_dec_column": settings.survey_a.dec_col,
         "survey_b_ra_column": settings.survey_b.ra_col,
         "survey_b_dec_column": settings.survey_b.dec_col,
-        "total_rows": int(n_match_rows),
-        "n_match_rows": int(n_match_rows),
-        "n_tiles": n_tiles,
+        "total_rows": int(tree_rows),
+        "n_match_rows": int(tree_rows),
+        "n_tiles": int(tree_tiles),
         "schema_version": "1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     out_root.mkdir(parents=True, exist_ok=True)
     with open(out_root / CROSSMATCH_INFO_FILENAME, "w") as fh:
         json.dump(info, fh, indent=2)
+    return tree_rows, tree_tiles
 
 
 # ---------------------------------------------------------------------------
@@ -1617,7 +1656,13 @@ def _write_column_xm_info(
     *,
     n_match_rows: int = 0,
     n_tiles: int | None = None,
-) -> None:
+) -> tuple[int, int]:
+    """Write column-crossmatch info with full-tree totals from disk.
+
+    Returns ``(tree_total_rows, tree_n_tiles)``.
+    """
+    del n_match_rows, n_tiles
+    tree_rows, tree_tiles = recount_crossmatch_tree(out_root)
     info = {
         "catalog_name": xm_name,
         "catalog_type": "association",
@@ -1631,15 +1676,16 @@ def _write_column_xm_info(
         "hats_order": norder_a,
         "survey_a_norder": norder_a,
         "survey_b_norder": norder_b,
-        "total_rows": int(n_match_rows),
-        "n_match_rows": int(n_match_rows),
-        "n_tiles": n_tiles,
+        "total_rows": int(tree_rows),
+        "n_match_rows": int(tree_rows),
+        "n_tiles": int(tree_tiles),
         "schema_version": "1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     out_root.mkdir(parents=True, exist_ok=True)
     with open(out_root / CROSSMATCH_INFO_FILENAME, "w") as fh:
         json.dump(info, fh, indent=2)
+    return tree_rows, tree_tiles
 
 
 def build_column_crossmatch(
@@ -1874,12 +1920,18 @@ def build_column_crossmatch(
         survey_a, survey_b, n_match_rows, n_tiles_written, elapsed,
     )
 
-    _write_column_xm_info(
+    tree_rows, tree_tiles = _write_column_xm_info(
         out_root, xm_name, survey_a, survey_b,
         norder_a, norder_b, match_col_a, match_col_b,
         n_match_rows=n_match_rows,
         n_tiles=n_tiles_written,
     )
+    if tree_rows != n_match_rows or tree_tiles != n_tiles_written:
+        log.info(
+            "Column crossmatch tree totals on disk: %d association row(s) in %d tile(s)",
+            tree_rows,
+            tree_tiles,
+        )
     parquet_path, fits_path = _export_crossmatch_outputs(
         out_root, norder_a,
         export_parquet=export_parquet,
@@ -1901,6 +1953,8 @@ def build_column_crossmatch(
         match_mode="column",
         match_col_a=match_col_a,
         match_col_b=match_col_b,
+        tree_total_rows=tree_rows,
+        tree_n_tiles=tree_tiles,
     )
 
 
@@ -1952,6 +2006,11 @@ def execute_crossmatch_plan(
     recomputed (resume skips written tiles). A ``region`` (a
     :class:`data_lake.discovery.region.Region`) restricts survey-A tiles to the
     region resolved at the base catalog order.
+
+    When *region* is set (``dl-crossmatch --from-area``), *overwrite* is forced
+    off: existing tiles outside or inside the area are never rebuilt; only
+    missing tiles in the area are computed. ``crossmatch_info.json`` always
+    stores full on-disk tree totals after the run.
     """
     from data_lake.discovery.area_plan import partner_match_mode
 
@@ -1962,6 +2021,9 @@ def execute_crossmatch_plan(
     partners = plan.get("partners") or []
     if not partners:
         raise ValueError("crossmatch_plan has no 'partners'")
+
+    if region is not None:
+        overwrite = False
 
     restrict_npix: set[int] | None = None
     if region is not None:
@@ -2364,6 +2426,12 @@ try:
         if from_area is not None or plan_file is not None:
             if from_area is not None and plan_file is not None:
                 raise click.ClickException("Use only one of --from-area or --plan.")
+            if from_area is not None and overwrite:
+                raise click.ClickException(
+                    "--overwrite cannot be combined with --from-area "
+                    "(region runs only gap-fill missing tiles; leave existing matches intact). "
+                    "Use unrestricted pair mode to rebuild a tree."
+                )
             # In plan mode the positional args are not survey names; the first
             # positional (if any) is the lake root.
             plan_output_root = output_root
@@ -2374,11 +2442,13 @@ try:
                 plan, region = load_crossmatch_plan(
                     lake, from_area=from_area, plan_file=plan_file
                 )
+                # Region-bounded runs never overwrite existing tiles.
+                plan_overwrite = False if region is not None else overwrite
                 results = execute_crossmatch_plan(
                     lake,
                     plan,
                     region=region,
-                    overwrite=overwrite,
+                    overwrite=plan_overwrite,
                     n_workers=n_workers,
                     tiles_per_worker=tiles_per_worker,
                     match_backend=match_backend,  # type: ignore[arg-type]
@@ -2387,15 +2457,27 @@ try:
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
-            total_rows = sum(r.n_match_rows for r in results)
+            run_rows = sum(r.n_match_rows for r in results)
+            tree_rows = sum(
+                (r.tree_total_rows if r.tree_total_rows is not None else r.n_match_rows)
+                for r in results
+            )
             click.echo(
-                f"Crossmatch plan: {len(results)} partner tree(s), "
-                f"{total_rows:,} total match row(s)"
+                f"Crossmatch plan: {len(results)} partner tree(s); "
+                f"this run accounted for {run_rows:,} row(s) in scope; "
+                f"on-disk tree total(s) {tree_rows:,} match row(s)"
             )
             for r in results:
+                tree_note = ""
+                if r.tree_total_rows is not None:
+                    tree_note = (
+                        f" (tree on disk: {r.tree_total_rows:,} row(s) "
+                        f"in {r.tree_n_tiles:,} tile(s))"
+                    )
                 click.echo(
                     f"  {r.crossmatch_name}: {r.n_match_rows:,} row(s) in "
-                    f"{r.n_tiles_written:,} tile(s) → {r.output_root}"
+                    f"{r.n_tiles_written:,} tile(s) this run → {r.output_root}"
+                    f"{tree_note}"
                 )
             return
 
@@ -2441,6 +2523,14 @@ try:
             f"→ {result.output_root} ({result.elapsed_s:.1f} s, "
             f"{result.n_workers} process worker(s), {backend_note}"
         )
+        if result.tree_total_rows is not None and (
+            result.tree_total_rows != result.n_match_rows
+            or (result.tree_n_tiles or 0) != result.n_tiles_written
+        ):
+            msg += (
+                f"; tree on disk: {result.tree_total_rows:,} row(s) "
+                f"in {result.tree_n_tiles:,} tile(s)"
+            )
         if result.export_parquet is not None:
             msg += f"; parquet → {result.export_parquet}"
         if result.export_fits is not None:
