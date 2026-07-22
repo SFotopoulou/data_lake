@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`dl-describe-lake --kind ingested` omitted spectra/cutouts** — registry rows for those modalities now set provenance `kind` (default `ingested`; homogenized products keep `product`). Stale `surveys.parquet` with null `kind` on spectra/cutouts is coalesced to `ingested` at filter/display time, so `--kind ingested` lists catalogs and spectra without requiring a refresh (refresh still rewrites the on-disk column).
 - **`dl-crossmatch --from-area` sidecar shrink** — `crossmatch_info.json` `total_rows` / `n_tiles` are always rewritten from a full on-disk Parquet recount after every run (sky and column), so a region-bounded gap-fill cannot make `dl-describe-lake` look like full-sky matches vanished. `--overwrite` is rejected with `--from-area` (gap-fill only; existing tiles outside the area are left untouched).
 - **`dl-describe-lake` crossmatch counts** — registry / describe prefer on-disk Parquet footers over the sidecar (lake-wide totals).
 - **`dl-gather` unmatched partner padding** — null-padded partner columns now use the partner catalog's real Arrow/Polars dtypes (string, int, float, …) instead of hard-coded `Float64`. Fixes schema conflicts such as `SDSS_DR17_CLASS` (`large_string` on matched tiles vs float on unmatched).

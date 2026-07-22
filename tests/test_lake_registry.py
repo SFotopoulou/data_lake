@@ -402,6 +402,121 @@ def test_describe_lake_kind_filter_cli(tmp_path: Path) -> None:
     assert "INGESTED_SURV" not in res_prod.output
 
 
+def test_registry_spectra_cutout_kind_filter(tmp_path: Path) -> None:
+    """Spectra/cutouts carry kind (default ingested; product when tagged)."""
+    from data_lake.lake_registry import filter_registry_by_kind
+    from data_lake.schema_registry import CATALOG_KIND_INGESTED, CATALOG_KIND_PRODUCT, MODALITY_CUTOUT
+
+    lake = tmp_path / "lake"
+    for name, modality, info_name, extra in (
+        ("SPEC_ING", "spectra", "spectrum_info.json", {}),
+        (
+            "SPEC_PROD",
+            "spectra",
+            "spectrum_info.json",
+            {"kind": "product", "product_subtype": "homogenized"},
+        ),
+        ("CUT_ING", "cutouts", "cutout_info.json", {"n_bands": 1, "height": 2, "width": 2}),
+    ):
+        root = lake / modality / name
+        root.mkdir(parents=True)
+        payload = {"hats_order": 5, "n_pix": 8, "wavelength_mode": "shared", **extra}
+        (root / info_name).write_text(json.dumps(payload))
+
+    table = build_lake_registry_table(lake)
+    by_survey = {r["survey"]: r for r in table.to_pylist()}
+    assert by_survey["SPEC_ING"]["kind"] == CATALOG_KIND_INGESTED
+    assert by_survey["SPEC_ING"]["modality"] == MODALITY_SPECTRA
+    assert by_survey["SPEC_PROD"]["kind"] == CATALOG_KIND_PRODUCT
+    assert by_survey["CUT_ING"]["kind"] == CATALOG_KIND_INGESTED
+    assert by_survey["CUT_ING"]["modality"] == MODALITY_CUTOUT
+
+    ingested = filter_registry_by_kind(table, "ingested")
+    ingested_names = {r["survey"] for r in ingested.to_pylist()}
+    assert ingested_names == {"SPEC_ING", "CUT_ING"}
+
+    products = filter_registry_by_kind(table, "product")
+    assert {r["survey"] for r in products.to_pylist()} == {"SPEC_PROD"}
+
+
+def test_describe_lake_kind_ingested_includes_catalog_and_spectra(tmp_path: Path) -> None:
+    """CLI --kind ingested lists both catalog and spectra after a fresh build."""
+    from click.testing import CliRunner
+
+    from data_lake.lake_registry import cli_describe_lake
+
+    _ingest_mini_catalog(tmp_path, "BOTH_SURV")
+    lake = tmp_path / "lake"
+    spec_root = lake / "spectra" / "BOTH_SURV"
+    spec_root.mkdir(parents=True)
+    (spec_root / "spectrum_info.json").write_text(
+        json.dumps({"hats_order": 5, "n_pix": 8, "wavelength_mode": "shared"})
+    )
+    refresh_lake_registry(lake)
+
+    result = CliRunner().invoke(
+        cli_describe_lake, [str(lake), "--kind", "ingested", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.output)["entries"]
+    pairs = {(e["survey"], e["modality"]) for e in entries}
+    assert ("BOTH_SURV", "catalog") in pairs
+    assert ("BOTH_SURV", "spectra") in pairs
+    assert all(e.get("kind") == "ingested" for e in entries)
+
+
+def test_filter_kind_ingested_coalesces_legacy_null_spectra(tmp_path: Path) -> None:
+    """Stale surveys.parquet with null spectra kind still matches --kind ingested."""
+    from data_lake.lake_registry import (
+        _align_registry_row_keys,
+        coalesce_registry_kinds,
+        filter_registry_by_kind,
+        cli_describe_lake,
+    )
+    from click.testing import CliRunner
+
+    lake = tmp_path / "lake"
+    cat = lake / "catalogs" / "LEGACY"
+    cat.mkdir(parents=True)
+    (cat / "catalog_info.json").write_text(
+        json.dumps({"hats_order": 5, "kind": "ingested", "total_rows": 1})
+    )
+    spec = lake / "spectra" / "LEGACY"
+    spec.mkdir(parents=True)
+    (spec / "spectrum_info.json").write_text(
+        json.dumps({"hats_order": 5, "n_pix": 4, "wavelength_mode": "shared"})
+    )
+
+    # Build rows then strip kind from spectra to simulate pre-fix parquet.
+    fresh = build_lake_registry_table(lake).to_pylist()
+    stale_rows = []
+    for row in fresh:
+        d = dict(row)
+        if d["modality"] == MODALITY_SPECTRA:
+            d["kind"] = None
+        stale_rows.append(d)
+    stale = pa.Table.from_pylist(_align_registry_row_keys(stale_rows))
+    assert any(r.get("kind") is None for r in stale.to_pylist())
+
+    ingested = filter_registry_by_kind(stale, "ingested")
+    mods = {r["modality"] for r in ingested.to_pylist()}
+    assert mods == {"catalog", "spectra"}
+
+    coalesced = coalesce_registry_kinds(stale)
+    assert all(r["kind"] == "ingested" for r in coalesced.to_pylist())
+
+    # Persist stale parquet; CLI without --refresh must still list spectra.
+    reg = lake / "shared" / "registry"
+    reg.mkdir(parents=True)
+    pq.write_table(stale, str(reg / REGISTRY_FILENAME))
+    result = CliRunner().invoke(
+        cli_describe_lake, [str(lake), "--kind", "ingested", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.output)["entries"]
+    assert {e["modality"] for e in entries} == {"catalog", "spectra"}
+
+
 def test_describe_lake_areas_block_cli(tmp_path: Path) -> None:
     from click.testing import CliRunner
 

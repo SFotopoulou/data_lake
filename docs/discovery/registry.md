@@ -8,6 +8,8 @@
 dl-refresh-lake-registry              # write shared/registry/surveys.parquet
 dl-describe-lake                      # print survey × modality summary
 dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout / crossmatch)
+dl-describe-lake --kind ingested      # primary ingest across modalities (catalogs + spectra + cutouts)
+dl-describe-lake --kind product       # derived products (gather/homogenize)
 dl-describe-lake --count-total        # footer: per-modality totals + grand total (registry sums)
 dl-describe-lake --modality catalog --count-total
 dl-describe-lake --json               # {"entries": [...]} per survey × modality

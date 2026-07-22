@@ -578,6 +578,10 @@ def _info_registry_row(
     row: dict[str, Any] = {
         "survey": survey,
         "modality": modality,
+        # Same provenance axis as catalogs: primary ingest defaults to
+        # "ingested"; homogenized spectra/cutouts write kind: "product".
+        "kind": info.get("kind") or CATALOG_KIND_INGESTED,
+        "product_subtype": info.get("product_subtype"),
         "path": str(survey_root.relative_to(lake_root)),
         "hats_order": info.get("hats_order"),
         "link_id_column": source_id,
@@ -839,16 +843,51 @@ def filter_lake_registry_table(
     return table.filter(pc.equal(table.column("modality"), modality))
 
 
-def filter_registry_by_kind(table: pa.Table, kind: str | None) -> pa.Table:
-    """Return registry rows whose ``kind`` matches (``ingested``/``product``/...)."""
-    if kind is None:
+def coalesce_registry_kinds(table: pa.Table) -> pa.Table:
+    """Fill null ``kind`` with ``ingested`` (legacy spectra/cutout registry rows).
+
+    Registries built before spectra/cutouts carried ``kind`` store null after
+    key alignment with catalog rows. Missing kind always meant primary ingest.
+    """
+    if "kind" not in table.schema.names or table.num_rows == 0:
         return table
-    if "kind" not in table.schema.names:
-        return table.slice(0, 0)
     import pyarrow.compute as pc
 
     col = table.column("kind")
-    return table.filter(pc.equal(col, kind))
+    if col.null_count == 0:
+        return table
+    filled = pc.fill_null(col, CATALOG_KIND_INGESTED)
+    idx = table.schema.get_field_index("kind")
+    return table.set_column(idx, "kind", filled)
+
+
+def filter_registry_by_kind(table: pa.Table, kind: str | None) -> pa.Table:
+    """Return registry rows whose ``kind`` matches (``ingested``/``product``/``crossmatch``).
+
+    Applies across modalities: catalogs, spectra, and cutouts all carry a
+    provenance ``kind`` (primary ingest → ``ingested``; derived → ``product``).
+
+    Legacy registries may have null ``kind`` on spectra/cutouts; those are
+    treated as ``ingested``. A missing ``kind`` column is treated the same way
+    for ``--kind ingested`` (all non-crossmatch rows).
+    """
+    if kind is None:
+        return table
+    import pyarrow.compute as pc
+
+    if "kind" not in table.schema.names:
+        if kind == CATALOG_KIND_INGESTED:
+            if "modality" in table.schema.names:
+                return table.filter(
+                    pc.not_equal(table.column("modality"), MODALITY_CROSSMATCH)
+                )
+            return table
+        if kind == "crossmatch" and "modality" in table.schema.names:
+            return table.filter(pc.equal(table.column("modality"), MODALITY_CROSSMATCH))
+        return table.slice(0, 0)
+
+    table = coalesce_registry_kinds(table)
+    return table.filter(pc.equal(table.column("kind"), kind))
 
 
 def format_areas_block(lake_root: Path | str) -> str:
@@ -1176,7 +1215,10 @@ try:
         "--kind",
         default=None,
         type=click.Choice(["ingested", "product", "crossmatch"]),
-        help="Filter catalogs by kind (e.g. --kind product for derived tables).",
+        help=(
+            "Filter by provenance kind across modalities "
+            "(ingested/product catalogs, spectra, cutouts; or crossmatch)."
+        ),
     )
     @click.option(
         "--areas",
@@ -1216,7 +1258,10 @@ try:
         lake_root = _resolve_lake_root(output_root, config_path)
         if refresh or not registry_path(lake_root).is_file():
             refresh_lake_registry(lake_root)
-        table = filter_lake_registry_table(load_lake_registry(lake_root), modality)
+        # Coalesce legacy null kinds so --json / text show ingested for
+        # spectra/cutouts even before the user re-runs --refresh.
+        table = coalesce_registry_kinds(load_lake_registry(lake_root))
+        table = filter_lake_registry_table(table, modality)
         table = filter_registry_by_kind(table, kind)
         summary = summarize_registry_row_counts(table) if count_total else None
         if as_json:
