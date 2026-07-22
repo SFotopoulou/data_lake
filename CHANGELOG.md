@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `dl-describe-lake --from-area` removed** — describe-lake is lake-wide only. Use `dl-region --from-area AREA --modalities …,crossmatch` (optionally `--count`) for area-scoped inventory including crossmatch trees.
+- **`dl-region` crossmatch discovery** — `crossmatch` is a discoverable modality (`--modalities catalog,spectra,crossmatch`); tile indices include `*.crossmatch.json`; `--count` sums Parquet footers for catalog and crossmatch overlap tiles. Default modalities remain catalog-only.
+
 ### Fixed
 
 - **`dl-crossmatch --from-area` sidecar shrink** — `crossmatch_info.json` `total_rows` / `n_tiles` are always rewritten from a full on-disk Parquet recount after every run (sky and column), so a region-bounded gap-fill cannot make `dl-describe-lake` look like full-sky matches vanished. `--overwrite` is rejected with `--from-area` (gap-fill only; existing tiles outside the area are left untouched).
-- **`dl-describe-lake` crossmatch counts** — registry / describe prefer on-disk Parquet footers over the sidecar. New `--from-area AREA` scopes crossmatch row/tile counts to that area (other modalities unchanged).
+- **`dl-describe-lake` crossmatch counts** — registry / describe prefer on-disk Parquet footers over the sidecar (lake-wide totals).
 - **`dl-gather` unmatched partner padding** — null-padded partner columns now use the partner catalog's real Arrow/Polars dtypes (string, int, float, …) instead of hard-coded `Float64`. Fixes schema conflicts such as `SDSS_DR17_CLASS` (`large_string` on matched tiles vs float on unmatched).
 - **`dl-homogenize --from-product` float vs string** — product schema union prefers string/binary over float when tiles disagree, so already-gathered products with legacy float64 null pads can homogenize without re-gathering.
 - **`dl-extract-catalog` FITS string columns** — nullable Arrow strings are written as fixed-width unicode (null → `""`) so Astropy no longer raises `unsupported object types or mixed types`. Schema unify also prefers string over float for legacy gather pads.

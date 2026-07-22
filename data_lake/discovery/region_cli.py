@@ -19,13 +19,14 @@ from data_lake.discovery.engine import DiscoveryRow, resolve_region, round_count
 from data_lake.discovery.region import Region, parse_npix_arg
 from data_lake.schema_registry import (
     MODALITY_CATALOG,
+    MODALITY_CROSSMATCH,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
 )
 
 log = logging.getLogger(__name__)
 
-_ALL_MODALITIES = (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT)
+_ALL_MODALITIES = (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT, MODALITY_CROSSMATCH)
 
 
 def _region_from_args(
@@ -121,7 +122,8 @@ try:
     @click.option("--modalities", default=None,
                   help="Comma-separated modalities (default: catalog).")
     @click.option("--count", "exact", is_flag=True,
-                  help="Exact catalog counts via Parquet footers (slower than the estimate).")
+                  help="Exact catalog/crossmatch counts via Parquet footers "
+                       "(slower than the estimate).")
     @click.option("--save-as", "save_as", default=None,
                   help="Persist this region as areas/<id>.json.")
     @click.option("--overwrite", is_flag=True,
@@ -165,6 +167,7 @@ try:
 
             dl-region --from-area Wide_Field_47
             dl-region --cone 150.1 2.2 --radius-arcsec 600 --modalities catalog,spectra
+            dl-region --from-area Wide_Field_47 --modalities catalog,spectra,crossmatch --count
             dl-region --npix 1002198,1002199 --norder 5 --save-as Wide_Field_47
             dl-region --bbox 149.5 150.5 1.8 2.6 --count
             dl-region --cone 150.1 2.2 --radius-arcsec 600 \\
@@ -220,7 +223,10 @@ try:
 
         click.echo(_format_rows(rows, exact=exact))
         if not exact and rows:
-            click.echo("\n(row counts are rounded estimates; use --count for exact catalog counts)")
+            click.echo(
+                "\n(row counts are rounded estimates; use --count for exact "
+                "catalog/crossmatch counts)"
+            )
 
         if save_as is not None:
             blocks: dict = {}

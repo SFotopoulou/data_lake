@@ -22,6 +22,7 @@ from typing import Iterator
 from data_lake.schema_registry import (
     CATALOGS_LAYER,
     MODALITY_CATALOG,
+    MODALITY_CROSSMATCH,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
     PRODUCTS_LAYER,
@@ -39,6 +40,7 @@ _MODALITY_CONFIG: dict[str, tuple[str, str, str]] = {
     MODALITY_CATALOG: ("catalogs", "catalog_info.json", "Npix=*.parquet"),
     MODALITY_SPECTRA: ("spectra", "spectrum_info.json", "Npix=*.zarr"),
     MODALITY_CUTOUT: ("cutouts", "cutout_info.json", "Npix=*.zarr"),
+    MODALITY_CROSSMATCH: ("crossmatch", "crossmatch_info.json", "Npix=*.parquet"),
 }
 
 
@@ -148,6 +150,10 @@ def iter_surveys_in_modality(lake_root: Path | str, modality: str) -> Iterator[s
 
     For ``MODALITY_CATALOG`` both ``catalogs/`` and ``products/`` are scanned
     so that derived products are discovered alongside ingested surveys.
+
+    For ``MODALITY_CROSSMATCH`` yields tree names under ``crossmatch/`` that have
+    ``crossmatch_info.json`` or any ``Npix=*.parquet`` (names containing ``_x_``
+    are valid and are not skipped).
     """
     root = Path(lake_root)
     info_name = _MODALITY_CONFIG[modality][1]
@@ -161,6 +167,20 @@ def iter_surveys_in_modality(lake_root: Path | str, modality: str) -> Iterator[s
             if (p / info_name).is_file() or any(p.glob("Norder=*")):
                 yield p.name
 
+    def _iter_crossmatch_trees(layer: Path) -> Iterator[str]:
+        if not layer.is_dir():
+            return
+        for p in sorted(layer.iterdir()):
+            if not p.is_dir():
+                continue
+            # Do not skip names containing ``_x_`` — those are normal XM tree ids.
+            if (
+                (p / info_name).is_file()
+                or any(p.glob("Norder=*"))
+                or any(p.rglob("Npix=*.parquet"))
+            ):
+                yield p.name
+
     if modality == MODALITY_CATALOG:
         seen: set[str] = set()
         for name in _iter_layer(root / CATALOGS_LAYER):
@@ -169,13 +189,20 @@ def iter_surveys_in_modality(lake_root: Path | str, modality: str) -> Iterator[s
         for name in _iter_layer(root / PRODUCTS_LAYER):
             if name not in seen:
                 yield name
+    elif modality == MODALITY_CROSSMATCH:
+        yield from _iter_crossmatch_trees(root / modality_layer_dir(modality))
     else:
         yield from _iter_layer(root / modality_layer_dir(modality))
 
 
 def refresh_tile_indices(
     lake_root: Path | str,
-    modalities: tuple[str, ...] = (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT),
+    modalities: tuple[str, ...] = (
+        MODALITY_CATALOG,
+        MODALITY_SPECTRA,
+        MODALITY_CUTOUT,
+        MODALITY_CROSSMATCH,
+    ),
 ) -> dict[str, int]:
     """Rebuild tile indices for every survey in each modality.
 

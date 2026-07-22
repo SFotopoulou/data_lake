@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 
 from data_lake.discovery import tile_index as ti
 from data_lake.ingest.fits_to_parquet import healpix_dir
+from data_lake.schema_registry import MODALITY_CROSSMATCH
 
 
 def _write_catalog_tile(lake: Path, survey: str, norder: int, npix: int) -> None:
@@ -21,6 +22,15 @@ def _write_catalog_tile(lake: Path, survey: str, norder: int, npix: int) -> None
 def _write_info(lake: Path, survey: str, norder: int) -> None:
     (lake / "catalogs" / survey / "catalog_info.json").write_text(
         json.dumps({"hats_order": norder})
+    )
+
+
+def _write_crossmatch_tree(lake: Path, tree: str, norder: int, npix: int) -> None:
+    tile_dir = lake / "crossmatch" / tree / healpix_dir(norder, npix)
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"x": [1]}), tile_dir / f"Npix={npix}.parquet")
+    (lake / "crossmatch" / tree / "crossmatch_info.json").write_text(
+        json.dumps({"hats_order": norder, "total_rows": 1})
     )
 
 
@@ -72,3 +82,21 @@ class TestTileIndex:
         assert summary["catalog"] == 2
         assert ti.load_tile_index(lake, "A", "catalog")["npix"] == [1]
         assert ti.load_tile_index(lake, "B", "catalog")["npix"] == [2]
+
+    def test_crossmatch_iter_and_refresh(self, tmp_path: Path) -> None:
+        lake = tmp_path / "lake"
+        tree = "A_x_B__r1.0"
+        _write_crossmatch_tree(lake, tree, norder=5, npix=42)
+
+        names = list(ti.iter_surveys_in_modality(lake, MODALITY_CROSSMATCH))
+        assert tree in names
+
+        summary = ti.refresh_tile_indices(lake)
+        assert summary.get(MODALITY_CROSSMATCH) == 1
+        index_path = ti.tile_index_path(lake, tree, MODALITY_CROSSMATCH)
+        assert index_path.name == f"{tree}.crossmatch.json"
+        assert index_path.is_file()
+        loaded = ti.load_tile_index(lake, tree, MODALITY_CROSSMATCH)
+        assert loaded is not None
+        assert loaded["npix"] == [42]
+        assert loaded["hats_order"] == 5

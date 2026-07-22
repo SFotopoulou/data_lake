@@ -77,3 +77,37 @@ class TestRegionCli:
         result = runner.invoke(cli, [str(lake), "--npix", "1,2,3"])
         assert result.exit_code != 0
         assert "norder" in result.output.lower()
+
+    def test_from_area_crossmatch_modality(self, lake: Path) -> None:
+        """CLI smoke: --from-area + --modalities crossmatch discovers XM trees."""
+        ra, dec, norder = 120.0, 45.0, 5
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), norder)[0])
+        tree = "A_x_B__r1.0"
+        xm_dir = lake / "crossmatch" / tree / healpix_dir(norder, npix)
+        xm_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table({"x": pa.array([1, 2, 3], type=pa.int64())}),
+            xm_dir / f"Npix={npix}.parquet",
+        )
+        (lake / "crossmatch" / tree / "crossmatch_info.json").write_text(
+            json.dumps({"hats_order": norder, "total_rows": 3})
+        )
+        ti.write_tile_index(lake, tree, "crossmatch")
+
+        runner = CliRunner()
+        r_save = runner.invoke(
+            cli,
+            [str(lake), "--cone", "120.0", "45.0", "--radius-arcsec", "60",
+             "--save-as", "XmField"],
+        )
+        assert r_save.exit_code == 0, r_save.output
+
+        result = runner.invoke(
+            cli,
+            [str(lake), "--from-area", "XmField",
+             "--modalities", "crossmatch", "--count"],
+        )
+        assert result.exit_code == 0, result.output
+        assert tree in result.output
+        assert "crossmatch" in result.output
+        assert "3" in result.output

@@ -191,8 +191,9 @@ only fills gaps. Column partners are written as ``__col_<col_a>__<col_b>`` trees
 to materialise the joined columns.
 
 Inventory: `dl-describe-lake` (and `--refresh`) always counts crossmatch rows
-from Parquet footers. Use `dl-describe-lake --from-area AREA` to report
-match counts restricted to that area's tiles (other modalities unchanged).
+from Parquet footers lake-wide. For area-scoped crossmatch discovery (tile
+overlap and exact `--count`), use
+`dl-region --from-area AREA --modalities catalog,spectra,crossmatch --count`.
 
 **Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A
 HEALPix tiles per worker process, amortizing DuckDB catalog registration. Try

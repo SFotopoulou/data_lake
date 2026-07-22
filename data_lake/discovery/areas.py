@@ -41,6 +41,7 @@ from typing import Any, Iterator
 from data_lake.discovery.region import Region
 from data_lake.schema_registry import (
     MODALITY_CATALOG,
+    MODALITY_CROSSMATCH,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
 )
@@ -48,7 +49,12 @@ from data_lake.schema_registry import (
 log = logging.getLogger(__name__)
 
 AREA_SCHEMA_VERSION = "1"
-_VALID_MODALITIES = {MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT}
+_VALID_MODALITIES = {
+    MODALITY_CATALOG,
+    MODALITY_SPECTRA,
+    MODALITY_CUTOUT,
+    MODALITY_CROSSMATCH,
+}
 _VALID_MULTIPLICITY = {"nearest", "all"}
 
 

@@ -49,6 +49,10 @@ dl-region /data/lake --cone 150.1 2.2 --radius-arcsec 600 --modalities catalog,s
 dl-region /data/lake --npix 1002198,1002199,1003000-1003010 --norder 5
 dl-region /data/lake --bbox 149.5 150.5 1.8 2.6 --count   # exact catalog counts
 
+# Include crossmatch trees (opt-in; default is catalog-only)
+dl-region /data/lake --from-area Wide_Field_47 \
+  --modalities catalog,spectra,crossmatch --count
+
 # Save an ad-hoc region as a reusable area
 dl-region /data/lake --npix 1002198-1003000 --norder 5 --save-as Wide_Field_47
 
@@ -87,8 +91,10 @@ Requires the optional **`moc` extra**: `uv sync --extra moc` (`mocpy`).
 
 Output is a `survey × modality` table with **rounded** row estimates
 (`~12k`, `~750M`) by default — fast and index-driven, no tile reads. Pass
-`--count` for **exact** catalog counts (Parquet footer sums over the overlap
-tiles only; spectra/cutout stay estimates).
+`--count` for **exact** catalog and crossmatch counts (Parquet footer sums over
+the overlap tiles only; spectra/cutout stay estimates). Crossmatch is a
+discoverable modality via `--modalities …,crossmatch` (not in the default
+catalog-only list).
 
 > Named `dl-region` (not `dl-discover`) to avoid colliding with existing
 > "discovery" vocabulary (registry inventory, config lookup, column discovery).

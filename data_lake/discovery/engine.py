@@ -9,15 +9,16 @@ Row counts:
 - **rounded estimate (default)** — ``round(total_rows / n_tiles) * |overlap|``;
   zero tile reads.
 - **exact (``count=True``)** — sum Parquet footer ``num_rows`` over the overlap
-  tiles only (O(k) footer reads, never a row scan). Exact counts are currently
-  catalog-only; spectra/cutout fall back to the estimate.
+  tiles only (O(k) footer reads, never a row scan). Exact counts apply to
+  catalog and crossmatch (same ``healpix_dir`` + ``Npix=*.parquet`` layout);
+  spectra/cutout fall back to the estimate.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from data_lake.discovery.region import Region
 from data_lake.ingest.fits_to_parquet import healpix_dir
 from data_lake.schema_registry import (
     MODALITY_CATALOG,
+    MODALITY_CROSSMATCH,
     MODALITY_CUTOUT,
     MODALITY_SPECTRA,
 )
@@ -38,6 +40,8 @@ log = logging.getLogger(__name__)
 
 _MAX_COUNT_WORKERS = 64
 _DEFAULT_MODALITIES = (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT)
+_EXACT_COUNT_MODALITIES = frozenset({MODALITY_CATALOG, MODALITY_CROSSMATCH})
+_NPIX_PARQUET_RE = re.compile(r"Npix=(\d+)\.parquet$")
 
 
 @dataclass
@@ -71,6 +75,7 @@ def _read_total_rows(survey_root: Path, modality: str) -> int | None:
         MODALITY_CATALOG: "catalog_info.json",
         MODALITY_SPECTRA: "spectrum_info.json",
         MODALITY_CUTOUT: "cutout_info.json",
+        MODALITY_CROSSMATCH: "crossmatch_info.json",
     }[modality]
     info_path = survey_root / info_name
     if not info_path.is_file():
@@ -80,7 +85,10 @@ def _read_total_rows(survey_root: Path, modality: str) -> int | None:
             info = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return None
-    val = info.get("total_rows") or info.get("total_sources") or info.get("n_sources")
+    if modality == MODALITY_CROSSMATCH:
+        val = info.get("total_rows") or info.get("n_match_rows")
+    else:
+        val = info.get("total_rows") or info.get("total_sources") or info.get("n_sources")
     return int(val) if val is not None else None
 
 
@@ -90,14 +98,20 @@ def _estimate_rows(total_rows: int | None, n_tiles_total: int, n_overlap: int) -
     return int(round(total_rows / n_tiles_total * n_overlap))
 
 
-def _exact_catalog_rows(
-    survey_root: Path,
+def sum_parquet_rows_in_npix(
+    survey_root: Path | str,
     hats_order: int,
     overlap_npix: Sequence[int],
     *,
     n_workers: int = 8,
 ) -> int:
-    """Sum Parquet footer row counts over the overlap tiles (no row scan)."""
+    """Sum Parquet footer row counts over overlap tiles (no row scan).
+
+    Shared by catalog and crossmatch (same ``healpix_dir`` + ``Npix=*.parquet``
+    layout).
+    """
+    survey_root = Path(survey_root)
+
     def _rows(npix: int) -> int:
         tile = survey_root / healpix_dir(hats_order, npix) / f"Npix={npix}.parquet"
         if not tile.is_file():
@@ -115,6 +129,34 @@ def _exact_catalog_rows(
         return sum(_rows(p) for p in npix_list)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return int(sum(pool.map(_rows, npix_list)))
+
+
+# Backward-compatible alias used by older call sites / tests.
+_exact_catalog_rows = sum_parquet_rows_in_npix
+
+
+def sum_crossmatch_rows_in_npix(
+    catalog_root: Path | str,
+    npix: set[int] | frozenset[int],
+) -> tuple[int, int]:
+    """Sum match rows / tiles whose ``Npix=`` is in *npix* (survey-A partition).
+
+    Returns ``(total_rows, n_tiles)``. Prefer :func:`sum_parquet_rows_in_npix`
+    when ``hats_order`` is known (direct path, no ``rglob``). This helper remains
+    for callers that only have an npix set (e.g. lake registry area scoping).
+    """
+    catalog_root = Path(catalog_root)
+    total = 0
+    n_tiles = 0
+    for path in catalog_root.rglob("Npix=*.parquet"):
+        m = _NPIX_PARQUET_RE.search(path.name)
+        if m is None:
+            continue
+        if int(m.group(1)) not in npix:
+            continue
+        total += int(pq.read_metadata(str(path)).num_rows)
+        n_tiles += 1
+    return total, n_tiles
 
 
 def resolve_region(
@@ -135,10 +177,11 @@ def resolve_region(
         ``"all"`` (default) enumerates surveys per modality from the tile index /
         filesystem; otherwise an explicit iterable of survey names.
     modalities:
-        Modalities to inspect (default: catalog only; opt-in spectra/cutout).
+        Modalities to inspect (default: catalog only; opt-in spectra/cutout/
+        crossmatch).
     count:
-        When True, compute exact catalog counts via footer sums over overlap
-        tiles. Spectra/cutout always use the rounded estimate.
+        When True, compute exact catalog/crossmatch counts via footer sums over
+        overlap tiles. Spectra/cutout always use the rounded estimate.
     """
     lake_root = Path(lake_root)
     modalities = tuple(modalities)
@@ -166,8 +209,8 @@ def resolve_region(
             est = _estimate_rows(total_rows, len(npix_set), len(overlap))
 
             exact: int | None = None
-            if count and modality == MODALITY_CATALOG:
-                exact = _exact_catalog_rows(
+            if count and modality in _EXACT_COUNT_MODALITIES:
+                exact = sum_parquet_rows_in_npix(
                     survey_root, hats_order, overlap, n_workers=n_workers
                 )
 

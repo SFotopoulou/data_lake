@@ -10,7 +10,6 @@ dl-describe-lake                      # print survey × modality summary
 dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout / crossmatch)
 dl-describe-lake --count-total        # footer: per-modality totals + grand total (registry sums)
 dl-describe-lake --modality catalog --count-total
-dl-describe-lake --from-area AREA_ID  # crossmatch rows/tiles scoped to area; other modalities unchanged
 dl-describe-lake --json               # {"entries": [...]} per survey × modality
 dl-describe-lake --json --count-total # entries + summary object
 dl-describe-lake --json --pair-surveys  # entries + catalog/spectra hats_order pairing
@@ -26,10 +25,11 @@ counts recorded at ingest time. If you have ingested new data since the last
 get up-to-date numbers.
 
 **Crossmatch totals always come from on-disk Parquet footers** (not
-`crossmatch_info.json`), including during `--refresh`. That keeps inventory
-correct even if an older region-bounded run wrote a shrunken sidecar.
-`--from-area` re-sums only tiles whose `Npix=` intersects the area for
-crossmatch entries.
+`crossmatch_info.json`), including during `--refresh`. That keeps lake-wide
+inventory correct even if an older region-bounded run wrote a shrunken sidecar.
+For **area-scoped** inventory (including crossmatch tile overlap and exact
+`--count`), use [`dl-region --from-area`](regions-and-areas.md) with
+`--modalities …,crossmatch`.
 
 The default table adds **sky** (`ra_column`/`dec_column`), a **detail** column (`link_id_mode` for catalogs; `n_pix` + `wavelength_mode` for spectra; band stack shape for cutouts), and **manifest** (`Y`/`·`). Full registry fields (including `link_id_mode`, `native_id_column`, `n_tiles`, ingest checkpoint flags, `hats_order_match`, `created_utc`, …) are in `shared/registry/surveys.parquet` and `--json`.
 
