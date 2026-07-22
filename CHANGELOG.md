@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`dl-region` spectra row estimates always `~0`** — `spectrum_info.json` from ingest often omits `total_rows` / `total_spectra`, so estimates fell through to 0 even when overlap tiles existed. Discovery now accepts `total_spectra` (and cutout equivalents), falls back to the same Zarr `_source_id` length sum used by `dl-describe-lake`, and `--count` sums those lengths over overlap tiles. New spectrum ingest writes `total_rows` into the sidecar when known.
 - **`dl-describe-lake --kind ingested` omitted spectra/cutouts** — registry rows for those modalities now set provenance `kind` (default `ingested`; homogenized products keep `product`). Stale `surveys.parquet` with null `kind` on spectra/cutouts is coalesced to `ingested` at filter/display time, so `--kind ingested` lists catalogs and spectra without requiring a refresh (refresh still rewrites the on-disk column).
 - **`dl-crossmatch --from-area` sidecar shrink** — `crossmatch_info.json` `total_rows` / `n_tiles` are always rewritten from a full on-disk Parquet recount after every run (sky and column), so a region-bounded gap-fill cannot make `dl-describe-lake` look like full-sky matches vanished. `--overwrite` is rejected with `--from-area` (gap-fill only; existing tiles outside the area are left untouched).
 - **`dl-describe-lake` crossmatch counts** — registry / describe prefer on-disk Parquet footers over the sidecar (lake-wide totals).

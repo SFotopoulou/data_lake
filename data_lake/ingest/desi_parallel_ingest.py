@@ -980,6 +980,7 @@ def ingest_spectra_parallel(
             wavelength_mode_run,
             "uint8",
             wcs_attrs_known,
+            total_rows=n_spectra_written,
         )
 
     elapsed = time.perf_counter() - t_start

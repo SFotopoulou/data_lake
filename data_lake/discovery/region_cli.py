@@ -2,7 +2,9 @@
 
 Resolve a region (saved area or ad-hoc selector) to the overlapping
 survey x modality tiles, with rounded row estimates (``--count`` for exact
-catalog counts). Optionally persist an ad-hoc region as an area (``--save-as``).
+overlap counts: Parquet footers for catalog/crossmatch, Zarr ``_source_id``
+lengths for spectra/cutout). Optionally persist an ad-hoc region as an area
+(``--save-as``).
 
 Named ``dl-region`` (not ``dl-discover``) to avoid colliding with the existing
 "discovery" vocabulary (registry inventory, config-file lookup, column
@@ -122,8 +124,8 @@ try:
     @click.option("--modalities", default=None,
                   help="Comma-separated modalities (default: catalog).")
     @click.option("--count", "exact", is_flag=True,
-                  help="Exact catalog/crossmatch counts via Parquet footers "
-                       "(slower than the estimate).")
+                  help="Exact overlap counts: Parquet footers (catalog/crossmatch) "
+                       "or Zarr _source_id lengths (spectra/cutout).")
     @click.option("--save-as", "save_as", default=None,
                   help="Persist this region as areas/<id>.json.")
     @click.option("--overwrite", is_flag=True,

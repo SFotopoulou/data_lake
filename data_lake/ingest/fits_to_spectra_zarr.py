@@ -3517,6 +3517,7 @@ def ingest_spectra_from_fits(
         resolution_n_diag=n_diag,
         resolution_offsets=res_offsets.tolist() if res_offsets is not None else None,
         on_duplicate_source_id=on_duplicate_source_id,
+        total_rows=len(records),
     )
 
     log.info(
@@ -3777,6 +3778,7 @@ def _write_spectrum_info(
     resolution_n_diag: int | None = None,
     resolution_offsets: list[int] | None = None,
     on_duplicate_source_id: str = "skip",
+    total_rows: int | None = None,
 ) -> None:
     info = {
         "survey_name": survey_name,
@@ -3800,6 +3802,8 @@ def _write_spectrum_info(
         "resolution_offsets": resolution_offsets,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if total_rows is not None:
+        info["total_rows"] = int(total_rows)
     spectra_survey_root.mkdir(parents=True, exist_ok=True)
     with open(spectra_survey_root / "spectrum_info.json", "w") as fh:
         json.dump(info, fh, indent=2)

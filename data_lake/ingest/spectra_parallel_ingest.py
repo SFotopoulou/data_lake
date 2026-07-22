@@ -493,6 +493,7 @@ def ingest_spectra_files_parallel(
             str(mask_dtype),
             wcs_attrs_known,
             on_duplicate_source_id=on_duplicate_source_id,
+            total_rows=n_spectra_written,
         )
 
     elapsed = time.perf_counter() - t_start
