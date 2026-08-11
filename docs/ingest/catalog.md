@@ -247,6 +247,53 @@ dl-repair-catalog-metadata /lake --survey 2DFGRS_DR3 \
 link-ID values before parsing or hashing (common for fixed-width FITS strings).
 Internal spaces are preserved.
 
+#### Injecting constant columns (`--set-column`)
+
+Some surveys deliver tiles whose native source ID alone is not unique — the same
+object may appear in multiple observations (visits). If the visit number is not
+inside the file, you can inject it as a constant column before identity
+resolution:
+
+```bash
+dl-ingest-catalog visit7.fits /data/lake \
+  --survey MYSURVEY \
+  --set-column VISIT=7 \
+  --link-id-col OBJECT_ID,TILE_ID,VISIT \
+  --tile-mode append --on-duplicate-id error
+```
+
+`_source_id` is then the stable hash of `"objid|tileid|7"`, and `VISIT` is a
+real filterable column in every tile.
+
+**Type inference.** `--set-column` auto-infers int64, then float64, then string.
+Force a specific type with `NAME:TYPE=VALUE` where TYPE is `int`, `float`,
+`str`, or `bool`. Values may contain `=` or `:` (only the first `=` is split,
+and `:` in the type tag is scanned only from the name part):
+
+| Spec | Column type | Value |
+|------|------------|-------|
+| `VISIT=7` | int64 | `7` |
+| `WEIGHT=1.5` | float64 | `1.5` |
+| `EPOCH=J2000` | string | `"J2000"` |
+| `VISIT:str=007` | string | `"007"` (preserves zero-padding) |
+| `FLAG:bool=true` | bool | `True` |
+
+**Constraints:**
+
+- The injected name must not already exist in the source file (raises a clear error).
+- Lake-internal names (`_source_id`, `_healpix_norder*`, `_cutout_*`, `_spectrum_*`) are rejected.
+- All ingest runs for a given survey must inject **the same set of columns from the very first write**. If earlier tiles were written without the flag, `--tile-mode append` will raise a schema-mismatch error pointing at the cause.
+- Provenance is stored in `catalog_info.json` as `set_columns: {NAME: VALUE}` and is preserved by `dl-finalize-catalog`.
+
+**Repeatable.** Pass `--set-column` multiple times to inject several columns:
+
+```bash
+dl-ingest-catalog obs.fits /data/lake --survey S \
+  --set-column VISIT=3 \
+  --set-column INSTRUMENT=HST \
+  --link-id-col OBJ_ID,VISIT
+```
+
 **Whitespace — column names:** leading and trailing spaces in FITS TTYPE keywords
 (e.g. ``' dec'`` instead of ``'dec'``) are **stripped at ingest** so Parquet
 column names always match the CLI flags you passed (``--ra-col``, ``--dec-col``).

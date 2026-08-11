@@ -1157,3 +1157,273 @@ class TestPackedVectorFits:
         tbl = _read_fits_catalog_table(path)
         assert len(tbl) == n
         assert int(tbl["objid"][0]) == 1000
+
+
+# ---------------------------------------------------------------------------
+# --set-column: parse_set_column_spec
+# ---------------------------------------------------------------------------
+
+
+class TestParseSetColumnSpec:
+    from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+
+    def test_auto_int(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        name, scalar = parse_set_column_spec("VISIT=7")
+        assert name == "VISIT"
+        assert scalar.as_py() == 7
+        import pyarrow as pa
+        assert scalar.type == pa.int64()
+
+    def test_auto_float(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        import pyarrow as pa
+        name, scalar = parse_set_column_spec("WEIGHT=1.5")
+        assert name == "WEIGHT"
+        assert scalar.as_py() == 1.5
+        assert scalar.type == pa.float64()
+
+    def test_auto_string(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        import pyarrow as pa
+        name, scalar = parse_set_column_spec("EPOCH=J2000")
+        assert name == "EPOCH"
+        assert scalar.as_py() == "J2000"
+        assert scalar.type == pa.string()
+
+    def test_explicit_str_type_preserves_zero_padding(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        import pyarrow as pa
+        name, scalar = parse_set_column_spec("VISIT:str=007")
+        assert name == "VISIT"
+        assert scalar.as_py() == "007"
+        assert scalar.type == pa.string()
+
+    def test_explicit_int_type(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        import pyarrow as pa
+        name, scalar = parse_set_column_spec("N:int=42")
+        assert scalar.as_py() == 42
+        assert scalar.type == pa.int64()
+
+    def test_explicit_bool_type(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        name, scalar = parse_set_column_spec("FLAG:bool=true")
+        assert scalar.as_py() is True
+
+    def test_value_with_colon(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        name, scalar = parse_set_column_spec("URL=http://example.com:8080/path")
+        assert name == "URL"
+        assert scalar.as_py() == "http://example.com:8080/path"
+
+    def test_value_with_equals(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        name, scalar = parse_set_column_spec("KV=a=b=c")
+        assert name == "KV"
+        assert scalar.as_py() == "a=b=c"
+
+    def test_bad_spec_no_equals(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        with pytest.raises(ValueError, match="NAME=VALUE"):
+            parse_set_column_spec("VISIT7")
+
+    def test_bad_type_tag(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        with pytest.raises(ValueError, match="unknown type tag"):
+            parse_set_column_spec("X:complex=1+2j")
+
+    def test_reserved_source_id(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        with pytest.raises(ValueError, match="lake-internal"):
+            parse_set_column_spec("_source_id=123")
+
+    def test_reserved_healpix_prefix(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        with pytest.raises(ValueError, match="reserved lake-internal prefix"):
+            parse_set_column_spec("_healpix_norder5=1")
+
+    def test_empty_name(self):
+        from data_lake.ingest.fits_to_parquet import parse_set_column_spec
+        with pytest.raises(ValueError, match="empty"):
+            parse_set_column_spec("=VALUE")
+
+
+# ---------------------------------------------------------------------------
+# --set-column: end-to-end ingest
+# ---------------------------------------------------------------------------
+
+
+class TestSetColumnEndToEnd:
+    """Integration tests: inject VISIT, use in composite link-id."""
+
+    def _write_fits(self, path: Path, visit: int, base_id: int = 1000) -> None:
+        """Write a small catalog FITS file with object IDs and sky coords."""
+        n = 8
+        rng = np.random.default_rng(base_id)
+        tbl = Table({
+            "OBJECT_ID": np.arange(base_id, base_id + n, dtype=np.int64),
+            "TILE_ID": np.full(n, 42, dtype=np.int64),
+            "RA": rng.uniform(120.0, 121.0, n),
+            "DEC": rng.uniform(44.0, 46.0, n),
+        })
+        tbl.write(str(path), format="fits", overwrite=True)
+
+    def test_visit_column_present_and_correct_value(self, tmp_path):
+        from data_lake.ingest.fits_to_parquet import ingest_catalog, parse_set_column_spec
+        fits_path = tmp_path / "visit7.fits"
+        self._write_fits(fits_path, visit=7)
+        _, scalar = parse_set_column_spec("VISIT=7")
+        ingest_catalog(
+            fits_path,
+            tmp_path / "lake",
+            survey_name="MYSURVEY",
+            ra_col="RA",
+            dec_col="DEC",
+            link_id_col="OBJECT_ID,TILE_ID,VISIT",
+            set_columns={"VISIT": scalar},
+        )
+        _, table = _read_merged_catalog(tmp_path / "lake", "MYSURVEY")
+        assert "VISIT" in table.schema.names
+        assert set(table.column("VISIT").to_pylist()) == {7}
+
+    def test_composite_link_id_mode_recorded(self, tmp_path):
+        from data_lake.ingest.fits_to_parquet import ingest_catalog, parse_set_column_spec
+        import pyarrow as pa
+        fits_path = tmp_path / "v1.fits"
+        self._write_fits(fits_path, visit=1)
+        _, scalar = parse_set_column_spec("VISIT=1")
+        ingest_catalog(
+            fits_path,
+            tmp_path / "lake",
+            survey_name="MYSURVEY",
+            ra_col="RA",
+            dec_col="DEC",
+            link_id_col="OBJECT_ID,TILE_ID,VISIT",
+            set_columns={"VISIT": scalar},
+        )
+        info_path = tmp_path / "lake" / "catalogs" / "MYSURVEY" / "catalog_info.json"
+        import json
+        info = json.loads(info_path.read_text())
+        assert "composite" in info["link_id_mode"]
+        assert info["set_columns"] == {"VISIT": 1}
+
+    def test_distinct_source_ids_across_visits(self, tmp_path):
+        """Same OBJECT_ID+TILE_ID in two different visits → different _source_id."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog, parse_set_column_spec
+        lake = tmp_path / "lake"
+        for visit in (1, 2):
+            fits_path = tmp_path / f"v{visit}.fits"
+            self._write_fits(fits_path, visit=visit, base_id=1000)
+            _, scalar = parse_set_column_spec(f"VISIT={visit}")
+            ingest_catalog(
+                fits_path,
+                lake,
+                survey_name="MYSURVEY",
+                ra_col="RA",
+                dec_col="DEC",
+                link_id_col="OBJECT_ID,TILE_ID,VISIT",
+                tile_mode="append",
+                on_duplicate_id="error",
+                set_columns={"VISIT": scalar},
+            )
+        _, table = _read_merged_catalog(lake, "MYSURVEY")
+        src_ids = table.column("_source_id").to_pylist()
+        assert len(src_ids) == len(set(src_ids)), "Duplicate _source_id across visits"
+
+    def test_collision_raises(self, tmp_path):
+        """Injecting a column name that already exists in the source table raises."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog, parse_set_column_spec
+        fits_path = tmp_path / "coll.fits"
+        # TILE_ID already exists in the FITS file
+        self._write_fits(fits_path, visit=1)
+        _, scalar = parse_set_column_spec("TILE_ID=99")
+        with pytest.raises(ValueError, match="already exists"):
+            ingest_catalog(
+                fits_path,
+                tmp_path / "lake",
+                survey_name="MYSURVEY",
+                ra_col="RA",
+                dec_col="DEC",
+                link_id_col="OBJECT_ID",
+                set_columns={"TILE_ID": scalar},
+            )
+
+    def test_streaming_path_same_source_ids(self, tmp_path):
+        """Streaming and non-streaming paths produce identical _source_id values."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog, parse_set_column_spec
+        fits_path = tmp_path / "src.fits"
+        self._write_fits(fits_path, visit=3)
+        _, scalar = parse_set_column_spec("VISIT=3")
+
+        lake_std = tmp_path / "lake_std"
+        lake_stream = tmp_path / "lake_stream"
+        kwargs = dict(
+            ra_col="RA",
+            dec_col="DEC",
+            link_id_col="OBJECT_ID,TILE_ID,VISIT",
+            set_columns={"VISIT": scalar},
+            survey_name="MYSURVEY",
+        )
+        ingest_catalog(fits_path, lake_std, **kwargs)
+        ingest_catalog(fits_path, lake_stream, streaming=True, **kwargs)
+
+        _, t_std = _read_merged_catalog(lake_std, "MYSURVEY")
+        _, t_stream = _read_merged_catalog(lake_stream, "MYSURVEY")
+        ids_std = sorted(t_std.column("_source_id").to_pylist())
+        ids_stream = sorted(t_stream.column("_source_id").to_pylist())
+        assert ids_std == ids_stream
+
+    def test_append_missing_injected_column_raises(self, tmp_path):
+        """Appending without --set-column into tiles that have an injected column raises."""
+        from data_lake.ingest.fits_to_parquet import ingest_catalog, parse_set_column_spec
+        fits_path = tmp_path / "src.fits"
+        self._write_fits(fits_path, visit=1)
+        lake = tmp_path / "lake"
+        _, scalar = parse_set_column_spec("VISIT=1")
+        # First ingest: with VISIT column
+        ingest_catalog(
+            fits_path,
+            lake,
+            survey_name="MYSURVEY",
+            ra_col="RA",
+            dec_col="DEC",
+            link_id_col="OBJECT_ID",
+            tile_mode="append",
+            set_columns={"VISIT": scalar},
+        )
+        # Second ingest: without VISIT → should raise on schema mismatch
+        with pytest.raises(ValueError, match="VISIT"):
+            ingest_catalog(
+                fits_path,
+                lake,
+                survey_name="MYSURVEY",
+                ra_col="RA",
+                dec_col="DEC",
+                link_id_col="OBJECT_ID",
+                tile_mode="append",
+            )
+
+    def test_set_columns_in_catalog_info_preserved_after_finalize(self, tmp_path):
+        """dl-finalize-catalog (finalize_catalog_survey) preserves set_columns."""
+        from data_lake.ingest.fits_to_parquet import (
+            finalize_catalog_survey, ingest_catalog, parse_set_column_spec,
+        )
+        fits_path = tmp_path / "src.fits"
+        self._write_fits(fits_path, visit=5)
+        lake = tmp_path / "lake"
+        _, scalar = parse_set_column_spec("VISIT=5")
+        ingest_catalog(
+            fits_path,
+            lake,
+            survey_name="MYSURVEY",
+            ra_col="RA",
+            dec_col="DEC",
+            link_id_col="OBJECT_ID,TILE_ID,VISIT",
+            set_columns={"VISIT": scalar},
+        )
+        catalog_root = lake / "catalogs" / "MYSURVEY"
+        finalize_catalog_survey(catalog_root, "MYSURVEY", norder=5)
+        import json
+        info = json.loads((catalog_root / "catalog_info.json").read_text())
+        assert info.get("set_columns") == {"VISIT": 5}

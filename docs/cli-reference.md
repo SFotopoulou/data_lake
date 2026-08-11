@@ -15,7 +15,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet; required: `--survey`, `--link-id-col` (source integer ID column), `--ra-col`, `--dec-col`; `--defer-finalize`/`--lifecycle live` for incremental live surveys |
+| `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet; required: `--survey`, `--link-id-col` (source integer ID column), `--ra-col`, `--dec-col`; `--set-column NAME=VALUE` to inject constant columns before identity resolution (repeatable); `--defer-finalize`/`--lifecycle live` for incremental live surveys |
 | `dl-ingest-catalog-batch` | Parallel decode, single-thread writer (large file lists) |
 | `dl-ingest-catalog-from-list` | Sequential (default) or parallel catalog file-list ingest |
 | `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |

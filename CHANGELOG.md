@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`dl-ingest-catalog --set-column NAME=VALUE`** — inject a constant column into every row *before* identity resolution, so composite `--link-id-col` specs can reference values that are not present in the source file (e.g. `VISIT`). Repeatable; auto-infers int64/float64/string, or use `NAME:TYPE=VALUE` to force a type (`int`, `float`, `str`, `bool`). Provenance is stored in `catalog_info.json` as `set_columns: {NAME: VALUE}`. `--tile-mode append` raises a clear error when the on-disk tile schema does not match (all runs for a survey must use the same injected columns from the first write).
+
 ### Changed
 
 - **Breaking: `dl-describe-lake --from-area` removed** — describe-lake is lake-wide only. Use `dl-region --from-area AREA --modalities …,crossmatch` (optionally `--count`) for area-scoped inventory including crossmatch trees.

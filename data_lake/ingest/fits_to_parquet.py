@@ -547,6 +547,135 @@ def _drop_join_id_columns(table: pa.Table) -> pa.Table:
     return table
 
 
+# ---------------------------------------------------------------------------
+# --set-column: inject constant columns before identity resolution
+# ---------------------------------------------------------------------------
+
+_SET_COLUMN_RESERVED_PREFIXES = ("_healpix_norder", "_cutout", "_spectrum")
+_SET_COLUMN_RESERVED_NAMES = frozenset({LAKE_JOIN_ID_COLUMN})
+
+_SET_COLUMN_TYPE_ALIASES: dict[str, pa.DataType] = {
+    "int": pa.int64(),
+    "float": pa.float64(),
+    "str": pa.string(),
+    "string": pa.string(),
+    "bool": pa.bool_(),
+}
+
+
+def parse_set_column_spec(spec: str) -> tuple[str, pa.Scalar]:
+    """Parse one ``--set-column`` spec into ``(column_name, scalar)``.
+
+    Accepted formats::
+
+        NAME=VALUE            # auto-infer int64, float64, or string
+        NAME:TYPE=VALUE       # explicit type (int, float, str, bool)
+
+    The split is on the **first** ``=`` so values may contain ``=``.  The
+    optional ``:TYPE`` suffix is parsed only from the *name* part (before
+    ``=``).  Examples::
+
+        VISIT=7               → (\"VISIT\", 7 [int64])
+        VISIT:str=007         → (\"VISIT\", \"007\" [string])
+        EPOCH=J2000           → (\"EPOCH\", \"J2000\" [string])
+        WEIGHT=1.5            → (\"WEIGHT\", 1.5 [float64])
+    """
+    if "=" not in spec:
+        raise ValueError(
+            f"--set-column spec {spec!r} must be in the form NAME=VALUE or NAME:TYPE=VALUE"
+        )
+    name_part, _, value_str = spec.partition("=")
+    name_part = name_part.strip()
+    if ":" in name_part:
+        raw_name, _, type_tag = name_part.rpartition(":")
+        raw_name = raw_name.strip()
+        type_tag = type_tag.strip().lower()
+        if type_tag not in _SET_COLUMN_TYPE_ALIASES:
+            raise ValueError(
+                f"--set-column {spec!r}: unknown type tag {type_tag!r}. "
+                f"Allowed: {sorted(_SET_COLUMN_TYPE_ALIASES)}"
+            )
+        arrow_type = _SET_COLUMN_TYPE_ALIASES[type_tag]
+    else:
+        raw_name = name_part
+        arrow_type = None
+
+    name = raw_name
+    if not name:
+        raise ValueError(f"--set-column spec {spec!r}: column name is empty")
+
+    # Validate name
+    if name in _SET_COLUMN_RESERVED_NAMES:
+        raise ValueError(
+            f"--set-column: {name!r} is a lake-internal column and cannot be injected. "
+            f"Reserved names: {sorted(_SET_COLUMN_RESERVED_NAMES)}"
+        )
+    for prefix in _SET_COLUMN_RESERVED_PREFIXES:
+        if name.startswith(prefix):
+            raise ValueError(
+                f"--set-column: {name!r} matches reserved lake-internal prefix "
+                f"{prefix!r} and cannot be injected"
+            )
+
+    # Coerce value to the requested (or inferred) type
+    if arrow_type is not None:
+        try:
+            if arrow_type == pa.int64():
+                py_val = int(value_str)
+            elif arrow_type == pa.float64():
+                py_val = float(value_str)
+            elif arrow_type == pa.bool_():
+                if value_str.lower() in ("true", "1", "yes"):
+                    py_val = True
+                elif value_str.lower() in ("false", "0", "no"):
+                    py_val = False
+                else:
+                    raise ValueError(f"cannot parse {value_str!r} as bool")
+            else:
+                py_val = value_str
+            scalar = pa.scalar(py_val, type=arrow_type)
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"--set-column {spec!r}: cannot convert value {value_str!r} to {arrow_type}: {exc}"
+            ) from exc
+    else:
+        # Auto-infer: int64 > float64 > string
+        scalar: pa.Scalar
+        for try_type, converter in ((pa.int64(), int), (pa.float64(), float)):
+            try:
+                scalar = pa.scalar(converter(value_str), type=try_type)
+                break
+            except (ValueError, OverflowError):
+                pass
+        else:
+            scalar = pa.scalar(value_str, type=pa.string())
+
+    return name, scalar
+
+
+def _apply_set_columns(
+    table: pa.Table,
+    set_columns: dict[str, pa.Scalar],
+) -> pa.Table:
+    """Append constant columns to *table*, one per ``--set-column`` spec.
+
+    Raises ``ValueError`` if any name already exists in the table (no silent
+    overwrite of survey data).
+    """
+    if not set_columns:
+        return table
+    n = table.num_rows
+    for name, scalar in set_columns.items():
+        if name in table.schema.names:
+            raise ValueError(
+                f"--set-column {name!r}: column already exists in the source table. "
+                "Choose a different name or omit the flag."
+            )
+        arr = pa.array([scalar.as_py()] * n, type=scalar.type)
+        table = table.append_column(name, arr)
+    return table
+
+
 def _set_lake_join_id_column(table: pa.Table, join_values: pa.Array) -> pa.Table:
     """Attach or replace ``_source_id`` with *join_values* (int64)."""
     table = _drop_join_id_columns(table)
@@ -1413,6 +1542,7 @@ def _filter_table_columns(
     dec_col: str,
     link_id_col: str | None,
     norder: int,
+    injected_names: Sequence[str] = (),
 ) -> pa.Table:
     """Keep only requested columns plus sky, ID, HEALPix, and index placeholders."""
     if not columns:
@@ -1424,7 +1554,12 @@ def _filter_table_columns(
         "_spectrum_index", "_spectrum_npix",
     }
     if link_id_col:
-        required.add(link_id_col)
+        # Expand composite (comma-separated) specs instead of adding the raw string
+        for part in parse_link_id_column_spec(link_id_col):
+            required.add(part)
+    # Injected columns are already in the table by the time we reach here
+    for name in injected_names:
+        required.add(name)
     required.add(LAKE_JOIN_ID_COLUMN)
     schema_names = list(table.schema.names)
     keep: list[str] = []
@@ -1451,15 +1586,16 @@ def _streaming_fits_read_columns(
     ra_col: str,
     dec_col: str,
     link_id_col: str | None,
+    injected_names: Sequence[str] = (),
 ) -> list[str] | None:
     """Column names to read from FITS memmap when ``--columns`` is set."""
     if not columns:
         return None
     required = {ra_col, dec_col}
     if link_id_col:
-        for part in link_id_col.split("+"):
-            part = part.strip()
-            if part:
+        # Expand composite (comma-separated) specs; skip injected-only parts
+        for part in parse_link_id_column_spec(link_id_col):
+            if part not in injected_names:
                 required.add(part)
     read = []
     seen: set[str] = set()
@@ -1730,9 +1866,28 @@ def reconcile_catalog_column_names(
 def _unified_append_schema(existing: pa.Schema, incoming: pa.Schema) -> pa.Schema:
     """Build a target schema that can hold both *existing* and *incoming* tiles."""
     if existing.names != incoming.names:
+        existing_set = set(existing.names)
+        incoming_set = set(incoming.names)
+        only_in_incoming = sorted(incoming_set - existing_set)
+        only_on_disk = sorted(existing_set - incoming_set)
+        hint = ""
+        if only_in_incoming and not only_on_disk:
+            hint = (
+                f"\n\nThe incoming tile has extra column(s) {only_in_incoming} that are absent "
+                "from the on-disk tile. This often means --set-column was used during ingest "
+                "but the existing tiles were written before the flag was introduced. "
+                "Fix: re-ingest from scratch (--tile-mode overwrite) or start a fresh survey "
+                "directory so that all tiles carry the injected column from the first write."
+            )
+        elif only_on_disk and not only_in_incoming:
+            hint = (
+                f"\n\nThe on-disk tile has column(s) {only_on_disk} that are absent from the "
+                "incoming tile. If --set-column was used for previous tiles, you must pass "
+                "the same --set-column flags for every ingest run."
+            )
         raise ValueError(
             "Cannot align tables: column name mismatch.\n"
-            f"On disk: {existing.names}\nIncoming: {incoming.names}"
+            f"On disk: {existing.names}\nIncoming: {incoming.names}{hint}"
         )
     fields: list[pa.Field] = []
     for name in existing.names:
@@ -2023,6 +2178,7 @@ def _finalize_catalog_writes(
     regenerate_metadata: bool = True,
     lifecycle: str | None = None,
     finalized: bool = True,
+    set_columns: dict[str, pa.Scalar] | None = None,
 ) -> None:
     """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles.
 
@@ -2106,6 +2262,7 @@ def _finalize_catalog_writes(
             native_id_column=native_col,
             streaming=streaming,
             allow_incomplete_link_id=bool(allow_incomplete_link_id),
+            set_columns=set_columns,
         )
 
     # Record lifecycle / finalized state. ``finalized`` is always written so a
@@ -2194,6 +2351,7 @@ def ingest_catalog(
     streaming_parallel: int = 0,
     defer_finalize: bool = False,
     lifecycle: str | None = None,
+    set_columns: dict[str, pa.Scalar] | None = None,
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -2310,12 +2468,14 @@ def ingest_catalog(
             fits_read_policy=fits_read_policy,
             defer_finalize=defer_finalize,
             lifecycle=lifecycle,
+            set_columns=set_columns or {},
         )
         return
 
     table = _read_source_table(source_path, fits_read_policy=fits_read_policy)
     log.info("Loaded %d rows × %d columns", len(table), len(table.schema))
 
+    table = _apply_set_columns(table, set_columns or {})
     table, sid_mode = ensure_catalog_source_ids(
         table, link_id_col, allow_incomplete_link_id=allow_incomplete_link_id,
     )
@@ -2324,6 +2484,7 @@ def ingest_catalog(
     table = _filter_table_columns(
         table, columns, ra_col=ra_col, dec_col=dec_col,
         link_id_col=link_id_col, norder=norder,
+        injected_names=list((set_columns or {}).keys()),
     )
     hp_col = f"_healpix_norder{norder}"
 
@@ -2379,6 +2540,7 @@ def ingest_catalog(
         regenerate_metadata=not defer_finalize,
         lifecycle=lifecycle,
         finalized=not defer_finalize,
+        set_columns=set_columns,
     )
     log.info("Catalog written to %s", catalog_root)
 
@@ -2415,6 +2577,7 @@ def decode_catalog_file_to_batches(
     columns: Sequence[str] | None = None,
     allow_incomplete_link_id: bool = False,
     fits_read_policy=None,
+    set_columns: dict[str, pa.Scalar] | None = None,
 ) -> tuple[list[tuple[int, pa.Table]], str, int]:
     """Read one catalog file and partition rows by HEALPix tile (in-memory).
 
@@ -2428,6 +2591,7 @@ def decode_catalog_file_to_batches(
     if is_catalog_fits_path(source_path):
         check_parallel_catalog_file_size(source_path, policy)
     table = _read_source_table(source_path, fits_read_policy=policy)
+    table = _apply_set_columns(table, set_columns or {})
     table, sid_mode = ensure_catalog_source_ids(
         table, link_id_col, allow_incomplete_link_id=allow_incomplete_link_id,
     )
@@ -2439,6 +2603,7 @@ def decode_catalog_file_to_batches(
         dec_col=dec_col,
         link_id_col=link_id_col,
         norder=norder,
+        injected_names=list((set_columns or {}).keys()),
     )
     table = normalize_catalog_table_types(table)
     batches = catalog_table_to_tile_batches(table, norder)
@@ -2465,6 +2630,7 @@ def _ingest_catalog_streaming(
     skip_finalize: bool = False,
     defer_finalize: bool = False,
     lifecycle: str | None = None,
+    set_columns: dict[str, pa.Scalar] | None = None,
 ) -> str | None:
     """Stream-write per-tile Parquet from a FITS BINTABLE without materialising
     the full catalog as a PyArrow Table in RAM.
@@ -2561,7 +2727,8 @@ def _ingest_catalog_streaming(
                 "Catalog ingest requires --link-id-col (e.g. TARGETID, SOURCE_ID). "
                 "Pass the survey's native object ID column."
             )
-        if not _link_id_columns_present(link_id_col, col_names):
+        injected_names = list((set_columns or {}).keys())
+        if not _link_id_columns_present(link_id_col, col_names + injected_names):
             raise KeyError(
                 f"Link-ID column {link_id_col!r} not found in FITS BINTABLE. "
                 f"Available columns: {col_names[:30]}"
@@ -2602,6 +2769,7 @@ def _ingest_catalog_streaming(
             ra_col=ra_col,
             dec_col=dec_col,
             link_id_col=link_id_col,
+            injected_names=list((set_columns or {}).keys()),
         )
 
         tile_schema: pa.Schema | None = None
@@ -2623,6 +2791,7 @@ def _ingest_catalog_streaming(
             astropy_chunk = Table(chunk, copy=False)
             tile_table = _astropy_table_to_arrow(astropy_chunk)
 
+            tile_table = _apply_set_columns(tile_table, set_columns or {})
             tile_table, tile_sid_mode = ensure_catalog_source_ids(
                 tile_table,
                 link_id_col,
@@ -2649,6 +2818,7 @@ def _ingest_catalog_streaming(
             tile_table = _filter_table_columns(
                 tile_table, columns, ra_col=ra_col, dec_col=dec_col,
                 link_id_col=link_id_col, norder=norder,
+                injected_names=list((set_columns or {}).keys()),
             )
 
             if tile_schema is None:
@@ -2691,6 +2861,7 @@ def _ingest_catalog_streaming(
                 regenerate_metadata=not defer_finalize,
                 lifecycle=lifecycle,
                 finalized=not defer_finalize,
+                set_columns=set_columns,
             )
         if not skip_finalize:
             log.info("Catalog written to %s", catalog_root)
@@ -2921,6 +3092,7 @@ def _write_catalog_info(
     native_id_column: str | None = None,
     streaming: bool,
     allow_incomplete_link_id: bool = False,
+    set_columns: dict[str, pa.Scalar] | None = None,
 ) -> None:
     join_col = link_id_column or LAKE_JOIN_ID_COLUMN
     info = {
@@ -2942,6 +3114,8 @@ def _write_catalog_info(
         info["native_id_column"] = native_id_column
     if allow_incomplete_link_id:
         info["allow_incomplete_link_id"] = True
+    if set_columns:
+        info["set_columns"] = {k: v.as_py() for k, v in set_columns.items()}
     with open(catalog_root / "catalog_info.json", "w") as fh:
         json.dump(info, fh, indent=2)
 
@@ -3088,6 +3262,17 @@ try:
              "--defer-finalize implies live).",
     )
     @click.option(
+        "--set-column",
+        "set_column_specs",
+        multiple=True,
+        metavar="NAME=VALUE",
+        help="Inject a constant column before identity resolution.  Repeatable. "
+             "Format: NAME=VALUE (auto-inferred type) or NAME:TYPE=VALUE where "
+             "TYPE is int, float, str, or bool.  Example: --set-column VISIT=7.  "
+             "The column must not already exist in the source file.  All ingest "
+             "runs for a given survey must use the same set of injected columns.",
+    )
+    @click.option(
         "--log-file",
         "log_file",
         type=click.Path(path_type=Path),
@@ -3116,6 +3301,7 @@ try:
         compression_level: int | None,
         defer_finalize: bool,
         lifecycle: str | None,
+        set_column_specs: tuple[str, ...],
         log_file: Path | None,
         quiet: bool,
         verbose: bool,
@@ -3138,6 +3324,15 @@ try:
         resolved_output = require_output_root(output_root, cfg, kind="catalogs")
 
         col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+        set_columns_dict: dict[str, pa.Scalar] = {}
+        for spec in set_column_specs:
+            name, scalar = parse_set_column_spec(spec)
+            if name in set_columns_dict:
+                raise click.UsageError(
+                    f"--set-column: duplicate column name {name!r}. "
+                    "Each column may only be specified once."
+                )
+            set_columns_dict[name] = scalar
         if streaming_parallel > 0:
             ctx = click.get_current_context(silent=True)
             if ctx is not None:
@@ -3182,6 +3377,7 @@ try:
                 "live" if (defer_finalize and lifecycle is None)
                 else (lifecycle.lower() if lifecycle else None)
             ),
+            set_columns=set_columns_dict or None,
         )
 
     @click.command("dl-finalize-catalog")
