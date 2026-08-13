@@ -398,6 +398,9 @@ def ingest_catalogs_parallel(
                     fallback_n_cols = len(res.batches[0].table.schema)
                 for batch in res.batches:
                     _write_batch(batch)
+        except Exception as exc:
+            exc.add_note(f"source catalog: {res.path}")
+            raise
         finally:
             if res.spool_dir:
                 shutil.rmtree(res.spool_dir, ignore_errors=True)
