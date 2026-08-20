@@ -98,7 +98,9 @@ if [[ ! -f "${CONCAT}" ]]; then
   exit 1
 fi
 
-mkdir -p "${OUTPUT_DIR}"
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+  mkdir -p "${OUTPUT_DIR}"
+fi
 
 # Prefer project venv when present (same as other scripts/).
 if [[ -f "${REPO}/.venv/bin/activate" ]]; then

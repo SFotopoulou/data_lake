@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 from astropy.io import fits
 from astropy.table import Table, vstack
+from astropy.utils.exceptions import AstropyWarning
 from tqdm import tqdm
+
+# Quiet noisy FITS header / unit warnings during bulk shard reads.
+warnings.filterwarnings("ignore", category=AstropyWarning)
 
 from data_lake.ingest.fits_to_parquet import (
     _bintable_hdu_index,
