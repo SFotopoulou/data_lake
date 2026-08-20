@@ -19,6 +19,7 @@
 #   --summary   After all folders, print output paths and sizes.
 #               With --dry-run: planned paths + estimated size (sum of input shards).
 #               Without --dry-run: actual written file sizes.
+#               Existing outputs without --overwrite are skipped (not failed).
 #
 # Other options after OUTPUT_DIR are forwarded to concatenate_fits.py
 # (e.g. --pattern, --recursive, --hdu, --join, --fits-memmap, --overwrite,
@@ -68,6 +69,7 @@ shift 3
 
 SUMMARY=0
 DRY_RUN=0
+OVERWRITE=0
 EXTRA_ARGS=()
 for arg in "$@"; do
   case "${arg}" in
@@ -76,6 +78,10 @@ for arg in "$@"; do
       ;;
     --dry-run)
       DRY_RUN=1
+      EXTRA_ARGS+=("${arg}")
+      ;;
+    --overwrite)
+      OVERWRITE=1
       EXTRA_ARGS+=("${arg}")
       ;;
     *)
@@ -129,6 +135,7 @@ fi
 failed=0
 succeeded=0
 skipped=0
+dry_run_count=0
 
 # Parallel arrays for --summary rows: path, size_bytes, n_files, status
 declare -a SUM_PATHS=()
@@ -171,12 +178,23 @@ for folder_path in "${folders[@]}"; do
     done < "${dry_out}"
     rm -f "${dry_out}"
 
-    skipped=$((skipped + 1))
+    dry_run_count=$((dry_run_count + 1))
     SUM_PATHS+=("${output_path}")
     SUM_BYTES+=("${est_bytes}")
     SUM_NFILES+=("${n_files}")
     SUM_STATUS+=("planned")
   else
+    if [[ -f "${output_path}" && "${OVERWRITE}" -eq 0 ]]; then
+      echo "SKIPPING: ${folder_name} (exists: ${output_path}; pass --overwrite to replace)"
+      skipped=$((skipped + 1))
+      out_bytes="$(wc -c < "${output_path}" | tr -d ' ')"
+      SUM_PATHS+=("${output_path}")
+      SUM_BYTES+=("${out_bytes}")
+      SUM_NFILES+=("-")
+      SUM_STATUS+=("skipped")
+      continue
+    fi
+
     if ! python "${CONCAT}" "${folder_path}" -o "${output_path}" "${EXTRA_ARGS[@]}"; then
       echo "FAILED: ${folder_name}" >&2
       failed=$((failed + 1))
@@ -200,7 +218,7 @@ for folder_path in "${folders[@]}"; do
 done
 
 echo "----"
-echo "done: succeeded=${succeeded} dry_run=${skipped} failed=${failed}"
+echo "done: succeeded=${succeeded} skipped=${skipped} dry_run=${dry_run_count} failed=${failed}"
 
 if [[ "${SUMMARY}" -eq 1 ]]; then
   echo "==== summary ===="
