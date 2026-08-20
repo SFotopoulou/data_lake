@@ -98,6 +98,10 @@ scripts/concatenate_fits_folders.sh LEGACY_DR10 /data/legacy/bricks /data/legacy
 
 scripts/concatenate_fits_folders.sh GAIA_DR3 /data/gaia/runs /data/gaia/merged \
   --pattern 'GaiaSource_*.fits' --recursive --overwrite
+
+# Preview planned outputs and estimated sizes (sum of input shards)
+scripts/concatenate_fits_folders.sh LEGACY_DR10 /data/legacy/bricks /data/legacy/merged \
+  --dry-run --summary
 ```
 
 **Typical workflow:** check shards, merge, then ingest the combined file:
