@@ -38,6 +38,94 @@ If any file is **`packed-vector`**, expect long ingest times and high RAM per
 worker; parallel whole-file ingest is a poor fit. Re-export as row-normal FITS
 (STILTS `col=false`) or Parquet, then ingest. See [Performance tuning](../performance.md).
 
+### Concatenate FITS shards (pre-ingest)
+
+Some surveys ship as **many small row-normal BINTABLE files** in one directory
+(e.g. Legacy Survey bricks, Gaia run folders). You can either ingest them with
+[`dl-ingest-catalog-batch`](batch-and-checkpoints.md#parallel-catalog-batch-large-file-lists)
+or merge them into a single FITS first with
+[`scripts/concatenate_fits.py`](../../scripts/concatenate_fits.py).
+
+**When to concatenate**
+
+| Approach | Best for |
+|----------|----------|
+| **`dl-ingest-catalog-batch`** | Large surveys (TB-scale), resume/checkpoints, append tiles incrementally |
+| **`concatenate_fits.py` → single ingest** | Moderate size, one merged file for archival or downstream tools, simpler one-shot ingest |
+
+The script stacks tables with Astropy `vstack`. Every shard must be a **catalog
+FITS** with the **same column names** (in the same order) and the same table HDU
+index. **Packed-vector** FITS (`NAXIS2=1`, STILTS colfits layout) are rejected —
+convert those to row-normal FITS or Parquet first (see check step above).
+
+```bash
+# Activate the project env (from repo root)
+source .venv/bin/activate
+
+# List matching files without writing output
+python scripts/concatenate_fits.py /data/legacy/bricks \
+  -o /data/legacy/legacy_dr10_merged.fits \
+  --dry-run
+
+# Merge all *.fits in one directory (non-recursive)
+python scripts/concatenate_fits.py /data/legacy/bricks \
+  -o /data/legacy/legacy_dr10_merged.fits \
+  --overwrite
+
+# Gaia-style run folders: search subdirectories
+python scripts/concatenate_fits.py /data/gaia/dr3/csv_fits_runs \
+  -o /data/gaia/gaia_dr3_merged.fits \
+  --pattern 'GaiaSource_*.fits' \
+  --recursive \
+  --overwrite
+
+# Explicit table HDU when extensions differ between files
+python scripts/concatenate_fits.py /data/my_survey/shards \
+  -o /data/my_survey/merged.fits \
+  --hdu 1 \
+  --overwrite
+
+# Same FITS memmap policy as dl-ingest-catalog (large merged writes)
+python scripts/concatenate_fits.py /data/shards \
+  -o /data/merged.fits \
+  --fits-memmap auto \
+  --overwrite
+```
+
+**Typical workflow:** check shards, merge, then ingest the combined file:
+
+```bash
+# 1. Verify layout (headers only)
+dl-check-fits-table-format /data/shards/*.fits
+
+# 2. Merge shards
+python scripts/concatenate_fits.py /data/shards \
+  -o /data/merged_catalog.fits \
+  --overwrite
+
+# 3. Ingest (streaming recommended for large merged FITS)
+dl-ingest-catalog /data/merged_catalog.fits --survey MY_SURVEY \
+  --ra-col RA --dec-col DEC --link-id-col SOURCE_ID --streaming
+```
+
+**CLI flags**
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `input_dir` | — | Directory containing FITS table shards |
+| `-o`, `--output` | required | Output FITS path |
+| `--pattern` | `*.fits` | Glob for input files (relative to `input_dir`) |
+| `--recursive` | off | Search subdirectories |
+| `--hdu` | first BINTABLE | Table HDU index or name in every file |
+| `--join` | `exact` | Column alignment when stacking (`exact` or `outer`) |
+| `--fits-memmap` | `auto` | FITS read policy (same as `dl-ingest-catalog`) |
+| `--overwrite` | off | Replace existing output file |
+| `--dry-run` | off | List input paths and exit |
+| `--no-progress` | off | Disable tqdm progress bar |
+
+If column names or HDU indices differ between shards, the script stops with an
+explicit error — fix the export or pass `--hdu` so every file uses the same extension.
+
 ### Ingest a survey catalog
 
 With a deployment config in place (`$DATA_LAKE_CONFIG` set), the

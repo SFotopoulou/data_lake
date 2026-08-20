@@ -46,7 +46,14 @@ decode; convert to row-normal FITS or Parquet first. Details:
 
 For surveys shipped as **many catalog files** (e.g. Gaia `GaiaSource_*.csv.gz`), use
 parallel decode with a **single-thread Parquet writer** so overlapping HEALPix tiles
-are merged safely:
+are merged safely.
+
+For **row-normal FITS shards** in one tree, you can alternatively merge them first
+with [`concatenate_fits.py`](catalog.md#concatenate-fits-shards-pre-ingest) and ingest
+the single output file — batch ingest is usually better at TB scale (checkpoints,
+append tiles). See [Catalog ingest — concatenate FITS shards](catalog.md#concatenate-fits-shards-pre-ingest).
+
+```bash
 
 ```bash
 dl-ingest-catalog-batch gaia_files.txt --survey GAIA_DR3_source \
