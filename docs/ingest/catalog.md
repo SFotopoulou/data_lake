@@ -90,6 +90,14 @@ python scripts/concatenate_fits.py /data/shards \
   -o /data/merged.fits \
   --fits-memmap auto \
   --overwrite
+
+# Many shard folders under one parent → one merged FITS per folder
+# Output names: {SURVEY}_{FOLDER}_merged.fits
+scripts/concatenate_fits_folders.sh LEGACY_DR10 /data/legacy/bricks /data/legacy/merged \
+  --overwrite
+
+scripts/concatenate_fits_folders.sh GAIA_DR3 /data/gaia/runs /data/gaia/merged \
+  --pattern 'GaiaSource_*.fits' --recursive --overwrite
 ```
 
 **Typical workflow:** check shards, merge, then ingest the combined file:
