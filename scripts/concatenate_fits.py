@@ -121,8 +121,7 @@ def main() -> int:
     parser.add_argument(
         "--pattern",
         default="*.fits",
-        show_default=True,
-        help="Glob pattern for input files (relative to input_dir).",
+        help="Glob pattern for input files relative to input_dir (default: %(default)s).",
     )
     parser.add_argument(
         "--recursive",
@@ -139,15 +138,13 @@ def main() -> int:
         dest="join_type",
         choices=("exact", "outer"),
         default="exact",
-        show_default=True,
-        help="How to align columns when stacking tables.",
+        help="How to align columns when stacking tables (default: %(default)s).",
     )
     parser.add_argument(
         "--fits-memmap",
         choices=("auto", "on", "off"),
         default="auto",
-        show_default=True,
-        help="FITS read policy (same semantics as dl-ingest-catalog).",
+        help="FITS read policy, same semantics as dl-ingest-catalog (default: %(default)s).",
     )
     parser.add_argument(
         "--overwrite",
