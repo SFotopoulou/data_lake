@@ -186,6 +186,30 @@ try:
         help="Per-spectrum FITS name when --format fits --fits-layout per-file.",
     )
     @click.option(
+        "--fits-chunk-rows",
+        default=50_000,
+        show_default=True,
+        type=int,
+        help="Rows per temporary catalog-FITS part when --fits-layout catalog "
+             "(merged into --output at the end).",
+    )
+    @click.option(
+        "--yes", "-y", "assume_yes", is_flag=True, default=False,
+        help="Skip confirmation prompt for multi-part catalog FITS extracts.",
+    )
+    @click.option(
+        "--keep-part-files",
+        is_flag=True,
+        default=False,
+        help="Keep temporary *_partNNNNN.fits after merging catalog FITS.",
+    )
+    @click.option(
+        "--force-many-fits-parts",
+        is_flag=True,
+        default=False,
+        help="Allow more than 100 temporary catalog-FITS parts (still capped at 10000).",
+    )
+    @click.option(
         "--lake-root", default=None,
         type=click.Path(exists=True, file_okay=False, path_type=Path),
         help="Lake root.  Defaults to <lake.root> from $DATA_LAKE_CONFIG.",
@@ -233,6 +257,10 @@ try:
         output_path: Path,
         fits_layout: str,
         fits_filename_template: str,
+        fits_chunk_rows: int,
+        assume_yes: bool,
+        keep_part_files: bool,
+        force_many_fits_parts: bool,
         lake_root: Path | None,
         config_path: Path | None,
         with_catalog: bool,
@@ -314,18 +342,37 @@ try:
             catalog_accessor=catalog_accessor,
         )
 
-        result = acc.extract_subset(
-            source_ids=source_ids,
-            output=output_path,
-            fmt=fmt,
-            missing=missing,
-            chunks_per_shard=chunks_per_shard,
-            show_progress=show_progress,
-            overwrite=overwrite,
-            fits_filename_template=fits_filename_template,
-            fits_layout=layout,
-            flux_scale=scale,
-        )
+        def _confirm_fits(plan_msg: str) -> bool:
+            click.echo(plan_msg)
+            if assume_yes:
+                return True
+            return click.confirm("Proceed?", default=False)
+
+        confirm_arg: bool | None
+        if fmt == "fits" and layout == "catalog":
+            confirm_arg = True if assume_yes else _confirm_fits
+        else:
+            confirm_arg = None
+
+        try:
+            result = acc.extract_subset(
+                source_ids=source_ids,
+                output=output_path,
+                fmt=fmt,
+                missing=missing,
+                chunks_per_shard=chunks_per_shard,
+                show_progress=show_progress,
+                overwrite=overwrite,
+                fits_filename_template=fits_filename_template,
+                fits_layout=layout,
+                flux_scale=scale,
+                fits_chunk_rows=fits_chunk_rows,
+                confirm=confirm_arg,
+                keep_part_files=keep_part_files,
+                force_many_fits_parts=force_many_fits_parts,
+            )
+        except (ValueError, RuntimeError, ImportError) as exc:
+            raise click.ClickException(str(exc)) from exc
 
         out = result.get("output", result.get("output_zarr", output_path))
         if calibration is not None and not no_calibration_sidecar:

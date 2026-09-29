@@ -27,9 +27,13 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import os
+import shutil
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 from astropy.io import fits
@@ -37,6 +41,95 @@ from astropy.io import fits
 from data_lake.io.spectra import Spectrum, SpectrumAccessor
 
 log = logging.getLogger(__name__)
+
+DEFAULT_FITS_CHUNK_ROWS = 50_000
+MAX_FITS_PARTS_SOFT = 100
+MAX_FITS_PARTS_HARD = 10_000
+# Leave headroom under 2**32 for FITS/CFITSIO 32-bit table size math.
+_BINTABLE_SIZE_LIMIT_BYTES = 2**32 - 64 * 1024 * 1024
+
+
+def catalog_fits_row_nbytes(n_pix: int, mask_dtype: np.dtype | type = np.uint8) -> int:
+    """Bytes per SPECTRA BINTABLE row (TARGETID + Z + FLUX + IVAR + MASK)."""
+    mask_item = np.dtype(mask_dtype).itemsize
+    return 8 + 4 + int(n_pix) * (4 + 4 + mask_item)
+
+
+def max_bintable_rows(n_pix: int, mask_dtype: np.dtype | type = np.uint8) -> int:
+    """Max rows safe for a single Astropy vector-column BINTABLE write."""
+    row = catalog_fits_row_nbytes(n_pix, mask_dtype)
+    if row <= 0:
+        raise ValueError("invalid n_pix / mask_dtype for catalog FITS row size")
+    return max(1, _BINTABLE_SIZE_LIMIT_BYTES // row)
+
+
+def _part_path(output_fits: Path, part: int) -> Path:
+    return output_fits.with_name(f"{output_fits.stem}_part{part:05d}{output_fits.suffix}")
+
+
+def _checkpoint_path(output_fits: Path) -> Path:
+    return output_fits.with_name(f"{output_fits.stem}.extract_fits_checkpoint.json")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, path)
+
+
+def validate_fits_part_count(
+    n_written: int,
+    chunk_rows: int,
+    *,
+    force_many_fits_parts: bool = False,
+) -> int:
+    """Return n_parts or raise if the chunking would create too many files."""
+    if chunk_rows < 1:
+        raise ValueError("--fits-chunk-rows / fits_chunk_rows must be >= 1")
+    if n_written < 1:
+        raise ValueError("n_written must be >= 1")
+    n_parts = int(math.ceil(n_written / chunk_rows))
+    if n_parts > MAX_FITS_PARTS_HARD:
+        min_chunk = int(math.ceil(n_written / MAX_FITS_PARTS_HARD))
+        raise ValueError(
+            f"Catalog FITS would create {n_parts} temporary part files "
+            f"(n_written={n_written}, chunk_rows={chunk_rows}), which exceeds the "
+            f"hard limit of {MAX_FITS_PARTS_HARD}. Increase fits_chunk_rows to at "
+            f"least {min_chunk}."
+        )
+    if n_parts > MAX_FITS_PARTS_SOFT and not force_many_fits_parts:
+        min_chunk = int(math.ceil(n_written / MAX_FITS_PARTS_SOFT))
+        raise ValueError(
+            f"Catalog FITS would create {n_parts} temporary part files "
+            f"(n_written={n_written}, chunk_rows={chunk_rows}). "
+            f"Raise fits_chunk_rows to at least {min_chunk} (keeps parts ≤ "
+            f"{MAX_FITS_PARTS_SOFT}), or pass force_many_fits_parts=True / "
+            f"--force-many-fits-parts."
+        )
+    return n_parts
+
+
+def format_catalog_fits_plan_message(
+    *,
+    n_written: int,
+    chunk_rows: int,
+    n_pix: int,
+    output_fits: Path,
+    mask_dtype: np.dtype | type = np.uint8,
+) -> str:
+    n_parts = int(math.ceil(n_written / chunk_rows))
+    rows0 = min(chunk_rows, n_written)
+    est_gib = rows0 * catalog_fits_row_nbytes(n_pix, mask_dtype) / (1024**3)
+    return (
+        "Catalog FITS extract plan:\n"
+        f"  spectra to write:  {n_written}\n"
+        f"  chunk rows:        {chunk_rows}\n"
+        f"  temporary parts:   {n_parts}\n"
+        f"  ~size per part:    {est_gib:.2f} GiB\n"
+        f"  final output:      {output_fits}\n"
+        "  (parts merged at end; intermediates deleted unless --keep-part-files)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +311,17 @@ def write_spectra_catalog_fits(
     if source_id.shape[0] != n_spec:
         raise ValueError("source_id length must match N_spec")
 
+    max_rows = max_bintable_rows(n_pix, mask.dtype)
+    if n_spec > max_rows:
+        est_gib = n_spec * catalog_fits_row_nbytes(n_pix, mask.dtype) / (1024**3)
+        raise ValueError(
+            f"FITS vector BINTABLE would be ~{est_gib:.1f} GiB "
+            f"({n_spec} rows × {catalog_fits_row_nbytes(n_pix, mask.dtype)} B/row), "
+            f"which exceeds the ~4 GiB Astropy/CFITSIO table limit "
+            f"(~{max_rows} rows max at n_pix={n_pix}). "
+            "Use streamed/sharded catalog extract (fits_chunk_rows) or Zarr/HDF5."
+        )
+
     if redshift is None:
         redshift = np.full(n_spec, np.nan, dtype=np.float32)
     else:
@@ -252,6 +356,410 @@ def write_spectra_catalog_fits(
     hdul.writeto(str(output_path), overwrite=overwrite)
     log.info("Wrote catalog FITS %s (%d spectra, %d pix)", output_path.name, n_spec, n_pix)
     return output_path
+
+
+def merge_spectra_catalog_fits_parts(
+    part_paths: Sequence[Path | str],
+    output_fits: Path | str,
+    *,
+    overwrite: bool = True,
+) -> Path:
+    """Merge ``_partNNNNN.fits`` catalog shards into one file.
+
+    Uses Astropy when the merged table fits under the vector-BINTABLE size
+    limit; otherwise requires ``fitsio`` for append-based merge.
+    """
+    parts = [Path(p) for p in part_paths]
+    if not parts:
+        raise ValueError("part_paths is empty")
+    for p in parts:
+        if not p.is_file():
+            raise FileNotFoundError(f"Missing catalog FITS part: {p}")
+
+    output_fits = Path(output_fits)
+    if output_fits.exists():
+        if not overwrite:
+            raise FileExistsError(f"{output_fits} already exists. Pass overwrite=True.")
+        output_fits.unlink()
+
+    if len(parts) == 1:
+        shutil.copy2(parts[0], output_fits)
+        log.info("Catalog FITS merge: single part → %s", output_fits)
+        return output_fits
+
+    # Inspect sizes from the first part.
+    with fits.open(parts[0]) as hdul:
+        n_pix = int(hdul[0].header.get("NPIX", hdul["WAVELENGTH"].data.shape[-1]))
+        mask0 = np.asarray(hdul["SPECTRA"].data["MASK"])
+        mask_dtype = mask0.dtype
+        survey = str(hdul[0].header.get("SURVEY", ""))
+        wcs_attrs = {
+            "ctype": hdul[0].header.get("CTYPE1", "WAVE"),
+            "crval": float(hdul[0].header.get("CRVAL1", 0.0)),
+            "cdelt": float(hdul[0].header.get("CDELT1", 1.0)),
+            "crpix": float(hdul[0].header.get("CRPIX1", 1.0)),
+            "unit": hdul[0].header.get("CUNIT1", "Angstrom"),
+        }
+        wavelength = np.asarray(hdul["WAVELENGTH"].data, dtype=np.float64).ravel()
+
+    total_rows = 0
+    for p in parts:
+        with fits.open(p) as hdul:
+            total_rows += int(hdul["SPECTRA"].header.get("NAXIS2", 0))
+
+    if total_rows <= max_bintable_rows(n_pix, mask_dtype):
+        sid_chunks: list[np.ndarray] = []
+        flux_chunks: list[np.ndarray] = []
+        ivar_chunks: list[np.ndarray] = []
+        mask_chunks: list[np.ndarray] = []
+        z_chunks: list[np.ndarray] = []
+        for p in parts:
+            with fits.open(p) as hdul:
+                data = hdul["SPECTRA"].data
+                sid_chunks.append(np.asarray(data["TARGETID"], dtype=np.int64))
+                flux_chunks.append(np.asarray(data["FLUX"], dtype=np.float32))
+                ivar_chunks.append(np.asarray(data["IVAR"], dtype=np.float32))
+                mask_chunks.append(np.asarray(data["MASK"]))
+                z_chunks.append(np.asarray(data["Z"], dtype=np.float32))
+        write_spectra_catalog_fits(
+            output_fits,
+            source_id=np.concatenate(sid_chunks),
+            flux=np.concatenate(flux_chunks, axis=0),
+            ivar=np.concatenate(ivar_chunks, axis=0),
+            mask=np.concatenate(mask_chunks, axis=0),
+            wavelength=wavelength,
+            redshift=np.concatenate(z_chunks),
+            wcs_attrs=wcs_attrs,
+            survey=survey,
+            overwrite=True,
+        )
+        log.info(
+            "Merged %d catalog FITS parts → %s (%d spectra, Astropy)",
+            len(parts), output_fits.name, total_rows,
+        )
+        return output_fits
+
+    try:
+        import fitsio
+    except ImportError as exc:
+        raise ImportError(
+            "Merging catalog FITS parts above the ~4 GiB Astropy BINTABLE limit "
+            "requires fitsio. Install with: uv sync --extra fitsio"
+        ) from exc
+
+    shutil.copy2(parts[0], output_fits)
+    with fitsio.FITS(str(output_fits), "rw") as out_fits:
+        spectra = out_fits["SPECTRA"]
+        for part in parts[1:]:
+            with fitsio.FITS(str(part), "r") as in_fits:
+                data = in_fits["SPECTRA"].read()
+            spectra.append(data)
+
+    with fits.open(output_fits, mode="update") as hdul:
+        n_spec = int(hdul["SPECTRA"].header.get("NAXIS2", 0))
+        hdul[0].header["NSPEC"] = n_spec
+        hdul.flush()
+
+    log.info(
+        "Merged %d catalog FITS parts → %s (%d spectra, fitsio)",
+        len(parts), output_fits.name, n_spec,
+    )
+    return output_fits
+
+
+def stream_spectra_catalog_fits(
+    batch_iter: Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    output_fits: Path | str,
+    *,
+    wavelength: np.ndarray,
+    wcs_attrs: dict[str, Any] | None = None,
+    survey: str = "",
+    n_written: int,
+    fits_chunk_rows: int = DEFAULT_FITS_CHUNK_ROWS,
+    overwrite: bool = False,
+    keep_part_files: bool = False,
+    force_many_fits_parts: bool = False,
+    confirm: bool | Callable[[str], bool] | None = None,
+    mask_dtype: np.dtype | type = np.uint8,
+) -> dict[str, Any]:
+    """Stream spectrum batches into catalog FITS parts, then merge to ``output_fits``.
+
+    ``batch_iter`` yields ``(source_id, flux, ivar, mask, redshift)`` arrays for
+    each tile (or other) batch in write order.
+
+    Parameters
+    ----------
+    confirm:
+        ``True`` to proceed without prompting; ``False`` to abort; a callable
+        receiving the plan message and returning bool; or ``None`` to require
+        an explicit ``True``/callable when more than one part is needed.
+    """
+    output_fits = Path(output_fits)
+    wavelength = np.asarray(wavelength, dtype=np.float64).ravel()
+    n_pix = int(wavelength.shape[0])
+    if fits_chunk_rows < 1:
+        raise ValueError("fits_chunk_rows must be >= 1")
+
+    n_parts = validate_fits_part_count(
+        n_written,
+        fits_chunk_rows,
+        force_many_fits_parts=force_many_fits_parts,
+    )
+    plan_msg = format_catalog_fits_plan_message(
+        n_written=n_written,
+        chunk_rows=fits_chunk_rows,
+        n_pix=n_pix,
+        output_fits=output_fits,
+        mask_dtype=mask_dtype,
+    )
+    log.info("\n%s", plan_msg)
+
+    if confirm is False:
+        raise RuntimeError("Catalog FITS extract cancelled (confirm=False).")
+    if confirm is None and n_parts > 1:
+        raise ValueError(
+            "Catalog FITS extract would write multiple temporary part files and "
+            "requires confirmation. Pass confirm=True, a confirm callback, or "
+            "use the CLI prompt / --yes."
+        )
+    if callable(confirm):
+        if not confirm(plan_msg):
+            raise RuntimeError("Catalog FITS extract cancelled by user.")
+    # confirm is True, or None with a single part → proceed
+
+    ckpt_path = _checkpoint_path(output_fits)
+    use_parts = n_parts > 1
+    part_paths = (
+        [_part_path(output_fits, i) for i in range(n_parts)]
+        if use_parts
+        else [output_fits]
+    )
+
+    if overwrite:
+        if use_parts:
+            for p in [_part_path(output_fits, i) for i in range(MAX_FITS_PARTS_HARD)]:
+                if p.exists():
+                    p.unlink()
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+        if output_fits.exists() and use_parts:
+            output_fits.unlink()
+        elif output_fits.exists() and overwrite and not use_parts:
+            output_fits.unlink()
+
+    ckpt: dict[str, Any] = {
+        "chunk_rows": fits_chunk_rows,
+        "n_written_total": n_written,
+        "n_pix": n_pix,
+        "part_nrows": [],
+        "completed_parts": [],
+        "merge_done": False,
+    }
+    if ckpt_path.exists() and not overwrite:
+        try:
+            loaded = json.loads(ckpt_path.read_text())
+            if (
+                int(loaded.get("chunk_rows", -1)) == fits_chunk_rows
+                and int(loaded.get("n_written_total", -1)) == n_written
+                and int(loaded.get("n_pix", -1)) == n_pix
+            ):
+                ckpt = loaded
+        except Exception:
+            log.warning("Ignoring unreadable checkpoint %s", ckpt_path)
+
+    completed = {int(x) for x in ckpt.get("completed_parts", [])}
+    part_nrows: list[int] = [int(x) for x in ckpt.get("part_nrows", [])]
+    while len(part_nrows) < n_parts:
+        part_nrows.append(0)
+
+    # Validate / repair completed parts on disk.
+    for part_i in sorted(completed):
+        path = part_paths[part_i]
+        if not path.is_file():
+            completed.discard(part_i)
+            part_nrows[part_i] = 0
+            continue
+        try:
+            with fits.open(path) as hdul:
+                n_on_disk = int(hdul["SPECTRA"].header.get("NAXIS2", 0))
+            expected = (
+                fits_chunk_rows
+                if part_i < n_parts - 1
+                else n_written - fits_chunk_rows * (n_parts - 1)
+            )
+            if n_on_disk != expected and n_on_disk != part_nrows[part_i]:
+                # Prefer header count; if mismatch with expected full part, rewrite.
+                if part_i < n_parts - 1 and n_on_disk != fits_chunk_rows:
+                    path.unlink(missing_ok=True)
+                    completed.discard(part_i)
+                    part_nrows[part_i] = 0
+                else:
+                    part_nrows[part_i] = n_on_disk
+        except Exception:
+            path.unlink(missing_ok=True)
+            completed.discard(part_i)
+            part_nrows[part_i] = 0
+
+    if ckpt.get("merge_done") and output_fits.is_file() and (
+        not use_parts or len(completed) >= n_parts
+    ):
+        log.info("Catalog FITS already complete: %s", output_fits)
+        return {
+            "output": str(output_fits),
+            "output_fits": str(output_fits),
+            "n_written": n_written,
+            "n_parts": n_parts,
+            "fits_chunk_rows": fits_chunk_rows,
+            "merged": True,
+        }
+
+    rows_to_skip = sum(
+        part_nrows[i] for i in range(n_parts) if i in completed and part_nrows[i] > 0
+    )
+    if not rows_to_skip and completed:
+        for part_i in range(n_parts):
+            if part_i not in completed:
+                continue
+            if part_nrows[part_i] > 0:
+                rows_to_skip += part_nrows[part_i]
+            elif part_i < n_parts - 1:
+                rows_to_skip += fits_chunk_rows
+
+    buf_sid: list[np.ndarray] = []
+    buf_flux: list[np.ndarray] = []
+    buf_ivar: list[np.ndarray] = []
+    buf_mask: list[np.ndarray] = []
+    buf_z: list[np.ndarray] = []
+    buf_rows = 0
+    skipped = 0
+    next_part = 0
+    while next_part < n_parts and next_part in completed:
+        next_part += 1
+
+    def _concat_take(
+        chunks: list[np.ndarray], n: int
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
+        flat = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+        head, rest = flat[:n], flat[n:]
+        return head, ([rest] if rest.shape[0] else [])
+
+    def _flush(part_i: int) -> None:
+        nonlocal buf_rows, next_part
+        if buf_rows == 0:
+            return
+        if part_i < n_parts - 1:
+            take = fits_chunk_rows
+        else:
+            take = buf_rows
+        take = min(take, buf_rows)
+
+        sid, buf_sid[:] = _concat_take(buf_sid, take)
+        flux, buf_flux[:] = _concat_take(buf_flux, take)
+        ivar, buf_ivar[:] = _concat_take(buf_ivar, take)
+        mask, buf_mask[:] = _concat_take(buf_mask, take)
+        z, buf_z[:] = _concat_take(buf_z, take)
+        buf_rows -= take
+
+        out_part = part_paths[part_i]
+        write_spectra_catalog_fits(
+            out_part,
+            source_id=sid,
+            flux=flux,
+            ivar=ivar,
+            mask=mask,
+            wavelength=wavelength,
+            redshift=z,
+            wcs_attrs=wcs_attrs,
+            survey=survey,
+            overwrite=True,
+        )
+        part_nrows[part_i] = int(take)
+        completed.add(part_i)
+        ckpt["completed_parts"] = sorted(completed)
+        ckpt["part_nrows"] = part_nrows
+        ckpt["merge_done"] = False
+        if use_parts:
+            _atomic_write_json(ckpt_path, ckpt)
+        log.info(
+            "Wrote catalog FITS part %d/%d → %s (%d rows)",
+            part_i + 1, n_parts, out_part.name, take,
+        )
+        next_part = part_i + 1
+
+    for sid_b, flux_b, ivar_b, mask_b, z_b in batch_iter:
+        sid_b = np.asarray(sid_b, dtype=np.int64).ravel()
+        flux_b = np.asarray(flux_b, dtype=np.float32)
+        ivar_b = np.asarray(ivar_b, dtype=np.float32)
+        mask_b = np.asarray(mask_b)
+        z_b = np.asarray(z_b, dtype=np.float32).ravel()
+        n = int(sid_b.shape[0])
+        if n == 0:
+            continue
+
+        if skipped < rows_to_skip:
+            remain_skip = rows_to_skip - skipped
+            if n <= remain_skip:
+                skipped += n
+                continue
+            sid_b = sid_b[remain_skip:]
+            flux_b = flux_b[remain_skip:]
+            ivar_b = ivar_b[remain_skip:]
+            mask_b = mask_b[remain_skip:]
+            z_b = z_b[remain_skip:]
+            skipped += remain_skip
+            n = int(sid_b.shape[0])
+
+        buf_sid.append(sid_b)
+        buf_flux.append(flux_b)
+        buf_ivar.append(ivar_b)
+        buf_mask.append(mask_b)
+        buf_z.append(z_b)
+        buf_rows += n
+
+        while next_part < n_parts - 1 and buf_rows >= fits_chunk_rows:
+            _flush(next_part)
+
+    if next_part < n_parts and buf_rows > 0:
+        _flush(next_part)
+
+    if len(completed) < n_parts:
+        raise RuntimeError(
+            f"Catalog FITS stream incomplete: finished {len(completed)}/{n_parts} parts "
+            f"({buf_rows} rows left in buffer; expected n_written={n_written})."
+        )
+
+    if use_parts:
+        try:
+            merge_spectra_catalog_fits_parts(part_paths, output_fits, overwrite=True)
+        except ImportError:
+            ckpt["completed_parts"] = sorted(completed)
+            ckpt["part_nrows"] = part_nrows
+            ckpt["merge_done"] = False
+            _atomic_write_json(ckpt_path, ckpt)
+            raise
+
+        ckpt["merge_done"] = True
+        ckpt["completed_parts"] = sorted(completed)
+        ckpt["part_nrows"] = part_nrows
+        _atomic_write_json(ckpt_path, ckpt)
+
+        if not keep_part_files:
+            for p in part_paths:
+                p.unlink(missing_ok=True)
+            ckpt_path.unlink(missing_ok=True)
+    else:
+        # Single-file write already targeted output_fits.
+        pass
+
+    return {
+        "output": str(output_fits),
+        "output_fits": str(output_fits),
+        "n_written": n_written,
+        "n_parts": n_parts,
+        "fits_chunk_rows": fits_chunk_rows,
+        "merged": True,
+        "kept_part_files": bool(keep_part_files and use_parts),
+    }
 
 
 # ---------------------------------------------------------------------------

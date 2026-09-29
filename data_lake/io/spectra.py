@@ -798,6 +798,10 @@ class SpectrumAccessor:
         fits_filename_template: str = "spec_{source_id}.fits",
         fits_layout: FitsLayout = "per-file",
         flux_scale: float | None = None,
+        fits_chunk_rows: int = 50_000,
+        confirm: bool | None = None,
+        keep_part_files: bool = False,
+        force_many_fits_parts: bool = False,
     ) -> dict[str, Any]:
         """Extract a subset to Zarr, Parquet, or FITS (per-file or catalog)."""
         if fmt == "zarr":
@@ -838,6 +842,10 @@ class SpectrumAccessor:
                 filename_template=fits_filename_template,
                 layout=fits_layout,
                 flux_scale=flux_scale,
+                fits_chunk_rows=fits_chunk_rows,
+                confirm=confirm,
+                keep_part_files=keep_part_files,
+                force_many_fits_parts=force_many_fits_parts,
             )
         raise ValueError(f"unknown format {fmt!r}; use zarr, parquet, hdf5, or fits")
 
@@ -1263,6 +1271,10 @@ class SpectrumAccessor:
         filename_template: str = "spec_{source_id}.fits",
         layout: FitsLayout = "per-file",
         flux_scale: float | None = None,
+        fits_chunk_rows: int = 50_000,
+        confirm: bool | None = None,
+        keep_part_files: bool = False,
+        force_many_fits_parts: bool = False,
     ) -> dict[str, Any]:
         """Extract a subset to FITS (one file per spectrum or one catalog file)."""
         if layout == "catalog":
@@ -1273,6 +1285,10 @@ class SpectrumAccessor:
                 show_progress=show_progress,
                 overwrite=overwrite,
                 flux_scale=flux_scale,
+                fits_chunk_rows=fits_chunk_rows,
+                confirm=confirm,
+                keep_part_files=keep_part_files,
+                force_many_fits_parts=force_many_fits_parts,
             )
         return self._extract_subset_to_fits_per_file(
             source_ids,
@@ -1293,13 +1309,25 @@ class SpectrumAccessor:
         show_progress: bool = True,
         overwrite: bool = False,
         flux_scale: float | None = None,
+        fits_chunk_rows: int = 50_000,
+        confirm: bool | None = None,
+        keep_part_files: bool = False,
+        force_many_fits_parts: bool = False,
     ) -> dict[str, Any]:
         """Extract a subset into one multi-row FITS catalog (BINTABLE + WAVELENGTH HDU).
 
+        Large extracts are written as temporary ``_partNNNNN.fits`` shards (default
+        ``fits_chunk_rows=50000``), then merged with fitsio into ``output_fits``.
         Requires ``wavelength_mode='shared'``; use ``--fits-layout per-file`` for
         per-source wavelength surveys.
         """
-        from data_lake.export.to_spectrum_fits import write_spectra_catalog_fits
+        from data_lake.export.to_spectrum_fits import (
+            DEFAULT_FITS_CHUNK_ROWS,
+            stream_spectra_catalog_fits,
+        )
+
+        if fits_chunk_rows <= 0:
+            fits_chunk_rows = DEFAULT_FITS_CHUNK_ROWS
 
         output_fits = Path(output_fits)
         plan = self._plan_subset_extraction(
@@ -1312,35 +1340,51 @@ class SpectrumAccessor:
                 "Use --fits-layout per-file instead."
             )
         z_map = self._build_catalog_redshift_map(plan)
-        source_id, flux, ivar, mask, redshift, id_to_row = self._collect_subset_stacks(
-            plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
-        )
-        write_spectra_catalog_fits(
+
+        def _batches():
+            for sorted_sids, flux_batch, ivar_batch, mask_batch, _wave, z_batch in (
+                self._iter_subset_tile_batches(
+                    plan,
+                    show_progress=show_progress,
+                    z_map=z_map,
+                    flux_scale=flux_scale,
+                )
+            ):
+                yield sorted_sids, flux_batch, ivar_batch, mask_batch, z_batch
+
+        stream_result = stream_spectra_catalog_fits(
+            _batches(),
             output_fits,
-            source_id=source_id,
-            flux=flux,
-            ivar=ivar,
-            mask=mask,
-            wavelength=plan.wavelength,  # type: ignore[arg-type]  # shared mode guarantees non-None
-            redshift=redshift,
+            wavelength=plan.wavelength,  # type: ignore[arg-type]
             wcs_attrs=plan.src_wcs,
             survey=self.survey_name,
+            n_written=plan.n_written,
+            fits_chunk_rows=fits_chunk_rows,
             overwrite=overwrite,
+            keep_part_files=keep_part_files,
+            force_many_fits_parts=force_many_fits_parts,
+            confirm=confirm,
+            mask_dtype=plan.mask_dtype,
         )
         log.info(
-            "Extracted %d/%d spectra → %s (FITS catalog)",
-            plan.n_written, plan.n_requested, output_fits,
+            "Extracted %d/%d spectra → %s (FITS catalog, %d part(s))",
+            plan.n_written,
+            plan.n_requested,
+            output_fits,
+            stream_result.get("n_parts", 1),
         )
         return {
             "n_requested": plan.n_requested,
             "n_written": plan.n_written,
             "missing_ids": plan.missing_ids,
-            "id_to_row": id_to_row,
+            "id_to_row": {},  # row map omitted for streamed catalog writes
             "output": str(output_fits),
             "output_fits": str(output_fits),
             "fits_layout": "catalog",
             "format": "fits",
             "flux_scale": flux_scale,
+            "fits_chunk_rows": fits_chunk_rows,
+            "n_parts": stream_result.get("n_parts", 1),
         }
 
     def _extract_subset_to_fits_per_file(
