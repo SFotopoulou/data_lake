@@ -25,8 +25,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-import json
 import shutil
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -192,6 +192,14 @@ class SpectrumTileStore:
             self._root = zarr.open_group(store=store, mode="r", zarr_format=3)
         return self._root
 
+    def close(self) -> None:
+        """Release Zarr file handles (idempotent)."""
+        if self._root is not None:
+            from data_lake.io.zarr_close import close_zarr_group
+
+            close_zarr_group(self._root)
+            self._root = None
+
     @property
     def wcs_attrs(self) -> dict[str, Any]:
         root = self._open()
@@ -314,6 +322,7 @@ class SpectrumAccessor:
         survey_name: str,
         norder: int | None = None,
         catalog_accessor=None,
+        max_open_tiles: int = 8,
     ) -> None:
         self.lake_root = Path(lake_root)
         self.survey_name = survey_name
@@ -329,8 +338,9 @@ class SpectrumAccessor:
 
         self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
         self._catalog = catalog_accessor
+        self._max_open_tiles: int = max_open_tiles
 
-        self._tile_stores: dict[int, SpectrumTileStore] = {}
+        self._tile_stores: OrderedDict[int, SpectrumTileStore] = OrderedDict()
         self._tile_indices: dict[int, dict[int, int]] = {}
 
     # ------------------------------------------------------------------
@@ -341,12 +351,32 @@ class SpectrumAccessor:
         return self._spectra_root / healpix_dir(self.norder, npix) / f"Npix={npix}.zarr"
 
     def _get_tile_store(self, npix: int) -> SpectrumTileStore:
-        if npix not in self._tile_stores:
-            path = self._tile_path(npix)
-            if not path.exists():
-                raise FileNotFoundError(f"Spectrum tile not found: {path}")
-            self._tile_stores[npix] = SpectrumTileStore(path)
-        return self._tile_stores[npix]
+        if npix in self._tile_stores:
+            self._tile_stores.move_to_end(npix)
+            return self._tile_stores[npix]
+        path = self._tile_path(npix)
+        if not path.exists():
+            raise FileNotFoundError(f"Spectrum tile not found: {path}")
+        store = SpectrumTileStore(path)
+        self._tile_stores[npix] = store
+        if self._max_open_tiles > 0:
+            while len(self._tile_stores) > self._max_open_tiles:
+                _, evicted = self._tile_stores.popitem(last=False)
+                evicted.close()
+        return store
+
+    def close(self) -> None:
+        """Close all cached tile stores and clear caches."""
+        for store in self._tile_stores.values():
+            store.close()
+        self._tile_stores.clear()
+        self._tile_indices.clear()
+
+    def __enter__(self) -> "SpectrumAccessor":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def _get_tile_index(self, npix: int) -> dict[int, int]:
         if npix not in self._tile_indices:
@@ -557,7 +587,7 @@ class SpectrumAccessor:
         if n_written == 0:
             raise ValueError("None of the requested source_ids were found in the lake.")
 
-        # Scan all tiles to find the maximum n_pix (per_source tiles can differ after widen).
+        # Open only the first planned tile for dtypes, WCS, and (shared) wavelength.
         first_npix = next(iter(by_tile))
         first_store = self._get_tile_store(first_npix)
         first_root = first_store._open()
@@ -566,25 +596,39 @@ class SpectrumAccessor:
         mask_dtype = first_root["mask"].dtype
         src_wcs = dict(first_store.wcs_attrs)
 
-        n_pix = int(first_root["flux"].shape[1])
-        for npix in by_tile:
-            if npix == first_npix:
-                continue
-            t_root = self._get_tile_store(npix)._open()
-            tile_n_pix = int(t_root["flux"].shape[1])
-            if wave_mode == "shared" and tile_n_pix != n_pix:
-                raise ValueError(
-                    f"Tile {npix} has N_pix={tile_n_pix} but tile {first_npix} has "
-                    f"N_pix={n_pix}; non-uniform wavelength grid is not supported for "
-                    f"wavelength_mode='shared'."
-                )
-            n_pix = max(n_pix, tile_n_pix)
-
         if wave_mode == "shared":
+            # For shared surveys n_pix is the same across tiles; read from
+            # spectrum_info.json if available to avoid opening every planned tile.
+            if "n_pix" in self._info:
+                n_pix = int(self._info["n_pix"])
+                # Verify first tile matches; raise early if the lake is inconsistent.
+                first_n_pix = int(first_root["flux"].shape[1])
+                if first_n_pix != n_pix:
+                    raise ValueError(
+                        f"spectrum_info.json reports n_pix={n_pix} but tile "
+                        f"{first_npix} has n_pix={first_n_pix}; lake may need "
+                        "re-indexing."
+                    )
+            else:
+                n_pix = int(first_root["flux"].shape[1])
+
             wavelength: np.ndarray | None = np.asarray(
                 first_root["wavelength"][:], dtype=np.float64
             )
         else:
+            # per_source: must find the maximum n_pix across all planned tiles.
+            # Use ephemeral opens so the scan does not pin thousands of stores.
+            n_pix = int(first_root["flux"].shape[1])
+            for npix in by_tile:
+                if npix == first_npix:
+                    continue
+                t_store = self._get_tile_store(npix)
+                t_root = t_store._open()
+                tile_n_pix = int(t_root["flux"].shape[1])
+                n_pix = max(n_pix, tile_n_pix)
+                # Close immediately so we don't pin every tile.
+                t_store.close()
+                self._tile_stores.pop(npix, None)
             wavelength = None
 
         return _SubsetExtractionPlan(

@@ -564,22 +564,22 @@ def _extract_cutouts_to_fits(
     from data_lake.io.cutouts import CutoutAccessor
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    acc = CutoutAccessor(lake_root, survey)
     written = 0
     missing_ids: list[int] = []
-    for sid in source_ids:
-        try:
-            image, wcs = acc.get_cutout(int(sid))
-        except (KeyError, FileNotFoundError):
-            missing_ids.append(int(sid))
-            if missing == "error":
-                raise
-            continue
-        header = wcs.to_fits_header() if hasattr(wcs, "to_fits_header") else None
-        fits.PrimaryHDU(data=image, header=header).writeto(
-            out_dir / f"cutout_{sid}.fits", overwrite=True
-        )
-        written += 1
+    with CutoutAccessor(lake_root, survey) as acc:
+        for sid in source_ids:
+            try:
+                image, wcs = acc.get_cutout(int(sid))
+            except (KeyError, FileNotFoundError):
+                missing_ids.append(int(sid))
+                if missing == "error":
+                    raise
+                continue
+            header = wcs.to_fits_header() if hasattr(wcs, "to_fits_header") else None
+            fits.PrimaryHDU(data=image, header=header).writeto(
+                out_dir / f"cutout_{sid}.fits", overwrite=True
+            )
+            written += 1
     return {"survey": survey, "n_written": written, "missing": len(missing_ids)}
 
 
@@ -626,16 +626,16 @@ def extract_modalities_for_product(
         if modality == "spectra":
             from data_lake.io.spectra import SpectrumAccessor
 
-            acc = SpectrumAccessor(lake_root=lake_root, survey_name=base_survey)
             out = output_dir / f"spectra_{base_survey}.zarr"
-            res = acc.extract_subset(
-                source_ids=np.asarray(source_ids, dtype=np.int64),
-                output=out,
-                fmt="zarr",
-                missing=missing,
-                show_progress=False,
-                overwrite=True,
-            )
+            with SpectrumAccessor(lake_root=lake_root, survey_name=base_survey) as acc:
+                res = acc.extract_subset(
+                    source_ids=np.asarray(source_ids, dtype=np.int64),
+                    output=out,
+                    fmt="zarr",
+                    missing=missing,
+                    show_progress=False,
+                    overwrite=True,
+                )
             results["spectra"] = {
                 "output": str(res.get("output", out)),
                 "n_written": res.get("n_written"),

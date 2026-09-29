@@ -12,6 +12,7 @@ Core API
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,14 @@ class TileStore:
             self._root = zarr.open_group(store=store, mode="r", zarr_format=3)
         return self._root
 
+    def close(self) -> None:
+        """Release Zarr file handles (idempotent)."""
+        if self._root is not None:
+            from data_lake.io.zarr_close import close_zarr_group
+
+            close_zarr_group(self._root)
+            self._root = None
+
     def get_image(self, idx: int) -> np.ndarray:
         """Return image at position idx; shape = (B, H, W)."""
         root = self._open()
@@ -181,6 +190,7 @@ class CutoutAccessor:
         survey_name: str,
         norder: int | None = None,
         catalog_accessor=None,
+        max_open_tiles: int = 8,
     ) -> None:
         self.lake_root = Path(lake_root)
         self.survey_name = survey_name
@@ -197,8 +207,9 @@ class CutoutAccessor:
 
         self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
         self._catalog = catalog_accessor
+        self._max_open_tiles: int = max_open_tiles
 
-        self._tile_stores: dict[int, TileStore] = {}
+        self._tile_stores: OrderedDict[int, TileStore] = OrderedDict()
         self._tile_indices: dict[int, dict[int, int]] = {}  # npix → {source_id: local_idx}
 
     # ------------------------------------------------------------------
@@ -209,12 +220,32 @@ class CutoutAccessor:
         return self._cutout_root / healpix_dir(self.norder, npix) / f"Npix={npix}.zarr"
 
     def _get_tile_store(self, npix: int) -> TileStore:
-        if npix not in self._tile_stores:
-            path = self._tile_path(npix)
-            if not path.exists():
-                raise FileNotFoundError(f"Tile not found: {path}")
-            self._tile_stores[npix] = TileStore(path)
-        return self._tile_stores[npix]
+        if npix in self._tile_stores:
+            self._tile_stores.move_to_end(npix)
+            return self._tile_stores[npix]
+        path = self._tile_path(npix)
+        if not path.exists():
+            raise FileNotFoundError(f"Tile not found: {path}")
+        store = TileStore(path)
+        self._tile_stores[npix] = store
+        if self._max_open_tiles > 0:
+            while len(self._tile_stores) > self._max_open_tiles:
+                _, evicted = self._tile_stores.popitem(last=False)
+                evicted.close()
+        return store
+
+    def close(self) -> None:
+        """Close all cached tile stores and clear caches."""
+        for store in self._tile_stores.values():
+            store.close()
+        self._tile_stores.clear()
+        self._tile_indices.clear()
+
+    def __enter__(self) -> "CutoutAccessor":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def _get_tile_index(self, npix: int) -> dict[int, int]:
         if npix not in self._tile_indices:

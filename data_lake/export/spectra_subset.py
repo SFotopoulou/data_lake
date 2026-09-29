@@ -336,11 +336,6 @@ try:
                 )
 
         from data_lake.io.spectra import SpectrumAccessor
-        acc = SpectrumAccessor(
-            lake_root=lake_root,
-            survey_name=survey_name,
-            catalog_accessor=catalog_accessor,
-        )
 
         def _confirm_fits(plan_msg: str) -> bool:
             click.echo(plan_msg)
@@ -355,22 +350,27 @@ try:
             confirm_arg = None
 
         try:
-            result = acc.extract_subset(
-                source_ids=source_ids,
-                output=output_path,
-                fmt=fmt,
-                missing=missing,
-                chunks_per_shard=chunks_per_shard,
-                show_progress=show_progress,
-                overwrite=overwrite,
-                fits_filename_template=fits_filename_template,
-                fits_layout=layout,
-                flux_scale=scale,
-                fits_chunk_rows=fits_chunk_rows,
-                confirm=confirm_arg,
-                keep_part_files=keep_part_files,
-                force_many_fits_parts=force_many_fits_parts,
-            )
+            with SpectrumAccessor(
+                lake_root=lake_root,
+                survey_name=survey_name,
+                catalog_accessor=catalog_accessor,
+            ) as acc:
+                result = acc.extract_subset(
+                    source_ids=source_ids,
+                    output=output_path,
+                    fmt=fmt,
+                    missing=missing,
+                    chunks_per_shard=chunks_per_shard,
+                    show_progress=show_progress,
+                    overwrite=overwrite,
+                    fits_filename_template=fits_filename_template,
+                    fits_layout=layout,
+                    flux_scale=scale,
+                    fits_chunk_rows=fits_chunk_rows,
+                    confirm=confirm_arg,
+                    keep_part_files=keep_part_files,
+                    force_many_fits_parts=force_many_fits_parts,
+                )
         except (ValueError, RuntimeError, ImportError) as exc:
             raise click.ClickException(str(exc)) from exc
 

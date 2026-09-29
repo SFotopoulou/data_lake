@@ -254,13 +254,14 @@ class _OpenTile:
 
 
 def _close_spectrum_tile_group(root: Any) -> None:
-    """Release Zarr file handles for a tile (best-effort)."""
-    store = getattr(root, "store", None)
-    if store is None:
-        return
-    close = getattr(store, "close", None)
-    if callable(close):
-        close()
+    """Release Zarr file handles for a tile (best-effort).
+
+    Thin wrapper around :func:`data_lake.io.zarr_close.close_zarr_group` so
+    the ingest write path and read path share one implementation.
+    """
+    from data_lake.io.zarr_close import close_zarr_group
+
+    close_zarr_group(root)
 
 
 def _load_tile_source_id_set(root: Any) -> set[int]:

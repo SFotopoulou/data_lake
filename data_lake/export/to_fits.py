@@ -83,7 +83,7 @@ def export_cutout(
         image, wcs = accessor.get_cutout(source_id)
     finally:
         if _own_accessor:
-            pass  # CutoutAccessor has no explicit close; stores are kept open
+            accessor.close()
 
     if band_index is not None:
         if band_index < 0 or band_index >= image.shape[0]:
@@ -195,24 +195,24 @@ def export_cutouts_batch(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    accessor = CutoutAccessor(lake_root, survey)
     paths: list[Path] = []
 
-    for source_id in source_ids:
-        out = output_dir / filename_template.format(source_id=source_id)
-        try:
-            p = export_cutout(
-                lake_root=lake_root,
-                survey=survey,
-                source_id=source_id,
-                output_path=out,
-                band_index=band_index,
-                overwrite=overwrite,
-                accessor=accessor,
-            )
-            paths.append(p)
-        except Exception as exc:
-            log.error("Failed to export source_id=%d: %s", source_id, exc)
+    with CutoutAccessor(lake_root, survey) as accessor:
+        for source_id in source_ids:
+            out = output_dir / filename_template.format(source_id=source_id)
+            try:
+                p = export_cutout(
+                    lake_root=lake_root,
+                    survey=survey,
+                    source_id=source_id,
+                    output_path=out,
+                    band_index=band_index,
+                    overwrite=overwrite,
+                    accessor=accessor,
+                )
+                paths.append(p)
+            except Exception as exc:
+                log.error("Failed to export source_id=%d: %s", source_id, exc)
 
     return paths
 
@@ -242,8 +242,8 @@ def verify_round_trip(
     work_dir = Path(ctx.name if ctx else tmp_dir)
 
     try:
-        acc = CutoutAccessor(lake_root, survey)
-        original_image, original_wcs = acc.get_cutout(source_id)
+        with CutoutAccessor(lake_root, survey) as acc:
+            original_image, original_wcs = acc.get_cutout(source_id)
 
         fits_path = work_dir / f"round_trip_{source_id}.fits"
         export_cutout(
