@@ -9,7 +9,7 @@ description = "Astronomy data lake: wide multi-survey catalogs (Parquet/HATS) + 
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Sotiria Fotopoulou" }]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     # Array / columnar I/O
     "pyarrow>=15.0",

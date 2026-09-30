@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: minimum Python version is 3.12** — `requires-python = ">=3.12"`; install docs use `uv venv --python 3.12`.
 - **Breaking: `dl-describe-lake --from-area` removed** — describe-lake is lake-wide only. Use `dl-region --from-area AREA --modalities …,crossmatch` (optionally `--count`) for area-scoped inventory including crossmatch trees.
 - **`dl-region` crossmatch discovery** — `crossmatch` is a discoverable modality (`--modalities catalog,spectra,crossmatch`); tile indices include `*.crossmatch.json`; `--count` sums Parquet footers for catalog and crossmatch overlap tiles. Default modalities remain catalog-only.
 

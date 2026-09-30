@@ -9,7 +9,7 @@ or renaming `dl-*` entry points in `pyproject.toml`.
 
 ## Getting set up
 
-The project is developed against Python 3.11 with [`uv`](https://docs.astral.sh/uv/)
+The project is developed against Python 3.12 with [`uv`](https://docs.astral.sh/uv/)
 as the recommended environment manager.
 
 ```bash
@@ -19,7 +19,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 # Project venv
 cd data_lake
-uv venv --python 3.11 .venv
+uv venv --python 3.12 .venv
 uv sync --extra desi --extra dev --extra fitsio
 source .venv/bin/activate
 ```
@@ -45,7 +45,7 @@ to see how to point it at your own files.
 
 ## Code style
 
-- Python 3.10+ features (`X | None`, PEP 604 unions, walrus where helpful).
+- Python 3.12+ features (`X | None`, PEP 604 unions, walrus where helpful).
 - Type hints on all public functions and dataclass fields.
 - Docstrings use NumPy style on public functions.
 - Inline comments are reserved for **why** a piece of code is the way it is.

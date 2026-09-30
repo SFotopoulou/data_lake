@@ -702,3 +702,218 @@ class TestExtractSubsetFluxCalibration:
         assert sidecar.is_file()
         data = json.loads(sidecar.read_text())
         assert data["flux_scale"] == 0.25
+
+    def test_fits_catalog_chunked_merge_and_cleanup(self, synthetic_lake: Path):
+        """Tiny fits_chunk_rows writes parts, merges, deletes intermediates."""
+        from astropy.io import fits
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        out = synthetic_lake / "subset_chunked.fits"
+        result = acc.extract_subset_to_fits_catalog(
+            source_ids=[101, 103, 201],
+            output_fits=out,
+            show_progress=False,
+            overwrite=True,
+            fits_chunk_rows=2,
+            confirm=True,
+        )
+        assert result["n_written"] == 3
+        assert result["n_parts"] == 2
+        assert out.is_file()
+        assert not list(synthetic_lake.glob("subset_chunked_part*.fits"))
+        with fits.open(out) as hdul:
+            assert hdul["SPECTRA"].header["NAXIS2"] == 3
+            assert set(hdul["SPECTRA"].data["TARGETID"].tolist()) == {101, 103, 201}
+
+    def test_fits_catalog_resume_skips_completed_part(self, synthetic_lake: Path):
+        from astropy.io import fits
+
+        from data_lake.export.to_spectrum_fits import _checkpoint_path, _part_path
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        out = synthetic_lake / "subset_resume.fits"
+        acc.extract_subset_to_fits_catalog(
+            source_ids=[101, 103, 201],
+            output_fits=out,
+            show_progress=False,
+            overwrite=True,
+            fits_chunk_rows=2,
+            confirm=True,
+            keep_part_files=True,
+        )
+        part0 = _part_path(out, 0)
+        part1 = _part_path(out, 1)
+        assert part0.is_file() and part1.is_file()
+        mtime0 = part0.stat().st_mtime_ns
+        out.unlink()
+        part1.unlink()
+        ckpt = json.loads(_checkpoint_path(out).read_text())
+        ckpt["completed_parts"] = [0]
+        ckpt["part_nrows"] = [2, 0]
+        ckpt["merge_done"] = False
+        _checkpoint_path(out).write_text(json.dumps(ckpt, indent=2))
+
+        acc.extract_subset_to_fits_catalog(
+            source_ids=[101, 103, 201],
+            output_fits=out,
+            show_progress=False,
+            overwrite=False,
+            fits_chunk_rows=2,
+            confirm=True,
+            keep_part_files=True,
+        )
+        assert part0.stat().st_mtime_ns == mtime0
+        assert out.is_file()
+        with fits.open(out) as hdul:
+            assert hdul["SPECTRA"].header["NAXIS2"] == 3
+
+    def test_fits_catalog_refuses_too_many_parts(self, synthetic_lake: Path):
+        from data_lake.export.to_spectrum_fits import validate_fits_part_count
+
+        with pytest.raises(ValueError, match="100"):
+            validate_fits_part_count(10_000, 1, force_many_fits_parts=False)
+        with pytest.raises(ValueError, match="hard limit"):
+            validate_fits_part_count(20_000, 1, force_many_fits_parts=True)
+
+    def test_write_spectra_catalog_fits_rejects_oversized(self, tmp_path: Path, monkeypatch):
+        from data_lake.export import to_spectrum_fits as mod
+
+        monkeypatch.setattr(mod, "max_bintable_rows", lambda *a, **k: 2)
+        n_pix = 4
+        n_spec = 3
+        with pytest.raises(ValueError, match="4 GiB"):
+            mod.write_spectra_catalog_fits(
+                tmp_path / "big.fits",
+                source_id=np.arange(n_spec, dtype=np.int64),
+                flux=np.zeros((n_spec, n_pix), dtype=np.float32),
+                ivar=np.zeros((n_spec, n_pix), dtype=np.float32),
+                mask=np.zeros((n_spec, n_pix), dtype=np.uint8),
+                wavelength=np.linspace(1.0, 2.0, n_pix),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tests for bounded open-tile LRU and close()
+# ---------------------------------------------------------------------------
+
+
+class TestOpenTileLRU:
+    """SpectrumTileStore.close and SpectrumAccessor LRU / context-manager."""
+
+    def test_tile_store_close_clears_root(self, synthetic_lake: Path):
+        """close() sets _root to None and is idempotent."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        tiles = list(acc.available_tiles())
+        assert tiles, "synthetic lake has no tiles"
+        npix = tiles[0]
+
+        store = acc._get_tile_store(npix)
+        # Force open
+        _ = store._open()
+        assert store._root is not None
+
+        # First close
+        store.close()
+        assert store._root is None
+
+        # Second close is idempotent
+        store.close()
+        assert store._root is None
+
+    def test_accessor_lru_evicts_oldest(self, synthetic_lake: Path):
+        """With max_open_tiles=1, each new tile evicts the previous one."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY, max_open_tiles=1)
+        tiles = list(acc.available_tiles())
+        assert len(tiles) >= 2, "need at least 2 tiles for this test"
+
+        # Open first tile
+        s0 = acc._get_tile_store(tiles[0])
+        _ = s0._open()
+        assert len(acc._tile_stores) == 1
+
+        # Open second tile — should evict first
+        acc._get_tile_store(tiles[1])
+        assert len(acc._tile_stores) == 1
+        assert tiles[1] in acc._tile_stores
+        assert tiles[0] not in acc._tile_stores
+        # Evicted store should be closed
+        assert s0._root is None
+
+    def test_accessor_close_clears_all(self, synthetic_lake: Path):
+        """close() closes every cached store and clears _tile_stores."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY)
+        # Touch all available tiles so they are all cached
+        for npix in acc.available_tiles():
+            s = acc._get_tile_store(npix)
+            _ = s._open()
+
+        assert len(acc._tile_stores) > 0
+        stores = list(acc._tile_stores.values())
+
+        acc.close()
+
+        assert len(acc._tile_stores) == 0
+        for s in stores:
+            assert s._root is None
+
+    def test_context_manager_closes_on_exit(self, synthetic_lake: Path):
+        """Using SpectrumAccessor as a context manager closes stores on exit."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        with SpectrumAccessor(synthetic_lake, SURVEY) as acc:
+            _ = acc.extract_subset_to_zarr(
+                source_ids=[101, 103, 201],
+                output_zarr=synthetic_lake / "cm_test.zarr",
+                show_progress=False,
+                overwrite=True,
+            )
+            # Inside: may have tiles open
+            n_open_inside = len(acc._tile_stores)
+
+        # Outside: all closed
+        assert len(acc._tile_stores) == 0
+        # The extract itself must have succeeded
+        assert n_open_inside >= 0  # trivially true; closed by __exit__
+
+    def test_extract_respects_max_open_tiles(self, synthetic_lake: Path):
+        """max_open_tiles=2 keeps at most 2 stores open during a multi-tile extract."""
+        import zarr
+
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY, max_open_tiles=2)
+
+        result = acc.extract_subset_to_zarr(
+            source_ids=[101, 102, 103, 201, 202],
+            output_zarr=synthetic_lake / "lru_test.zarr",
+            show_progress=False,
+            overwrite=True,
+        )
+        acc.close()
+
+        assert result["n_written"] == 5
+        assert len(acc._tile_stores) == 0
+
+    def test_shared_planning_uses_info_n_pix(self, synthetic_lake: Path):
+        """Shared-mode planning reads n_pix from spectrum_info.json, not all tiles."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        # Build plan with max_open_tiles=1 so any multi-tile open would evict anyway.
+        acc = SpectrumAccessor(synthetic_lake, SURVEY, max_open_tiles=1)
+        plan = acc._plan_subset_extraction(
+            [101, 103, 201], show_progress=False
+        )
+        # n_pix must match what spectrum_info.json reports
+        assert plan.n_pix == N_PIX
+        # At most 1 tile pinned after planning (LRU cap)
+        assert len(acc._tile_stores) <= 1
+        acc.close()

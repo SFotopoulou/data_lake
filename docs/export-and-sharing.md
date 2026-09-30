@@ -54,8 +54,12 @@ dl-extract-spectra-subset ... --format hdf5 --output /scratch/qso_subset.h5
 dl-extract-spectra-subset ... --format fits --fits-layout per-file \
     --output /scratch/qso_fits/
 
-# One multi-row FITS catalog (BINTABLE: TARGETID, Z, FLUX, IVAR, MASK + WAVELENGTH HDU)
+# One multi-row FITS catalog (BINTABLE: TARGETID, Z, FLUX, IVAR, MASK + WAVELENGTH HDU).
+# Large extracts write temporary *_partNNNNN.fits shards (default 50k rows), then merge
+# into --output with fitsio and delete intermediates. You are prompted with the expected
+# part count unless --yes. Resume reuses completed parts.
 dl-extract-spectra-subset ... --format fits --fits-layout catalog \
+    --fits-chunk-rows 50000 --yes \
     --output /scratch/qso_spectra.fits
 
 # Apply bundled SDSS/DESI flux calibration (native 10^-17 → cgs erg/s/cm²/Å)
@@ -75,7 +79,12 @@ and divide ivar by factor².  Use `--apply-survey-calibration` to load
 `flux_scale` in group/file metadata when scaling is applied.
 
 `--format` choices: `zarr` (default), `parquet`, `hdf5`, `fits`.  For FITS,
-`--fits-layout` is `per-file` (default) or `catalog`.  All formats support
+`--fits-layout` is `per-file` (default) or `catalog`.  Catalog FITS streams in
+`--fits-chunk-rows` shards (default 50000) to avoid Astropy/CFITSIO ~4 GiB
+vector-BINTABLE crashes, then merges with `fitsio` into one file.  The CLI
+prints the expected temporary part count and asks for confirmation (`--yes` to
+skip).  Re-run the same command to resume after a crash.  Cap: refuse more than
+100 parts unless `--force-many-fits-parts` (hard max 10000).  All formats support
 both `wavelength_mode="shared"` and `wavelength_mode="per_source"` surveys,
 except FITS catalog layout, which requires a shared wavelength grid (use
 `--fits-layout per-file` for per-source surveys such as 2dF/6dF).

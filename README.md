@@ -14,7 +14,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/SFotopoulou/data_lake.git && cd data_lake
 
 # 2. Create the environment and run the test suite
-uv venv --python 3.11 .venv && uv sync --extra dev --extra fitsio
+uv venv --python 3.12 .venv && uv sync --extra dev --extra fitsio
 source .venv/bin/activate
 pytest                                  # all tests; no external data needed
 

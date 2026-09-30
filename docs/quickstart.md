@@ -13,10 +13,10 @@ Use [`uv`](https://docs.astral.sh/uv/) for all Python environments.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"   # add to your shell rc
 
-# Clone and create a Python 3.11 venv
+# Clone and create a Python 3.12 venv
 git clone https://github.com/SFotopoulou/data_lake.git
 cd data_lake
-uv venv --python 3.11 .venv
+uv venv --python 3.12 .venv
 
 # Install from the lockfile (editable, with extras):
 #   dev      — pytest, Jupyter, matplotlib, napari, ...
