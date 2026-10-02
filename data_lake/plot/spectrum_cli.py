@@ -60,6 +60,13 @@ from data_lake.cli_utils import (
     default=False,
     help="Use a linear wavelength axis (default is log).",
 )
+@click.option(
+    "--clip-sigma",
+    default=10.0,
+    show_default=True,
+    type=float,
+    help="Y-axis clip: median ± N×MAD-σ over good pixels. Use 0 to disable.",
+)
 @config_option
 @logging_options
 def cli(
@@ -71,6 +78,7 @@ def cli(
     title: str | None,
     rest_frame: bool,
     linear_x: bool,
+    clip_sigma: float,
     config_path: Path | None,
     quiet: bool,
     verbose: bool,
@@ -128,6 +136,7 @@ def cli(
     from data_lake.plot.source_figure import plot_spectrum
 
     log.info("Rendering figure → %s", output_path)
+    clip = None if clip_sigma <= 0 else clip_sigma
     fig = plot_spectrum(
         spectrum,
         title=title,
@@ -135,6 +144,7 @@ def cli(
         dpi=dpi,
         rest_frame=rest_frame,
         log_x=not linear_x,
+        clip_sigma=clip,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")

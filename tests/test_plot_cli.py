@@ -229,3 +229,43 @@ def test_dl_plot_spectrum_missing_survey(tmp_path):
     result = runner.invoke(cli, ["NOSPEC", str(tmp_path), "--id", "1"])
     assert result.exit_code != 0
     assert "NOSPEC" in result.output or "not found" in result.output.lower()
+
+
+def test_flux_ylim_sigma_clip_rejects_outliers():
+    from data_lake.plot.source_figure import flux_ylim_sigma_clip
+
+    rng = np.random.default_rng(0)
+    flux = rng.normal(0.0, 1.0, size=200).astype(np.float64)
+    flux[50] = 1e6  # spike
+    good = np.ones(200, dtype=bool)
+    ylim = flux_ylim_sigma_clip(flux, good=good, n_sigma=10.0)
+    assert ylim is not None
+    lo, hi = ylim
+    assert hi < 100.0
+    assert lo < 0 < hi
+
+
+def test_flux_ylim_sigma_clip_disabled_via_none_plot():
+    """plot_spectrum accepts clip_sigma=None without error."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from data_lake.io.spectra import Spectrum
+    from data_lake.plot.source_figure import plot_spectrum
+
+    n = 32
+    wave = np.linspace(3600.0, 9800.0, n)
+    spec = Spectrum(
+        source_id=1,
+        flux=np.ones(n, dtype=np.float32),
+        ivar=np.ones(n, dtype=np.float32),
+        mask=np.zeros(n, dtype=np.uint8),
+        wavelength=wave,
+        meta={"z": 0.0, "z_err": 0.0, "snr": 1.0, "exptime": 1.0, "R": 1000.0, "instr": "T"},
+        wcs_attrs={"ctype": "WAVE", "unit": "Angstrom", "n_pix": n},
+    )
+    fig = plot_spectrum(spec, clip_sigma=None)
+    assert fig is not None
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)

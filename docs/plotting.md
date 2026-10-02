@@ -74,6 +74,7 @@ Options:
   --title TEXT             Figure title override
   --rest-frame             Convert spectrum to rest-frame wavelength
   --linear-x               Linear wavelength axis (default: log)
+  --clip-sigma FLOAT       Y-axis median ± N×MAD-σ clip [default: 10]; 0 disables
   --config PATH            Path to lake_config.toml (or $DATA_LAKE_CONFIG)
   -q / -v                  Quiet / verbose logging
 ```

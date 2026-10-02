@@ -59,6 +59,46 @@ def _wave_angstrom_to_um(wave_angstrom: np.ndarray) -> np.ndarray:
     return wave_angstrom * 1e-4
 
 
+def flux_ylim_sigma_clip(
+    flux: np.ndarray,
+    *,
+    good: np.ndarray | None = None,
+    n_sigma: float = 10.0,
+) -> tuple[float, float] | None:
+    """Return ``(ymin, ymax)`` as median ± ``n_sigma`` × σ over finite pixels.
+
+    Scale is the robust MAD estimator ``1.4826 × median(|x − median|)`` so a
+    few cosmic-ray spikes do not inflate the window.  Uses good pixels when
+    *good* is provided.  Returns ``None`` when there are too few finite samples.
+    """
+    if n_sigma <= 0:
+        raise ValueError(f"n_sigma must be > 0, got {n_sigma}")
+
+    flux64 = np.asarray(flux, dtype=np.float64)
+    if good is not None:
+        mask = np.asarray(good, dtype=bool) & np.isfinite(flux64)
+    else:
+        mask = np.isfinite(flux64)
+    sample = flux64[mask]
+    if sample.size < 2:
+        return None
+
+    med = float(np.median(sample))
+    mad = float(np.median(np.abs(sample - med)))
+    sigma = 1.4826 * mad
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = float(np.std(sample))
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        return None
+
+    lo = med - n_sigma * sigma
+    hi = med + n_sigma * sigma
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+        return None
+    pad = 0.05 * (hi - lo)
+    return lo - pad, hi + pad
+
+
 def plot_source_sed_spectrum(
     sed: SEDPoints,
     spectrum: Spectrum,
@@ -247,6 +287,7 @@ def plot_spectrum(
     dpi: int = 150,
     rest_frame: bool = False,
     log_x: bool = True,
+    clip_sigma: float | None = 10.0,
     extra_kwargs: dict[str, Any] | None = None,
 ):
     """Render a single-panel 1D spectrum figure.
@@ -265,6 +306,9 @@ def plot_spectrum(
         If ``True``, convert wavelength to rest-frame using ``meta["z"]``.
     log_x:
         Use a logarithmic wavelength axis (default ``True``).
+    clip_sigma:
+        Y-axis limits as median ± ``clip_sigma`` × MAD-σ over good pixels
+        (default ``10``).  Pass ``None`` to disable clipping.
     extra_kwargs:
         Passed through to ``plt.subplots``.
     """
@@ -296,6 +340,11 @@ def plot_spectrum(
             (flux + err1d)[good],
             color="#1f77b4", alpha=0.2, linewidth=0, label=r"$\pm1\sigma$",
         )
+
+    if clip_sigma is not None:
+        ylim = flux_ylim_sigma_clip(flux, good=good, n_sigma=clip_sigma)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Flux (native units)")
