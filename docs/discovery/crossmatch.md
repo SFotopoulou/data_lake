@@ -191,8 +191,24 @@ only fills gaps. Column partners are written as ``__col_<col_a>__<col_b>`` trees
 to materialise the joined columns.
 
 Inventory: `dl-describe-lake` (and `--refresh`) always counts crossmatch rows
-from Parquet footers lake-wide. For area-scoped crossmatch discovery (tile
-overlap and exact `--count`), use
+from Parquet footers lake-wide. For a focused inventory of association trees
+(sky and column), use ``dl-describe-crossmatch``:
+
+```bash
+# List every tree under crossmatch/
+dl-describe-crossmatch /data/lake
+dl-describe-crossmatch /data/lake --json
+
+# Detail for one sky tree (disambiguate radius when needed)
+dl-describe-crossmatch EUCLID_DR1 2MASS_PSC /data/lake --radius-arcsec 1.0
+dl-describe-crossmatch EUCLID_DR1_x_2MASS_PSC__r1.0 /data/lake
+dl-describe-crossmatch --name EUCLID_DR1_x_DESI_DR1__col_TARGETID__TARGETID /data/lake
+
+# Authoritative row/tile recount from Parquet footers
+dl-describe-crossmatch EUCLID_DR1 2MASS_PSC /data/lake --radius-arcsec 1.0 --recount
+```
+
+For area-scoped crossmatch discovery (tile overlap and exact `--count`), use
 `dl-region --from-area AREA --modalities catalog,spectra,crossmatch --count`.
 
 **Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A

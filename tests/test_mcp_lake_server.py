@@ -19,6 +19,7 @@ from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, assign_healpix
 from data_lake.io.crossmatch import build_crossmatch
 from data_lake.lake_registry import refresh_lake_registry
 from data_lake.mcp_lake_server import (
+    tool_describe_crossmatch,
     tool_describe_product,
     tool_discover_region,
     tool_estimate_operation_cost,
@@ -149,6 +150,15 @@ def test_list_crossmatches(product_lake: Path) -> None:
     xm = payload["crossmatches"][0]
     assert xm["survey_a"] == "EUCLID"
     assert xm["survey_b"] == "DESI_DR1"
+
+
+def test_describe_crossmatch(product_lake: Path) -> None:
+    listed = tool_list_crossmatches(str(product_lake))
+    name = listed["crossmatches"][0]["name"]
+    detail = tool_describe_crossmatch(str(product_lake), name=name)
+    assert detail["name"] == name
+    assert detail["survey_a"] == "EUCLID"
+    assert "info" in detail
 
 
 def test_describe_product(product_lake: Path) -> None:

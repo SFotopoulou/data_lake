@@ -155,24 +155,45 @@ def tool_list_crossmatches(
     survey_a: str | None = None,
     survey_b: str | None = None,
 ) -> dict[str, Any]:
-    from data_lake.io.crossmatch import CROSSMATCH_INFO_FILENAME, find_crossmatch_roots
+    from data_lake.io.crossmatch import list_crossmatch_descriptions
 
     root = resolve_lake_root(lake_root)
-    entries: list[dict[str, Any]] = []
-    for a, b, radius, path in find_crossmatch_roots(root, survey_a, survey_b):
-        info: dict[str, Any] = {}
-        info_path = path / CROSSMATCH_INFO_FILENAME
-        if info_path.is_file():
-            with open(info_path) as fh:
-                info = json.load(fh)
-        entries.append({
-            "survey_a": a,
-            "survey_b": b,
-            "radius_arcsec": radius,
-            "path": str(path),
-            "info": info,
-        })
+    entries = list_crossmatch_descriptions(
+        root, survey_a, survey_b, recount=False, include_columns=False
+    )
     return {"crossmatches": entries}
+
+
+def tool_describe_crossmatch(
+    lake_root: str | None = None,
+    survey_a: str | None = None,
+    survey_b: str | None = None,
+    *,
+    name: str | None = None,
+    radius_arcsec: float | None = None,
+    match_mode: str | None = None,
+    match_col_a: str | None = None,
+    match_col_b: str | None = None,
+    recount: bool = False,
+) -> dict[str, Any]:
+    """Describe one crossmatch tree (same payload as ``dl-describe-crossmatch --json``)."""
+    from data_lake.io.crossmatch import (
+        describe_crossmatch_tree,
+        resolve_crossmatch_describe_target,
+    )
+
+    root = resolve_lake_root(lake_root)
+    target = resolve_crossmatch_describe_target(
+        root,
+        name=name,
+        survey_a=survey_a,
+        survey_b=survey_b,
+        radius_arcsec=radius_arcsec,
+        match_mode=match_mode,
+        match_col_a=match_col_a,
+        match_col_b=match_col_b,
+    )
+    return describe_crossmatch_tree(target, recount=recount, include_columns=True)
 
 
 def tool_describe_product(
@@ -478,8 +499,33 @@ def create_lake_mcp_app() -> Any:
         survey_a: str | None = None,
         survey_b: str | None = None,
     ) -> str:
-        """List crossmatch trees and crossmatch_info.json metadata."""
+        """List crossmatch trees (sky and column) with metadata."""
         return json_dumps(tool_list_crossmatches(lake_root, survey_a, survey_b))
+
+    @mcp.tool()
+    def describe_crossmatch(
+        lake_root: str | None = None,
+        survey_a: str | None = None,
+        survey_b: str | None = None,
+        name: str | None = None,
+        radius_arcsec: float | None = None,
+        match_mode: str | None = None,
+        match_col_a: str | None = None,
+        match_col_b: str | None = None,
+        recount: bool = False,
+    ) -> str:
+        """Describe one crossmatch tree (dl-describe-crossmatch --json)."""
+        return json_dumps(tool_describe_crossmatch(
+            lake_root,
+            survey_a,
+            survey_b,
+            name=name,
+            radius_arcsec=radius_arcsec,
+            match_mode=match_mode,
+            match_col_a=match_col_a,
+            match_col_b=match_col_b,
+            recount=recount,
+        ))
 
     @mcp.tool()
     def describe_product(lake_root: str | None = None, name: str = "") -> str:

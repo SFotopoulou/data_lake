@@ -8,6 +8,9 @@
 dl-refresh-lake-registry              # write shared/registry/surveys.parquet
 dl-describe-lake                      # print survey × modality summary
 dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout / crossmatch)
+dl-describe-lake --modality crossmatch   # crossmatch rows in the registry table
+dl-describe-crossmatch                   # list every sky/column tree
+dl-describe-crossmatch A B --radius-arcsec 1.0   # one tree detail
 dl-describe-lake --kind ingested      # primary ingest across modalities (catalogs + spectra + cutouts)
 dl-describe-lake --kind product       # derived products (gather/homogenize)
 dl-describe-lake --count-total        # footer: per-modality totals + grand total (registry sums)

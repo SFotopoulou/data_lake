@@ -66,6 +66,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 |---------|---------|
 | `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--kind ingested\|product\|crossmatch`, `--areas`, `--refresh`, `--verbose`, `--pair-surveys` |
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
+| `dl-describe-crossmatch` | List or describe crossmatch trees (sky + column); `--name`, `--radius-arcsec`, `--match-mode column --match-col-a/b`, `--recount`, `--json` ([docs](discovery/crossmatch.md)) |
 | `dl-preview-sources` | Peek first N sources from a modality (`catalog` / `spectra` / `cutouts`); `-n`, `-c COL`, `-o`, `--format` |
 | `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |

@@ -1325,3 +1325,155 @@ class TestColumnCrossmatchCLI:
         ])
         assert result.exit_code == 0, result.output
         assert "__r1.0" in result.output
+
+
+# ---------------------------------------------------------------------------
+# dl-describe-crossmatch
+# ---------------------------------------------------------------------------
+
+
+def _write_minimal_xm_tree(
+    lake: Path,
+    name: str,
+    info: dict,
+    *,
+    norder: int = 5,
+    npix: int = 0,
+    n_rows: int = 3,
+) -> Path:
+    root = lake / "crossmatch" / name
+    tile_dir = root / f"Norder={norder}" / "Dir=0"
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    hp = f"_healpix_norder{norder}"
+    pq.write_table(
+        pa.table({
+            "source_id_a": pa.array(list(range(n_rows)), type=pa.int64()),
+            "source_id_b": pa.array(list(range(100, 100 + n_rows)), type=pa.int64()),
+            "sep_arcsec": pa.array([0.1] * n_rows, type=pa.float64()),
+            hp: pa.array([npix] * n_rows, type=pa.int64()),
+        }),
+        tile_dir / f"Npix={npix}.parquet",
+    )
+    (root / "crossmatch_info.json").write_text(json.dumps(info))
+    return root
+
+
+class TestDescribeCrossmatch:
+    def test_list_and_detail_sky(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.io.crossmatch import cli_describe_crossmatch
+
+        lake = tmp_path / "lake"
+        _write_minimal_xm_tree(
+            lake,
+            "A_x_B__r1.0",
+            {
+                "catalog_name": "A_x_B__r1.0",
+                "match_mode": "sky",
+                "survey_a": "A",
+                "survey_b": "B",
+                "match_radius_arcsec": 1.0,
+                "match_backend": "astropy",
+                "hats_order": 5,
+                "total_rows": 3,
+                "n_tiles": 1,
+            },
+        )
+        runner = CliRunner()
+        listed = runner.invoke(cli_describe_crossmatch, [str(lake)])
+        assert listed.exit_code == 0, listed.output
+        assert "A_x_B__r1.0" in listed.output
+        assert "r=1.0" in listed.output
+
+        detail = runner.invoke(
+            cli_describe_crossmatch, ["A", "B", str(lake), "--radius-arcsec", "1.0"]
+        )
+        assert detail.exit_code == 0, detail.output
+        assert "match_mode:        sky" in detail.output
+        assert "source_id_a" in detail.output
+
+        by_name = runner.invoke(
+            cli_describe_crossmatch, ["A_x_B__r1.0", str(lake), "--json"]
+        )
+        assert by_name.exit_code == 0, by_name.output
+        payload = json.loads(by_name.output)
+        assert payload["survey_a"] == "A"
+        assert payload["total_rows"] == 3
+        assert "columns" in payload
+
+    def test_column_tree_and_ambiguity(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.io.crossmatch import cli_describe_crossmatch
+
+        lake = tmp_path / "lake"
+        _write_minimal_xm_tree(
+            lake,
+            "A_x_B__r1.0",
+            {
+                "match_mode": "sky",
+                "survey_a": "A",
+                "survey_b": "B",
+                "match_radius_arcsec": 1.0,
+                "hats_order": 5,
+                "total_rows": 3,
+                "n_tiles": 1,
+            },
+        )
+        _write_minimal_xm_tree(
+            lake,
+            "A_x_B__col_KEY__KEY",
+            {
+                "match_mode": "column",
+                "survey_a": "A",
+                "survey_b": "B",
+                "match_col_a": "KEY",
+                "match_col_b": "KEY",
+                "match_radius_arcsec": None,
+                "hats_order": 5,
+                "total_rows": 3,
+                "n_tiles": 1,
+            },
+        )
+        runner = CliRunner()
+        amb = runner.invoke(cli_describe_crossmatch, ["A", "B", str(lake)])
+        assert amb.exit_code != 0
+        assert "Multiple" in amb.output
+
+        col = runner.invoke(
+            cli_describe_crossmatch,
+            [
+                "A", "B", str(lake),
+                "--match-mode", "column",
+                "--match-col-a", "KEY",
+                "--match-col-b", "KEY",
+                "--json",
+            ],
+        )
+        assert col.exit_code == 0, col.output
+        payload = json.loads(col.output)
+        assert payload["match_mode"] == "column"
+        assert payload["match_col_a"] == "KEY"
+
+    def test_recount(self, tmp_path: Path) -> None:
+        from data_lake.io.crossmatch import describe_crossmatch_tree
+
+        lake = tmp_path / "lake"
+        root = _write_minimal_xm_tree(
+            lake,
+            "A_x_B__r2.0",
+            {
+                "match_mode": "sky",
+                "survey_a": "A",
+                "survey_b": "B",
+                "match_radius_arcsec": 2.0,
+                "total_rows": 999,  # stale sidecar
+                "n_tiles": 99,
+            },
+            n_rows=3,
+        )
+        desc = describe_crossmatch_tree(root, recount=True)
+        assert desc["disk_rows"] == 3
+        assert desc["disk_tiles"] == 1
+        assert desc["total_rows"] == 3

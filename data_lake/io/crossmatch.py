@@ -45,7 +45,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Any, Iterable, Literal, Sequence
 
 import healpy as hp
 import numpy as np
@@ -384,6 +384,291 @@ def resolve_column_crossmatch_root(
             f"{crossmatch_modality_root(lake_root)}"
         )
     return root
+
+
+# ---------------------------------------------------------------------------
+# Describe / inventory helpers (dl-describe-crossmatch)
+# ---------------------------------------------------------------------------
+
+
+def load_crossmatch_info(xm_root: Path | str) -> dict[str, Any]:
+    """Load ``crossmatch_info.json`` from a tree root (empty dict if missing)."""
+    info_path = Path(xm_root) / CROSSMATCH_INFO_FILENAME
+    if not info_path.is_file():
+        return {}
+    try:
+        with open(info_path) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sample_crossmatch_columns(xm_root: Path) -> list[str] | None:
+    """Return Parquet column names from the first ``Npix=*.parquet`` tile, if any."""
+    for path in sorted(xm_root.rglob("Npix=*.parquet")):
+        try:
+            return list(pq.read_schema(str(path)).names)
+        except Exception:
+            continue
+    return None
+
+
+def describe_crossmatch_tree(
+    xm_root: Path | str,
+    *,
+    recount: bool = False,
+    include_columns: bool = True,
+) -> dict[str, Any]:
+    """Build a structured description of one crossmatch tree.
+
+    Combines dirname parsing, ``crossmatch_info.json``, and optional on-disk
+    Parquet footer recount / sample schema.
+    """
+    root = Path(xm_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Crossmatch tree not found: {root}")
+
+    info = load_crossmatch_info(root)
+    sky = parse_crossmatch_dirname(root.name)
+    col = parse_column_crossmatch_dirname(root.name)
+
+    if sky is not None:
+        survey_a, survey_b, radius = sky
+        match_mode = str(info.get("match_mode") or "sky")
+        match_radius = info.get("match_radius_arcsec", radius)
+        match_col_a = info.get("match_col_a")
+        match_col_b = info.get("match_col_b")
+    elif col is not None:
+        survey_a, survey_b, match_col_a, match_col_b = col
+        match_mode = str(info.get("match_mode") or "column")
+        match_radius = info.get("match_radius_arcsec")
+    else:
+        survey_a = str(info.get("survey_a") or "")
+        survey_b = str(info.get("survey_b") or "")
+        match_mode = str(info.get("match_mode") or "unknown")
+        match_radius = info.get("match_radius_arcsec")
+        match_col_a = info.get("match_col_a")
+        match_col_b = info.get("match_col_b")
+
+    disk_rows: int | None = None
+    disk_tiles: int | None = None
+    if recount:
+        disk_rows, disk_tiles = recount_crossmatch_tree(root)
+
+    total_rows = disk_rows if disk_rows is not None else info.get("total_rows", info.get("n_match_rows"))
+    n_tiles = disk_tiles if disk_tiles is not None else info.get("n_tiles")
+
+    desc: dict[str, Any] = {
+        "name": root.name,
+        "path": str(root),
+        "match_mode": match_mode,
+        "survey_a": info.get("survey_a", survey_a),
+        "survey_b": info.get("survey_b", survey_b),
+        "match_radius_arcsec": match_radius,
+        "match_col_a": match_col_a if match_mode == "column" else info.get("match_col_a"),
+        "match_col_b": match_col_b if match_mode == "column" else info.get("match_col_b"),
+        "match_backend": info.get("match_backend"),
+        "gpu_id": info.get("gpu_id"),
+        "hats_order": info.get("hats_order"),
+        "survey_a_norder": info.get("survey_a_norder"),
+        "survey_b_norder": info.get("survey_b_norder"),
+        "survey_a_ra_column": info.get("survey_a_ra_column"),
+        "survey_a_dec_column": info.get("survey_a_dec_column"),
+        "survey_b_ra_column": info.get("survey_b_ra_column"),
+        "survey_b_dec_column": info.get("survey_b_dec_column"),
+        "total_rows": total_rows,
+        "n_tiles": n_tiles,
+        "schema_version": info.get("schema_version"),
+        "created_utc": info.get("created_utc"),
+        "info": info,
+    }
+    if disk_rows is not None:
+        desc["disk_rows"] = disk_rows
+        desc["disk_tiles"] = disk_tiles
+    if include_columns:
+        cols = _sample_crossmatch_columns(root)
+        if cols is not None:
+            desc["columns"] = cols
+    return desc
+
+
+def list_crossmatch_descriptions(
+    lake_root: Path | str,
+    survey_a: str | None = None,
+    survey_b: str | None = None,
+    *,
+    recount: bool = False,
+    include_columns: bool = False,
+) -> list[dict[str, Any]]:
+    """Describe every sky and column crossmatch tree under ``crossmatch/``."""
+    lake_root = Path(lake_root)
+    out: list[dict[str, Any]] = []
+    for _a, _b, _r, path in find_crossmatch_roots(lake_root, survey_a, survey_b):
+        out.append(
+            describe_crossmatch_tree(
+                path, recount=recount, include_columns=include_columns
+            )
+        )
+    for _a, _b, _ca, _cb, path in find_column_crossmatch_roots(
+        lake_root, survey_a, survey_b
+    ):
+        out.append(
+            describe_crossmatch_tree(
+                path, recount=recount, include_columns=include_columns
+            )
+        )
+    out.sort(key=lambda d: str(d.get("name") or ""))
+    return out
+
+
+def resolve_crossmatch_describe_target(
+    lake_root: Path | str,
+    *,
+    name: str | None = None,
+    survey_a: str | None = None,
+    survey_b: str | None = None,
+    radius_arcsec: float | None = None,
+    match_mode: str | None = None,
+    match_col_a: str | None = None,
+    match_col_b: str | None = None,
+) -> Path:
+    """Resolve a single crossmatch tree path for describe.
+
+    Accepts a tree *name* (dirname under ``crossmatch/``) or a survey pair with
+    sky radius / column identity. Raises ``FileNotFoundError`` / ``ValueError``
+    when the target is missing or ambiguous.
+    """
+    lake_root = Path(lake_root)
+    if name:
+        root = crossmatch_modality_root(lake_root) / name
+        if not root.is_dir():
+            raise FileNotFoundError(
+                f"No crossmatch tree named {name!r} under {crossmatch_modality_root(lake_root)}"
+            )
+        return root
+
+    if not survey_a or not survey_b:
+        raise ValueError("Provide a tree --name or SURVEY_A SURVEY_B")
+
+    mode = match_mode
+    if mode is None:
+        if match_col_a or match_col_b:
+            mode = "column"
+        elif radius_arcsec is not None:
+            mode = "sky"
+        else:
+            sky = find_crossmatch_roots(lake_root, survey_a, survey_b)
+            col = find_column_crossmatch_roots(lake_root, survey_a, survey_b)
+            if len(sky) + len(col) == 0:
+                raise FileNotFoundError(
+                    f"No crossmatch tree found for {survey_a}_x_{survey_b} under "
+                    f"{crossmatch_modality_root(lake_root)}"
+                )
+            if len(sky) + len(col) > 1:
+                labels: list[str] = [
+                    f"r={format_match_radius(r)}" for _, _, r, _ in sky
+                ]
+                labels.extend(f"col:{ca}:{cb}" for _, _, ca, cb, _ in col)
+                raise ValueError(
+                    f"Multiple crossmatch trees for {survey_a}_x_{survey_b} "
+                    f"({', '.join(labels)}); pass --radius-arcsec or "
+                    "--match-mode column --match-col-a/--match-col-b."
+                )
+            return sky[0][3] if sky else col[0][4]
+
+    if mode == "column":
+        if not match_col_a or not match_col_b:
+            raise ValueError(
+                "Column mode requires --match-col-a and --match-col-b"
+            )
+        return resolve_column_crossmatch_root(
+            lake_root, survey_a, survey_b, match_col_a, match_col_b
+        )
+
+    return resolve_crossmatch_root(lake_root, survey_a, survey_b, radius_arcsec)
+
+
+def format_crossmatch_list(descriptions: list[dict[str, Any]]) -> str:
+    """Human-readable table for ``dl-describe-crossmatch`` list mode."""
+    if not descriptions:
+        return "No crossmatch trees found."
+    lines = [
+        f"{'name':<52} {'mode':<7} {'detail':<22} {'rows':>12} {'tiles':>6}",
+        "-" * 104,
+    ]
+    for d in descriptions:
+        mode = str(d.get("match_mode") or "?")
+        if mode == "column":
+            detail = f"col:{d.get('match_col_a')}:{d.get('match_col_b')}"
+        elif d.get("match_radius_arcsec") is not None:
+            detail = f"r={d.get('match_radius_arcsec')}\""
+        else:
+            detail = "—"
+        rows = d.get("total_rows")
+        tiles = d.get("n_tiles")
+        rows_s = f"{int(rows):,}" if rows is not None else "—"
+        tiles_s = f"{int(tiles):,}" if tiles is not None else "—"
+        lines.append(
+            f"{str(d.get('name') or ''):<52} {mode:<7} {detail:<22} {rows_s:>12} {tiles_s:>6}"
+        )
+    lines.append(f"\n{len(descriptions)} crossmatch tree(s)")
+    return "\n".join(lines)
+
+
+def format_crossmatch_report(desc: dict[str, Any]) -> str:
+    """Human-readable detail report for one crossmatch tree."""
+    lines = [
+        f"Crossmatch: {desc.get('name')}",
+        f"  path:              {desc.get('path')}",
+        f"  match_mode:        {desc.get('match_mode')}",
+        f"  survey_a:          {desc.get('survey_a')}",
+        f"  survey_b:          {desc.get('survey_b')}",
+    ]
+    mode = desc.get("match_mode")
+    if mode == "column":
+        lines.append(f"  match_col_a:       {desc.get('match_col_a')}")
+        lines.append(f"  match_col_b:       {desc.get('match_col_b')}")
+    else:
+        lines.append(f"  match_radius:      {desc.get('match_radius_arcsec')} arcsec")
+        if desc.get("match_backend") is not None:
+            lines.append(f"  match_backend:     {desc.get('match_backend')}")
+        if desc.get("gpu_id") is not None:
+            lines.append(f"  gpu_id:            {desc.get('gpu_id')}")
+        if desc.get("survey_a_ra_column"):
+            lines.append(
+                f"  sky_a:             {desc.get('survey_a_ra_column')}, "
+                f"{desc.get('survey_a_dec_column')}"
+            )
+        if desc.get("survey_b_ra_column"):
+            lines.append(
+                f"  sky_b:             {desc.get('survey_b_ra_column')}, "
+                f"{desc.get('survey_b_dec_column')}"
+            )
+    lines.append(f"  hats_order (A):    {desc.get('hats_order')}")
+    if desc.get("survey_a_norder") is not None:
+        lines.append(f"  survey_a_norder:   {desc.get('survey_a_norder')}")
+    if desc.get("survey_b_norder") is not None:
+        lines.append(f"  survey_b_norder:   {desc.get('survey_b_norder')}")
+    rows = desc.get("total_rows")
+    tiles = desc.get("n_tiles")
+    lines.append(f"  total_rows:        {rows:,}" if rows is not None else "  total_rows:        —")
+    lines.append(f"  n_tiles:           {tiles:,}" if tiles is not None else "  n_tiles:           —")
+    if desc.get("disk_rows") is not None and desc.get("info"):
+        info_rows = desc["info"].get("total_rows", desc["info"].get("n_match_rows"))
+        if info_rows is not None and int(info_rows) != int(desc["disk_rows"]):
+            lines.append(
+                f"  info sidecar rows: {int(info_rows):,} "
+                f"(differs from on-disk recount)"
+            )
+    if desc.get("created_utc"):
+        lines.append(f"  created_utc:       {desc.get('created_utc')}")
+    if desc.get("schema_version"):
+        lines.append(f"  schema_version:    {desc.get('schema_version')}")
+    cols = desc.get("columns")
+    if cols:
+        lines.append(f"  columns:           {', '.join(cols)}")
+    return "\n".join(lines)
 
 
 def _sky_columns_from_catalog_info(catalog_root: Path) -> tuple[str, str, int]:
@@ -2540,5 +2825,134 @@ try:
         msg += ")"
         click.echo(msg)
 
+    @click.command("dl-describe-crossmatch")
+    @click.argument("survey_a", required=False)
+    @click.argument("survey_b", required=False)
+    @click.argument("output_root", type=click.Path(path_type=Path), required=False)
+    @config_option
+    @click.option(
+        "--name",
+        "tree_name",
+        default=None,
+        help="Tree dirname under crossmatch/ (e.g. A_x_B__r1.0 or A_x_B__col_ID__ID).",
+    )
+    @click.option(
+        "--radius-arcsec",
+        type=float,
+        default=None,
+        help="Disambiguate a sky tree when multiple radii exist for the pair.",
+    )
+    @click.option(
+        "--match-mode",
+        type=click.Choice(["sky", "column"], case_sensitive=False),
+        default=None,
+        help="Select sky vs column tree when both exist for the pair.",
+    )
+    @click.option("--match-col-a", default=None, help="Column-equality key on survey A.")
+    @click.option("--match-col-b", default=None, help="Column-equality key on survey B.")
+    @click.option(
+        "--recount",
+        is_flag=True,
+        help="Recount total_rows / n_tiles from Parquet footers (slower, authoritative).",
+    )
+    @click.option("--json", "as_json", is_flag=True, help="Emit description as JSON.")
+    def cli_describe_crossmatch(
+        survey_a: str | None,
+        survey_b: str | None,
+        output_root: Path | None,
+        config_path: Path | None,
+        tree_name: str | None,
+        radius_arcsec: float | None,
+        match_mode: str | None,
+        match_col_a: str | None,
+        match_col_b: str | None,
+        recount: bool,
+        as_json: bool,
+    ) -> None:
+        """List or describe crossmatch trees (sky and column).
+
+        With no survey args: list every tree under ``crossmatch/``.
+        With SURVEY_A SURVEY_B (or ``--name`` / a tree dirname): show one tree.
+        """
+        cfg = load_optional_config(config_path)
+
+        def _is_tree_dirname(token: str) -> bool:
+            return (
+                parse_crossmatch_dirname(token) is not None
+                or parse_column_crossmatch_dirname(token) is not None
+            )
+
+        def _looks_like_lake(token: str) -> bool:
+            p = Path(token)
+            return p.is_dir() and (p / "crossmatch").is_dir()
+
+        a, b, lake_arg = survey_a, survey_b, output_root
+
+        if tree_name is None and a and _is_tree_dirname(a):
+            tree_name = a
+            a = None
+            if b is not None and lake_arg is None:
+                lake_arg = Path(b)
+                b = None
+        elif tree_name is not None and a is not None and b is None and lake_arg is None:
+            # --name TREE LAKE_ROOT → Click binds LAKE to survey_a
+            lake_arg = Path(a)
+            a = None
+        elif (
+            tree_name is None
+            and a
+            and b is None
+            and lake_arg is None
+            and _looks_like_lake(a)
+        ):
+            lake_arg = Path(a)
+            a = None
+
+        lake = require_output_root(lake_arg, cfg, kind="catalogs")
+
+        list_mode = tree_name is None and not a and not b
+        if list_mode:
+            descs = list_crossmatch_descriptions(
+                lake,
+                recount=recount,
+                include_columns=False,
+            )
+            if as_json:
+                click.echo(json.dumps({"crossmatches": descs}, indent=2, default=str))
+            else:
+                click.echo(format_crossmatch_list(descs))
+            return
+
+        if tree_name is None and a and not b:
+            raise click.UsageError(
+                "Provide SURVEY_A SURVEY_B, a tree dirname / --name, "
+                "or omit surveys to list all trees."
+            )
+
+        try:
+            target = resolve_crossmatch_describe_target(
+                lake,
+                name=tree_name,
+                survey_a=a,
+                survey_b=b,
+                radius_arcsec=radius_arcsec,
+                match_mode=match_mode.lower() if match_mode else None,
+                match_col_a=match_col_a,
+                match_col_b=match_col_b,
+            )
+        except FileNotFoundError as exc:
+            raise click.ClickException(str(exc)) from exc
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        desc = describe_crossmatch_tree(
+            target, recount=recount, include_columns=True
+        )
+        if as_json:
+            click.echo(json.dumps(desc, indent=2, default=str))
+        else:
+            click.echo(format_crossmatch_report(desc))
+
 except ImportError:
     cli = None  # type: ignore[misc, assignment]
+    cli_describe_crossmatch = None  # type: ignore[misc, assignment]

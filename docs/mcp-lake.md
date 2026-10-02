@@ -45,7 +45,8 @@ Restart Cursor after changing MCP config.
 |------|---------|
 | `discover_region` | Survey × modality overlap for a region (`from_area`, cone, bbox, npix, moc); rounded counts or `--count` exact |
 | `list_areas` / `get_area` | List or load `areas/<id>.json` (region, crossmatch_plan, gather); plans are also editable via [`dl-area`](discovery/areas-cli.md) |
-| `list_crossmatches` | Crossmatch trees + `crossmatch_info.json` metadata |
+| `list_crossmatches` | Crossmatch trees (sky + column) with metadata |
+| `describe_crossmatch` | Detail for one crossmatch tree (`dl-describe-crossmatch --json`) |
 | `describe_product` | Product catalog provenance and contributing crossmatch trees |
 | `build_query` | DuckDB SQL from a master association file (never executes) |
 | `validate_survey` | Sample ingest validation (`catalog` / `spectra` / `cutout`) |
