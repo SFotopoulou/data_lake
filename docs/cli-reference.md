@@ -83,6 +83,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | Command | Purpose |
 |---------|---------|
 | `dl-plot-source` | Two-panel SED + 1D spectrum figure for one source (`--id`, `--product`, `--spectra-survey`, `-o`); requires `--extra viz` ([docs](plotting.md)) |
+| `dl-plot-spectrum` | 1D spectrum only for one source (`SURVEY --id`, `-o`); requires `--extra viz` ([docs](plotting.md)) |
 
 **Agents (MCP)**
 

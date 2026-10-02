@@ -5,7 +5,12 @@
 - **Top panel** — spectral energy distribution (SED): AB magnitudes from a homogenized product catalog, plotted at each band's effective wavelength with error bars.  Optional semi-transparent transmission-curve shading when ECSV curve files are registered.
 - **Bottom panel** — 1D spectrum: observed-frame flux from the Zarr spectrum store, with 1σ uncertainty shaded.
 
-Both panels share a logarithmic wavelength axis in micron.
+`dl-plot-spectrum` is the spectrum-only helper: given a survey and lake
+``_source_id``, it writes a single-panel flux vs wavelength figure (no product
+catalog required).
+
+Both panels / figures use wavelength in micron (log axis by default for
+``dl-plot-spectrum``).
 
 ## Install the viz extra
 
@@ -22,6 +27,10 @@ uv sync --extra viz
 ```bash
 export DATA_LAKE_CONFIG=/home/user/como/lake_config.toml
 
+# Spectrum only (survey + _source_id)
+dl-plot-spectrum DESI_DR1 --id 1234567890 -o desi_123.png
+
+# Two-panel SED + spectrum (needs a homogenized product)
 dl-plot-source \
     --id 1234567890 \
     --product EDFF_cone_joined \
@@ -29,7 +38,7 @@ dl-plot-source \
     -o source_1234567890.png
 ```
 
-This saves `source_1234567890.png` (or prints the path to stdout).
+This saves the figure (or prints the path to stdout).
 
 ## Source ID semantics
 
@@ -48,9 +57,28 @@ Or from the CLI:
 ```bash
 dl-extract-catalog --survey SDSS_DR17 -c _source_id -c SPECOBJID \
     --where "SPECOBJID = 123" -o /tmp/lookup.csv
+
+# Peek a few IDs from the spectrum store
+dl-preview-sources DESI_DR1 --modality spectra -n 5
 ```
 
-## All options
+## Spectrum-only options (`dl-plot-spectrum`)
+
+```
+dl-plot-spectrum SURVEY [LAKE_ROOT] --id INTEGER [OPTIONS]
+
+Options:
+  --id INTEGER             Lake _source_id (required)
+  -o, --output PATH        Output file: .png (default), .pdf, .svg
+  --dpi INTEGER            DPI for raster output [default: 150]
+  --title TEXT             Figure title override
+  --rest-frame             Convert spectrum to rest-frame wavelength
+  --linear-x               Linear wavelength axis (default: log)
+  --config PATH            Path to lake_config.toml (or $DATA_LAKE_CONFIG)
+  -q / -v                  Quiet / verbose logging
+```
+
+## SED + spectrum options (`dl-plot-source`)
 
 ```
 dl-plot-source [OPTIONS]

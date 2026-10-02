@@ -92,6 +92,7 @@ dl-generate-cutout-fits = "data_lake.cutouts.generate_fits:cli"
 dl-mcp-docs = "data_lake.mcp_server:main"
 dl-mcp-lake = "data_lake.mcp_lake_server:main"
 dl-plot-source = "data_lake.plot.plot_cli:cli"
+dl-plot-spectrum = "data_lake.plot.spectrum_cli:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]

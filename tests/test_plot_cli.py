@@ -193,3 +193,39 @@ def test_dl_plot_source_requires_lake_root():
         "--spectra-survey", "SDSS",
     ])
     assert result.exit_code != 0
+
+
+def test_dl_plot_spectrum_writes_png(tmp_path):
+    import matplotlib
+    matplotlib.use("Agg")
+
+    from click.testing import CliRunner
+
+    from data_lake.plot.spectrum_cli import cli
+
+    source_id = 99
+    survey = "SPEC_ONLY"
+    npix = 12
+    _write_minimal_spectrum(tmp_path, survey, source_id, npix)
+    out = tmp_path / "spec.png"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [survey, str(tmp_path), "--id", str(source_id), "-o", str(out), "-q"],
+    )
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    assert out.stat().st_size > 0
+    assert str(out) in result.output
+
+
+def test_dl_plot_spectrum_missing_survey(tmp_path):
+    from click.testing import CliRunner
+
+    from data_lake.plot.spectrum_cli import cli
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["NOSPEC", str(tmp_path), "--id", "1"])
+    assert result.exit_code != 0
+    assert "NOSPEC" in result.output or "not found" in result.output.lower()

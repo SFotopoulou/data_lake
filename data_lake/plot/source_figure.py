@@ -236,3 +236,89 @@ def plot_source_sed_spectrum(
     fig.suptitle(suptitle, fontsize=11, y=1.01)
 
     return fig
+
+
+def plot_spectrum(
+    spectrum: Spectrum,
+    *,
+    title: str | None = None,
+    survey_name: str | None = None,
+    figsize: tuple[float, float] = (10, 4),
+    dpi: int = 150,
+    rest_frame: bool = False,
+    log_x: bool = True,
+    extra_kwargs: dict[str, Any] | None = None,
+):
+    """Render a single-panel 1D spectrum figure.
+
+    Parameters
+    ----------
+    spectrum:
+        Spectrum from ``SpectrumAccessor.get_spectrum``.
+    title:
+        Figure title.  Defaults to ``"Source <source_id>"`` (plus survey / z).
+    survey_name:
+        Optional survey label included in the default title.
+    figsize / dpi:
+        Matplotlib figure size and DPI.
+    rest_frame:
+        If ``True``, convert wavelength to rest-frame using ``meta["z"]``.
+    log_x:
+        Use a logarithmic wavelength axis (default ``True``).
+    extra_kwargs:
+        Passed through to ``plt.subplots``.
+    """
+    _require_matplotlib()
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi, **(extra_kwargs or {}))
+
+    if rest_frame:
+        wave_um = _wave_angstrom_to_um(spectrum.rest_frame_wavelength())
+        xlabel = r"Rest-frame wavelength ($\mu$m)"
+    else:
+        wave_um = _wave_angstrom_to_um(spectrum.wavelength)
+        xlabel = r"Observed wavelength ($\mu$m)"
+
+    good = spectrum.good
+    flux = spectrum.flux.copy().astype(np.float64)
+    err1d = spectrum.err.astype(np.float64)
+
+    ax.plot(wave_um, flux, color="0.7", linewidth=0.5, zorder=1)
+    if good.any():
+        ax.plot(
+            wave_um[good], flux[good],
+            color="#1f77b4", linewidth=0.8, zorder=2, label="flux",
+        )
+        ax.fill_between(
+            wave_um[good],
+            (flux - err1d)[good],
+            (flux + err1d)[good],
+            color="#1f77b4", alpha=0.2, linewidth=0, label=r"$\pm1\sigma$",
+        )
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Flux (native units)")
+    ax.legend(fontsize="small", loc="best", framealpha=0.7)
+    if log_x:
+        ax.set_xscale("log")
+    if wave_um.size:
+        ax.set_xlim(float(wave_um.min()) * 0.98, float(wave_um.max()) * 1.02)
+
+    if title is None:
+        title = f"Source {spectrum.source_id}"
+        if survey_name:
+            title = f"{survey_name} — {title}"
+        z = spectrum.meta.get("z")
+        instr = str(spectrum.meta.get("instr", "") or "").strip()
+        bits: list[str] = []
+        if z is not None and not np.isnan(float(z)) and float(z) != 0.0:
+            bits.append(f"z = {float(z):.4f}")
+        if instr:
+            bits.append(instr)
+        if bits:
+            title += "  —  " + ", ".join(bits)
+    fig.suptitle(title, fontsize=11)
+
+    fig.tight_layout()
+    return fig
