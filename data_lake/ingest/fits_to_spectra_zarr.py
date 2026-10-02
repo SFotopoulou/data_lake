@@ -23,6 +23,13 @@ The DESI B/R/Z arms overlap in wavelength (~5772–5800 Å and ~7570–7770 Å).
 Naive concatenation (the previous implementation) produced duplicated wavelength
 regions and ignored IVAR-weighting at the overlaps. ``coadd_cameras`` handles
 both correctly and is what ``desispec``'s own pipeline uses. If ``desispec``
+
+``TARGETID`` alone is **not** unique across DESI DR1 (the same target can appear
+under different ``SURVEY`` / ``PROGRAM``).  Coadd ingest defaults to a composite
+link key ``TARGETID|SURVEY|PROGRAM``: ``TARGETID`` from the fibermap, ``SURVEY``
+and ``PROGRAM`` from the PRIMARY (HDU 0) header with whitespace stripped.  Catalog
+ingest must use the same ``--link-id-col TARGETID,SURVEY,PROGRAM``.
+
 is not installed and a DESI coadd file is encountered, an ``ImportError`` is
 raised with an actionable install hint.
 
@@ -908,6 +915,98 @@ def _desi_read_spectra_skip_hdus(*, with_resolution: bool) -> set[str]:
     return skip
 
 
+_DESI_DEFAULT_LINK_ID_PARTS = ("TARGETID", "SURVEY", "PROGRAM")
+
+
+def _desi_primary_header_text(path: Path, *keys: str) -> str:
+    """Return the first non-empty PRIMARY (HDU 0) keyword value, whitespace-stripped."""
+    from astropy.io import fits
+
+    header = fits.getheader(path, 0)
+    for key in keys:
+        if key not in header:
+            continue
+        val = header[key]
+        if val in ("", None):
+            continue
+        text = str(val).strip()
+        if text:
+            return text
+    return ""
+
+
+def _desi_link_parts(link_id_col: str | None) -> list[str]:
+    """Resolve DESI link-id parts; default is TARGETID + SURVEY + PROGRAM."""
+    from data_lake.ingest.fits_to_parquet import parse_link_id_column_spec
+
+    if not link_id_col or not str(link_id_col).strip():
+        return list(_DESI_DEFAULT_LINK_ID_PARTS)
+    return parse_link_id_column_spec(link_id_col)
+
+
+def _desi_resolve_source_id(
+    row: Any,
+    fmap_colnames: Sequence[str],
+    *,
+    survey: str,
+    program: str,
+    link_id_col: str | None,
+    context: str,
+) -> int:
+    """Build ``_source_id`` for one DESI fibermap row.
+
+    Default (and recommended) key is the composite
+    ``TARGETID|SURVEY|PROGRAM``:
+
+    * ``TARGETID`` — fibermap column (verified present)
+    * ``SURVEY`` / ``PROGRAM`` — PRIMARY header values (already stripped)
+
+    A single-column ``--link-id-col TARGETID`` still reads only that fibermap
+    column (legacy native-int path).  Comma-separated specs may mix fibermap
+    columns with ``SURVEY`` / ``PROGRAM`` (filled from the header).
+    """
+    from data_lake.ingest.fits_to_parquet import (
+        composite_link_label,
+        normalize_object_id,
+    )
+
+    parts = _desi_link_parts(link_id_col)
+    if len(parts) == 1 and parts[0].upper() not in ("SURVEY", "PROGRAM"):
+        sid_key = parts[0]
+        if sid_key not in fmap_colnames:
+            raise KeyError(
+                f"{context}: fibermap column {sid_key!r} not found for object ID. "
+                f"Available: {list(fmap_colnames)[:30]}"
+            )
+        return normalize_object_id(row[sid_key])
+
+    values: list[object] = []
+    for part in parts:
+        key = part.upper()
+        if key == "SURVEY":
+            if not survey:
+                raise ValueError(
+                    f"{context}: PRIMARY header keyword SURVEY is missing or blank; "
+                    "required for DESI composite link id TARGETID|SURVEY|PROGRAM."
+                )
+            values.append(survey)
+        elif key == "PROGRAM":
+            if not program:
+                raise ValueError(
+                    f"{context}: PRIMARY header keyword PROGRAM is missing or blank; "
+                    "required for DESI composite link id TARGETID|SURVEY|PROGRAM."
+                )
+            values.append(program)
+        else:
+            if part not in fmap_colnames:
+                raise KeyError(
+                    f"{context}: fibermap column {part!r} not found for composite "
+                    f"link id. Available: {list(fmap_colnames)[:30]}"
+                )
+            values.append(row[part])
+    return normalize_object_id(composite_link_label(*values))
+
+
 def _read_desi_with_desispec(
     path: Path,
     with_resolution: bool = False,
@@ -922,6 +1021,11 @@ def _read_desi_with_desispec(
     approach (np.concatenate of arms) produced duplicated wavelength regions at
     the B/R and R/Z overlaps.
 
+    Object identity defaults to the composite ``TARGETID|SURVEY|PROGRAM`` where
+    ``TARGETID`` comes from the fibermap and ``SURVEY`` / ``PROGRAM`` come from
+    the PRIMARY (HDU 0) header (whitespace stripped).  Pass
+    ``link_id_col="TARGETID"`` for the legacy native-int path.
+
     Parameters
     ----------
     path:
@@ -929,6 +1033,8 @@ def _read_desi_with_desispec(
     with_resolution:
         When True, extract the banded resolution matrix ``(n_diag, N_pix)``
         per source from ``coadded.R["brz"]``.
+    link_id_col:
+        Optional link-id spec.  Default ``None`` → ``TARGETID,SURVEY,PROGRAM``.
 
     Returns
     -------
@@ -938,6 +1044,10 @@ def _read_desi_with_desispec(
         ``resolution_offsets`` is a (n_diag,) int array or None.
     """
     desispec = _import_desispec()
+
+    # PRIMARY header: SURVEY / PROGRAM for composite link ids (strip padding).
+    survey = _desi_primary_header_text(path, "SURVEY")
+    program = _desi_primary_header_text(path, "PROGRAM")
 
     # ``single=True``: float32 from disk (matches Zarr).  ``skip_hdus`` avoids
     # reading EXP_FIBERMAP / SCORES / etc. — often a large fraction of coadd FITS.
@@ -999,15 +1109,14 @@ def _read_desi_with_desispec(
             row_index=i,
             context=str(path),
         )
-        sid_key = link_id_col or "TARGETID"
-        if sid_key not in fmap.colnames:
-            raise KeyError(
-                f"Fibermap column {sid_key!r} not found for object ID. "
-                f"Available: {list(fmap.colnames)[:30]}"
-            )
-        from data_lake.ingest.fits_to_parquet import normalize_object_id
-
-        source_id = normalize_object_id(row[sid_key])
+        source_id = _desi_resolve_source_id(
+            row,
+            list(fmap.colnames),
+            survey=survey,
+            program=program,
+            link_id_col=link_id_col,
+            context=str(path),
+        )
         meta = _spectrum_sky_meta(
             path,
             ra,
@@ -3391,8 +3500,10 @@ def ingest_spectra_from_fits(
         Header keywords for sky coordinates (generic format; SDSS plug RA/Dec
         fallbacks when the named keys are absent).
     link_id_col:
-        Header keyword or DESI fibermap column for object ID (e.g. ``TARGETID``).
-        Must match the catalog ID column.  DESI coadds default to ``TARGETID``.
+        Header keyword or DESI fibermap / composite link spec.  DESI coadds
+        default to ``TARGETID|SURVEY|PROGRAM`` (fibermap ``TARGETID`` + PRIMARY
+        ``SURVEY`` / ``PROGRAM``).  Pass ``TARGETID`` alone for the legacy
+        native-int path.  Must match the catalog ``--link-id-col``.
     norder:
         HEALPix partitioning order.
     wavelength_mode:
@@ -3849,8 +3960,11 @@ try:
         default=None,
         help=(
             "Object ID for SDSS/DESI/generic/spPlate ingest: FITS header keyword "
-            "(generic/SDSS) or fibermap column (DESI). Ignored by format-specific "
-            "readers (2df, 6df, OzDES, …) which resolve IDs internally."
+            "(generic/SDSS) or DESI link spec.  DESI coadds default to composite "
+            "TARGETID,SURVEY,PROGRAM (fibermap TARGETID + PRIMARY SURVEY/PROGRAM, "
+            "stripped); pass TARGETID alone for the legacy native-int path. "
+            "Ignored by format-specific readers (2df, 6df, OzDES, …) which resolve "
+            "IDs internally."
         ),
     )
     @click.option("--norder", default=None, type=int,

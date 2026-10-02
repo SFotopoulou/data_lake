@@ -8,9 +8,13 @@
 ```bash
 # Single file (debug / smoke-testing).
 # With $DATA_LAKE_CONFIG set, OUTPUT_ROOT is taken from the config.
-# DESI coadds: object ID comes from fibermap TARGETID (default); override with --link-id-col.
-dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits --survey desi_edr \
-  --link-id-col TARGETID
+# DESI coadds: object ID defaults to TARGETID|SURVEY|PROGRAM
+# (fibermap TARGETID + PRIMARY SURVEY/PROGRAM, whitespace stripped).
+# Catalog must use the same --link-id-col. Legacy native TARGETID: pass it explicitly.
+dl-ingest-spectra coadd-1-b0-0000p005-thru20210801.fits --survey desi_dr1
+# Catalog side (match spectrum composite):
+# dl-ingest-catalog zall-pix-iron.fits --survey desi_dr1 \
+#   --ra-col TARGET_RA --dec-col TARGET_DEC --link-id-col TARGETID,SURVEY,PROGRAM --streaming
 
 # With resolution matrix (needed for redshift fitting / SPS / kinematic measurements)
 # Storage cost: ~3× flux+ivar footprint (~170–200 GB per million coadded BRZ spectra)
@@ -34,7 +38,7 @@ Quick index of all supported `--fmt` values, the **catalog** ingest flag require
 
 | `--fmt` | Catalog `--link-id-col` | Spectrum link source | Spectrum sky source | Example / note |
 |---------|------------------------|----------------------|---------------------|----------------|
-| `desi_coadd` | `TARGETID` (or default) | Fibermap `TARGETID` | Fibermap `TARGET_RA` / `TARGET_DEC` (fallbacks: `RA_TARGET`, `FIBER_RA`; `DEC_TARGET`, `FIBER_DEC`) | Auto-detected from DESI coadd layout |
+| `desi_coadd` | `TARGETID,SURVEY,PROGRAM` (default) | Fibermap `TARGETID` + PRIMARY `SURVEY`/`PROGRAM` (stripped) → composite hash; `--link-id-col TARGETID` for legacy native int | Fibermap `TARGET_RA` / `TARGET_DEC` (fallbacks: `RA_TARGET`, `FIBER_RA`; `DEC_TARGET`, `FIBER_DEC`) | Auto-detected from DESI coadd layout; `TARGETID` alone is not unique in DR1 |
 | `sdss_boss` | `SPECOBJID` | Primary header, then `SPALL` BINTABLE (HDU 2) | Header `RA` / `DEC` (fallback `PLUG_RA` / `PLUG_DEC`) | `spec-PLATE-MJD-FIBER.fits` |
 | `sdss_spplate` | `PLATE,MJD,FIBERID` (default) or via sidecar / plate header | plugmap `FIBERID` → composite hash (default), or specObjID from sidecar/synthesis | Fiber table columns (default `RA` / `DEC`, configurable via `--ra-col/--dec-col`) | `spPlate-PLATE-MJD.fits`; see spPlate section |
 | `generic` | `--link-id-col` or auto | Header keyword chain | Header columns from `--ra-col/--dec-col` (default `RA` / `DEC`) | Any 1-D FITS with spectral WCS |
@@ -72,7 +76,7 @@ on catalog ``_source_id`` (resolved from ``catalog_info.json``), not by reusing
 | Spectrum ingest (2df, 6df) | **Not used** — reader resolves IDs internally (`SPFILE`/`FIBRE`; filename stem + `OBSID_V`/`OBSID_R`) | **Not used** — reader reads `OBSRA`/`OBSDEC` from header |
 | Spectrum ingest (OzDES, zCOSMOS, VANDELS, WiggleZ, VIPERS, VUDS, VVDS) | **Not used** — reader hashes the filename | **Not used** — reader reads sky from header |
 | Spectrum ingest (spPlate, default) | **Not used** — reader hashes `PLATE\|MJD\|FIBERID` per fiber (catalog must use `--link-id-col PLATE,MJD,FIBERID`) | FITS plugmap `RA` / `DEC` |
-| Spectrum ingest (SDSS, DESI, generic) | Header keyword / fibermap column | FITS header keywords |
+| Spectrum ingest (SDSS, DESI, generic) | DESI defaults to composite `TARGETID,SURVEY,PROGRAM` (omit flag); SDSS/generic need header keyword; DESI legacy: `--link-id-col TARGETID` | FITS header keywords (DESI sky from fibermap) |
 | Spectrum ingest (spPlate, legacy modes) | `--link-id-col` used only with `--specobj-lookup-from-catalog` | FITS plugmap `RA` / `DEC` |
 | Catalog patch after spectrum ingest | **Not used** — joins on ``_source_id`` | — |
 
@@ -684,7 +688,7 @@ Key properties:
   `_spectrum_index` in the Parquet catalog (`--no-update-catalog` to
   skip; silently no-ops if no catalog exists yet for the survey).
   The ID column is read from `catalog_info.json` so DESI catalogs
-  ingested with `--link-id-col TARGETID` are handled correctly.
+  ingested with `--link-id-col TARGETID,SURVEY,PROGRAM` are handled correctly.
 - **`--n-workers` is required** — no implicit default; pick consciously
   (typical: `cpu_count - 1` to keep one core for the writer / OS).
 - **Threads do not help here**: `read_spectra` is mostly Python under

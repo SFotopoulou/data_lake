@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: DESI coadd `_source_id` defaults to `TARGETID|SURVEY|PROGRAM`** — `TARGETID` alone is not unique in DESI DR1. Coadd ingest reads `TARGETID` from the fibermap and `SURVEY`/`PROGRAM` from the PRIMARY (HDU 0) header (whitespace stripped), then hashes the composite. Catalog ingest must use `--link-id-col TARGETID,SURVEY,PROGRAM`. Pass `--link-id-col TARGETID` on spectrum ingest for the previous native-int behaviour.
 - **Breaking: minimum Python version is 3.12** — `requires-python = ">=3.12"`; install docs use `uv venv --python 3.12`.
 - **Breaking: `dl-describe-lake --from-area` removed** — describe-lake is lake-wide only. Use `dl-region --from-area AREA --modalities …,crossmatch` (optionally `--count`) for area-scoped inventory including crossmatch trees.
 - **`dl-region` crossmatch discovery** — `crossmatch` is a discoverable modality (`--modalities catalog,spectra,crossmatch`); tile indices include `*.crossmatch.json`; `--count` sums Parquet footers for catalog and crossmatch overlap tiles. Default modalities remain catalog-only.

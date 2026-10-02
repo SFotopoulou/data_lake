@@ -32,6 +32,102 @@ def test_desi_read_spectra_skip_hdus():
     assert "RESOLUTION" not in _desi_read_spectra_skip_hdus(with_resolution=True)
 
 
+class TestDesiCompositeSourceId:
+    """TARGETID alone is not unique in DESI DR1 — default is TARGETID|SURVEY|PROGRAM."""
+
+    def test_primary_header_text_strips_padding(self, tmp_path):
+        from astropy.io import fits
+
+        from data_lake.ingest.fits_to_spectra_zarr import _desi_primary_header_text
+
+        path = tmp_path / "coadd.fits"
+        hdu = fits.PrimaryHDU()
+        hdu.header["SURVEY"] = " main "
+        hdu.header["PROGRAM"] = "dark   "
+        hdu.writeto(path)
+
+        assert _desi_primary_header_text(path, "SURVEY") == "main"
+        assert _desi_primary_header_text(path, "PROGRAM") == "dark"
+
+    def test_default_composite_uses_header_survey_program(self):
+        from data_lake.ingest.fits_to_parquet import (
+            composite_link_label,
+            normalize_object_id,
+        )
+        from data_lake.ingest.fits_to_spectra_zarr import _desi_resolve_source_id
+
+        row = {"TARGETID": 123456789012345}
+        sid = _desi_resolve_source_id(
+            row,
+            ["TARGETID", "TARGET_RA", "TARGET_DEC"],
+            survey="main",
+            program="dark",
+            link_id_col=None,
+            context="test.fits",
+        )
+        expected = normalize_object_id(
+            composite_link_label(123456789012345, "main", "dark")
+        )
+        assert sid == expected
+        # Not the raw TARGETID (composite is hashed)
+        assert sid != 123456789012345
+
+    def test_same_targetid_different_survey_distinct_ids(self):
+        from data_lake.ingest.fits_to_spectra_zarr import _desi_resolve_source_id
+
+        row = {"TARGETID": 99}
+        cols = ["TARGETID"]
+        a = _desi_resolve_source_id(
+            row, cols, survey="main", program="dark",
+            link_id_col=None, context="a.fits",
+        )
+        b = _desi_resolve_source_id(
+            row, cols, survey="sv1", program="dark",
+            link_id_col=None, context="b.fits",
+        )
+        assert a != b
+
+    def test_legacy_targetid_only(self):
+        from data_lake.ingest.fits_to_spectra_zarr import _desi_resolve_source_id
+
+        row = {"TARGETID": 42}
+        sid = _desi_resolve_source_id(
+            row,
+            ["TARGETID"],
+            survey="main",
+            program="dark",
+            link_id_col="TARGETID",
+            context="legacy.fits",
+        )
+        assert sid == 42
+
+    def test_missing_survey_raises(self):
+        from data_lake.ingest.fits_to_spectra_zarr import _desi_resolve_source_id
+
+        with pytest.raises(ValueError, match="SURVEY"):
+            _desi_resolve_source_id(
+                {"TARGETID": 1},
+                ["TARGETID"],
+                survey="",
+                program="dark",
+                link_id_col=None,
+                context="bad.fits",
+            )
+
+    def test_missing_targetid_column_raises(self):
+        from data_lake.ingest.fits_to_spectra_zarr import _desi_resolve_source_id
+
+        with pytest.raises(KeyError, match="TARGETID"):
+            _desi_resolve_source_id(
+                {"OTHER": 1},
+                ["OTHER"],
+                survey="main",
+                program="dark",
+                link_id_col=None,
+                context="bad.fits",
+            )
+
+
 def _make_spectrum(n_pix: int = 100, with_resolution: bool = True):
     """
     Return a minimal Spectrum with or without a resolution matrix.

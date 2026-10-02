@@ -123,6 +123,10 @@ dl-describe-lake --count-total
 
 # Show columns for a survey
 dl-describe-survey MY_SURVEY --modality catalog
+
+# Peek first sources (catalog / spectra / cutouts)
+dl-preview-sources MY_SURVEY --modality catalog -n 5
+dl-preview-sources MY_SURVEY --modality spectra -n 5
 ```
 
 Python one-liner (DuckDB-backed):
@@ -133,6 +137,16 @@ from data_lake.io.catalog import CatalogAccessor
 cat = CatalogAccessor("/data/lake", "MY_SURVEY")
 df = cat.query("SELECT _source_id, ra, dec FROM catalog LIMIT 10")
 print(df)
+```
+
+Unified peek across modalities:
+
+```python
+from data_lake.io.preview import preview_sources
+
+preview_sources("/data/lake", "MY_SURVEY", modality="catalog", n=5)
+preview_sources("/data/lake", "MY_SURVEY", modality="spectra", n=5)
+preview_sources("/data/lake", "MY_SURVEY", modality="cutouts", n=5)
 ```
 
 ---
