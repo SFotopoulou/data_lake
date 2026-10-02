@@ -50,6 +50,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-validate-cutout-ingest` | Check Zarr cutout tiles (`--survey` or `--all`) |
 | `dl-validate-catalog-spectra-link` | Verify `_spectrum_index` ↔ Zarr `_source_id` agreement (`--survey` or `--all`); `--n-workers N` for parallel Zarr scan; progress on by default (`--no-progress` to disable) |
 | `dl-widen-spectrum-tiles` | Pad narrower `Npix=*.zarr` tiles to survey `n_pix` in `spectrum_info.json` (`--survey` or `--all`) |
+| `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |
 
 **Export and extract**
 
@@ -68,16 +69,23 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
 | `dl-describe-crossmatch` | List or describe crossmatch trees (sky + column); `--name`, `--radius-arcsec`, `--match-mode column --match-col-a/b`, `--recount`, `--json` ([docs](discovery/crossmatch.md)) |
 | `dl-preview-sources` | Peek first N sources from a modality (`catalog` / `spectra` / `cutouts`); `-n`, `-c COL`, `-o`, `--format` |
-| `dl-describe-master` | Show master association columns mapped to catalog schemas |
 | `dl-refresh-lake-registry` | Scan lake, write `shared/registry/surveys.parquet`, rebuild tile indices |
 | `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); `--modalities` may include `crossmatch`; rounded counts, `--count` exact for catalog/crossmatch, `--save-as` area, `--export-moc`, `--moc-format fits\|json\|ascii` ([docs](discovery/regions-and-areas.md)) |
 | `dl-area` | Manage `areas/<id>.json`: `list`, `show`, `validate`, `set-crossmatch`, `set-gather`, `set-homogenize`, `import` ([docs](discovery/areas-cli.md)) |
 | `dl-export-moc` | Write survey tile footprint (or region-clipped) as IVOA MOC FITS/JSON/ASCII; `--moc-order` ([docs](discovery/regions-and-areas.md#export-as-moc)) |
-| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--matches-only` (default: keep all base rows), partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities`; progress on by default (`--no-progress`) ([docs](discovery/gather.md)) |
-| **Workflow** | End-to-end region → ML export: [discovery/workflow.md](discovery/workflow.md), [notebook](../notebooks/14_discovery_workflow.ipynb) |
-| `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
+
+
+**Accosiations**
+
+| Command | Purpose |
+|---------|---------|
 | `dl-crossmatch` | Catalog↔catalog match at lake scale; sky mode (default, `--radius-arcsec`) or column equality (`--match-mode column --match-col-a COL --match-col-b COL`); `--from-area`/`--plan` for region-bounded sky plans; progress on by default (`--no-progress`) |
-| `dl-debug-specobj-lookup` | Diagnose SDSS specObj fiber-to-ID mapping issues |
+| `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--matches-only` (default: keep all base rows), partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities`; progress on by default (`--no-progress`) ([docs](discovery/gather.md)) |
+| `dl-homogenize` | Apply transform registry to a survey+region → homogenized product catalog; progress on by default (`--no-progress`) ([docs](homogenization.md)) |
+| `dl-validate-homogenization` | Lint transform registry, golden spot checks, homogenized product validation |
+| `dl-build-query-from-master` | Generate DuckDB SQL from a master association file |
+| `dl-describe-master` | Show master association columns mapped to catalog schemas |
+
 
 **Visualisation**
 
@@ -90,8 +98,6 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-homogenize` | Apply transform registry to a survey+region → homogenized product catalog; progress on by default (`--no-progress`) ([docs](homogenization.md)) |
-| `dl-validate-homogenization` | Lint transform registry, golden spot checks, homogenized product validation |
 | `dl-mcp-docs` | Stdio MCP server: search docs, describe lake/survey (requires `--extra mcp`) |
 | `dl-mcp-lake` | Stdio MCP server: region discovery, provenance, query builder, QA, ingest advisor ([docs](mcp-lake.md)) |
 
