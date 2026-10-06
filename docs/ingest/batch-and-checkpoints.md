@@ -28,6 +28,7 @@
 | `dl-ingest-spectra-from-list` | `--fits-memmap` | `auto`, `on`, `off` | FITS read policy for spectrum decode |
 | `dl-ingest-spectra-from-list` | `--files-per-worker` | int | FITS files per worker task (default 1; try 8–32 for small specs) |
 | `dl-ingest-spectra-batch-desi-coadds` | `--on-duplicate` | same | DESI parallel batch; default **`skip`** |
+| `dl-ingest-spectra-batch-desi-coadds` | `--link-id-col` | string | Object ID spec; default **`TARGETID,SURVEY,PROGRAM`** |
 | `dl-ingest-spectra-batch-desi-coadds` | `--files-per-worker` | int | Coadd FITS files decoded per worker task |
 
 Cutout/spectrum ingest defaults to **`--on-duplicate skip`** so file-list and batch re-runs

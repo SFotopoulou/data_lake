@@ -18,6 +18,7 @@ from data_lake.discovery import tile_index as ti
 from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN, assign_healpix, healpix_dir
 from data_lake.io.crossmatch import build_crossmatch
 from data_lake.lake_registry import refresh_lake_registry
+from data_lake.mcp_inventory import tool_describe_lake, tool_list_products
 from data_lake.mcp_lake_server import (
     tool_describe_crossmatch,
     tool_describe_product,
@@ -27,6 +28,7 @@ from data_lake.mcp_lake_server import (
     tool_lake_health,
     tool_list_areas,
     tool_list_crossmatches,
+    tool_list_homogenize_recipes,
     tool_recommend_ingest,
     tool_validate_survey,
 )
@@ -211,3 +213,171 @@ def test_create_lake_mcp_app() -> None:
 
     app = create_lake_mcp_app()
     assert app is not None
+
+
+# --- Tests for new tools added in MCP improvement plan ---
+
+
+def test_describe_lake_all(mini_lake: Path) -> None:
+    payload = tool_describe_lake(str(mini_lake))
+    assert "entries" in payload
+    assert "summary" in payload
+    surveys = {e["survey"] for e in payload["entries"]}
+    assert "ALLWISE" in surveys
+
+
+def test_describe_lake_kind_filter(product_lake: Path) -> None:
+    products = tool_describe_lake(str(product_lake), kind="product")
+    assert products["filters_applied"]["kind"] == "product"
+    kinds = {e.get("kind") for e in products["entries"]}
+    assert "ingested" not in kinds
+
+    ingested = tool_describe_lake(str(product_lake), kind="ingested")
+    kinds_i = {e.get("kind") for e in ingested["entries"]}
+    assert "product" not in kinds_i
+
+
+def test_list_products(product_lake: Path) -> None:
+    payload = tool_list_products(str(product_lake))
+    assert "n_products" in payload
+    assert payload["n_products"] >= 1
+    names = [p["name"] for p in payload["products"]]
+    assert "EUCLID_desi" in names
+
+
+def test_list_products_empty(mini_lake: Path) -> None:
+    payload = tool_list_products(str(mini_lake))
+    assert payload["n_products"] == 0
+    assert "Run dl-gather" in payload["hint"]
+
+
+def test_get_area_includes_homogenize(tmp_path: Path) -> None:
+    from data_lake.discovery.areas import make_area, save_area
+    from data_lake.discovery.region import Region
+    from data_lake.lake_registry import refresh_lake_registry
+
+    lake = tmp_path / "lake"
+    region = Region.cone(10.0, 20.0, 30.0)
+    area = make_area(
+        "test_hom",
+        region,
+        homogenize={
+            "survey": "MY_SURVEY",
+            "transform": "phot_ab_v1",
+            "materialize_as": "MY_SURVEY_homogenized",
+        },
+    )
+    save_area(lake, area)
+    refresh_lake_registry(lake)
+
+    detail = tool_get_area(str(lake), "test_hom")
+    assert "homogenize" in detail
+    assert detail["homogenize"] is not None
+    assert detail["homogenize"]["survey"] == "MY_SURVEY"
+
+
+def test_lake_health_counts_by_kind(product_lake: Path) -> None:
+    health = tool_lake_health(str(product_lake))
+    assert health["registry_present"] is True
+    assert "counts_by_kind" in health
+    assert "counts_by_modality" in health
+    assert "registry_age_hours" in health
+    # product_lake has both ingested surveys and one product
+    assert health["counts_by_kind"]["ingested"] >= 2
+    assert health["counts_by_kind"]["product"] >= 1
+
+
+def test_lake_health_missing_registry(tmp_path: Path) -> None:
+    lake = tmp_path / "empty_lake"
+    lake.mkdir()
+    health = tool_lake_health(str(lake))
+    assert health["registry_present"] is False
+    assert health["notes"]
+
+
+def test_describe_product_enriched(product_lake: Path) -> None:
+    payload = tool_describe_product(str(product_lake), "EUCLID_desi")
+    assert "product_subtype" in payload
+    assert "total_rows" in payload
+    assert "homogenize_provenance" in payload
+    assert "columns_summary" in payload
+
+
+def test_estimate_operation_cost_bbox(mini_lake: Path) -> None:
+    payload = tool_estimate_operation_cost(
+        str(mini_lake),
+        "gather",
+        bbox_ra_min=119.0,
+        bbox_ra_max=121.0,
+        bbox_dec_min=44.0,
+        bbox_dec_max=46.0,
+    )
+    assert "n_overlap_tiles" in payload
+    assert payload["operation"] == "gather"
+
+
+def test_list_homogenize_recipes(mini_lake: Path) -> None:
+    payload = tool_list_homogenize_recipes(str(mini_lake))
+    assert "n_recipes" in payload
+    assert "recipes" in payload
+    assert "hint" in payload
+    # bundled defaults should always be present
+    assert payload["n_recipes"] >= 0  # may be 0 if no bundled surveys
+
+
+def test_list_areas_normalizes_legacy_stems(tmp_path: Path) -> None:
+    """list_areas should strip .area suffix from legacy *.area.json files."""
+    from data_lake.discovery.areas import areas_dir, list_areas
+
+    lake = tmp_path / "lake"
+    d = areas_dir(lake)
+    d.mkdir(parents=True, exist_ok=True)
+    # Write a canonical area
+    (d / "Modern_Area.json").write_text('{"area_id": "Modern_Area", "region": {"type": "cone", "ra": 0, "dec": 0, "radius_arcsec": 60}}')
+    # Write a legacy area
+    (d / "Legacy_Area.area.json").write_text('{"area_id": "Legacy_Area", "region": {"type": "cone", "ra": 1, "dec": 0, "radius_arcsec": 60}}')
+
+    ids = list_areas(lake)
+    assert "Modern_Area" in ids
+    assert "Legacy_Area" in ids
+    # The .area suffix must not appear in the returned IDs
+    assert all(".area" not in aid for aid in ids)
+
+
+def test_load_area_resolves_legacy_filename(tmp_path: Path) -> None:
+    """load_area should resolve <id>.area.json files by normalized ID."""
+    from data_lake.discovery.areas import areas_dir, load_area
+
+    lake = tmp_path / "lake"
+    d = areas_dir(lake)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "Old_Survey.area.json").write_text(
+        '{"area_id": "Old_Survey", "region": {"type": "cone", "ra": 5, "dec": 10, "radius_arcsec": 120}}'
+    )
+    area = load_area(lake, "Old_Survey")
+    assert area.area_id == "Old_Survey"
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("mcp") is None,
+    reason="mcp optional extra not installed",
+)
+def test_lake_mcp_app_tool_names() -> None:
+    """Explorer MCP app must expose all expected tool names."""
+    from data_lake.mcp_lake_server import create_lake_mcp_app
+
+    app = create_lake_mcp_app()
+    assert app is not None
+    expected = {
+        "discover_region", "list_areas", "get_area",
+        "list_crossmatches", "describe_crossmatch",
+        "describe_product", "build_query", "validate_survey",
+        "lake_health", "recommend_norder", "estimate_operation_cost",
+        "recommend_ingest",
+        # New inventory tools
+        "describe_lake", "describe_survey", "list_products",
+        "list_homogenize_recipes",
+    }
+    tools = {t.name for t in app._tool_manager.list_tools()}
+    missing = expected - tools
+    assert not missing, f"MCP tools missing from explorer: {missing}"

@@ -76,12 +76,18 @@ def normalize_area_id(area_id: str) -> str:
 
 
 def resolve_area_path(lake_root: Path | str, area_id: str) -> Path | None:
-    """Return the first existing area JSON path for *area_id*, or ``None``."""
+    """Return the first existing area JSON path for *area_id*, or ``None``.
+
+    Tries (in order):
+      1. ``areas/<normalized>.json``        (canonical form)
+      2. ``areas/<raw>.json``               (as provided, e.g. if already has `.json`)
+      3. ``areas/<normalized>.area.json``   (legacy naming convention)
+    """
     raw = area_id.strip()
     normalized = normalize_area_id(raw)
     d = areas_dir(lake_root)
     seen: set[Path] = set()
-    for stem in (normalized, raw):
+    for stem in (normalized, raw, f"{normalized}.area"):
         candidate = d / f"{stem}.json"
         if candidate not in seen:
             seen.add(candidate)
@@ -186,10 +192,15 @@ def save_area(lake_root: Path | str, area: Area, *, overwrite: bool = False) -> 
 
 
 def list_areas(lake_root: Path | str) -> list[str]:
+    """Return sorted area IDs (stems) from ``areas/*.json``.
+
+    Legacy files named ``<id>.area.json`` are normalised: ``.area`` is stripped
+    so the returned ID matches what ``load_area`` expects.
+    """
     d = areas_dir(lake_root)
     if not d.is_dir():
         return []
-    return sorted(p.stem for p in d.glob("*.json"))
+    return sorted(normalize_area_id(p.stem) for p in d.glob("*.json"))
 
 
 def iter_areas(lake_root: Path | str) -> Iterator[Area]:

@@ -555,3 +555,46 @@ class TestCLIInputValidation:
         ])
         assert res.exit_code != 0
         assert "n-workers" in res.output.lower()
+
+    def test_link_id_col_in_help(self):
+        from click.testing import CliRunner
+
+        from data_lake.ingest.desi_parallel_ingest import cli
+
+        res = CliRunner().invoke(cli, ["--help"])
+        assert res.exit_code == 0
+        assert "--link-id-col" in res.output
+        assert "TARGETID,SURVEY,PROGRAM" in res.output
+
+
+def test_default_decoder_binds_link_id_col(monkeypatch, tmp_path: Path):
+    """ingest_spectra_parallel passes link_id_col into the default worker decoder."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from data_lake.ingest import desi_parallel_ingest as dpi
+
+    seen: dict[str, object] = {}
+
+    def fake_decode(path_str: str, norder: int, link_id_col: str | None = None):
+        seen["link_id_col"] = link_id_col
+        seen["path"] = path_str
+        return dpi.WorkerResult(path=path_str, ok=True, elapsed_s=0.0)
+
+    monkeypatch.setattr(dpi, "_decode_one_coadd_safe", fake_decode)
+
+    fake = tmp_path / "coadd.fits"
+    fake.write_bytes(b"")
+
+    result = dpi.ingest_spectra_parallel(
+        file_paths=[fake],
+        output_root=tmp_path / "lake",
+        survey_name="DESI_T",
+        n_workers=1,
+        checkpoint_path=None,
+        failures_log=None,
+        show_progress=False,
+        executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+        link_id_col="TARGETID",
+    )
+    assert seen.get("link_id_col") == "TARGETID"
+    assert result["n_files_succeeded"] == 1

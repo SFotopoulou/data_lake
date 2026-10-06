@@ -12,11 +12,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from data_lake.discovery.areas import iter_areas, list_areas, load_area
+from data_lake.discovery.areas import list_areas, load_area
 from data_lake.discovery.engine import DiscoveryRow, resolve_region, round_count
 from data_lake.discovery.region import Region, parse_npix_arg
 from data_lake.ingest_advisor import recommend_ingest
 from data_lake.mcp_common import json_dumps, resolve_lake_root
+from data_lake.mcp_inventory import (
+    tool_describe_lake,
+    tool_describe_survey,
+    tool_list_products,
+)
 from data_lake.schema_registry import (
     CATALOG_KIND_PRODUCT,
     MODALITY_CATALOG,
@@ -147,6 +152,7 @@ def tool_get_area(lake_root: str | None = None, area_id: str = "") -> dict[str, 
         "discover": area.data.get("discover"),
         "crossmatch_plan": area.crossmatch_plan,
         "gather": area.gather,
+        "homogenize": area.homogenize,
     }
 
 
@@ -238,11 +244,32 @@ def tool_describe_product(
                     "path": str(path),
                 })
 
+    # Include columns summary from schema registry if available
+    columns_summary: list[dict[str, Any]] = []
+    try:
+        from data_lake.schema_registry import get_survey_manifest
+
+        manifest = get_survey_manifest(
+            root, name, "catalog", rebuild=False, apply_overlay=False
+        )
+        cols = manifest.get("columns") or []
+        columns_summary = [
+            {"name": c.get("name"), "dtype": c.get("dtype")} for c in cols[:20]
+        ]
+        if len(cols) > 20:
+            columns_summary.append({"name": f"... +{len(cols) - 20} more", "dtype": None})
+    except Exception:
+        pass
+
     return {
         "name": name,
         "kind": info.get("kind"),
+        "product_subtype": info.get("product_subtype"),
+        "total_rows": info.get("total_rows"),
         "provenance": provenance,
+        "homogenize_provenance": info.get("homogenize_provenance"),
         "crossmatch_trees": crossmatch_trees,
+        "columns_summary": columns_summary,
         "catalog_root": str(catalog_root),
     }
 
@@ -303,11 +330,26 @@ def tool_validate_survey(
 
 
 def tool_lake_health(lake_root: str | None = None) -> dict[str, Any]:
+    """Summarize lake health with entry counts, unfinalized surveys, and missing indices."""
+    import os
+    import time
+
     from data_lake.discovery import tile_index as ti
-    from data_lake.lake_registry import load_lake_registry, registry_path
+    from data_lake.lake_registry import (
+        coalesce_registry_kinds,
+        load_lake_registry,
+        registry_path,
+    )
+    from data_lake.schema_registry import (
+        CATALOG_KIND_INGESTED,
+        CATALOG_KIND_PRODUCT,
+        MODALITY_CROSSMATCH,
+    )
 
     root = resolve_lake_root(lake_root)
-    if not registry_path(root).is_file():
+    rpath = registry_path(root)
+
+    if not rpath.is_file():
         return {
             "registry_present": False,
             "unfinalized_live": [],
@@ -315,29 +357,71 @@ def tool_lake_health(lake_root: str | None = None) -> dict[str, Any]:
             "notes": ["Run dl-refresh-lake-registry to build the registry."],
         }
 
-    table = load_lake_registry(root)
+    # Stale hint: registry older than 24 h
+    age_h = (time.time() - os.path.getmtime(rpath)) / 3600
+    stale_hint = (
+        f"Registry is {age_h:.0f} h old — consider dl-refresh-lake-registry."
+        if age_h > 24
+        else None
+    )
+
+    table = coalesce_registry_kinds(load_lake_registry(root))
     entries = table.to_pylist()
+
     unfinalized: list[dict[str, str]] = []
     missing_index: list[dict[str, str]] = []
 
+    # Counts by kind and modality
+    counts_by_kind: dict[str, int] = {}
+    counts_by_modality: dict[str, int] = {}
+
     for row in entries:
+        kind = row.get("kind", CATALOG_KIND_INGESTED)
+        modality = row.get("modality", MODALITY_CATALOG)
+        counts_by_kind[kind] = counts_by_kind.get(kind, 0) + 1
+        counts_by_modality[modality] = counts_by_modality.get(modality, 0) + 1
+
         if row.get("lifecycle") == "live" and row.get("finalized") is False:
             unfinalized.append({
-                "survey": row["survey"],
-                "modality": row.get("modality", MODALITY_CATALOG),
+                "survey": row.get("survey", ""),
+                "modality": modality,
             })
+
         survey = row.get("survey")
-        modality = row.get("modality", MODALITY_CATALOG)
         if survey and modality in (MODALITY_CATALOG, MODALITY_SPECTRA, MODALITY_CUTOUT):
             idx_path = ti.tile_index_path(root, survey, modality)
             if not idx_path.is_file():
                 missing_index.append({"survey": survey, "modality": modality})
 
+    notes: list[str] = []
+    if stale_hint:
+        notes.append(stale_hint)
+    if unfinalized:
+        notes.append(
+            f"{len(unfinalized)} live survey(s) unfinalized — run dl-finalize-catalog."
+        )
+    if missing_index:
+        notes.append(
+            f"{len(missing_index)} survey(s) missing tile index — run dl-refresh-tile-index."
+        )
+
+    n_ingested = counts_by_kind.get(CATALOG_KIND_INGESTED, 0)
+    n_products = counts_by_kind.get(CATALOG_KIND_PRODUCT, 0)
+    n_crossmatch = counts_by_kind.get(MODALITY_CROSSMATCH, 0)
+
     return {
         "registry_present": True,
         "n_entries": len(entries),
+        "counts_by_kind": {
+            "ingested": n_ingested,
+            "product": n_products,
+            "crossmatch": n_crossmatch,
+        },
+        "counts_by_modality": counts_by_modality,
         "unfinalized_live": unfinalized,
         "missing_tile_index": missing_index,
+        "registry_age_hours": round(age_h, 1),
+        "notes": notes,
     }
 
 
@@ -369,6 +453,64 @@ def tool_recommend_norder(
     }
 
 
+def tool_list_homogenize_recipes(lake_root: str | None = None) -> dict[str, Any]:
+    """List per-survey homogenization recipes (read-only).
+
+    Returns which surveys have a recipe (lake override or bundled default) and
+    which modalities are covered. To run homogenization use ``dl-homogenize``;
+    to validate use ``dl-validate-homogenization``.
+    """
+    from data_lake.homogenize.survey_registry import (
+        _PKG_SURVEYS,
+        surveys_homogenize_dir,
+    )
+
+    root = resolve_lake_root(lake_root)
+    lake_dir = surveys_homogenize_dir(root)
+    bundled_dir = _PKG_SURVEYS
+
+    # Collect all known survey names from both locations
+    lake_paths: dict[str, Path] = {}
+    bundled_paths: dict[str, Path] = {}
+
+    if lake_dir.is_dir():
+        for p in sorted(lake_dir.glob("*.json")):
+            lake_paths[p.stem] = p
+    if bundled_dir.is_dir():
+        for p in sorted(bundled_dir.glob("*.json")):
+            bundled_paths[p.stem] = p
+
+    all_surveys = sorted(set(lake_paths) | set(bundled_paths))
+
+    recipes: list[dict[str, Any]] = []
+    for survey in all_surveys:
+        path = lake_paths.get(survey) or bundled_paths.get(survey)
+        source = "lake_override" if survey in lake_paths else "bundled"
+        try:
+            import json as _json
+
+            with open(path, encoding="utf-8") as fh:  # type: ignore[arg-type]
+                data = _json.load(fh)
+            modalities = [m for m in ("catalog", "spectra", "cutout") if m in data]
+        except Exception:
+            modalities = []
+        recipes.append({
+            "survey": survey,
+            "source": source,
+            "modalities": modalities,
+            "path": str(path),
+        })
+
+    return {
+        "n_recipes": len(recipes),
+        "recipes": recipes,
+        "hint": (
+            "Use dl-homogenize --survey <name> to apply a recipe. "
+            "Use dl-validate-homogenization to lint and check coverage."
+        ),
+    }
+
+
 def tool_estimate_operation_cost(
     lake_root: str | None = None,
     operation: str = "crossmatch",
@@ -379,11 +521,19 @@ def tool_estimate_operation_cost(
     cone_ra: float | None = None,
     cone_dec: float | None = None,
     radius_arcsec: float | None = None,
+    bbox_ra_min: float | None = None,
+    bbox_ra_max: float | None = None,
+    bbox_dec_min: float | None = None,
+    bbox_dec_max: float | None = None,
+    moc: str | None = None,
 ) -> dict[str, Any]:
     root = resolve_lake_root(lake_root)
     if operation not in _SEC_PER_TILE:
         raise ValueError(f"operation must be one of: {', '.join(_SEC_PER_TILE)}")
 
+    bbox = None
+    if bbox_ra_min is not None:
+        bbox = (bbox_ra_min, bbox_ra_max, bbox_dec_min, bbox_dec_max)
     region = _region_from_params(
         root,
         from_area=from_area,
@@ -392,6 +542,8 @@ def tool_estimate_operation_cost(
         cone_ra=cone_ra,
         cone_dec=cone_dec,
         radius_arcsec=radius_arcsec,
+        bbox=bbox,
+        moc=moc,
     )
     rows = resolve_region(root, region, surveys="all", modalities=(MODALITY_CATALOG,))
     total_tiles = sum(r.n_tiles_overlap for r in rows)
@@ -583,6 +735,11 @@ def create_lake_mcp_app() -> Any:
         cone_ra: float | None = None,
         cone_dec: float | None = None,
         radius_arcsec: float | None = None,
+        bbox_ra_min: float | None = None,
+        bbox_ra_max: float | None = None,
+        bbox_dec_min: float | None = None,
+        bbox_dec_max: float | None = None,
+        moc: str | None = None,
     ) -> str:
         """Rough runtime estimate for crossmatch/gather/ingest over a region."""
         return json_dumps(tool_estimate_operation_cost(
@@ -594,6 +751,11 @@ def create_lake_mcp_app() -> Any:
             cone_ra=cone_ra,
             cone_dec=cone_dec,
             radius_arcsec=radius_arcsec,
+            bbox_ra_min=bbox_ra_min,
+            bbox_ra_max=bbox_ra_max,
+            bbox_dec_min=bbox_dec_min,
+            bbox_dec_max=bbox_dec_max,
+            moc=moc,
         ))
 
     @mcp.tool()
@@ -620,6 +782,58 @@ def create_lake_mcp_app() -> Any:
             total_size_gb=total_size_gb,
             streaming=streaming,
         ))
+
+    # --- Inventory tools (mirrored from dl-mcp-docs so the explorer alone suffices) ---
+
+    @mcp.tool()
+    def describe_lake(
+        lake_root: str | None = None,
+        kind: str | None = None,
+        refresh: bool = False,
+        count_total: bool = True,
+        modality: str | None = None,
+    ) -> str:
+        """Summarize all surveys and modalities in the lake registry.
+
+        kind: filter by 'ingested', 'product', or 'crossmatch' (default: all).
+        Use list_products for a focused product listing.
+        """
+        return json_dumps(tool_describe_lake(
+            lake_root,
+            kind=kind,
+            refresh=refresh,
+            count_total=count_total,
+            modality=modality,
+        ))
+
+    @mcp.tool()
+    def describe_survey(
+        survey: str,
+        lake_root: str | None = None,
+        modality: str = "catalog",
+        rebuild: bool = False,
+    ) -> str:
+        """Return column manifest for a survey (dl-describe-survey --json)."""
+        return json_dumps(tool_describe_survey(
+            survey, lake_root=lake_root, modality=modality, rebuild=rebuild,
+        ))
+
+    @mcp.tool()
+    def list_products(lake_root: str | None = None) -> str:
+        """List all product catalogs with name, subtype, and row count.
+
+        Use describe_product(name=...) for provenance and crossmatch lineage.
+        """
+        return json_dumps(tool_list_products(lake_root))
+
+    @mcp.tool()
+    def list_homogenize_recipes(lake_root: str | None = None) -> str:
+        """List per-survey homogenization recipes (read-only).
+
+        Shows which surveys have a recipe and which modalities are covered.
+        Use dl-homogenize to apply; dl-validate-homogenization to lint.
+        """
+        return json_dumps(tool_list_homogenize_recipes(lake_root))
 
     return mcp
 

@@ -669,8 +669,13 @@ ls /data/desi/coadds/coadd-*.fits > coadds.txt
 dl-ingest-spectra-batch-desi-coadds \
     --survey desi_dr1 \
     --file-list coadds.txt \
-    --n-workers 16
+    --n-workers 16 \
+    --link-id-col TARGETID,SURVEY,PROGRAM
 ```
+
+``--link-id-col`` defaults to ``TARGETID,SURVEY,PROGRAM`` (fibermap ``TARGETID`` +
+PRIMARY ``SURVEY``/``PROGRAM``, stripped → composite hash).  Pass ``TARGETID`` alone
+only for the legacy native-int path; the catalog must use the same spec.
 
 Key properties:
 

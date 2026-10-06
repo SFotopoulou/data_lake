@@ -146,12 +146,19 @@ class WorkerResult:
 # ---------------------------------------------------------------------------
 
 
-def _decode_one_coadd(path_str: str, norder: int) -> WorkerResult:
+def _decode_one_coadd(
+    path_str: str,
+    norder: int,
+    link_id_col: str | None = None,
+) -> WorkerResult:
     """Decode one DESI coadd FITS file into per-tile numpy batches.
 
     Runs entirely in a worker process.  All heavy lifting (FITS decompress,
     ``coadd_cameras`` IVAR-weighted combine, healpy assignment, meta byte
     packing) happens here so the writer is essentially free.
+
+    *link_id_col* is forwarded to :func:`_read_desi_with_desispec` (default
+    ``None`` → composite ``TARGETID|SURVEY|PROGRAM``).
     """
     from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
 
@@ -161,7 +168,7 @@ def _decode_one_coadd(path_str: str, norder: int) -> WorkerResult:
     path = Path(path_str)
 
     records, wcs_attrs, _res_diags, _res_offsets = _read_desi_with_desispec(
-        path, with_resolution=False,
+        path, with_resolution=False, link_id_col=link_id_col,
     )
     if not records:
         return WorkerResult(path=path_str, ok=True, elapsed_s=time.perf_counter() - t0)
@@ -214,10 +221,14 @@ def _decode_one_coadd(path_str: str, norder: int) -> WorkerResult:
     )
 
 
-def _decode_one_coadd_safe(path_str: str, norder: int) -> WorkerResult:
+def _decode_one_coadd_safe(
+    path_str: str,
+    norder: int,
+    link_id_col: str | None = None,
+) -> WorkerResult:
     """Picklable wrapper: never raises, returns a failure-marked result instead."""
     try:
-        return _decode_one_coadd(path_str, norder)
+        return _decode_one_coadd(path_str, norder, link_id_col=link_id_col)
     except Exception as exc:
         return WorkerResult(
             path=path_str,
@@ -561,7 +572,7 @@ def ingest_spectra_parallel(
     checkpoint_path: Path | str | None = None,
     failures_log: Path | str | None = None,
     show_progress: bool = True,
-    decoder: Callable[[str, int], WorkerResult] = _decode_one_coadd_safe,
+    decoder: Callable[..., WorkerResult] | None = None,
     executor_factory: Callable[[int], Executor] | None = None,
     worker_log_file: Path | str | None = None,
     worker_verbose: bool = False,
@@ -574,6 +585,7 @@ def ingest_spectra_parallel(
     wavelength_mode: str = "shared",
     heartbeat: "Any | None" = None,
     files_per_worker: int = 1,
+    link_id_col: str | None = None,
 ) -> dict:
     """Ingest many DESI coadd FITS files in parallel into per-tile Zarr stacks.
 
@@ -600,8 +612,8 @@ def ingest_spectra_parallel(
     show_progress:
         Show a tqdm progress bar on the writer side.
     decoder:
-        Worker decode function; defaults to ``_decode_one_coadd_safe``.
-        Injectable for unit tests (must accept ``(path_str, norder)``).
+        Worker decode function accepting ``(path_str, norder)``.  Default
+        ``None`` uses :func:`_decode_one_coadd_safe` with *link_id_col* bound.
     executor_factory:
         Callable taking ``n_workers`` and returning an ``Executor``.  Defaults
         to ``ProcessPoolExecutor``; tests can pass a thread-pool factory.
@@ -616,7 +628,7 @@ def ingest_spectra_parallel(
         JSON journal used for crash-safe per-file commits (default
         ``<survey_root>/.ingest_inflight.json``).  Pass ``None`` for that default.
     on_duplicate_source_id:
-        ``append`` (default), ``error``, or ``skip`` when a ``TARGETID`` is already
+        ``append``, ``error``, or ``skip`` when a ``_source_id`` is already
         in a tile's Zarr (same as ``dl-ingest-spectra --on-duplicate``).
     track_index_map:
         When True, accumulate ``{source_id: local_index}`` in RAM for the return
@@ -627,46 +639,23 @@ def ingest_spectra_parallel(
         Max decoder futures in flight (default ``n_workers + 2``).  Lower if the
         process or terminal is killed under memory pressure (e.g. systemd-oomd).
     max_open_tiles:
-        Max HEALPix tile Zarr groups kept open in the writer (default 64).
-        Use ``0`` for unlimited (not recommended on 10k+ coadd runs).  Evicted
-        tiles are closed and re-opened on the next write; duplicate-ID sets are
-        reloaded when ``on_duplicate`` is not ``append``.
-    length_policy:
-        ``error`` (default): reject a file when its ``n_pix`` differs from the
-        first file in the run.  ``pad`` or ``truncate``: allow mixed pixel
-        lengths; widen tiles and pad/truncate rows via
-        :func:`~data_lake.ingest.fits_to_spectra_zarr.append_tile_batch_to_zarr`.
-    wavelength_mode:
-        Wavelength storage when creating or widening tiles (default ``shared``).
-
-    Returns
-    -------
-    dict with keys:
-        ``n_files_requested``    – before checkpoint filtering
-        ``n_files_processed``    – attempts in this run
-        ``n_files_skipped``      – already in checkpoint
-        ``n_files_succeeded``    – ok=True results
-        ``n_files_failed``       – ok=False results
-        ``n_spectra``            – total spectra appended to tiles
-        ``n_tiles``              – distinct HEALPix tiles written/touched
-        ``index_map``            – dict[source_id, local_index_in_tile]
-        ``failures``             – list[dict] of per-file errors
-        ``elapsed_s``            – total wall-clock seconds
-
-    Notes
-    -----
-    The single-thread writer is the strict serialisation point.  All Zarr
-    state lives in this process; workers only return numpy arrays.  Pickle
-    protocol 5 (default in Python 3.11) carries the arrays as out-of-band
-    buffers so transfer is near-zero-copy.
-
-    **Crash safety:** before appending a coadd, the writer records each touched
-    tile's current row count in ``inflight_path`` (atomic JSON).  After all
-    appends for that file succeed, it updates the checkpoint (if enabled) and
-    then clears the inflight journal.  On startup, if the journal names a file
-    that is not yet in the checkpoint, each listed tile is truncated back to
-    the saved row counts so the coadd can be re-ingested without duplicate rows.
+        Max open tile Zarr groups in the writer (LRU); ``0`` = unlimited.
+    length_policy / wavelength_mode:
+        Forwarded to tile open helpers (same as single-file ingest).
+    heartbeat:
+        Optional progress heartbeat callback.
+    files_per_worker:
+        Coadd FITS files decoded per worker task (default 1).
+    link_id_col:
+        DESI link-id spec for the default decoder.  ``None`` → composite
+        ``TARGETID|SURVEY|PROGRAM``; pass ``TARGETID`` for the legacy native-int
+        path.  Ignored when a custom *decoder* is injected.
     """
+    from functools import partial
+
+    if decoder is None:
+        decoder = partial(_decode_one_coadd_safe, link_id_col=link_id_col)
+
     try:
         from tqdm.auto import tqdm
     except ImportError:
@@ -1094,11 +1083,22 @@ try:
              "Default: <output>/spectra/<survey>/.ingest.log",
     )
     @click.option(
+        "--link-id-col",
+        default="TARGETID,SURVEY,PROGRAM",
+        show_default=True,
+        help=(
+            "Object ID for Zarr _source_id. Default is composite fibermap "
+            "TARGETID plus PRIMARY SURVEY/PROGRAM (whitespace-stripped). "
+            "Pass TARGETID alone for the legacy native-int path. "
+            "Must match catalog --link-id-col."
+        ),
+    )
+    @click.option(
         "--on-duplicate",
         type=click.Choice(["append", "error", "skip"]),
         default="skip",
         show_default=True,
-        help="If TARGETID already exists in a tile Zarr: skip (default), raise, or append.",
+        help="If _source_id already exists in a tile Zarr: skip (default), raise, or append.",
     )
     @click.option(
         "--update-catalog/--no-update-catalog", default=True, show_default=True,
@@ -1123,6 +1123,7 @@ try:
         checkpoint_path: Path | None,
         failures_log: Path | None,
         log_file_path: Path | None,
+        link_id_col: str,
         on_duplicate: str,
         update_catalog: bool,
         show_progress: bool,
@@ -1206,6 +1207,7 @@ try:
             max_open_tiles=max_open_tiles,
             files_per_worker=files_per_worker,
             show_progress=show_progress and not quiet,
+            link_id_col=link_id_col,
         )
 
         click.echo(

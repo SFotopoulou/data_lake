@@ -10,9 +10,8 @@ from astropy.table import Table
 
 from data_lake.ingest.fits_to_parquet import ingest_catalog
 from data_lake.lake_registry import refresh_lake_registry
+from data_lake.mcp_inventory import tool_describe_lake, tool_describe_survey
 from data_lake.mcp_server import (
-    tool_describe_lake,
-    tool_describe_survey,
     tool_get_doc_section,
     tool_list_cli_commands,
     tool_search_docs,
@@ -73,6 +72,16 @@ def test_tool_describe_lake(tmp_path: Path) -> None:
     assert payload["entries"]
     assert "TEST_SURV" in {e["survey"] for e in payload["entries"]}
     assert "summary" in payload
+    assert "filters_applied" in payload
+
+
+def test_tool_describe_lake_kind_filter(tmp_path: Path) -> None:
+    lake = _ingest_mini_catalog(tmp_path)
+    payload = tool_describe_lake(str(lake), kind="ingested")
+    assert payload["filters_applied"]["kind"] == "ingested"
+    # No products in a fresh mini lake
+    kinds = {e.get("kind") for e in payload["entries"]}
+    assert "product" not in kinds
 
 
 def test_tool_describe_survey(tmp_path: Path) -> None:

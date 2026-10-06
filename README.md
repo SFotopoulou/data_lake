@@ -46,6 +46,7 @@ dl-describe-lake --count-total
 | `lake_config.toml` | [lake-config.md](docs/lake-config.md) |
 | Example notebooks | [notebooks.md](docs/notebooks.md) |
 | MCP access for agents | [mcp.md](docs/mcp.md), [mcp-lake.md](docs/mcp-lake.md) |
+| MCP deployment (team lakes) | [mcp-deploy.md](docs/mcp-deploy.md) |
 
 ### Ingest
 
@@ -89,6 +90,12 @@ dl-describe-lake --count-total
 | Repository layout | [layout/repository.md](docs/layout/repository.md) |
 | Data on disk (HEALPix tiles) | [layout/data-on-disk.md](docs/layout/data-on-disk.md) |
 | Design decisions | [design-decisions.md](docs/design-decisions.md) |
+
+### Sprints
+
+| Sprint | Notes |
+|--------|-------|
+| Lake COMO — July 2026 | [sprints/como-2026-07.md](docs/sprints/como-2026-07.md) |
 
 ## Which command for this file?
 

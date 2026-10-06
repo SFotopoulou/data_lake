@@ -28,7 +28,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | Command | Purpose |
 |---------|---------|
 | `dl-ingest-spectra` | Single spectrum FITS → Zarr (all supported formats) |
-| `dl-ingest-spectra-batch-desi-coadds` | Multi-process DESI coadd batch |
+| `dl-ingest-spectra-batch-desi-coadds` | Multi-process DESI coadd batch; `--link-id-col` (default `TARGETID,SURVEY,PROGRAM`) |
 | `dl-ingest-spectra-batch-spplate` | Multi-process spPlate batch ingest |
 | `dl-ingest-spectra-from-list` | Spectrum file-list ingest (sequential default; `--n-workers > 1` for parallel decode) |
 | `dl-rebuild-catalog-indices` | Backfill `_spectrum_index` / `_cutout_index` in Parquet tiles; `--kind spectrum\|cutout`, `--n-workers N` for parallel catalog patch; progress bars are on by default (`--no-progress` to disable) |

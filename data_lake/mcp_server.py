@@ -8,7 +8,6 @@ Requires the ``mcp`` optional extra: ``uv sync --extra mcp``.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from data_lake.doc_index import (
@@ -18,11 +17,7 @@ from data_lake.doc_index import (
 )
 
 
-from data_lake.mcp_common import json_dumps, resolve_lake_root
-
-
-def _resolve_lake_root(lake_root: str | None) -> Path:
-    return resolve_lake_root(lake_root)
+from data_lake.mcp_inventory import tool_describe_lake, tool_describe_survey
 
 
 def tool_search_docs(query: str, limit: int = 5) -> list[dict[str, str]]:
@@ -41,47 +36,8 @@ def tool_list_cli_commands() -> list[dict[str, str]]:
     return list_cli_commands()
 
 
-def tool_describe_lake(
-    lake_root: str | None = None,
-    *,
-    refresh: bool = False,
-    count_total: bool = True,
-    modality: str | None = None,
-) -> dict[str, Any]:
-    """Return lake registry summary (same shape as dl-describe-lake --json)."""
-    from data_lake.lake_registry import (
-        filter_lake_registry_table,
-        load_lake_registry,
-        refresh_lake_registry,
-        registry_path,
-        summarize_registry_row_counts,
-    )
-
-    root = _resolve_lake_root(lake_root)
-    if refresh or not registry_path(root).is_file():
-        refresh_lake_registry(root)
-    table = filter_lake_registry_table(load_lake_registry(root), modality)
-    payload: dict[str, Any] = {"entries": table.to_pylist()}
-    if count_total:
-        payload["summary"] = summarize_registry_row_counts(table)
-    return payload
-
-
-def tool_describe_survey(
-    survey: str,
-    *,
-    lake_root: str | None = None,
-    modality: str = "catalog",
-    rebuild: bool = False,
-) -> dict[str, Any]:
-    """Return schema manifest for a survey layer (dl-describe-survey --json)."""
-    from data_lake.schema_registry import get_survey_manifest
-
-    root = _resolve_lake_root(lake_root)
-    manifest = get_survey_manifest(
-        root, survey, modality, rebuild=rebuild, apply_overlay=True,
-    )
-    return manifest
+# tool_describe_lake and tool_describe_survey are imported from mcp_inventory
+# so that dl-mcp-lake can share the same implementations.
 
 
 def create_mcp_app() -> Any:
@@ -108,14 +64,22 @@ def create_mcp_app() -> Any:
     @mcp.tool()
     def describe_lake(
         lake_root: str | None = None,
+        kind: str | None = None,
         refresh: bool = False,
         count_total: bool = True,
         modality: str | None = None,
     ) -> str:
-        """Summarize surveys and modalities on disk (dl-describe-lake --json)."""
+        """Summarize surveys and modalities on disk (dl-describe-lake --json).
+
+        kind: filter by 'ingested', 'product', or 'crossmatch' (default: all).
+        """
         return json.dumps(
             tool_describe_lake(
-                lake_root, refresh=refresh, count_total=count_total, modality=modality,
+                lake_root,
+                kind=kind,
+                refresh=refresh,
+                count_total=count_total,
+                modality=modality,
             ),
             indent=2,
             default=str,
