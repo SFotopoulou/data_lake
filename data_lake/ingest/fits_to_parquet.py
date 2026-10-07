@@ -22,7 +22,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Literal, Sequence
+from typing import Callable, Iterator, Literal, Mapping, Sequence
 
 TileMode = Literal["skip", "overwrite", "append"]
 DuplicateIdMode = Literal["skip", "error", "last"]
@@ -213,21 +213,28 @@ def object_id_from_fits_header(
     link_id_col: str | None = None,
     *,
     hdu_index: int = 0,
+    context: str = "",
 ) -> int:
     """Read one integer object ID from a FITS header for cutout/spectrum ingest.
 
-    When *link_id_col* is set, only that keyword is used (same convention as
-    catalog ``--link-id-col``).  Otherwise a fixed fallback chain ending in
-    *hdu_index* when no ID keyword is present.
+    *link_id_col* may be a single keyword name or a comma-separated composite
+    spec (e.g. ``"TARGETID,SURVEY,PROGRAM"``) — same rule as catalog/DESI
+    ``--link-id-col``.  Each keyword is looked up case-insensitively via
+    :func:`fits_header_keyword`.  When *link_id_col* is ``None``, a fixed
+    fallback chain is tried before falling back to *hdu_index*.
     """
     if link_id_col:
-        if link_id_col not in header:
-            keys = [k for k in header.keys() if k and not str(k).startswith("HISTORY")]
-            raise KeyError(
-                f"Header keyword {link_id_col!r} not found for object ID. "
-                f"Sample keys: {keys[:25]}{'…' if len(keys) > 25 else ''}"
-            )
-        return normalize_object_id(header[link_id_col])
+        def _get(name: str) -> object:
+            val = fits_header_keyword(header, name)
+            if val is None:
+                keys = [k for k in header.keys() if k and not str(k).startswith("HISTORY")]
+                raise KeyError(
+                    f"Header keyword {name!r} not found. "
+                    f"Sample keys: {keys[:25]}{'…' if len(keys) > 25 else ''}"
+                )
+            return val
+
+        return resolve_link_object_id(link_id_col, _get, context=context)
 
     for key in _FITS_HEADER_ID_KEYWORDS:
         if key in header:
@@ -442,6 +449,103 @@ def _stable_join_hashes(labels: Sequence[str | None]) -> pa.Array:
 def parse_link_id_column_spec(link_id_col: str) -> list[str]:
     """Split a catalog ``--link-id-col`` spec into one or more column names."""
     return [part.strip() for part in link_id_col.split(",") if part.strip()]
+
+
+def resolve_link_object_id(
+    link_id_spec: str,
+    get_value: "Callable[[str], object]",
+    *,
+    context: str = "",
+) -> int:
+    """Resolve ``_source_id`` from a single or composite link-id spec.
+
+    This is the canonical scalar resolver used by header-based ingest (cutouts,
+    generic/SDSS spectra) and the DESI fibermap path.  The same rule applies
+    across all ``dl-*`` commands:
+
+    * single part  → ``normalize_object_id(get_value(part))``
+    * multiple parts → ``normalize_object_id(composite_link_label(*values))``
+
+    Parameters
+    ----------
+    link_id_spec:
+        One or more comma-separated column / header keyword names
+        (e.g. ``"TARGETID"`` or ``"TARGETID,SURVEY,PROGRAM"``).
+    get_value:
+        Callable that returns the value for one column/keyword name.  Raise
+        ``KeyError`` for missing keys — the error will be wrapped with context.
+    context:
+        Optional file/HDU description for error messages.
+    """
+    parts = parse_link_id_column_spec(link_id_spec)
+    if not parts:
+        raise ValueError(f"Empty link-id spec: {link_id_spec!r}")
+    ctx = f" [{context}]" if context else ""
+    if len(parts) == 1:
+        try:
+            return normalize_object_id(get_value(parts[0]))
+        except KeyError as exc:
+            raise KeyError(
+                f"Link-id column/keyword {parts[0]!r} not found{ctx}."
+            ) from exc
+    values: list[object] = []
+    missing: list[str] = []
+    for part in parts:
+        try:
+            values.append(get_value(part))
+        except KeyError:
+            missing.append(part)
+    if missing:
+        raise KeyError(
+            f"Composite link-id part(s) {missing!r} not found{ctx}."
+        )
+    return normalize_object_id(composite_link_label(*values))
+
+
+def resolve_link_object_ids(
+    link_id_spec: str,
+    columns: "Mapping[str, Sequence[object]]",
+    *,
+    context: str = "",
+) -> "np.ndarray":
+    """Vectorised form of :func:`resolve_link_object_id` for table columns.
+
+    Parameters
+    ----------
+    link_id_spec:
+        One or more comma-separated column names.
+    columns:
+        Mapping of column name → sequence of values (equal length).
+    context:
+        Optional source description for error messages.
+
+    Returns
+    -------
+    np.ndarray of int64 ``_source_id`` values.
+    """
+    parts = parse_link_id_column_spec(link_id_spec)
+    if not parts:
+        raise ValueError(f"Empty link-id spec: {link_id_spec!r}")
+    ctx = f" [{context}]" if context else ""
+    missing = [p for p in parts if p not in columns]
+    if missing:
+        available = list(columns)[:30]
+        raise KeyError(
+            f"Composite link-id column(s) {missing!r} not found{ctx}. "
+            f"Available: {available}"
+        )
+    n = len(next(iter(columns.values())))  # type: ignore[arg-type]
+    if len(parts) == 1:
+        key = parts[0]
+        return np.asarray(
+            [normalize_object_id(columns[key][i]) for i in range(n)],
+            dtype=np.int64,
+        )
+    out = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        label = composite_link_label(*(columns[p][i] for p in parts))
+        out[i] = normalize_object_id(label)
+    return out
 
 
 def _link_id_columns_present(link_id_col: str | None, schema_names: list[str]) -> bool:

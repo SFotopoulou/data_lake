@@ -468,7 +468,11 @@ try:
     @click.option(
         "--link-id-col",
         default=None,
-        help="FITS header keyword for object ID (e.g. TARGETID); must match catalog.",
+        help=(
+            "FITS header keyword(s) for object ID — single name (e.g. TARGETID) "
+            "or comma-separated composite (e.g. TARGETID,SURVEY,PROGRAM); "
+            "must match catalog --link-id-col."
+        ),
     )
     @click.option("--image-hdu", "image_hdu_index", default=0, type=int, show_default=True)
     @click.option("--band-axis", default=None, type=int)

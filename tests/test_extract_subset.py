@@ -917,3 +917,53 @@ class TestOpenTileLRU:
         # At most 1 tile pinned after planning (LRU cap)
         assert len(acc._tile_stores) <= 1
         acc.close()
+
+
+class TestReadTargetIdsComposite:
+    """--target-id-col TARGETID,SURVEY,PROGRAM must hash like DESI ingest."""
+
+    def test_fits_composite_matches_ingest_hash(self, tmp_path: Path):
+        from astropy.table import Table
+
+        from data_lake.export.spectra_subset import _read_target_ids
+        from data_lake.ingest.fits_to_parquet import (
+            composite_link_label,
+            normalize_object_id,
+        )
+
+        path = tmp_path / "targets.fits"
+        Table({
+            "TARGETID": [123456789012345, 99],
+            "SURVEY": ["main", "sv3"],
+            "PROGRAM": ["dark", "bright"],
+            "Z": [0.1, 0.2],
+        }).write(path, overwrite=True)
+
+        ids = _read_target_ids(path, "TARGETID,SURVEY,PROGRAM")
+        expected = np.asarray([
+            normalize_object_id(composite_link_label(123456789012345, "main", "dark")),
+            normalize_object_id(composite_link_label(99, "sv3", "bright")),
+        ], dtype=np.int64)
+        np.testing.assert_array_equal(ids, expected)
+        # Not the raw TARGETID
+        assert ids[0] != 123456789012345
+
+    def test_single_column_still_works(self, tmp_path: Path):
+        from astropy.table import Table
+
+        from data_lake.export.spectra_subset import _read_target_ids
+
+        path = tmp_path / "targets.fits"
+        Table({"TARGETID": [101, 102]}).write(path, overwrite=True)
+        ids = _read_target_ids(path, "TARGETID")
+        np.testing.assert_array_equal(ids, np.asarray([101, 102], dtype=np.int64))
+
+    def test_missing_component_reports_clear_error(self, tmp_path: Path):
+        from astropy.table import Table
+
+        from data_lake.export.spectra_subset import _read_target_ids
+
+        path = tmp_path / "targets.fits"
+        Table({"TARGETID": [1], "SURVEY": ["main"]}).write(path, overwrite=True)
+        with pytest.raises(ValueError, match="PROGRAM"):
+            _read_target_ids(path, "TARGETID,SURVEY,PROGRAM")

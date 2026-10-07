@@ -110,3 +110,65 @@ def test_missing_catalog_column(tmp_path: Path) -> None:
         generate_cutout_fits(
             p, tmp_path / "out", [img], size_pix=8, show_progress=False,
         )
+
+
+def test_composite_id_col_matches_ingest_hash(tmp_path: Path) -> None:
+    """Composite --id-col produces the same _source_id hash as catalog/DESI ingest."""
+    import numpy as np
+
+    from data_lake.ingest.fits_to_parquet import composite_link_label, normalize_object_id
+
+    img = tmp_path / "r.fits"
+    _make_image_fits(img, crval1=150.0, crval2=2.5, flux=5.0)
+
+    cat = Table({
+        "TARGETID": np.array([9876543210123456], dtype=np.int64),
+        "SURVEY": ["main"],
+        "PROGRAM": ["dark"],
+        "TARGET_RA": [150.0],
+        "TARGET_DEC": [2.5],
+    })
+    cat_path = tmp_path / "cat.ecsv"
+    cat.write(cat_path, overwrite=True)
+
+    out_dir = tmp_path / "stamps"
+    result = generate_cutout_fits(
+        cat_path,
+        out_dir,
+        [img],
+        size_pix=16,
+        id_col="TARGETID,SURVEY,PROGRAM",
+        ra_col="TARGET_RA",
+        dec_col="TARGET_DEC",
+        id_hdu_key="SOURCE_ID",
+        ra_hdu_key="TARGET_RA",
+        dec_hdu_key="TARGET_DEC",
+        show_progress=False,
+    )
+    expected_id = normalize_object_id(
+        composite_link_label(9876543210123456, "main", "dark")
+    )
+    expected_fname = out_dir / f"cutout_{expected_id}.fits"
+
+    assert result.n_written == 1
+    assert expected_fname.is_file(), f"Expected {expected_fname.name}"
+    with fits.open(expected_fname) as hdul:
+        assert int(hdul[0].header["SOURCE_ID"]) == expected_id
+
+
+def test_composite_id_col_missing_part_raises(tmp_path: Path) -> None:
+    """Composite --id-col with a missing component column raises KeyError."""
+    img = tmp_path / "r.fits"
+    _make_image_fits(img, crval1=0.0, crval2=0.0)
+    cat = Table({"TARGETID": [1], "ra": [0.0], "dec": [0.0]})
+    cat_path = tmp_path / "c.ecsv"
+    cat.write(cat_path, overwrite=True)
+    with pytest.raises(KeyError, match="SURVEY"):
+        generate_cutout_fits(
+            cat_path,
+            tmp_path / "out",
+            [img],
+            size_pix=8,
+            id_col="TARGETID,SURVEY,PROGRAM",
+            show_progress=False,
+        )

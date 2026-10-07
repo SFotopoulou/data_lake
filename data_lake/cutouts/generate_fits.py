@@ -37,6 +37,11 @@ from astropy.table import Table
 from astropy import units as u
 from astropy.wcs import WCS
 
+from data_lake.ingest.fits_to_parquet import (
+    parse_link_id_column_spec,
+    resolve_link_object_ids,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -55,12 +60,18 @@ def _read_catalog_table(
     ra_col: str,
     dec_col: str,
 ) -> Table:
+    """Read catalog and validate required columns.
+
+    *id_col* may be a comma-separated composite spec (e.g.
+    ``TARGETID,SURVEY,PROGRAM``); each part is checked.
+    """
     catalog_path = Path(catalog_path)
     if not catalog_path.is_file():
         raise FileNotFoundError(catalog_path)
 
     tbl = Table.read(str(catalog_path))
-    for col in (id_col, ra_col, dec_col):
+    id_parts = parse_link_id_column_spec(id_col)
+    for col in (*id_parts, ra_col, dec_col):
         if col not in tbl.colnames:
             raise KeyError(
                 f"Catalog column {col!r} not found in {catalog_path.name}. "
@@ -238,7 +249,13 @@ def generate_cutout_fits(
 
         n_written = 0
         n_skipped = 0
-        ids = np.asarray(tbl[id_col])
+        # Resolve IDs through the shared composite rule so the hash matches
+        # catalog and spectra ingest (e.g. TARGETID,SURVEY,PROGRAM).
+        id_parts = parse_link_id_column_spec(id_col)
+        cols_for_id = {p: list(tbl[p]) for p in id_parts}
+        ids = resolve_link_object_ids(
+            id_col, cols_for_id, context=str(catalog_path.name)
+        )
         ras = np.asarray(tbl[ra_col], dtype=np.float64)
         decs = np.asarray(tbl[dec_col], dtype=np.float64)
 
@@ -286,7 +303,14 @@ try:
     @click.option("--images", default=None)
     @click.option("--images-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
     @click.option("--size", "size_pix", required=True, type=int)
-    @click.option("--id-col", default="source_id", show_default=True)
+    @click.option(
+        "--id-col", default="source_id", show_default=True,
+        help=(
+            "Catalog column(s) for object ID. Single name or comma-separated "
+            "composite spec (e.g. TARGETID,SURVEY,PROGRAM) matching catalog/DESI "
+            "--link-id-col; the hash is identical to ingest."
+        ),
+    )
     @click.option("--ra-col", default="ra", show_default=True)
     @click.option("--dec-col", default="dec", show_default=True)
     @click.option("--id-hdu-key", default="SOURCE_ID", show_default=True)

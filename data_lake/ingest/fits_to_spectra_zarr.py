@@ -104,6 +104,7 @@ from data_lake.ingest.fits_to_parquet import (
     healpix_dir,
     is_valid_sky_position,
     object_id_from_fits_header,
+    resolve_link_object_id,
     sky_from_fits_header,
     sky_from_header_chain,
 )
@@ -953,7 +954,7 @@ def _desi_resolve_source_id(
     link_id_col: str | None,
     context: str,
 ) -> int:
-    """Build ``_source_id`` for one DESI fibermap row.
+    """Build ``_source_id`` for one DESI fibermap row via :func:`resolve_link_object_id`.
 
     Default (and recommended) key is the composite
     ``TARGETID|SURVEY|PROGRAM``:
@@ -963,24 +964,14 @@ def _desi_resolve_source_id(
 
     A single-column ``--link-id-col TARGETID`` still reads only that fibermap
     column (legacy native-int path).  Comma-separated specs may mix fibermap
-    columns with ``SURVEY`` / ``PROGRAM`` (filled from the header).
+    columns with ``SURVEY`` / ``PROGRAM`` (filled from the PRIMARY header).
+    The final hash is computed by the shared :func:`resolve_link_object_id`
+    so all ``dl-*`` commands produce identical ``_source_id`` values.
     """
-    from data_lake.ingest.fits_to_parquet import (
-        composite_link_label,
-        normalize_object_id,
-    )
-
     parts = _desi_link_parts(link_id_col)
-    if len(parts) == 1 and parts[0].upper() not in ("SURVEY", "PROGRAM"):
-        sid_key = parts[0]
-        if sid_key not in fmap_colnames:
-            raise KeyError(
-                f"{context}: fibermap column {sid_key!r} not found for object ID. "
-                f"Available: {list(fmap_colnames)[:30]}"
-            )
-        return normalize_object_id(row[sid_key])
 
-    values: list[object] = []
+    # Header-backed values for SURVEY / PROGRAM parts.
+    header_vals: dict[str, str] = {}
     for part in parts:
         key = part.upper()
         if key == "SURVEY":
@@ -989,22 +980,27 @@ def _desi_resolve_source_id(
                     f"{context}: PRIMARY header keyword SURVEY is missing or blank; "
                     "required for DESI composite link id TARGETID|SURVEY|PROGRAM."
                 )
-            values.append(survey)
+            header_vals[part] = survey
         elif key == "PROGRAM":
             if not program:
                 raise ValueError(
                     f"{context}: PRIMARY header keyword PROGRAM is missing or blank; "
                     "required for DESI composite link id TARGETID|SURVEY|PROGRAM."
                 )
-            values.append(program)
-        else:
-            if part not in fmap_colnames:
-                raise KeyError(
-                    f"{context}: fibermap column {part!r} not found for composite "
-                    f"link id. Available: {list(fmap_colnames)[:30]}"
-                )
-            values.append(row[part])
-    return normalize_object_id(composite_link_label(*values))
+            header_vals[part] = program
+
+    def _get(name: str) -> object:
+        if name in header_vals:
+            return header_vals[name]
+        if name not in fmap_colnames:
+            raise KeyError(
+                f"{context}: fibermap column {name!r} not found for object ID. "
+                f"Available: {list(fmap_colnames)[:30]}"
+            )
+        return row[name]
+
+    spec = ",".join(parts)
+    return resolve_link_object_id(spec, _get, context=context)
 
 
 def _read_desi_with_desispec(

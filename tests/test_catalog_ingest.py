@@ -1427,3 +1427,147 @@ class TestSetColumnEndToEnd:
         import json
         info = json.loads((catalog_root / "catalog_info.json").read_text())
         assert info.get("set_columns") == {"VISIT": 5}
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared resolve_link_object_id / resolve_link_object_ids helpers
+# ---------------------------------------------------------------------------
+
+class TestResolveLinkObjectId:
+    """Unit tests for the canonical scalar + vector resolvers in fits_to_parquet."""
+
+    def test_single_part_scalar(self):
+        from data_lake.ingest.fits_to_parquet import (
+            normalize_object_id,
+            resolve_link_object_id,
+        )
+        result = resolve_link_object_id("TARGETID", lambda name: 12345)
+        assert result == normalize_object_id(12345)
+
+    def test_composite_scalar_matches_composite_link_label(self):
+        from data_lake.ingest.fits_to_parquet import (
+            composite_link_label,
+            normalize_object_id,
+            resolve_link_object_id,
+        )
+        mapping = {"TARGETID": 9999, "SURVEY": "main", "PROGRAM": "dark"}
+        result = resolve_link_object_id(
+            "TARGETID,SURVEY,PROGRAM", lambda name: mapping[name]
+        )
+        expected = normalize_object_id(
+            composite_link_label(9999, "main", "dark")
+        )
+        assert result == expected
+
+    def test_missing_key_raises_keyerror_with_context(self):
+        from data_lake.ingest.fits_to_parquet import resolve_link_object_id
+
+        def _raise(name: str):
+            raise KeyError(name)
+
+        import pytest
+        with pytest.raises(KeyError, match="TARGETID"):
+            resolve_link_object_id("TARGETID", _raise, context="test.fits")
+
+    def test_empty_spec_raises_valueerror(self):
+        import pytest
+        from data_lake.ingest.fits_to_parquet import resolve_link_object_id
+
+        with pytest.raises(ValueError, match="Empty"):
+            resolve_link_object_id("  ,  ", lambda n: n)
+
+    def test_vector_single_part(self):
+        import numpy as np
+
+        from data_lake.ingest.fits_to_parquet import (
+            normalize_object_id,
+            resolve_link_object_ids,
+        )
+        cols = {"TARGETID": [101, 202, 303]}
+        ids = resolve_link_object_ids("TARGETID", cols)
+        expected = np.asarray(
+            [normalize_object_id(v) for v in cols["TARGETID"]], dtype=np.int64
+        )
+        np.testing.assert_array_equal(ids, expected)
+
+    def test_vector_composite_matches_scalar(self):
+        import numpy as np
+
+        from data_lake.ingest.fits_to_parquet import (
+            composite_link_label,
+            normalize_object_id,
+            resolve_link_object_id,
+            resolve_link_object_ids,
+        )
+        cols = {
+            "TARGETID": [1, 2],
+            "SURVEY": ["main", "sv3"],
+            "PROGRAM": ["dark", "bright"],
+        }
+        ids = resolve_link_object_ids("TARGETID,SURVEY,PROGRAM", cols)
+        for i in range(2):
+            scalar = resolve_link_object_id(
+                "TARGETID,SURVEY,PROGRAM",
+                lambda name, _i=i: cols[name][_i],
+            )
+            assert int(ids[i]) == scalar
+
+    def test_vector_missing_column_raises_keyerror(self):
+        import pytest
+        from data_lake.ingest.fits_to_parquet import resolve_link_object_ids
+
+        with pytest.raises(KeyError, match="PROGRAM"):
+            resolve_link_object_ids(
+                "TARGETID,SURVEY,PROGRAM",
+                {"TARGETID": [1], "SURVEY": ["main"]},
+            )
+
+
+class TestObjectIdFromFitsHeaderComposite:
+    """Composite keyword spec in object_id_from_fits_header."""
+
+    def test_composite_header_matches_resolver(self):
+        from astropy.io import fits
+
+        from data_lake.ingest.fits_to_parquet import (
+            composite_link_label,
+            normalize_object_id,
+            object_id_from_fits_header,
+        )
+        hdr = fits.Header()
+        hdr["TARGETID"] = 9876543210123456
+        hdr["SURVEY"] = "main"
+        hdr["PROGRAM"] = "dark"
+
+        result = object_id_from_fits_header(hdr, "TARGETID,SURVEY,PROGRAM")
+        expected = normalize_object_id(
+            composite_link_label(9876543210123456, "main", "dark")
+        )
+        assert result == expected
+
+    def test_single_keyword_unchanged(self):
+        from astropy.io import fits
+
+        from data_lake.ingest.fits_to_parquet import (
+            normalize_object_id,
+            object_id_from_fits_header,
+        )
+        hdr = fits.Header()
+        hdr["TARGETID"] = 12345
+
+        result = object_id_from_fits_header(hdr, "TARGETID")
+        assert result == normalize_object_id(12345)
+
+    def test_missing_composite_part_raises_keyerror(self):
+        import pytest
+        from astropy.io import fits
+
+        from data_lake.ingest.fits_to_parquet import object_id_from_fits_header
+
+        hdr = fits.Header()
+        hdr["TARGETID"] = 1
+        hdr["SURVEY"] = "main"
+        # PROGRAM is absent
+
+        with pytest.raises(KeyError, match="PROGRAM"):
+            object_id_from_fits_header(hdr, "TARGETID,SURVEY,PROGRAM")

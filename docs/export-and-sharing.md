@@ -40,9 +40,13 @@ Or the CLI:
 dl-extract-spectra-subset \
     --survey DESI_DR1 \
     --target-list zall-pix-iron-qso.fits \
-    --target-id-col TARGETID \
+    --target-id-col TARGETID,SURVEY,PROGRAM \
     --format zarr \
     --output /scratch/qso_subset.zarr
+
+# ``--target-id-col`` must match the spectra (and catalog) ``--link-id-col``.
+# For DESI coadds ingested with the default composite key, pass
+# TARGETID,SURVEY,PROGRAM (not TARGETID alone).
 
 # One Parquet file (one row per spectrum; wavelength in file metadata)
 dl-extract-spectra-subset ... --format parquet --output /scratch/qso_subset.parquet
@@ -138,8 +142,9 @@ the code warns and falls back to `meta.z`.
 The `dl-ingest-spectra`, `dl-ingest-cutouts`, and `dl-ingest-cutouts-from-list`
 CLIs patch the catalog automatically after each ingest run (`--no-update-catalog`
 to skip).  The ID column is resolved from `catalog_info.json`, so surveys
-ingested with `--link-id-col TARGETID` (or any other native column) work
-without extra configuration.
+ingested with `--link-id-col TARGETID` or a composite spec such as
+`TARGETID,SURVEY,PROGRAM` work without extra configuration — the hash
+rule is consistent across all `dl-*` commands.
 
 To backfill an existing lake where spectra or cutouts were ingested without
 catalog patching (no FITS re-ingestion needed):

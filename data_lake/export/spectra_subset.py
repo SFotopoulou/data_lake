@@ -59,41 +59,62 @@ log = logging.getLogger(__name__)
 
 
 def _read_target_ids(path: Path, column: str) -> np.ndarray:
-    """Read a 1-D int64 array of target IDs from a variety of file formats."""
+    """Read a 1-D int64 array of target IDs from a variety of file formats.
+
+    *column* may be a single name or a comma-separated composite spec matching
+    catalog / DESI ``--link-id-col`` (e.g. ``TARGETID,SURVEY,PROGRAM``).
+    Uses :func:`~data_lake.ingest.fits_to_parquet.resolve_link_object_ids` so
+    the hash is identical to catalog and spectra ingest.
+    """
+    from data_lake.ingest.fits_to_parquet import (
+        parse_link_id_column_spec,
+        resolve_link_object_ids,
+    )
+
+    parts = parse_link_id_column_spec(column)
+    if not parts:
+        raise ValueError(f"Empty --target-id-col spec: {column!r}")
+
     suffix = path.suffix.lower()
 
-    # Plain text: one int per line
+    # Plain text: one int per line (composite specs are not supported)
     if suffix in {".txt", ".lst", ".list"}:
+        if len(parts) > 1:
+            raise ValueError(
+                f"Plain-text target lists cannot use composite --target-id-col "
+                f"{column!r}; use FITS/CSV/Parquet with the component columns."
+            )
         return np.loadtxt(str(path), dtype=np.int64, ndmin=1)
 
     # Parquet
     if suffix in {".parquet", ".pq"}:
         import pyarrow.parquet as pq
 
-        from data_lake.ingest.fits_to_parquet import normalize_object_id
-
-        tbl = pq.read_table(str(path), columns=[column])
-        return np.asarray(
-            [normalize_object_id(v) for v in tbl.column(column).to_pylist()],
-            dtype=np.int64,
-        )
+        tbl = pq.read_table(str(path), columns=parts)
+        missing = [p for p in parts if p not in tbl.column_names]
+        if missing:
+            raise ValueError(
+                f"Column(s) {missing} not in {path.name}. "
+                f"Available columns: {tbl.column_names[:20]}"
+                f"{'…' if len(tbl.column_names) > 20 else ''}"
+            )
+        cols = {p: tbl.column(p).to_pylist() for p in parts}
+        return resolve_link_object_ids(column, cols, context=path.name)
 
     # CSV / TSV / FITS / VOTable / IPAC – let astropy figure it out
     from astropy.table import Table
+
     tbl = Table.read(str(path))
-    if column not in tbl.colnames:
+    missing = [p for p in parts if p not in tbl.colnames]
+    if missing:
         preview = tbl.colnames[:20]
         ellipsis = "…" if len(tbl.colnames) > 20 else ""
         raise ValueError(
-            f"Column {column!r} not in {path.name}. "
-            f"Available columns: {preview}{ellipsis}"
+            f"Column(s) {missing} not in {path.name} "
+            f"(spec={column!r}). Available columns: {preview}{ellipsis}"
         )
-    from data_lake.ingest.fits_to_parquet import normalize_object_id
-
-    return np.asarray(
-        [normalize_object_id(v) for v in tbl[column]],
-        dtype=np.int64,
-    )
+    cols = {p: list(tbl[p]) for p in parts}
+    return resolve_link_object_ids(column, cols, context=path.name)
 
 
 def _validate_output_path(
@@ -161,7 +182,11 @@ try:
     )
     @click.option(
         "--target-id-col", default="TARGETID", show_default=True,
-        help="Column name carrying the source IDs (ignored for plain-text files).",
+        help=(
+            "Column carrying source IDs, or a comma-separated composite matching "
+            "catalog/DESI --link-id-col (e.g. TARGETID,SURVEY,PROGRAM). "
+            "Ignored for plain-text files."
+        ),
     )
     @click.option(
         "--format", "output_format",

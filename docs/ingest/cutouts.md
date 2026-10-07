@@ -30,7 +30,7 @@ so ``update_index_column`` can patch ``_cutout_index``.
 
 | Purpose | CLI flag | Header keyword(s) | Notes |
 |--------|----------|-------------------|--------|
-| Object ID (join to catalog) | ``--link-id-col`` | e.g. ``TARGETID``, ``NAME`` | **Required** for production. Must match catalog ingest (int64 or hashed label). See [Catalog vs spectrum CLI flags](spectra.md#catalog-vs-spectrum-cli-flags) for how IDs are resolved across modalities. If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index. |
+| Object ID (join to catalog) | ``--link-id-col`` | e.g. ``TARGETID``, ``NAME``, or ``TARGETID,SURVEY,PROGRAM`` | **Required** for production. May be a single keyword or a comma-separated composite spec (same rule as catalog ``--link-id-col`` and DESI ingest). Must match catalog ingest; the hash is identical. If omitted, tries ``SOURCE_ID``, ``OBJ_ID``, ``TARGETID``, … then HDU index. |
 | Sky position (tile routing) | ``--ra-col`` / ``--dec-col`` | e.g. ``TARGET_RA``, ``TARGET_DEC`` | Degrees; fallbacks include ``RA_TARG``/``DEC_TARG``, ``CRVAL1``/``CRVAL2``. Should match catalog coordinates. |
 | Astrometry (export) | — | Standard 2-D WCS | ``CTYPE*``, ``CRVAL*``, ``CRPIX*``, ``CD*_*`` (or CDELT/CROTA); stored in ``wcs/`` for FITS round-trip. |
 | Image data | — | Primary or image HDU | 2-D ``(H,W)`` → one band; 3-D → set ``--band-axis``. Fixed ``(H,W)`` per survey tile after the first file. |
@@ -83,18 +83,22 @@ If you start from full-field (or tile) images rather than pre-cut stamps, use
 
 ```bash
 # bands.txt: one path per line (r.fits, then i.fits, then z.fits)
-dl-generate-cutout-fits targets.parquet /data/stamps \\
-  --images-file bands.txt \\
-  --size 64 \\
-  --id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
-  --id-hdu-key TARGETID --ra-hdu-key TARGET_RA --dec-hdu-key TARGET_DEC \\
+dl-generate-cutout-fits targets.parquet /data/stamps \
+  --images-file bands.txt \
+  --size 64 \
+  --id-col TARGETID,SURVEY,PROGRAM \
+  --ra-col TARGET_RA --dec-col TARGET_DEC \
+  --id-hdu-key SOURCE_ID --ra-hdu-key TARGET_RA --dec-hdu-key TARGET_DEC \
   --band-names r,i,z
 
 find /data/stamps -name 'cutout_*.fits' | sort > cutout_files.txt
-dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \\
-  --link-id-col TARGETID --ra-col TARGET_RA --dec-col TARGET_DEC \\
+dl-ingest-cutouts-from-list cutout_files.txt --survey desi_dr1 \
+  --link-id-col TARGETID,SURVEY,PROGRAM \
+  --ra-col TARGET_RA --dec-col TARGET_DEC \
   --band-names r,i,z
 ```
+
+`--id-col` accepts a single column name (e.g. `TARGETID`) or a comma-separated composite spec (e.g. `TARGETID,SURVEY,PROGRAM`). The generated `_source_id` hash is identical to catalog ingest and DESI spectra ingest, so joins work without an extra step.
 
 Band images must share a consistent astrometric grid (2-D WCS per FITS). Cutouts
 use ``astropy.nddata.Cutout2D`` with ``mode='partial'`` (edge sources may include
