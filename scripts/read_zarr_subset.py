@@ -2,22 +2,26 @@
 """
 read_zarr_subset.py
 -------------------
-Read a spectra subset produced by dl-extract-spectra-subset --format zarr
-and export a FITS catalog + individual spectra suitable for TOPCAT validation.
+Read a spectra OR cutout subset produced by dl-extract-*-subset --format zarr
+and export a FITS catalog suitable for TOPCAT validation.
 
-The script resolves the original identifier columns (e.g. TARGETID, SURVEY,
-PROGRAM) from the lake's Parquet catalog by joining on _source_id — the same
-way redshift is resolved during extraction.  No data_lake install is needed.
+The script auto-detects the modality from the Zarr group layout:
+  • spectra  → arrays: flux, ivar, mask, wavelength, _source_id, redshift
+  • cutouts  → arrays: images, wcs, _source_id
+
+Original identifier columns (e.g. TARGETID, SURVEY, PROGRAM) are resolved
+from the lake's Parquet catalog by joining on _source_id — the same way
+redshift is resolved during extraction.  No data_lake install is needed.
 
 Usage
 -----
-    python read_zarr_subset.py subset.zarr                     # summary only
-    python read_zarr_subset.py subset.zarr --catalog out.fits  # TOPCAT catalog
-    python read_zarr_subset.py subset.zarr --catalog out.fits \
-        --plot-row 0                                           # plot spectrum 0
+    python read_zarr_subset.py subset.zarr                      # summary only
+    python read_zarr_subset.py subset.zarr --catalog out.fits   # TOPCAT catalog
+    python read_zarr_subset.py subset.zarr --plot-row 0         # plot row 0
+    python read_zarr_subset.py cutouts.zarr --show-cutout 0     # display cutout
 
 Requirements:  zarr, numpy, astropy, pyarrow
-               (no desispec, no data_lake install needed)
+               (matplotlib optional for --plot-row / --show-cutout)
 """
 
 from __future__ import annotations
@@ -36,31 +40,61 @@ import zarr
 # Zarr layout → FITS/DESI column mapping
 # ---------------------------------------------------------------------------
 #
+#  SPECTRA layout (dl-extract-spectra-subset --format zarr)
+#  ---------------------------------------------------------
 #  Zarr array         FITS / DESI equivalent        Notes
-#  -----------------  ----------------------------  -------------------------
-#  flux               FLUX                          float32, shape (N, N_pix)
-#  ivar               IVAR                          float32, shape (N, N_pix)
-#  mask               MASK                          uint8,   shape (N, N_pix)
-#  wavelength         WAVELENGTH                    float64, shape (N_pix,)
-#                                                   Ångström, vacuum, shared grid
-#  _source_id         —                             int64 hash of TARGETID|SURVEY|PROGRAM
-#                                                   NOT the raw TARGETID integer
-#  redshift           Z                             float32, shape (N,)
-#                                                   from catalog if available
+#  flux               FLUX                          float32, (N, N_pix)
+#  ivar               IVAR                          float32, (N, N_pix)
+#  mask               MASK                          uint8,   (N, N_pix)
+#  wavelength         WAVELENGTH                    float64, (N_pix,) Å vacuum
+#  _source_id         —                             int64 hash (not raw TARGETID)
+#  redshift           Z                             float32, (N,)
 #
-#  Group attributes (out_root.attrs):
-#    source_survey          survey name (e.g. "DESI_DR1")
+#  CUTOUT layout (dl-extract-cutout-subset --format zarr)
+#  -------------------------------------------------------
+#  images             image data                    float32, (N, B, H, W)
+#  wcs                WCS structured bytes          (N,) — decode for CRVAL/CRPIX/CD
+#  _source_id         —                             int64 hash (not raw TARGETID)
+#
+#  Group attributes (both modalities)
+#  ------------------------------------
+#    source_survey          survey name
 #    source_lake_root       absolute path to the lake root
 #    n_sources              rows written
-#    n_pix                  wavelength pixels per spectrum
-#    wavelength_mode        "shared" (one grid) | "per_source" (N × N_pix)
 #    extract_created_utc    ISO timestamp
 #    schema_version         "1"
 #
-#  catalog_info.json  link_id_mode examples:
-#    "column:TARGETID"              → single identifier column
-#    "composite:TARGETID,SURVEY,PROGRAM"  → composite; all parts in Parquet
+#  catalog_info.json  link_id_mode examples (for ID column resolution)
+#    "column:TARGETID"                    → single column
+#    "composite:TARGETID,SURVEY,PROGRAM"  → all parts stored in Parquet
 # ---------------------------------------------------------------------------
+
+
+def _detect_modality(root: zarr.Group) -> str:
+    """Return 'spectra' or 'cutout' based on which arrays are present."""
+    keys = set(root.array_keys())
+    if "images" in keys:
+        return "cutout"
+    if "flux" in keys:
+        return "spectra"
+    raise ValueError(
+        f"Cannot determine modality from arrays: {sorted(keys)}. "
+        "Expected 'flux' (spectra) or 'images' (cutouts)."
+    )
+
+
+def _parse_wcs_raw(raw) -> dict[str, Any]:
+    """Decode a WCS structured-bytes entry into a plain dict."""
+    import struct
+
+    # _WCS_DTYPE: crval1,crval2,crpix1,crpix2,cd1_1,cd1_2,cd2_1,cd2_2  (8×float64)
+    #             naxis1, naxis2 (2×int32)
+    fields = ["crval1", "crval2", "crpix1", "crpix2",
+              "cd1_1", "cd1_2", "cd2_1", "cd2_2"]
+    raw_bytes = bytes(raw)
+    vals = struct.unpack_from("8d2i", raw_bytes)
+    result = dict(zip(fields + ["naxis1", "naxis2"], vals))
+    return result
 
 
 def open_zarr(path: str | Path) -> zarr.Group:
@@ -216,8 +250,9 @@ def resolve_id_columns_from_lake(
 
 def print_summary(root: zarr.Group) -> None:
     attrs = dict(root.attrs)
+    modality = _detect_modality(root)
     print("=" * 60)
-    print("  Zarr subset summary")
+    print(f"  Zarr subset summary  [{modality}]")
     print("=" * 60)
     for k, v in attrs.items():
         print(f"  {k:<28} {v}")
@@ -228,22 +263,36 @@ def print_summary(root: zarr.Group) -> None:
         print(f"  {name:<20} shape={arr.shape}  dtype={arr.dtype}")
     print()
 
-    wave = np.asarray(root["wavelength"])
-    if wave.ndim == 1:
-        print(f"Wavelength grid:  {wave[0]:.2f} – {wave[-1]:.2f} Å  "
-              f"({len(wave)} pixels,  Δλ ≈ {float(wave[1]-wave[0]):.3f} Å/pix)")
-    print()
+    if modality == "spectra":
+        wave = np.asarray(root["wavelength"])
+        if wave.ndim == 1:
+            print(f"Wavelength grid:  {wave[0]:.2f} – {wave[-1]:.2f} Å  "
+                  f"({len(wave)} pixels,  Δλ ≈ {float(wave[1]-wave[0]):.3f} Å/pix)")
+        print()
+        n = min(10, root["flux"].shape[0])
+        flux_sample = np.asarray(root["flux"][:n])
+        mask_sample = np.asarray(root["mask"][:n])
+        good = mask_sample == 0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            snr_sample = np.where(
+                good, flux_sample * np.sqrt(np.asarray(root["ivar"][:n])), np.nan
+            )
+        snr_per = np.where(good.any(axis=1), np.nanmedian(snr_sample, axis=1), np.nan)
+        print(f"Median S/N (first {n} spectra, good pixels): "
+              f"min={np.nanmin(snr_per):.1f}  median={np.nanmedian(snr_per):.1f}  "
+              f"max={np.nanmax(snr_per):.1f}")
 
-    n = min(10, root["flux"].shape[0])
-    flux_sample = np.asarray(root["flux"][:n])
-    mask_sample = np.asarray(root["mask"][:n])
-    good = mask_sample == 0
-    with np.errstate(invalid="ignore", divide="ignore"):
-        snr_sample = np.where(good, flux_sample * np.sqrt(np.asarray(root["ivar"][:n])), np.nan)
-    snr_per = np.where(good.any(axis=1), np.nanmedian(snr_sample, axis=1), np.nan)
-    print(f"Median S/N (first {n} spectra, good pixels): "
-          f"min={np.nanmin(snr_per):.1f}  median={np.nanmedian(snr_per):.1f}  "
-          f"max={np.nanmax(snr_per):.1f}")
+    else:  # cutout
+        _, n_bands, h, w = root["images"].shape
+        band_names = list(attrs.get("band_names", []))
+        print(f"Image shape:  {n_bands} band(s) × {h} × {w} px")
+        if band_names:
+            print(f"Band names:   {band_names}")
+        n = min(5, root["images"].shape[0])
+        imgs = np.asarray(root["images"][:n])
+        print(f"Flux range (first {n} cutouts):  "
+              f"min={float(np.nanmin(imgs)):.3g}  max={float(np.nanmax(imgs)):.3g}  "
+              f"median={float(np.nanmedian(imgs)):.3g}")
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +365,72 @@ def export_catalog(root: zarr.Group, out_path: Path) -> None:
         print("  Cross-match in TOPCAT: join on _source_id (lake not accessible).")
 
 
+def export_cutout_catalog(root: zarr.Group, out_path: Path) -> None:
+    """Write a per-cutout scalar FITS table for TOPCAT (WCS centre + flux stats)."""
+    from astropy.table import Table
+
+    attrs = dict(root.attrs)
+    n = root["images"].shape[0]
+    source_ids = np.asarray(root["_source_id"]).astype(np.int64)
+
+    # Decode WCS centre coords from stored structured bytes
+    crval1 = np.empty(n, dtype=np.float64)
+    crval2 = np.empty(n, dtype=np.float64)
+    crpix1 = np.empty(n, dtype=np.float64)
+    crpix2 = np.empty(n, dtype=np.float64)
+    cd1_1  = np.empty(n, dtype=np.float64)
+    cd2_2  = np.empty(n, dtype=np.float64)
+    naxis1 = np.empty(n, dtype=np.int32)
+    naxis2 = np.empty(n, dtype=np.int32)
+    for i in range(n):
+        p = _parse_wcs_raw(root["wcs"][i])
+        crval1[i] = p["crval1"]
+        crval2[i] = p["crval2"]
+        crpix1[i] = p["crpix1"]
+        crpix2[i] = p["crpix2"]
+        cd1_1[i]  = p["cd1_1"]
+        cd2_2[i]  = p["cd2_2"]
+        naxis1[i] = p["naxis1"]
+        naxis2[i] = p["naxis2"]
+
+    # Pixel scale from |CD1_1| diagonal (degrees → arcsec)
+    pix_scale_arcsec = np.abs(cd1_1) * 3600.0
+
+    # Per-cutout median flux across all bands and pixels
+    images = np.asarray(root["images"])
+    median_flux = np.nanmedian(images.reshape(n, -1), axis=1).astype(np.float32)
+    max_flux    = np.nanmax(images.reshape(n, -1), axis=1).astype(np.float32)
+
+    id_col_names, id_col_arrays = resolve_id_columns_from_lake(attrs, source_ids)
+
+    cols: dict[str, Any] = {}
+    for col in id_col_names:
+        cols[col] = id_col_arrays[col]
+    cols["_source_id"]       = source_ids
+    cols["ra"]               = crval1.astype(np.float64)
+    cols["dec"]              = crval2.astype(np.float64)
+    cols["pix_scale_arcsec"] = pix_scale_arcsec.astype(np.float32)
+    cols["stamp_width_px"]   = naxis1
+    cols["stamp_height_px"]  = naxis2
+    cols["median_flux"]      = median_flux
+    cols["max_flux"]         = max_flux
+
+    tbl = Table(cols)
+    tbl.meta["SURVEY"]   = str(attrs.get("source_survey", ""))
+    tbl.meta["NBANDS"]   = int(attrs.get("n_bands", root["images"].shape[1]))
+    tbl.meta["CREATED"]  = str(attrs.get("extract_created_utc", ""))
+    if id_col_names:
+        tbl.meta["LINKID"] = ",".join(id_col_names)
+
+    tbl.write(str(out_path), format="fits", overwrite=True)
+    print(f"Wrote TOPCAT cutout catalog ({n} rows) → {out_path}")
+    print(f"  Columns: {list(cols)}")
+    if id_col_names:
+        print(f"  Cross-match in TOPCAT: join on "
+              f"{id_col_names[0] if len(id_col_names) == 1 else str(id_col_names)}"
+              f" or ra/dec with a 1-arcsec cone.")
+
+
 def plot_spectrum(root: zarr.Group, row: int) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -351,27 +466,87 @@ def plot_spectrum(root: zarr.Group, row: int) -> None:
     plt.show()
 
 
+def show_cutout(root: zarr.Group, row: int) -> None:
+    """Display a cutout stamp with WCS overlay using matplotlib."""
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+    except ImportError:
+        sys.exit("matplotlib is required for --show-cutout. pip install matplotlib")
+
+    n = root["images"].shape[0]
+    if row >= n:
+        sys.exit(f"ERROR: --show-cutout {row} out of range (0–{n-1})")
+
+    attrs = dict(root.attrs)
+    band_names: list[str] = list(attrs.get("band_names", []))
+    img = np.asarray(root["images"][row])  # (B, H, W)
+    sid = int(np.asarray(root["_source_id"])[row])
+    wcs_params = _parse_wcs_raw(root["wcs"][row])
+
+    n_bands = img.shape[0]
+    fig, axes = plt.subplots(1, n_bands, figsize=(4 * n_bands, 4), squeeze=False)
+    axes = axes[0]
+
+    for b, ax in enumerate(axes):
+        plane = img[b]
+        vmin, vmax = float(np.nanpercentile(plane, 1)), float(np.nanpercentile(plane, 99))
+        ax.imshow(plane, origin="lower", cmap="gray",
+                  norm=Normalize(vmin=vmin, vmax=vmax))
+        label = band_names[b] if b < len(band_names) else f"band {b}"
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel("x (px)")
+        ax.set_ylabel("y (px)")
+        # Mark reference pixel
+        ax.scatter([wcs_params["crpix1"] - 1], [wcs_params["crpix2"] - 1],
+                   s=40, c="red", marker="+", linewidths=1)
+
+    ra, dec = wcs_params["crval1"], wcs_params["crval2"]
+    pix_as = abs(wcs_params["cd1_1"]) * 3600.0
+    fig.suptitle(
+        f"Row {row}  |  _source_id={sid}\n"
+        f"RA={ra:.5f}  Dec={dec:.5f}  pix={pix_as:.3f} arcsec",
+        fontsize=10,
+    )
+    plt.tight_layout()
+    plt.show()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("zarr_path", help="Path to the .zarr directory")
     ap.add_argument("--catalog", metavar="OUT.fits",
-                    help="Export a per-spectrum scalar summary FITS for TOPCAT")
+                    help="Export a per-row scalar FITS for TOPCAT "
+                         "(spectra: flux stats; cutouts: WCS centre + flux stats).")
     ap.add_argument("--plot-row", metavar="N", type=int,
-                    help="Plot spectrum at row N (0-based)")
+                    help="[spectra] Plot spectrum at row N (0-based).")
+    ap.add_argument("--show-cutout", metavar="N", type=int,
+                    help="[cutouts] Display cutout stamp at row N (0-based).")
     args = ap.parse_args()
 
     root = open_zarr(args.zarr_path)
+    modality = _detect_modality(root)
     print_summary(root)
 
     if args.catalog:
-        export_catalog(root, Path(args.catalog))
+        if modality == "spectra":
+            export_catalog(root, Path(args.catalog))
+        else:
+            export_cutout_catalog(root, Path(args.catalog))
 
     if args.plot_row is not None:
+        if modality != "spectra":
+            sys.exit("ERROR: --plot-row is for spectra Zarr. Use --show-cutout for cutouts.")
         n = root["flux"].shape[0]
         if args.plot_row >= n:
-            sys.exit(f"ERROR: --plot-row {args.plot_row} is out of range (0–{n-1})")
+            sys.exit(f"ERROR: --plot-row {args.plot_row} out of range (0–{n-1})")
         plot_spectrum(root, args.plot_row)
+
+    if args.show_cutout is not None:
+        if modality != "cutout":
+            sys.exit("ERROR: --show-cutout is for cutout Zarr. Use --plot-row for spectra.")
+        show_cutout(root, args.show_cutout)
 
 
 if __name__ == "__main__":

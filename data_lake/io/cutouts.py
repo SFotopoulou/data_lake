@@ -424,3 +424,374 @@ class CutoutAccessor:
             f"CutoutAccessor(survey={self.survey_name!r}, "
             f"norder={self.norder}, root={self.lake_root})"
         )
+
+    # ------------------------------------------------------------------
+    # Subset extraction
+    # ------------------------------------------------------------------
+
+    def _iter_subset_batches(
+        self,
+        sid_to_loc: "dict[int, tuple[int, int]]",
+        show_progress: bool,
+    ):
+        """Yield ``(sorted_sids, images, wcs_raw_list)`` per tile.
+
+        Images have shape ``(k, B, H, W)``; *wcs_raw_list* is a list of
+        raw structured-array entries (one per source) that can be decoded
+        with :func:`data_lake.io.cutouts._decode_wcs`.
+        """
+        from collections import defaultdict
+
+        tile_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for sid, (npix, local_idx) in sid_to_loc.items():
+            tile_groups[npix].append((sid, local_idx))
+
+        items = list(tile_groups.items())
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                items = tqdm(items, desc="cutout tiles", unit="tile")
+            except ImportError:
+                pass
+
+        for npix, pairs in items:
+            sids = np.array([p[0] for p in pairs], dtype=np.int64)
+            local_idxs = np.array([p[1] for p in pairs], dtype=np.int64)
+            store = self._get_tile_store(npix)
+            images = store.get_images(local_idxs)
+            root = store._open()
+            wcs_raw = [root["wcs"][int(i)] for i in local_idxs]
+            yield sids, images, wcs_raw
+
+    def extract_subset_to_zarr(
+        self,
+        source_ids: "list[int]",
+        output_zarr: "Path | str",
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+    ) -> dict:
+        """Extract a subset of cutouts into a self-contained flat Zarr group.
+
+        Output layout
+        -------------
+        ::
+
+            output_zarr/
+              images/      (N, B, H, W)  float32    sharded
+              wcs/         (N,)           bytes      WCS structured array (preserve)
+              _source_id/  (N,)           int64
+
+        Group attributes mirror those of the source tiles plus
+        ``source_survey``, ``source_lake_root``, ``n_sources``,
+        ``extract_created_utc``.
+
+        Returns
+        -------
+        dict with ``n_requested``, ``n_written``, ``missing_ids``,
+        ``id_to_row``, ``output_zarr``.
+        """
+        import shutil
+        import time
+
+        import zarr
+        import zarr.codecs
+
+        from data_lake.ingest.fits_to_zarr import _WCS_DTYPE
+        from data_lake.ingest.zarr_ids import create_zarr_join_array
+
+        output_zarr = Path(output_zarr)
+        if output_zarr.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"{output_zarr} already exists. Pass overwrite=True to replace it."
+                )
+            shutil.rmtree(output_zarr)
+
+        unique_ids = list(dict.fromkeys(int(s) for s in source_ids))
+        n_requested = len(unique_ids)
+
+        sid_to_loc = self._build_source_id_lookup(unique_ids, show_progress=show_progress)
+        found_ids = set(sid_to_loc)
+        missing_ids = [s for s in unique_ids if s not in found_ids]
+
+        if missing_ids and missing == "error":
+            raise KeyError(
+                f"{len(missing_ids)} source_id(s) not found in {self.survey_name}: "
+                f"{missing_ids[:10]}{'…' if len(missing_ids) > 10 else ''}"
+            )
+
+        sid_to_loc = {s: v for s, v in sid_to_loc.items() if s in found_ids}
+
+        # Determine image geometry from the first tile
+        sample_npix = next(iter(sid_to_loc.values()))[0]
+        sample_store = self._get_tile_store(sample_npix)
+        sample_root = sample_store._open()
+        _, n_bands, h, w = sample_root["images"].shape
+        band_names: list[str] = list(sample_root.attrs.get("band_names", []))
+
+        # Create output Zarr
+        store = zarr.storage.LocalStore(str(output_zarr))
+        out = zarr.open_group(store=store, mode="w", zarr_format=3)
+
+        blosc = zarr.codecs.BloscCodec(
+            cname="zstd", clevel=3,
+            shuffle=zarr.codecs.BloscShuffle.bitshuffle,
+        )
+        n_out = len(sid_to_loc)
+        chunk_img = (1, n_bands, h, w)
+        shard_img = (min(512, n_out), n_bands, h, w)
+
+        images_arr = out.create_array(
+            "images", shape=(n_out, n_bands, h, w),
+            chunks=chunk_img, shards=shard_img,
+            dtype=np.float32, compressors=blosc, fill_value=np.nan,
+        )
+        create_zarr_join_array(out, shape=(n_out,), chunks=(4096,), dtype=np.int64, fill_value=-1)
+        wcs_arr = out.create_array(
+            "wcs", shape=(n_out,), chunks=(512,),
+            dtype="|V" + str(_WCS_DTYPE.itemsize),
+            fill_value=b"\x00" * _WCS_DTYPE.itemsize,
+        )
+
+        id_to_row: dict[int, int] = {}
+        row = 0
+        for sids_batch, images_batch, wcs_raw_batch in self._iter_subset_batches(
+            sid_to_loc, show_progress=show_progress
+        ):
+            k = len(sids_batch)
+            slc = slice(row, row + k)
+            images_arr[slc] = images_batch
+            out["_source_id"][slc] = sids_batch
+            for j, raw in enumerate(wcs_raw_batch):
+                wcs_arr[row + j] = raw
+            for j, sid in enumerate(sids_batch):
+                id_to_row[int(sid)] = row + j
+            row += k
+
+        out.attrs.update({
+            "source_survey": self.survey_name,
+            "source_lake_root": str(self.lake_root),
+            "n_sources": n_out,
+            "n_requested": n_requested,
+            "n_missing": len(missing_ids),
+            "n_bands": n_bands,
+            "height": h,
+            "width": w,
+            "band_names": band_names,
+            "extract_created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "schema_version": "1",
+        })
+
+        return {
+            "n_requested": n_requested,
+            "n_written": n_out,
+            "missing_ids": missing_ids,
+            "id_to_row": id_to_row,
+            "output_zarr": str(output_zarr),
+        }
+
+    def extract_subset_to_fits(
+        self,
+        source_ids: "list[int]",
+        output_dir: "Path | str",
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+        filename_template: str = "cutout_{source_id}.fits",
+        id_hdu_key: str = "SOURCE_ID",
+    ) -> dict:
+        """Extract cutouts to per-source FITS files, each with full WCS.
+
+        Each FITS has a PrimaryHDU with shape ``(B, H, W)`` float32 and
+        WCS keywords (CTYPE1/2, CRVAL1/2, CRPIX1/2, CD1_1 etc.) populated
+        from the stored WCS structured array.
+
+        Returns
+        -------
+        dict with ``n_written``, ``missing_ids``, ``id_to_path``.
+        """
+        from astropy.io import fits as apfits
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        unique_ids = list(dict.fromkeys(int(s) for s in source_ids))
+        n_requested = len(unique_ids)
+
+        sid_to_loc = self._build_source_id_lookup(unique_ids, show_progress=show_progress)
+        found_ids = set(sid_to_loc)
+        missing_ids = [s for s in unique_ids if s not in found_ids]
+
+        if missing_ids and missing == "error":
+            raise KeyError(
+                f"{len(missing_ids)} source_id(s) not found: "
+                f"{missing_ids[:10]}{'…' if len(missing_ids) > 10 else ''}"
+            )
+        sid_to_loc = {s: v for s, v in sid_to_loc.items() if s in found_ids}
+
+        # Band names from the first tile
+        sample_store = self._get_tile_store(next(iter(sid_to_loc.values()))[0])
+        band_names: list[str] = list(sample_store._open().attrs.get("band_names", []))
+
+        id_to_path: dict[int, str] = {}
+        n_written = 0
+
+        for sids_batch, images_batch, wcs_raw_batch in self._iter_subset_batches(
+            sid_to_loc, show_progress=show_progress
+        ):
+            for j, (sid, img, raw) in enumerate(
+                zip(sids_batch.tolist(), images_batch, wcs_raw_batch)
+            ):
+                wcs_obj = _decode_wcs(raw)
+                fname = output_dir / filename_template.format(source_id=sid)
+                if fname.exists() and not overwrite:
+                    log.warning("Skipping existing %s (pass overwrite=True to replace)", fname.name)
+                    continue
+
+                hdu = apfits.PrimaryHDU(data=img.astype(np.float32, copy=False))
+                hdr = hdu.header
+                hdr[id_hdu_key] = int(sid)
+                # WCS keywords — preserve full TAN projection
+                hdr["CTYPE1"] = "RA---TAN"
+                hdr["CTYPE2"] = "DEC--TAN"
+                hdr["CRVAL1"] = wcs_obj.crval[0]
+                hdr["CRVAL2"] = wcs_obj.crval[1]
+                hdr["CRPIX1"] = wcs_obj.crpix[0]
+                hdr["CRPIX2"] = wcs_obj.crpix[1]
+                cd = wcs_obj.cd_matrix
+                hdr["CD1_1"] = cd[0, 0]
+                hdr["CD1_2"] = cd[0, 1]
+                hdr["CD2_1"] = cd[1, 0]
+                hdr["CD2_2"] = cd[1, 1]
+                if band_names:
+                    hdr["NBANDS"] = len(band_names)
+                    hdr["BANDLIST"] = ",".join(band_names)[:68]
+                hdu.writeto(str(fname), overwrite=True)
+                id_to_path[int(sid)] = str(fname)
+                n_written += 1
+
+        return {
+            "n_requested": n_requested,
+            "n_written": n_written,
+            "missing_ids": missing_ids,
+            "id_to_path": id_to_path,
+        }
+
+    def extract_subset_to_hdf5(
+        self,
+        source_ids: "list[int]",
+        output_hdf5: "Path | str",
+        *,
+        missing: str = "skip",
+        show_progress: bool = True,
+        overwrite: bool = False,
+        compression: str = "gzip",
+        compression_opts: int = 4,
+    ) -> dict:
+        """Extract cutouts to a single HDF5 file.
+
+        Datasets
+        --------
+        images       (N, B, H, W)  float32
+        _source_id   (N,)           int64
+        wcs_crval1   (N,)           float64   RA of reference pixel (deg)
+        wcs_crval2   (N,)           float64   Dec of reference pixel (deg)
+        wcs_crpix1   (N,)           float64
+        wcs_crpix2   (N,)           float64
+        wcs_cd1_1 …  (N,)           float64   CD matrix elements
+        wcs_naxis1   (N,)           int32
+        wcs_naxis2   (N,)           int32
+
+        Root attributes: survey, band_names, n_sources, extract_created_utc.
+        """
+        import time
+
+        try:
+            import h5py
+        except ImportError:
+            raise ImportError("h5py is required for HDF5 export: pip install h5py")
+
+        from data_lake.ingest.fits_to_zarr import _WCS_DTYPE
+
+        output_hdf5 = Path(output_hdf5)
+        if output_hdf5.exists():
+            if not overwrite:
+                raise FileExistsError(f"{output_hdf5} already exists.")
+            output_hdf5.unlink()
+
+        unique_ids = list(dict.fromkeys(int(s) for s in source_ids))
+        n_requested = len(unique_ids)
+
+        sid_to_loc = self._build_source_id_lookup(unique_ids, show_progress=show_progress)
+        found_ids = set(sid_to_loc)
+        missing_ids = [s for s in unique_ids if s not in found_ids]
+
+        if missing_ids and missing == "error":
+            raise KeyError(
+                f"{len(missing_ids)} source_id(s) not found: "
+                f"{missing_ids[:10]}{'…' if len(missing_ids) > 10 else ''}"
+            )
+        sid_to_loc = {s: v for s, v in sid_to_loc.items() if s in found_ids}
+
+        sample_store = self._get_tile_store(next(iter(sid_to_loc.values()))[0])
+        sample_root = sample_store._open()
+        _, n_bands, h, w = sample_root["images"].shape
+        band_names: list[str] = list(sample_root.attrs.get("band_names", []))
+        n_out = len(sid_to_loc)
+
+        ck = dict(compression=compression, compression_opts=compression_opts)
+        wcs_fields = [f for f in _WCS_DTYPE.names]
+
+        id_to_row: dict[int, int] = {}
+        row = 0
+
+        output_hdf5.parent.mkdir(parents=True, exist_ok=True)
+        with h5py.File(str(output_hdf5), "w") as hf:
+            ds_img = hf.create_dataset(
+                "images", shape=(n_out, n_bands, h, w), dtype=np.float32, **ck
+            )
+            ds_sid = hf.create_dataset("_source_id", shape=(n_out,), dtype=np.int64, **ck)
+            wcs_ds = {
+                f: hf.create_dataset(
+                    f"wcs_{f}",
+                    shape=(n_out,),
+                    dtype=_WCS_DTYPE[f],
+                    **ck,
+                )
+                for f in wcs_fields
+            }
+
+            for sids_batch, images_batch, wcs_raw_batch in self._iter_subset_batches(
+                sid_to_loc, show_progress=show_progress
+            ):
+                k = len(sids_batch)
+                slc = slice(row, row + k)
+                ds_img[slc] = images_batch
+                ds_sid[slc] = sids_batch
+                for j, raw in enumerate(wcs_raw_batch):
+                    wcs_obj = _decode_wcs(raw)
+                    for field in wcs_fields:
+                        wcs_ds[field][row + j] = wcs_obj._p[field]
+                for j, sid in enumerate(sids_batch):
+                    id_to_row[int(sid)] = row + j
+                row += k
+
+            hf.attrs["source_survey"] = self.survey_name
+            hf.attrs["source_lake_root"] = str(self.lake_root)
+            hf.attrs["n_sources"] = n_out
+            hf.attrs["n_bands"] = n_bands
+            hf.attrs["band_names"] = band_names
+            hf.attrs["extract_created_utc"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+
+        return {
+            "n_requested": n_requested,
+            "n_written": n_out,
+            "missing_ids": missing_ids,
+            "id_to_row": id_to_row,
+            "output_hdf5": str(output_hdf5),
+        }
