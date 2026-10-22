@@ -109,7 +109,7 @@ dl-ingest-catalog survey.fits \
 
 The `--link-id-col` value becomes the stable `_source_id` that links catalog rows to spectra and cutout tiles. Pick the column that is already used as a unique integer identifier in your survey (e.g. SDSS `SPECOBJID`, DESI `TARGETID`).
 
-For large surveys or file lists, see [ingest/catalog.md](ingest/catalog.md) and [ingest/batch-and-checkpoints.md](ingest/batch-and-checkpoints.md).
+For many input files, pick the command from how the files are laid out on disk: files covering about one lake tile each use `dl-ingest-catalog-batch`, while bricks, RA/Dec patches or unsorted files use `dl-ingest-from-shard`. See [Choosing a catalog ingest command](ingest/catalog.md#choosing-a-catalog-ingest-command) and [ingest/batch-and-checkpoints.md](ingest/batch-and-checkpoints.md).
 
 ---
 

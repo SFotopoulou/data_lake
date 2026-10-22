@@ -577,6 +577,9 @@ def tool_recommend_ingest(
     n_files: int = 1,
     total_size_gb: float | None = None,
     streaming: bool = False,
+    layout: str | None = None,
+    file_area_deg2: float | None = None,
+    norder: int | None = None,
 ) -> dict[str, Any]:
     rec = recommend_ingest(
         modality,  # type: ignore[arg-type]
@@ -588,6 +591,9 @@ def tool_recommend_ingest(
         n_files=n_files,
         total_size_gb=total_size_gb,
         streaming=streaming,
+        layout=layout,  # type: ignore[arg-type]
+        file_area_deg2=file_area_deg2,
+        norder=norder,
     )
     return rec.to_dict()
 
@@ -769,8 +775,18 @@ def create_lake_mcp_app() -> Any:
         n_files: int = 1,
         total_size_gb: float | None = None,
         streaming: bool = False,
+        layout: str | None = None,
+        file_area_deg2: float | None = None,
+        norder: int | None = None,
     ) -> str:
-        """Recommend dl-* ingest command and Slurm script for a survey."""
+        """Recommend dl-* ingest command and Slurm script for a survey.
+
+        Catalog file lists: pass layout ('spatial' for bricks / RA-Dec patches,
+        'unsorted' for files not grouped on the sky, 'partitioned' for files
+        already aligned with lake tiles) or file_area_deg2 (sky area per file,
+        with norder) to choose between batch append and dl-ingest-from-shard.
+        Shard recommendations return the reduce job in extra_slurm_scripts.
+        """
         return json_dumps(tool_recommend_ingest(
             modality,
             survey,
@@ -781,6 +797,9 @@ def create_lake_mcp_app() -> Any:
             n_files=n_files,
             total_size_gb=total_size_gb,
             streaming=streaming,
+            layout=layout,
+            file_area_deg2=file_area_deg2,
+            norder=norder,
         ))
 
     # --- Inventory tools (mirrored from dl-mcp-docs so the explorer alone suffices) ---

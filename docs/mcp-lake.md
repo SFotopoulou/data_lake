@@ -94,7 +94,7 @@ Restart Cursor after changing MCP config.
 | `lake_health` | Registry entry counts by kind/modality, unfinalized surveys, missing tile indices, stale registry hint |
 | `recommend_norder` | Suggest `--norder` from sample catalog files |
 | `estimate_operation_cost` | Rough crossmatch/gather/ingest duration for a region (cone, bbox, moc, npix, or area) |
-| `recommend_ingest` | Recommend `dl-*` command + Slurm script for a survey ingest |
+| `recommend_ingest` | Recommend `dl-*` command + Slurm script for a survey ingest. For catalog file lists, pass `layout` (`spatial`, `unsorted`, `partitioned`) or `file_area_deg2` with `norder` to choose between batch append and `dl-ingest-from-shard`; shard results put the reduce job in `extra_slurm_scripts` |
 
 Pass `lake_root` to any tool when `DATA_LAKE_CONFIG` is not set.
 
@@ -132,6 +132,17 @@ list_homogenize_recipes()
 ```
 recommend_ingest(modality="spectra", survey="2DFGRS_DR3", fmt="2df", n_files=300000)
 ```
+
+**"How should I ingest 93k Legacy Survey brick catalogs?"**
+
+```
+recommend_ingest(modality="catalog", survey="Legacy_DR11_north", n_files=93000,
+                 layout="spatial", file_area_deg2=0.0625, norder=7)
+```
+
+Returns map/reduce `dl-ingest-from-shard` commands, a map array script, and
+`extra_slurm_scripts["reduce"]`. Without `layout` or `file_area_deg2` it keeps the batch
+recommendation and adds a warning.
 
 ## Out of scope
 

@@ -203,6 +203,12 @@ def test_recommend_ingest() -> None:
     assert "dl-ingest-catalog-batch" in payload["command"]
     assert payload["slurm_script"]
 
+    shard = tool_recommend_ingest(
+        "catalog", "LEGACY", n_files=1000, file_list="bricks.txt", layout="spatial",
+    )
+    assert "dl-ingest-from-shard" in shard["command"]
+    assert "reduce" in shard["extra_slurm_scripts"]
+
 
 @pytest.mark.skipif(
     __import__("importlib").util.find_spec("mcp") is None,

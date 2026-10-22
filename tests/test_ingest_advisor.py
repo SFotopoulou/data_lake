@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from data_lake.ingest_advisor import recommend_ingest
+from data_lake.ingest_advisor import (
+    estimate_files_per_tile,
+    recommend_ingest,
+    tile_area_deg2,
+)
 
 
 def test_catalog_batch_many_files() -> None:
@@ -15,6 +19,79 @@ def test_catalog_batch_many_files() -> None:
     assert rec.slurm_script is not None
     assert "SBATCH" in rec.slurm_script
     assert any("parallel" in r.lower() for r in rec.rationale)
+    assert any("layout unknown" in w.lower() for w in rec.warnings)
+    assert rec.extra_slurm_scripts == {}
+
+
+def test_tile_area_matches_docs_table() -> None:
+    assert tile_area_deg2(5) == pytest.approx(3.36, abs=0.01)
+    assert tile_area_deg2(7) == pytest.approx(0.21, abs=0.001)
+
+
+def test_files_per_tile_legacy_bricks() -> None:
+    brick = 0.25 * 0.25
+    assert estimate_files_per_tile(4, brick) == pytest.approx(215, rel=0.01)
+    assert estimate_files_per_tile(7, brick) == pytest.approx(3.36, rel=0.01)
+    assert estimate_files_per_tile(4, 100.0) == 1.0
+    with pytest.raises(ValueError):
+        estimate_files_per_tile(5, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "shard"),
+    [
+        ({"layout": "spatial"}, True),
+        ({"layout": "unsorted"}, True),
+        ({"layout": "partitioned"}, False),
+        ({"file_area_deg2": 0.0625, "norder": 4}, True),
+        ({"file_area_deg2": 0.0625, "norder": 8}, False),
+        # Area estimate wins over a contradicting layout hint.
+        ({"layout": "partitioned", "file_area_deg2": 0.0625, "norder": 4}, True),
+    ],
+)
+def test_catalog_layout_selects_helper(kwargs, shard) -> None:
+    rec = recommend_ingest(
+        "catalog", "LEGACY_DR11", n_files=93_000, file_list="bricks.txt", **kwargs,
+    )
+    assert ("dl-ingest-from-shard" in rec.command) is shard
+    assert ("dl-ingest-catalog-batch" in rec.command) is not shard
+    assert not any("layout unknown" in w.lower() for w in rec.warnings)
+
+
+def test_shard_recommendation_commands_and_scripts() -> None:
+    rec = recommend_ingest(
+        "catalog", "LEGACY_DR11", n_files=93_000, file_list="bricks.txt",
+        layout="spatial", norder=7,
+    )
+    assert "--phase map" in rec.command and "--phase reduce" in rec.command
+    assert "--norder 7" in rec.command
+    assert "--file-list bricks.txt" in rec.command
+    map_script = rec.slurm_script
+    reduce_script = rec.extra_slurm_scripts["reduce"]
+    assert "--array=0-$((N-1))%64" in map_script
+    assert '--file-list "${CHUNK}"' in map_script
+    assert "LINK_ID_COL:?" in map_script
+    assert "<" not in map_script.split("set -euo pipefail")[1].replace("<<", "")
+    assert "--dependency=afterok:${MAP_JID}" in reduce_script
+    assert "--phase reduce" in reduce_script and "--failures-log" in reduce_script
+    assert "dl-finalize-catalog" not in reduce_script
+    assert any("~47 chunk" in r for r in rec.rationale)
+
+
+def test_shard_not_used_for_live_or_single_or_packed(tmp_path: Path) -> None:
+    live = recommend_ingest(
+        "catalog", "EUCLID", n_files=500, layout="spatial", lifecycle="live",
+    )
+    assert "dl-ingest-catalog-batch" in live.command
+    assert "--defer-finalize" in live.command
+
+    single = recommend_ingest("catalog", "ONE", n_files=1, layout="spatial")
+    assert "dl-ingest-catalog " in single.command
+
+
+def test_invalid_layout_rejected() -> None:
+    with pytest.raises(ValueError, match="layout"):
+        recommend_ingest("catalog", "X", n_files=10, layout="bricks")  # type: ignore[arg-type]
 
 
 def test_catalog_live_defer_finalize() -> None:

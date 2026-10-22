@@ -46,6 +46,24 @@ dl-ingest-spectra-from-list gama.txt /data/lake \
     --heartbeat-interval 120
 ```
 
+**Map-reduce catalog ingest (Slurm array, one log per task):**
+
+```bash
+dl-ingest-from-shard --phase map --file-list "$CHUNK" \
+    --survey Legacy_DR11_north --shard-root "$SCRATCH/shards" \
+    --link-id-col ls_id_dr11 --norder 7 --n-workers 8 \
+    --no-progress -q \
+    --log-file "logs/map_${SLURM_ARRAY_TASK_ID}.log" \
+    --failures-log "logs/map_${SLURM_ARRAY_TASK_ID}_failures.jsonl"
+
+# Failed inputs across all tasks
+cat logs/map_*_failures.jsonl | jq -r .path | sort -u
+```
+
+Use a separate log file per array task: concurrent tasks appending to one file can
+interleave lines. Reduce failure lines carry `npix` and `parts` instead of `path`. See
+[Two-phase map-reduce ingest](batch-and-checkpoints.md#two-phase-map-reduce-ingest-dl-ingest-from-shard).
+
 ### Config-file default
 
 Set in `lake_config.toml` to make quiet the deployment default:

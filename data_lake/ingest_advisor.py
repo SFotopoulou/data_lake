@@ -8,11 +8,9 @@ text. Never runs ingest or submits jobs.
 
 from __future__ import annotations
 
+import math
 import textwrap
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Literal
-
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,6 +20,34 @@ def _repo_root() -> Path:
 
 Modality = Literal["catalog", "spectra", "cutout"]
 Lifecycle = Literal["static", "live"]
+# How catalog files are organised on the sky:
+#   spatial     — each file is a small sky patch (bricks, RA/Dec chunks, fine HEALPix)
+#   unsorted    — rows not grouped on the sky (split by row count, magnitude, night, …)
+#   partitioned — files already align with lake tiles or cover large disjoint regions
+CatalogLayout = Literal["spatial", "unsorted", "partitioned"]
+CATALOG_LAYOUTS: tuple[str, ...] = ("spatial", "unsorted", "partitioned")
+
+# Append rewrites each tile once per contributing file (≈ (k+1)/2 × survey bytes);
+# the shard path writes every row twice.  Shard wins above this many files per tile.
+SHARD_BREAK_EVEN_FILES_PER_TILE = 3.0
+_DEFAULT_NORDER = 5
+_FULL_SKY_DEG2 = 4 * math.pi * (180 / math.pi) ** 2
+
+
+def tile_area_deg2(norder: int) -> float:
+    """Mean HEALPix tile area at *norder* (deg²)."""
+    return _FULL_SKY_DEG2 / (12 * 4**norder)
+
+
+def estimate_files_per_tile(norder: int, file_area_deg2: float) -> float:
+    """Average number of spatially organised input files feeding one lake tile.
+
+    Files larger than a tile give ~1 (each tile is fed by one file, apart from
+    edges); smaller files give ``tile area / file area``.
+    """
+    if file_area_deg2 <= 0:
+        raise ValueError(f"file_area_deg2 must be > 0, got {file_area_deg2}")
+    return max(1.0, tile_area_deg2(norder) / file_area_deg2)
 
 _KNOWN_SLURM_SCRIPTS: dict[str, str] = {
     "2df": "scripts/slurm_ingest_2df_spectra.sh",
@@ -54,6 +80,8 @@ class IngestRecommendation:
     preflight: list[str] = field(default_factory=list)
     doc_refs: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Follow-on job scripts keyed by step name (e.g. ``{"reduce": ...}`` for shard ingest).
+    extra_slurm_scripts: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +89,7 @@ class IngestRecommendation:
             "rationale": self.rationale,
             "slurm_script_path": self.slurm_script_path,
             "slurm_script": self.slurm_script,
+            "extra_slurm_scripts": self.extra_slurm_scripts,
             "preflight": self.preflight,
             "doc_refs": self.doc_refs,
             "warnings": self.warnings,
@@ -179,6 +208,188 @@ def _catalog_command(
             "dl-refresh-lake-registry."
         )
     return cmd, rationale
+
+
+def _prefer_shard_ingest(
+    *,
+    n_files: int,
+    layout: CatalogLayout | None,
+    files_per_tile: float | None,
+) -> tuple[bool, str | None]:
+    """Decide between append batch ingest and map-reduce shard ingest.
+
+    Returns ``(use_shard, reason)``; *reason* is None when nothing is known
+    about the layout (caller keeps the batch default and warns).
+    """
+    k = SHARD_BREAK_EVEN_FILES_PER_TILE
+    if files_per_tile is not None:
+        if files_per_tile > k:
+            return True, (
+                f"~{files_per_tile:.1f} files feed each tile (> {k:g}): append would "
+                f"rewrite each tile ~{files_per_tile:.0f}× as it grows; map-reduce "
+                "writes every row twice regardless."
+            )
+        return False, (
+            f"~{files_per_tile:.1f} files feed each tile (≤ {k:g}): append rewrites "
+            "are cheap; single-command batch ingest is simpler."
+        )
+    if layout == "unsorted":
+        if n_files > k:
+            return True, (
+                "Files are not grouped on the sky, so every file touches most tiles "
+                "and append rewrites the whole survey once per file; use map-reduce."
+            )
+        return False, "Only a few unsorted files: append rewrites stay cheap."
+    if layout == "spatial":
+        return True, (
+            "Files are small sky patches (bricks / RA-Dec chunks), so many files share "
+            "each tile; map-reduce writes each tile once instead of once per file."
+        )
+    if layout == "partitioned":
+        return False, (
+            "Files already align with lake tiles or cover disjoint regions "
+            "(~1 file per tile): append batch ingest writes each tile ~once."
+        )
+    return False, None
+
+
+def _shard_commands(
+    survey: str,
+    *,
+    list_arg: str,
+    norder: int,
+    shard_root: str = '"$SHARD_ROOT"',
+    lake_root: str = "$LAKE_ROOT",
+) -> tuple[str, str]:
+    """Return ``(map_cmd, reduce_cmd)`` for dl-ingest-from-shard.
+
+    *lake_root* is left unquoted so an empty ``$LAKE_ROOT`` falls back to the
+    config's ``lake.root``.
+    """
+    map_cmd = (
+        f"dl-ingest-from-shard --phase map --file-list {list_arg} "
+        f"--survey {survey} --shard-root {shard_root} "
+        f'--ra-col ra --dec-col dec --link-id-col "$LINK_ID_COL" --norder {norder} '
+        f"--n-workers 8 --no-progress"
+    )
+    reduce_cmd = (
+        f"dl-ingest-from-shard {lake_root} --phase reduce "
+        f"--survey {survey} --shard-root {shard_root} "
+        f"--n-workers 16 --on-duplicate-id skip --no-progress"
+    )
+    return map_cmd, reduce_cmd
+
+
+def _shard_catalog_recommendation(
+    survey: str,
+    *,
+    n_files: int,
+    file_list: str | None,
+    norder: int,
+    reason: str,
+) -> tuple[str, list[str], str, str]:
+    """Return ``(command, rationale, map_slurm, reduce_slurm)``."""
+    map_cmd, reduce_cmd = _shard_commands(
+        survey, list_arg=file_list or "files.txt", norder=norder,
+    )
+    command = (
+        "# 1. Map (Slurm array: one task per folder or file-list chunk)\n"
+        f"{map_cmd}\n"
+        "# 2. Reduce (one job after the whole array succeeds)\n"
+        f"{reduce_cmd}"
+    )
+    rationale = [
+        reason,
+        "Use dl-ingest-from-shard: map decodes FITS into immutable per-HEALPix "
+        "parts in parallel across nodes; reduce concatenates each tile once.",
+        "Scratch for --shard-root ≈ final survey size; keep it on large storage "
+        "and pass --staging-dir for a small local SSD.",
+        "Always pass the same --norder to every map task; reduce reads it from "
+        "shard_info.json.",
+    ]
+    if n_files > 1:
+        n_chunks = max(1, math.ceil(n_files / 2000))
+        rationale.append(
+            f"Split the file list into ~{n_chunks} chunk(s) of ≤2000 files "
+            "(sorted, so each chunk stays on nearby sky) for the map array."
+        )
+
+    map_body = _generate_shard_slurm_script(
+        survey=survey, phase="map", ingest_command=_shard_commands(
+            survey, list_arg='"${CHUNK}"', norder=norder,
+        )[0],
+    )
+    reduce_body = _generate_shard_slurm_script(
+        survey=survey, phase="reduce", ingest_command=reduce_cmd,
+    )
+    return command, rationale, map_body, reduce_body
+
+
+def _generate_shard_slurm_script(
+    *,
+    survey: str,
+    phase: Literal["map", "reduce"],
+    ingest_command: str,
+) -> str:
+    job_name = f"dl-{survey.lower()[:20]}-{phase}"
+    log_suffix = "%A_%a" if phase == "map" else "%j"
+    if phase == "map":
+        resources = "#SBATCH --cpus-per-task=8\n#SBATCH --mem=32G\n#SBATCH --time=12:00:00"
+        usage = textwrap.dedent("""\
+            # Submit (map array, at most 64 concurrent tasks):
+            #   mkdir -p logs "$CHUNK_DIR"
+            #   sort "$FILE_LIST" | split -l 2000 -d -a 4 - "$CHUNK_DIR/chunk_"
+            #   N=$(ls "$CHUNK_DIR"/chunk_* | wc -l)
+            #   MAP_JID=$(sbatch --parsable --array=0-$((N-1))%64 this_script.sh)""")
+        select = (
+            ': "${CHUNK_DIR:?Set CHUNK_DIR}"\n'
+            ': "${LINK_ID_COL:?Set LINK_ID_COL}"\n'
+            'CHUNK=$(ls "${CHUNK_DIR}"/chunk_* | sed -n "$((SLURM_ARRAY_TASK_ID+1))p")\n'
+            'TAG="map_${SLURM_ARRAY_TASK_ID}"'
+        )
+    else:
+        resources = "#SBATCH --cpus-per-task=16\n#SBATCH --mem=200G\n#SBATCH --time=1-00:00:00"
+        usage = textwrap.dedent("""\
+            # Submit after the map array:
+            #   sbatch --dependency=afterok:${MAP_JID} this_script.sh""")
+        select = 'TAG="reduce"'
+
+    return (
+        "#!/bin/bash\n"
+        f"# Generated Slurm wrapper for {survey} shard ingest, phase {phase} "
+        "(data-lake ingest advisor).\n"
+        "#\n"
+        "# Required env:\n"
+        "#   DATA_LAKE_CONFIG  — path to lake_config.toml\n"
+        "#   LAKE_INGEST_TOKEN — ingest secret\n"
+        "#   SHARD_ROOT        — large scratch for immutable shard parts\n"
+        "#   LAKE_ROOT         — lake root (reduce; defaults to lake.root in config)\n"
+        "#   CHUNK_DIR         — directory of file-list chunks (map)\n"
+        "#   LINK_ID_COL       — survey ID column or composite spec (map)\n"
+        "# Optional: DATA_LAKE_STAGING_DIR — fast local SSD buffer\n"
+        "#\n"
+        f"{usage}\n"
+        "\n"
+        f"#SBATCH --job-name={job_name}\n"
+        "#SBATCH --nodes=1\n"
+        "#SBATCH --ntasks=1\n"
+        f"{resources}\n"
+        f"#SBATCH --output=logs/{job_name}-{log_suffix}.out\n"
+        f"#SBATCH --error=logs/{job_name}-{log_suffix}.err\n"
+        "\n"
+        "set -euo pipefail\n"
+        "\n"
+        ': "${DATA_LAKE_CONFIG:?Set DATA_LAKE_CONFIG}"\n'
+        ': "${LAKE_INGEST_TOKEN:?Set LAKE_INGEST_TOKEN}"\n'
+        ': "${SHARD_ROOT:?Set SHARD_ROOT}"\n'
+        'LAKE_ROOT="${LAKE_ROOT:-}"\n'
+        f"{select}\n"
+        'mkdir -p logs\n'
+        "\n"
+        f"{ingest_command} \\\n"
+        f'    -q --log-file "logs/{job_name}-${{TAG}}.log" \\\n'
+        f'    --failures-log "logs/{job_name}-${{TAG}}-failures.jsonl"\n'
+    )
 
 
 def _spectra_command(
@@ -353,6 +564,9 @@ def recommend_ingest(
     n_files: int = 1,
     total_size_gb: float | None = None,
     streaming: bool = False,
+    layout: CatalogLayout | None = None,
+    file_area_deg2: float | None = None,
+    norder: int | None = None,
 ) -> IngestRecommendation:
     """
     Recommend a ``dl-*`` ingest command and Slurm wrapper for the given inputs.
@@ -364,6 +578,16 @@ def recommend_ingest(
     streaming
         For single-file catalog FITS, suggest ``--streaming`` when True or when
         ``total_size_gb`` exceeds ~8 GiB.
+    layout
+        Catalog only: how files are organised on the sky (``spatial``,
+        ``unsorted``, ``partitioned``).  Chooses between append batch ingest and
+        ``dl-ingest-from-shard``.
+    file_area_deg2
+        Catalog only: sky area of a typical input file.  With *norder*, gives
+        the files-per-tile estimate that drives the choice (overrides *layout*).
+    norder
+        Target HEALPix order for the files-per-tile estimate and the shard
+        commands (default 5).
     """
     file_list_str = str(file_list) if file_list is not None else None
     warnings: list[str] = []
@@ -371,27 +595,62 @@ def recommend_ingest(
     warnings.extend(inspect_warnings)
 
     packed_vector = any("packed-vector" in w for w in inspect_warnings)
+    extra_slurm: dict[str, str] = {}
+    if layout is not None and layout not in CATALOG_LAYOUTS:
+        raise ValueError(f"layout must be one of {CATALOG_LAYOUTS}, got {layout!r}")
 
     if modality == "catalog":
         if total_size_gb is not None and total_size_gb > 8:
             streaming = True
         preflight.append(f"dl-recommend-catalog-norder --file-list {file_list_str or 'files.txt'}")
-        command, rationale = _catalog_command(
-            survey,
-            n_files=n_files,
-            file_list=file_list_str,
-            lifecycle=lifecycle,
-            packed_vector=packed_vector,
-            streaming=streaming,
+        n = norder if norder is not None else _DEFAULT_NORDER
+        files_per_tile = (
+            estimate_files_per_tile(n, file_area_deg2) if file_area_deg2 is not None else None
         )
+        use_shard, reason = (False, None)
+        if n_files > 1 and not packed_vector:
+            use_shard, reason = _prefer_shard_ingest(
+                n_files=n_files, layout=layout, files_per_tile=files_per_tile,
+            )
+        if use_shard and lifecycle == "live":
+            use_shard = False
+            reason = (
+                "Live survey: keep batch append with --defer-finalize "
+                "(shard reduce always finalizes)."
+            )
+
         slurm_path = None
-        ingest_for_slurm = command.split("\n")[-1] if "\n" in command else command
-        slurm_body = _generate_slurm_script(
-            job_name=f"dl-{survey.lower()[:20]}-catalog",
-            ingest_command=ingest_for_slurm,
-            survey=survey,
-            state_subdir=f"{survey.lower()}/catalog",
-        )
+        if use_shard:
+            command, rationale, slurm_body, reduce_body = _shard_catalog_recommendation(
+                survey, n_files=n_files, file_list=file_list_str, norder=n,
+                reason=reason or "",
+            )
+            extra_slurm["reduce"] = reduce_body
+        else:
+            command, rationale = _catalog_command(
+                survey,
+                n_files=n_files,
+                file_list=file_list_str,
+                lifecycle=lifecycle,
+                packed_vector=packed_vector,
+                streaming=streaming,
+            )
+            if reason:
+                rationale.insert(0, reason)
+            elif n_files > 1 and not packed_vector:
+                warnings.append(
+                    "File layout unknown: batch append is fast only when ~1 file feeds "
+                    "each tile. If files are bricks / RA-Dec patches or not sorted on the "
+                    "sky, pass layout='spatial'|'unsorted' or file_area_deg2 to get the "
+                    "dl-ingest-from-shard recommendation."
+                )
+            ingest_for_slurm = command.split("\n")[-1] if "\n" in command else command
+            slurm_body = _generate_slurm_script(
+                job_name=f"dl-{survey.lower()[:20]}-catalog",
+                ingest_command=ingest_for_slurm,
+                survey=survey,
+                state_subdir=f"{survey.lower()}/catalog",
+            )
     elif modality == "spectra":
         command, rationale, slurm_path = _spectra_command(
             survey, fmt=fmt, n_files=n_files, file_list=file_list_str,
@@ -427,6 +686,7 @@ def recommend_ingest(
         rationale=rationale,
         slurm_script_path=slurm_path,
         slurm_script=slurm_body,
+        extra_slurm_scripts=extra_slurm,
         preflight=preflight,
         doc_refs=_DOC_REFS.get(modality, []),
         warnings=warnings,

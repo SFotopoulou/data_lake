@@ -1,5 +1,49 @@
 # Catalog ingest
 
+### Choosing a catalog ingest command
+
+Pick the helper from **how the input files are laid out on disk**, not from the
+total survey size alone.
+
+| Input layout on disk | Command |
+|----------------------|---------|
+| One file (any size) | `dl-ingest-catalog` (`--streaming` for >8 GiB) |
+| Many files, **~1 file per lake tile**: each file covers a region ≥ one tile, or files are already split by HEALPix | `dl-ingest-catalog-batch` / `dl-ingest-catalog-from-list` |
+| Many files **smaller than a tile**: bricks, RA/Dec patches, pointings, plates | [`dl-ingest-from-shard`](batch-and-checkpoints.md#two-phase-map-reduce-ingest-dl-ingest-from-shard) |
+| Many files **not sorted on the sky**: run folders, time-ordered dumps, every file spans the whole footprint | [`dl-ingest-from-shard`](batch-and-checkpoints.md#two-phase-map-reduce-ingest-dl-ingest-from-shard) |
+
+**Why it matters.** Batch ingest *appends*: each file read-merge-rewrites every
+tile it touches. If **k** files feed one tile, that tile is rewritten k times as it
+grows, so the survey is written roughly **(k+1)/2×**. `dl-ingest-from-shard`
+writes every row exactly **twice** (immutable shard parts, then one reduce per
+tile), whatever k is. The break-even is **k ≈ 3**; above it, map-reduce wins, and
+the gap grows linearly with k.
+
+**Estimating k** for spatially organised files: k ≈ tile area / file area (tile
+areas in [Choosing HEALPix order](#choosing-healpix-order)). For unsorted files,
+k ≈ number of files, since each file touches most tiles.
+
+| Example | File area | norder 4 (13.4 deg²) | norder 5 (3.36) | norder 7 (0.21) |
+|---------|-----------|----------------------|-----------------|-----------------|
+| Legacy Survey brick (0.25° × 0.25°) | 0.0625 deg² | k ≈ 215 | k ≈ 54 | k ≈ 3.4 |
+| 1° × 1° RA/Dec patch | 1 deg² | k ≈ 13 | k ≈ 3.4 | k ≈ 1 |
+| 10° × 10° RA/Dec block | 100 deg² | k ≈ 1 | k ≈ 1 | k ≈ 1 |
+
+Lowering k by raising norder is not a substitute: choose norder for query
+performance (rows per tile), then pick the command from k.
+
+**What map-reduce costs.** It needs a scratch `--shard-root` about the size of the
+final survey, two Slurm steps (map array, then a dependent reduce), and the reduce
+always finalizes. Live surveys that rely on `--defer-finalize` stay on batch.
+
+**Not `concatenate_fits.py`.** Merging thousands of bricks into one FITS first
+just moves the same cost into a single-node, in-memory `vstack`. Use it only for
+moderate inputs (see [Concatenate FITS shards](#concatenate-fits-shards-pre-ingest)).
+
+The ingest advisor applies the same rule: `recommend_ingest(..., layout="spatial")`
+or `file_area_deg2=...` with `norder=...` returns the shard map/reduce commands and
+both Slurm scripts (see [MCP lake server](../mcp-lake.md)).
+
 ### Check FITS layout before ingest
 
 Before starting catalog ingest on FITS (especially large file lists), run
@@ -41,17 +85,20 @@ worker; parallel whole-file ingest is a poor fit. Re-export as row-normal FITS
 ### Concatenate FITS shards (pre-ingest)
 
 Some surveys ship as **many small row-normal BINTABLE files** in one directory
-(e.g. Legacy Survey bricks, Gaia run folders). You can either ingest them with
-[`dl-ingest-catalog-batch`](batch-and-checkpoints.md#parallel-catalog-batch-large-file-lists)
+(e.g. Legacy Survey bricks, Gaia run folders). You can ingest them with
+[`dl-ingest-from-shard`](batch-and-checkpoints.md#two-phase-map-reduce-ingest-dl-ingest-from-shard),
+with [`dl-ingest-catalog-batch`](batch-and-checkpoints.md#parallel-catalog-batch-large-file-lists),
 or merge them into a single FITS first with
-[`scripts/concatenate_fits.py`](../../scripts/concatenate_fits.py).
+[`scripts/concatenate_fits.py`](../../scripts/concatenate_fits.py). See
+[Choosing a catalog ingest command](#choosing-a-catalog-ingest-command).
 
 **When to concatenate**
 
 | Approach | Best for |
 |----------|----------|
-| **`dl-ingest-catalog-batch`** | Large surveys (TB-scale), resume/checkpoints, append tiles incrementally |
-| **`concatenate_fits.py` → single ingest** | Moderate size, one merged file for archival or downstream tools, simpler one-shot ingest |
+| **`dl-ingest-from-shard`** | Many files per tile (k > 3): bricks, RA/Dec patches, unsorted run folders; any size, multi-node |
+| **`dl-ingest-catalog-batch`** | ~1 file per tile (k ≲ 3), resume/checkpoints, live surveys appending incrementally |
+| **`concatenate_fits.py` → single ingest** | Moderate size (fits in RAM on one node), one merged file for archival or downstream tools |
 
 The script stacks tables with Astropy `vstack`. Every shard must be a **catalog
 FITS** with the **same column names** (in the same order) and the same table HDU

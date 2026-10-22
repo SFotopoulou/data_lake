@@ -37,8 +37,11 @@ Catalog append uses **`--on-duplicate-id skip`** (default) with **`--tile-mode a
 
 #### Two-phase map-reduce ingest (`dl-ingest-from-shard`)
 
-> **Use this instead of `dl-ingest-catalog-batch` when you have ≥ 50 k catalog FITS files
-> (e.g. Legacy Survey DR11, DES Sector catalogs).**
+> **Use this instead of `dl-ingest-catalog-batch` when more than ~3 input files feed
+> each lake tile**: files smaller than a tile (Legacy Survey bricks, RA/Dec patches,
+> pointings), or files not sorted on the sky. This holds for thousands of files, not only
+> very large surveys. Decision table and how to estimate files-per-tile:
+> [Choosing a catalog ingest command](catalog.md#choosing-a-catalog-ingest-command).
 
 **Why the append path does not scale**
 
@@ -93,7 +96,10 @@ dl-ingest-from-shard --phase map \
   --survey Legacy_DR11_north \
   --shard-root $SCRATCH/shards \
   --ra-col ra --dec-col dec --link-id-col ls_id_dr11 \
-  --norder 7 --n-workers 8
+  --norder 7 --n-workers 8 \
+  --no-progress -q \
+  --log-file "logs/map_${SLURM_ARRAY_TASK_ID}.log" \
+  --failures-log "logs/map_${SLURM_ARRAY_TASK_ID}_failures.jsonl"
 
 # Reduce job (single job, depends on array)
 #SBATCH --cpus-per-task=32 --mem=200G --time=1-00:00:00 --dependency=afterok:<array_jobid>
@@ -102,8 +108,27 @@ dl-ingest-from-shard /data/lake --phase reduce \
   --survey Legacy_DR11_north \
   --shard-root $SCRATCH/shards \
   --staging-dir "$TMPDIR/dl_stage" \
-  --n-workers 32 --on-duplicate-id skip
+  --n-workers 32 --on-duplicate-id skip \
+  --no-progress -q --log-file logs/reduce.log --failures-log logs/reduce_failures.jsonl
 ```
+
+Files not grouped in folders? Sort the full list and split it into chunks instead
+(`sort files.txt | split -l 2000 -d -a 4 - chunks/chunk_`), then pass
+`--file-list chunks/chunk_NNNN` per array task. The ingest advisor
+(`recommend_ingest(..., layout="spatial")`) generates both scripts in this form.
+
+**Retrying failures:** collect failed inputs from every map task and re-run map on just
+those (finished files are skipped through the checkpoint, so re-running a whole task is
+also safe):
+
+```bash
+cat logs/map_*_failures.jsonl | jq -r .path | sort -u > retry.txt
+dl-ingest-from-shard --phase map --file-list retry.txt --survey Legacy_DR11_north \
+  --shard-root $SCRATCH/shards --link-id-col ls_id_dr11 --norder 7
+```
+
+Run reduce only after map has no failures; reduce skips finalize when a tile fails, so
+fix the cause and re-run reduce.
 
 Reduce takes `--norder` from the shard tree's `shard_info.json` when omitted. Both
 phases exit with status 1 if any file or tile failed. A settings mismatch exits with a
@@ -159,6 +184,11 @@ partial tile and the SSD only needs room for the tiles currently in flight.
 ---
 
 #### Parallel catalog batch (large file lists)
+
+> Batch append is fast when about one file feeds each lake tile. If many files share a
+> tile (bricks, RA/Dec patches, unsorted run folders), use
+> [`dl-ingest-from-shard`](#two-phase-map-reduce-ingest-dl-ingest-from-shard) instead; see
+> [Choosing a catalog ingest command](catalog.md#choosing-a-catalog-ingest-command).
 
 **Pre-flight:** run **`dl-check-fits-table-format --file-list <paths.txt>`** on FITS
 catalogs before batch ingest. The summary reports total estimated **sources** and
