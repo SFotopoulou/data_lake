@@ -150,6 +150,61 @@ class TestCheckpointHelpers:
         done = _load_checkpoint(cp)
         assert done == {"/data/a.fits", "/data/b.fits"}
 
+    def test_torn_line_does_not_hide_later_entries(self, tmp_path):
+        cp = tmp_path / "cp.jsonl"
+        _append_checkpoint(cp, "/data/a.fits")
+        with open(cp, "a") as fh:
+            fh.write('{"path": "/data/tor\n')
+        _append_checkpoint(cp, "/data/b.fits")
+        assert _load_checkpoint(cp) == {"/data/a.fits", "/data/b.fits"}
+
+
+# ---------------------------------------------------------------------------
+# Test: failures log
+# ---------------------------------------------------------------------------
+
+
+class TestFailuresLog:
+    def test_map_records_bad_fits(self, catalog_fits_files, shard_root, tmp_path):
+        bad = catalog_fits_files[0].parent / "broken.fits"
+        bad.write_bytes(b"not a fits file")
+        flog = tmp_path / "fail.jsonl"
+        result = run_map_phase(
+            source_paths=[*catalog_fits_files, bad],
+            shard_root=shard_root,
+            survey=_SURVEY,
+            ra_col=_RA_COL,
+            dec_col=_DEC_COL,
+            norder=_NORDER,
+            link_id_col=_LINK_ID_COL,
+            failures_log=flog,
+        )
+        assert result["n_files_ok"] == len(catalog_fits_files)
+        assert result["n_files_failed"] == 1
+        entries = [json.loads(l) for l in flog.read_text().splitlines()]
+        assert [e["path"] for e in entries] == [str(bad)]
+        assert entries[0]["error"] and "Traceback" in entries[0]["traceback"]
+
+    def test_reduce_records_bad_npix(self, catalog_fits_files, shard_root, lake_root, tmp_path):
+        _run_map(catalog_fits_files, shard_root)
+        npix, parts = next(_iter_shard_parts(shard_root, _SURVEY, _NORDER))
+        parts[0].write_bytes(b"corrupt")
+        flog = tmp_path / "fail.jsonl"
+        catalog_root = lake_root / "catalogs" / _SURVEY
+        result = run_reduce_phase(
+            shard_root=shard_root,
+            survey=_SURVEY,
+            catalog_root=catalog_root,
+            norder=_NORDER,
+            failures_log=flog,
+        )
+        assert result["n_tiles_failed"] == 1
+        assert result["finalized"] is False
+        assert not (catalog_root / "catalog_info.json").exists()
+        (entry,) = [json.loads(l) for l in flog.read_text().splitlines()]
+        assert entry["npix"] == npix
+        assert str(parts[0]) in entry["parts"]
+
 
 # ---------------------------------------------------------------------------
 # Test: collect_fits_files
@@ -361,59 +416,406 @@ class TestIterShardParts:
 
 
 # ---------------------------------------------------------------------------
+# Test: reducing into an existing lake survey
+# ---------------------------------------------------------------------------
+
+
+def _map_reduce(files, shard_root, lake_root, *, tile_mode="append", norder=_NORDER,
+                on_duplicate_id="skip", link_id_col=_LINK_ID_COL):
+    run_map_phase(
+        source_paths=files,
+        shard_root=shard_root,
+        survey=_SURVEY,
+        ra_col=_RA_COL,
+        dec_col=_DEC_COL,
+        norder=norder,
+        link_id_col=link_id_col,
+    )
+    catalog_root = lake_root / "catalogs" / _SURVEY
+    run_reduce_phase(
+        shard_root=shard_root,
+        survey=_SURVEY,
+        catalog_root=catalog_root,
+        norder=norder,
+        on_duplicate_id=on_duplicate_id,
+        tile_mode=tile_mode,
+    )
+    return catalog_root
+
+
+def _n_rows(catalog_root: Path) -> int:
+    return sum(_read_tile(t).num_rows for t in catalog_root.rglob("Npix=*.parquet"))
+
+
+class TestExistingTiles:
+    def test_append_adds_new_files_to_existing_survey(
+        self, catalog_fits_files, lake_root, tmp_path
+    ):
+        catalog_root = _map_reduce(catalog_fits_files[:2], tmp_path / "s1", lake_root)
+        first = _n_rows(catalog_root)
+        _map_reduce(catalog_fits_files[2:], tmp_path / "s2", lake_root)
+        n_input = sum(len(_make_catalog_table(*b)) for b in _RA_BANDS)
+        assert first < n_input
+        assert _n_rows(catalog_root) == n_input
+
+    def test_append_same_shards_twice_is_noop(
+        self, catalog_fits_files, shard_root, lake_root
+    ):
+        catalog_root = _map_reduce(catalog_fits_files, shard_root, lake_root)
+        before = {t: t.stat().st_mtime_ns for t in catalog_root.rglob("Npix=*.parquet")}
+        _map_reduce(catalog_fits_files, shard_root, lake_root)
+        after = {t: t.stat().st_mtime_ns for t in catalog_root.rglob("Npix=*.parquet")}
+        assert before == after
+
+    def test_append_error_on_overlap(self, catalog_fits_files, lake_root, tmp_path):
+        catalog_root = _map_reduce(catalog_fits_files, tmp_path / "s1", lake_root)
+        s2 = tmp_path / "s2"
+        _run_map(catalog_fits_files, s2)
+        result = run_reduce_phase(
+            shard_root=s2,
+            survey=_SURVEY,
+            catalog_root=catalog_root,
+            norder=_NORDER,
+            on_duplicate_id="error",
+        )
+        assert result["n_tiles_failed"] == result["n_tiles"] > 0
+        assert result["finalized"] is False
+
+    def test_skip_leaves_existing_tiles(self, catalog_fits_files, lake_root, tmp_path):
+        catalog_root = _map_reduce(catalog_fits_files[:1], tmp_path / "s1", lake_root)
+        tiles_before = {t: _read_tile(t).num_rows for t in catalog_root.rglob("Npix=*.parquet")}
+        _map_reduce(catalog_fits_files, tmp_path / "s2", lake_root, tile_mode="skip")
+        for t, n in tiles_before.items():
+            assert _read_tile(t).num_rows == n
+
+    def test_overwrite_replaces_existing_tiles(
+        self, catalog_fits_files, lake_root, tmp_path
+    ):
+        catalog_root = _map_reduce(catalog_fits_files, tmp_path / "s1", lake_root)
+        s2 = tmp_path / "s2"
+        _map_reduce(catalog_fits_files[:1], s2, lake_root, tile_mode="overwrite")
+        groups = dict(_iter_shard_parts(s2, _SURVEY, _NORDER))
+        assert groups
+        for npix, parts in groups.items():
+            tile = next(catalog_root.rglob(f"Npix={npix}.parquet"))
+            assert _read_tile(tile).num_rows == sum(_read_tile(p).num_rows for p in parts)
+
+    def test_catalog_info_records_shard_link_id_mode(
+        self, catalog_fits_files, shard_root, lake_root
+    ):
+        catalog_root = _map_reduce(catalog_fits_files, shard_root, lake_root)
+        shard_info = json.loads((shard_root / _SURVEY / "shard_info.json").read_text())
+        info = json.loads((catalog_root / "catalog_info.json").read_text())
+        assert info["link_id_mode"] == shard_info["link_id_mode"] != "sequential"
+
+
+class TestGuards:
+    def test_reduce_norder_mismatch_with_lake(
+        self, catalog_fits_files, lake_root, tmp_path
+    ):
+        _map_reduce(catalog_fits_files, tmp_path / "s1", lake_root, norder=_NORDER)
+        with pytest.raises(ValueError, match="hats_order"):
+            _map_reduce(catalog_fits_files, tmp_path / "s2", lake_root, norder=_NORDER + 1)
+
+    def test_reduce_link_id_mismatch_with_lake(
+        self, catalog_fits_files, shard_root, lake_root
+    ):
+        catalog_root = _map_reduce(catalog_fits_files, shard_root, lake_root)
+        info_path = catalog_root / "catalog_info.json"
+        info = json.loads(info_path.read_text())
+        info["link_id_mode"] = "column:SOMETHING_ELSE"
+        info_path.write_text(json.dumps(info))
+        with pytest.raises(ValueError, match="link_id_mode"):
+            run_reduce_phase(
+                shard_root=shard_root,
+                survey=_SURVEY,
+                catalog_root=catalog_root,
+                norder=_NORDER,
+            )
+
+    def test_reduce_norder_mismatch_with_shards(
+        self, catalog_fits_files, shard_root, lake_root
+    ):
+        _run_map(catalog_fits_files, shard_root)
+        with pytest.raises(ValueError, match="does not match shard tree"):
+            run_reduce_phase(
+                shard_root=shard_root,
+                survey=_SURVEY,
+                catalog_root=lake_root / "catalogs" / _SURVEY,
+                norder=_NORDER + 1,
+            )
+
+    def test_map_link_id_mismatch_with_shards(self, catalog_fits_files, shard_root):
+        run_map_phase(
+            source_paths=catalog_fits_files[:1],
+            shard_root=shard_root,
+            survey=_SURVEY,
+            ra_col=_RA_COL,
+            dec_col=_DEC_COL,
+            norder=_NORDER,
+            link_id_col=_LINK_ID_COL,
+        )
+        with pytest.raises(ValueError, match="link_id_mode"):
+            run_map_phase(
+                source_paths=catalog_fits_files[1:],
+                shard_root=shard_root,
+                survey=_SURVEY,
+                ra_col=_RA_COL,
+                dec_col=_DEC_COL,
+                norder=_NORDER,
+                link_id_col=f"{_LINK_ID_COL},dec",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test: staging area
+# ---------------------------------------------------------------------------
+
+
+class TestStaging:
+    def test_map_and_reduce_via_staging(
+        self, catalog_fits_files, shard_root, lake_root, tmp_path
+    ):
+        staging = tmp_path / "ssd"
+        run_map_phase(
+            source_paths=catalog_fits_files,
+            shard_root=shard_root,
+            survey=_SURVEY,
+            ra_col=_RA_COL,
+            dec_col=_DEC_COL,
+            norder=_NORDER,
+            link_id_col=_LINK_ID_COL,
+            staging_dir=staging,
+        )
+        catalog_root = lake_root / "catalogs" / _SURVEY
+        run_reduce_phase(
+            shard_root=shard_root,
+            survey=_SURVEY,
+            catalog_root=catalog_root,
+            norder=_NORDER,
+            ra_col=_RA_COL,
+            dec_col=_DEC_COL,
+            staging_dir=staging,
+        )
+        assert not [p for p in staging.rglob("*") if p.is_file()]
+        n_input = sum(len(_make_catalog_table(*b)) for b in _RA_BANDS)
+        tiles = list(catalog_root.rglob("Npix=*.parquet"))
+        assert sum(_read_tile(t).num_rows for t in tiles) == n_input
+
+    def test_tiles_have_no_partition_columns(
+        self, catalog_fits_files, shard_root, lake_root
+    ):
+        _run_map(catalog_fits_files, shard_root)
+        catalog_root = _run_reduce(shard_root, lake_root)
+        for tile in catalog_root.rglob("Npix=*.parquet"):
+            names = set(_read_tile(tile).schema.names)
+            assert not names & {"Norder", "Dir", "Npix"}, tile
+
+    def test_falls_back_when_staging_full(
+        self, catalog_fits_files, shard_root, monkeypatch, tmp_path
+    ):
+        import data_lake.ingest.catalog_shard_ingest as mod
+
+        monkeypatch.setattr(mod, "_staging_has_room", lambda *_a, **_k: False)
+        staging = tmp_path / "ssd"
+        run_map_phase(
+            source_paths=catalog_fits_files,
+            shard_root=shard_root,
+            survey=_SURVEY,
+            ra_col=_RA_COL,
+            dec_col=_DEC_COL,
+            norder=_NORDER,
+            link_id_col=_LINK_ID_COL,
+            staging_dir=staging,
+        )
+        assert list((shard_root / _SURVEY).rglob("part-*.parquet"))
+        assert not staging.exists() or not any(staging.rglob("*.parquet"))
+
+    def test_publish_cross_device(self, tmp_path, monkeypatch):
+        import errno as _errno
+        import data_lake.ingest.catalog_shard_ingest as mod
+
+        staged = tmp_path / "a" / "x.parquet"
+        staged.parent.mkdir()
+        staged.write_bytes(b"data")
+        final = tmp_path / "b" / "x.parquet"
+
+        real_replace = mod.os.replace
+
+        def fake_replace(src, dst):
+            if Path(src) == staged:
+                raise OSError(_errno.EXDEV, "cross-device")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(mod.os, "replace", fake_replace)
+        mod._publish(staged, final)
+        assert final.read_bytes() == b"data"
+        assert not staged.exists()
+        assert not final.with_name(final.name + ".tmp").exists()
+
+
+# ---------------------------------------------------------------------------
 # Test: CLI integration (smoke test)
 # ---------------------------------------------------------------------------
 
 
-class TestCLI:
-    def test_cli_map_and_reduce(self, catalog_fits_files, tmp_path):
-        from click.testing import CliRunner
-        from data_lake.ingest.catalog_shard_ingest import cli
+_TOKEN = "shard-secret"
 
+
+@pytest.fixture()
+def deployment(tmp_path, monkeypatch):
+    """Deployment config (lake root = tmp/cfg_lake) with an ingest token."""
+    from data_lake.cli_utils import INGEST_TOKEN_ENV, write_ingest_token_hash
+
+    dep = tmp_path / "dep"
+    dep.mkdir()
+    lake = tmp_path / "cfg_lake"
+    cfg_path = dep / "lake_config.toml"
+    cfg_path.write_text(
+        f'schema_version = "1"\n[lake]\nname = "t"\nroot = "{lake.as_posix()}"\n'
+        '[guardrails]\ningest_token_file = ".ingest_token_hash"\n'
+    )
+    write_ingest_token_hash(dep, _TOKEN)
+    monkeypatch.setenv("DATA_LAKE_CONFIG", str(cfg_path))
+    monkeypatch.setenv(INGEST_TOKEN_ENV, _TOKEN)
+    monkeypatch.delenv("DATA_LAKE_STAGING_DIR", raising=False)
+    return lake
+
+
+def _invoke(args):
+    from click.testing import CliRunner
+    from data_lake.ingest.catalog_shard_ingest import cli
+
+    return CliRunner().invoke(cli, args)
+
+
+def _map_args(fits_dir: Path, shard_root: Path, *extra: str) -> list[str]:
+    return [
+        "--phase", "map",
+        "--input-dir", str(fits_dir),
+        "--survey", _SURVEY,
+        "--shard-root", str(shard_root),
+        "--ra-col", _RA_COL,
+        "--dec-col", _DEC_COL,
+        "--link-id-col", _LINK_ID_COL,
+        "--norder", str(_NORDER),
+        "--no-progress",
+        *extra,
+    ]
+
+
+def _reduce_args(shard_root: Path, *extra: str) -> list[str]:
+    return [
+        "--phase", "reduce",
+        "--survey", _SURVEY,
+        "--shard-root", str(shard_root),
+        "--no-progress",
+        *extra,
+    ]
+
+
+class TestCLI:
+    def test_map_and_reduce_parallel_positional_root(
+        self, deployment, catalog_fits_files, tmp_path
+    ):
         shard_root = tmp_path / "shards"
-        lake_root = tmp_path / "lake"
+        lake = tmp_path / "lake"
         fits_dir = catalog_fits_files[0].parent
 
-        runner = CliRunner()
-
-        # Map phase
-        result = runner.invoke(cli, [
-            "--phase", "map",
-            "--input-dir", str(fits_dir),
-            "--survey", _SURVEY,
-            "--shard-root", str(shard_root),
-            "--ra-col", _RA_COL,
-            "--dec-col", _DEC_COL,
-            "--link-id-col", _LINK_ID_COL,
-            "--norder", str(_NORDER),
-        ])
+        result = _invoke(_map_args(fits_dir, shard_root, "--n-workers", "2", "--max-in-flight", "1"))
         assert result.exit_code == 0, result.output
 
-        # Reduce phase
-        result = runner.invoke(cli, [
-            "--phase", "reduce",
-            "--survey", _SURVEY,
-            "--shard-root", str(shard_root),
-            "--lake-root", str(lake_root),
-            "--norder", str(_NORDER),
-        ])
+        result = _invoke([str(lake), *_reduce_args(shard_root, "--n-workers", "2")])
         assert result.exit_code == 0, result.output
+        catalog_root = lake / "catalogs" / _SURVEY
+        n_input = sum(len(_make_catalog_table(*b)) for b in _RA_BANDS)
+        assert _n_rows(catalog_root) == n_input
+        assert json.loads((catalog_root / "catalog_info.json").read_text())["hats_order"] == _NORDER
 
-        # Verify tiles were written
-        catalog_root = lake_root / "catalogs" / _SURVEY
-        tiles = list(catalog_root.rglob("Npix=*.parquet"))
-        assert len(tiles) > 0
+    def test_reduce_defaults_to_config_lake_and_shard_norder(
+        self, deployment, catalog_fits_files, tmp_path
+    ):
+        shard_root = tmp_path / "shards"
+        assert _invoke(_map_args(catalog_fits_files[0].parent, shard_root)).exit_code == 0
+        result = _invoke(_reduce_args(shard_root))  # no OUTPUT_ROOT, no --norder
+        assert result.exit_code == 0, result.output
+        assert list((deployment / "catalogs" / _SURVEY).rglob("Npix=*.parquet"))
 
-    def test_cli_map_no_input_exits_nonzero(self, tmp_path):
-        from click.testing import CliRunner
-        from data_lake.ingest.catalog_shard_ingest import cli
+    def test_lake_root_alias_still_works(self, deployment, catalog_fits_files, tmp_path):
+        shard_root = tmp_path / "shards"
+        lake = tmp_path / "legacy_lake"
+        assert _invoke(_map_args(catalog_fits_files[0].parent, shard_root)).exit_code == 0
+        result = _invoke(_reduce_args(shard_root, "--lake-root", str(lake)))
+        assert result.exit_code == 0, result.output
+        assert list((lake / "catalogs" / _SURVEY).rglob("Npix=*.parquet"))
 
-        runner = CliRunner()
-        result = runner.invoke(cli, [
+    def test_lake_root_alias_conflict(self, deployment, tmp_path):
+        result = _invoke([
+            str(tmp_path / "a"),
+            *_reduce_args(tmp_path / "shards", "--lake-root", str(tmp_path / "b")),
+        ])
+        assert result.exit_code != 0
+        assert "disagree" in result.output
+
+    @pytest.mark.parametrize("phase_args", ["map", "reduce"])
+    def test_token_required_in_both_phases(
+        self, deployment, catalog_fits_files, tmp_path, monkeypatch, phase_args
+    ):
+        from data_lake.cli_utils import INGEST_TOKEN_ENV
+
+        monkeypatch.delenv(INGEST_TOKEN_ENV)
+        shard_root = tmp_path / "shards"
+        args = (
+            _map_args(catalog_fits_files[0].parent, shard_root)
+            if phase_args == "map"
+            else _reduce_args(shard_root)
+        )
+        result = _invoke(args)
+        assert result.exit_code != 0
+        assert "ingest token" in result.output
+        assert not shard_root.exists()
+
+    def test_map_requires_link_id_col(self, deployment, catalog_fits_files, tmp_path):
+        args = _map_args(catalog_fits_files[0].parent, tmp_path / "shards")
+        i = args.index("--link-id-col")
+        del args[i:i + 2]
+        result = _invoke(args)
+        assert result.exit_code != 0
+        assert "--link-id-col is required" in result.output
+
+    def test_map_failure_exits_1(self, deployment, catalog_fits_files, tmp_path):
+        (catalog_fits_files[0].parent / "broken.fits").write_bytes(b"nope")
+        result = _invoke(_map_args(catalog_fits_files[0].parent, tmp_path / "shards"))
+        assert result.exit_code == 1
+
+    def test_guard_mismatch_is_clean_error(self, deployment, catalog_fits_files, tmp_path):
+        shard_root = tmp_path / "shards"
+        assert _invoke(_map_args(catalog_fits_files[0].parent, shard_root)).exit_code == 0
+        result = _invoke(_reduce_args(shard_root, "--norder", str(_NORDER + 1)))
+        assert result.exit_code == 1
+        assert "does not match shard tree" in result.output
+        assert not isinstance(result.exception, ValueError)
+
+    def test_log_file(self, deployment, catalog_fits_files, tmp_path):
+        log_file = tmp_path / "logs" / "map.log"
+        result = _invoke(_map_args(
+            catalog_fits_files[0].parent, tmp_path / "shards",
+            "--quiet", "--log-file", str(log_file),
+        ))
+        assert result.exit_code == 0, result.output
+        assert "Map phase done" in log_file.read_text()
+
+    def test_quiet_and_verbose_conflict(self, tmp_path):
+        result = _invoke([*_reduce_args(tmp_path / "shards"), "-q", "-v"])
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
+
+    def test_map_no_input_exits_nonzero(self, deployment, tmp_path):
+        result = _invoke([
             "--phase", "map",
             "--survey", _SURVEY,
             "--shard-root", str(tmp_path / "shards"),
-            "--norder", str(_NORDER),
+            "--link-id-col", _LINK_ID_COL,
         ])
-        # Missing --input-dir or --file-list: should show error
         assert result.exit_code != 0
+        assert "--input-dir or --file-list" in result.output

@@ -29,15 +29,19 @@ After all tiles are written, ``finalize_catalog_survey`` refreshes metadata.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
+import shutil
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
+import traceback
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from functools import partial
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -45,6 +49,11 @@ import pyarrow.parquet as pq
 from data_lake.ingest.fits_to_parquet import (
     CatalogParquetOptions,
     DuplicateIdMode,
+    TileMode,
+    _id_column_for_dedup,
+    _is_valid_parquet_tile,
+    _merge_tile_tables,
+    _read_catalog_tile,
     _write_catalog_parquet_tile,
     decode_catalog_file_to_batches,
     finalize_catalog_survey,
@@ -58,6 +67,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _CHECKPOINT_FILENAME = "map_checkpoint.jsonl"
+_SHARD_INFO_FILENAME = "shard_info.json"
 
 
 def _shard_part_path(
@@ -81,17 +91,21 @@ def _load_checkpoint(checkpoint: Path) -> set[str]:
     if not checkpoint.exists():
         return set()
     done: set[str] = set()
-    try:
-        for line in checkpoint.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            p = obj.get("path", "")
-            if p:
-                done.add(p)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Could not read checkpoint %s: %s", checkpoint, exc)
+    n_bad = 0
+    # Many array tasks append concurrently; a torn line must not hide the rest.
+    for line in checkpoint.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            p = json.loads(line).get("path", "")
+        except (json.JSONDecodeError, AttributeError):
+            n_bad += 1
+            continue
+        if p:
+            done.add(p)
+    if n_bad:
+        log.warning("Ignored %d malformed line(s) in checkpoint %s", n_bad, checkpoint)
     return done
 
 
@@ -101,6 +115,162 @@ def _append_checkpoint(checkpoint: Path, source_path: str) -> None:
     record = json.dumps({"path": source_path, "ts": time.time()}) + "\n"
     with open(checkpoint, "a") as fh:
         fh.write(record)
+
+
+def _append_failure(failures_log: Path | None, entry: dict) -> None:
+    """Append one failure record to the JSONL *failures_log* (no-op when None)."""
+    if failures_log is None:
+        return
+    failures_log.parent.mkdir(parents=True, exist_ok=True)
+    with failures_log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({**entry, "ts": time.time()}, ensure_ascii=False) + "\n")
+
+
+def _failure_entry(exc: BaseException, **ids: object) -> dict:
+    return {
+        **ids,
+        "error": f"{type(exc).__name__}: {exc}",
+        "traceback": "".join(traceback.format_exception(exc)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shard / catalog consistency guards
+# ---------------------------------------------------------------------------
+
+
+def _shard_info_path(shard_root: Path, survey: str) -> Path:
+    return shard_root / survey / _SHARD_INFO_FILENAME
+
+
+def _read_json(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def _check_shard_norder(shard_root: Path, survey: str, norder: int) -> dict | None:
+    """Abort when *norder* differs from the order the shard tree was mapped at."""
+    info = _read_json(_shard_info_path(shard_root, survey))
+    if info is not None and int(info["norder"]) != norder:
+        raise ValueError(
+            f"--norder {norder} does not match shard tree "
+            f"{_shard_info_path(shard_root, survey)} (norder={info['norder']}). "
+            "Use the same --norder for every map task and for reduce."
+        )
+    return info
+
+
+def _record_shard_info(shard_root: Path, survey: str, info: dict) -> None:
+    """Write ``shard_info.json`` once; abort if a later map task disagrees."""
+    path = _shard_info_path(shard_root, survey)
+    existing = _read_json(path)
+    if existing is not None:
+        diffs = {
+            k: (existing.get(k), v) for k, v in info.items() if existing.get(k) != v
+        }
+        if diffs:
+            raise ValueError(
+                f"Map settings differ from existing shard tree {path}: "
+                + ", ".join(f"{k}: shards={a!r} now={b!r}" for k, (a, b) in diffs.items())
+                + ". Use a new --shard-root or --survey."
+            )
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Array tasks may race here; per-PID tmp + replace keeps the file whole.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(info, indent=2))
+    os.replace(tmp, path)
+
+
+def _check_against_catalog(shard_info: dict, catalog_root: Path) -> None:
+    """Abort when the existing lake survey uses another order or link-id spec."""
+    info = _read_json(catalog_root / "catalog_info.json")
+    if info is None:
+        return
+    problems: list[str] = []
+    lake_order = info.get("hats_order")
+    if lake_order is not None and int(lake_order) != int(shard_info["norder"]):
+        problems.append(f"hats_order: lake={lake_order} shards={shard_info['norder']}")
+    lake_mode = info.get("link_id_mode")
+    shard_mode = shard_info.get("link_id_mode")
+    if lake_mode and shard_mode and lake_mode != shard_mode:
+        problems.append(f"link_id_mode: lake={lake_mode!r} shards={shard_mode!r}")
+    if problems:
+        raise ValueError(
+            f"Shards are incompatible with existing survey at {catalog_root}: "
+            + "; ".join(problems)
+            + ". Reduce into a new --survey, or re-map with matching settings."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Staging: write on fast local disk, publish to the final (large) area
+# ---------------------------------------------------------------------------
+
+# Headroom factor applied to the estimated tile size before staging it.
+_STAGING_HEADROOM = 1.5
+
+
+def _staged_path(staging_dir: Path, final_root: Path, final_path: Path) -> Path:
+    """Mirror *final_path* (relative to *final_root*) under *staging_dir*."""
+    return staging_dir / final_path.relative_to(final_root)
+
+
+def _staging_has_room(staging_dir: Path, needed_bytes: int) -> bool:
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(staging_dir).free
+    return free >= needed_bytes * _STAGING_HEADROOM
+
+
+def _publish(staged: Path, final: Path) -> None:
+    """Move a finished file from staging to its final location atomically.
+
+    Same filesystem → ``os.replace``.  Cross-device → copy to ``<final>.tmp``
+    then ``os.replace`` so readers never see a partial file.
+    """
+    final.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(staged, final)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    tmp = final.with_name(final.name + ".tmp")
+    try:
+        shutil.copyfile(staged, tmp)
+        os.replace(tmp, final)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    staged.unlink(missing_ok=True)
+
+
+def _write_tile_staged(
+    table: pa.Table,
+    final_path: Path,
+    final_root: Path,
+    options: CatalogParquetOptions,
+    staging_dir: Path | None,
+    *,
+    estimated_bytes: int,
+) -> None:
+    """Write *table* to *final_path*, via *staging_dir* when it has room."""
+    if staging_dir is None or not _staging_has_room(staging_dir, estimated_bytes):
+        if staging_dir is not None:
+            log.warning(
+                "Staging %s low on space for %s (~%.1f MiB); writing directly.",
+                staging_dir, final_path.name, estimated_bytes / 2**20,
+            )
+        _write_catalog_parquet_tile(table, final_path, options)
+        return
+    staged = _staged_path(staging_dir, final_root, final_path)
+    try:
+        _write_catalog_parquet_tile(table, staged, options)
+        _publish(staged, final_path)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -118,14 +288,15 @@ def _map_one_file(
     link_id_col: str | None,
     columns: tuple[str, ...] | None,
     allow_incomplete_link_id: bool,
-) -> tuple[str, int, int]:
+    staging_dir: Path | None = None,
+) -> tuple[str, int, int, str]:
     """Decode one FITS file and write immutable Npix shard parts.
 
-    Returns ``(source_path_str, n_tiles_written, n_rows)`` on success.
-    Raises on decode/write error.
+    Returns ``(source_path_str, n_tiles_written, n_rows, link_id_mode)`` on
+    success.  Raises on decode/write error.
     """
     stem = Path(source_path).stem
-    batches, _sid_mode, n_rows = decode_catalog_file_to_batches(
+    batches, sid_mode, n_rows = decode_catalog_file_to_batches(
         source_path,
         ra_col=ra_col,
         dec_col=dec_col,
@@ -141,15 +312,79 @@ def _map_one_file(
         if part_path.exists():
             # idempotent resume: never overwrite a completed part
             continue
-        part_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_catalog_parquet_tile(tile_table, part_path, options)
+        _write_tile_staged(
+            tile_table,
+            part_path,
+            shard_root,
+            options,
+            staging_dir,
+            estimated_bytes=int(tile_table.nbytes),
+        )
         n_written += 1
-    return str(source_path), n_written, n_rows
+    return str(source_path), n_written, n_rows, sid_mode
 
 
 # ---------------------------------------------------------------------------
 # Map phase – orchestrator
 # ---------------------------------------------------------------------------
+
+
+def _run_tasks(
+    fn: Callable[..., Any],
+    items: Iterable[tuple[Any, tuple]],
+    n_workers: int,
+    *,
+    max_in_flight: int | None = None,
+) -> Iterator[tuple[Any, Any, BaseException | None]]:
+    """Yield ``(key, result, exc)`` as ``fn(*args)`` tasks finish.
+
+    At most *max_in_flight* (default ``2 * n_workers``) tasks are queued at
+    once.  Closing the generator early cancels work not yet started.
+    """
+    if n_workers <= 1:
+        for key, args in items:
+            try:
+                res = fn(*args)
+            except Exception as exc:  # noqa: BLE001
+                yield key, None, exc
+            else:
+                yield key, res, None
+        return
+
+    limit = max(max_in_flight or 2 * n_workers, n_workers)
+    todo = iter(items)
+    pool = ProcessPoolExecutor(max_workers=n_workers)
+    in_flight: dict[Future, Any] = {}
+
+    def _submit_next() -> None:
+        for key, args in todo:
+            in_flight[pool.submit(fn, *args)] = key
+            return
+
+    try:
+        for _ in range(limit):
+            _submit_next()
+        while in_flight:
+            finished, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                key = in_flight.pop(fut)
+                _submit_next()
+                try:
+                    res = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    yield key, None, exc
+                else:
+                    yield key, res, None
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _progress(total: int, desc: str, unit: str, enabled: bool):
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        return None
+    return tqdm(total=total, disable=not enabled, unit=unit, desc=desc)
 
 
 def run_map_phase(
@@ -164,13 +399,28 @@ def run_map_phase(
     columns: Sequence[str] | None = None,
     allow_incomplete_link_id: bool = False,
     n_workers: int = 1,
-) -> None:
+    max_in_flight: int | None = None,
+    staging_dir: Path | None = None,
+    failures_log: Path | None = None,
+    checkpoint_path: Path | None = None,
+    skip_completed: bool = True,
+    show_progress: bool = False,
+) -> dict[str, Any]:
     """Map FITS files → immutable Npix part files inside ``shard_root``.
 
-    Skips files already recorded in the JSONL checkpoint (resume-safe).
+    Skips files recorded in the JSONL checkpoint (default
+    ``<shard_root>/<survey>/map_checkpoint.jsonl``) unless *skip_completed*
+    is False; existing part files are never rewritten either way.
+    With *staging_dir*, each part is written there first and then moved to
+    ``shard_root``.  Per-file errors are appended to *failures_log* (JSONL).
+
+    Returns a summary with ``n_files``, ``n_files_skipped``, ``n_files_ok``,
+    ``n_files_failed`` and ``elapsed_s``.  Raises ``ValueError`` when the
+    settings disagree with the existing shard tree.
     """
-    checkpoint = _checkpoint_path(shard_root, survey)
-    done = _load_checkpoint(checkpoint)
+    _check_shard_norder(shard_root, survey, norder)
+    checkpoint = checkpoint_path or _checkpoint_path(shard_root, survey)
+    done = _load_checkpoint(checkpoint) if skip_completed else set()
 
     pending = [p for p in source_paths if str(p.resolve()) not in done]
     log.info(
@@ -180,48 +430,66 @@ def run_map_phase(
         len(pending),
     )
 
-    cols_tuple: tuple[str, ...] | None = tuple(columns) if columns else None
-    kwargs = dict(
+    worker = partial(
+        _map_one_file,
         shard_root=shard_root,
         survey=survey,
         ra_col=ra_col,
         dec_col=dec_col,
         norder=norder,
         link_id_col=link_id_col,
-        columns=cols_tuple,
+        columns=tuple(columns) if columns else None,
         allow_incomplete_link_id=allow_incomplete_link_id,
+        staging_dir=staging_dir,
     )
 
     t0 = time.monotonic()
     n_ok = 0
     n_err = 0
+    info_recorded = False
 
-    if n_workers <= 1:
-        for src in pending:
-            try:
-                _, n_tiles, n_rows = _map_one_file(src, **kwargs)  # type: ignore[arg-type]
-                _append_checkpoint(checkpoint, str(src.resolve()))
-                n_ok += 1
-                log.debug("OK  %s  tiles=%d rows=%d", src.name, n_tiles, n_rows)
-            except Exception as exc:  # noqa: BLE001
-                n_err += 1
-                log.error("FAIL %s: %s", src, exc)
-    else:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {
-                pool.submit(_map_one_file, src, **kwargs): src  # type: ignore[arg-type]
-                for src in pending
-            }
-            for fut in as_completed(futures):
-                src = futures[fut]
-                try:
-                    _, n_tiles, n_rows = fut.result()
-                    _append_checkpoint(checkpoint, str(src.resolve()))
-                    n_ok += 1
-                    log.debug("OK  %s  tiles=%d rows=%d", src.name, n_tiles, n_rows)
-                except Exception as exc:  # noqa: BLE001
-                    n_err += 1
-                    log.error("FAIL %s: %s", src, exc)
+    def _on_success(src: Path, n_tiles: int, n_rows: int, sid_mode: str) -> None:
+        nonlocal n_ok, info_recorded
+        if not info_recorded:
+            _record_shard_info(
+                shard_root,
+                survey,
+                {
+                    "norder": norder,
+                    "link_id_mode": sid_mode,
+                    "ra_column": ra_col,
+                    "dec_column": dec_col,
+                    "allow_incomplete_link_id": allow_incomplete_link_id,
+                },
+            )
+            info_recorded = True
+        _append_checkpoint(checkpoint, str(src.resolve()))
+        n_ok += 1
+        log.debug("OK  %s  tiles=%d rows=%d", src.name, n_tiles, n_rows)
+
+    def _on_failure(src: Path, exc: BaseException) -> None:
+        nonlocal n_err
+        n_err += 1
+        log.error("FAIL %s: %s", src, exc)
+        _append_failure(failures_log, _failure_entry(exc, path=str(src)))
+
+    pbar = _progress(len(pending), "map", "file", show_progress)
+    tasks = _run_tasks(
+        worker, ((src, (src,)) for src in pending), n_workers, max_in_flight=max_in_flight,
+    )
+    try:
+        for src, res, exc in tasks:
+            if exc is not None:
+                _on_failure(src, exc)
+            else:
+                _, n_tiles, n_rows, sid_mode = res
+                _on_success(src, n_tiles, n_rows, sid_mode)
+            if pbar is not None:
+                pbar.update(1)
+    finally:
+        tasks.close()
+        if pbar is not None:
+            pbar.close()
 
     elapsed = time.monotonic() - t0
     log.info(
@@ -232,7 +500,15 @@ def run_map_phase(
         elapsed / max(n_ok + n_err, 1),
     )
     if n_err:
-        raise RuntimeError(f"Map phase finished with {n_err} error(s). See log above.")
+        where = f" Failures: {failures_log}." if failures_log else ""
+        log.error("Map phase finished with %d error(s).%s", n_err, where)
+    return {
+        "n_files": len(source_paths),
+        "n_files_skipped": len(source_paths) - len(pending),
+        "n_files_ok": n_ok,
+        "n_files_failed": n_err,
+        "elapsed_s": elapsed,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -302,20 +578,63 @@ def _reduce_one_npix(
     catalog_root: Path,
     norder: int,
     on_duplicate_id: DuplicateIdMode,
-) -> tuple[int, int]:
+    staging_dir: Path | None = None,
+    tile_mode: TileMode = "append",
+    parquet_options: CatalogParquetOptions | None = None,
+) -> tuple[int, int, str]:
     """Concatenate all part files for one Npix and write the final lake tile.
 
-    Returns ``(npix, n_rows)``.
-    """
-    tables = [pq.read_table(str(p)) for p in part_paths]
-    combined = pa.concat_tables(tables, promote_options="default")
-    combined = _dedup_table(combined, on_duplicate_id)
+    An existing lake tile is handled per *tile_mode*: ``append`` merges it
+    with the shard rows (existing rows win on ``--on-duplicate-id skip``),
+    ``skip`` leaves it untouched, ``overwrite`` replaces it.
 
+    Returns ``(npix, n_rows, action)`` with action one of ``written``,
+    ``merged``, ``unchanged``, ``skipped``.
+    """
     hp_dir = healpix_dir(norder, npix)
     out_path = catalog_root / hp_dir / f"Npix={npix}.parquet"
-    options = CatalogParquetOptions()
-    _write_catalog_parquet_tile(combined, out_path, options)
-    return npix, len(combined)
+    exists = out_path.exists()
+    if exists and tile_mode == "skip":
+        return npix, 0, "skipped"
+
+    # ParquetFile avoids Hive-partition inference from ``Norder=/Npix=`` paths.
+    tables = [pq.ParquetFile(str(p)).read() for p in part_paths]
+    combined = pa.concat_tables(tables, promote_options="default")
+    del tables
+    combined = _dedup_table(combined, on_duplicate_id)
+    estimated = sum(p.stat().st_size for p in part_paths)
+
+    action = "written"
+    if exists and tile_mode == "append":
+        if _is_valid_parquet_tile(out_path):
+            existing = _read_catalog_tile(out_path)
+            n_before = existing.num_rows
+            estimated += out_path.stat().st_size
+            combined = _merge_tile_tables(
+                existing,
+                combined,
+                sid_col=_id_column_for_dedup(existing, None),
+                on_duplicate_id=on_duplicate_id,
+            )
+            del existing
+            if combined.num_rows == n_before and on_duplicate_id != "last":
+                return npix, n_before, "unchanged"
+            action = "merged"
+        else:
+            log.warning(
+                "Existing tile %s is corrupt (likely aborted write); replacing.",
+                out_path,
+            )
+
+    _write_tile_staged(
+        combined,
+        out_path,
+        catalog_root,
+        parquet_options or CatalogParquetOptions(),
+        staging_dir,
+        estimated_bytes=estimated,
+    )
+    return npix, len(combined), action
 
 
 # ---------------------------------------------------------------------------
@@ -354,74 +673,118 @@ def run_reduce_phase(
     n_workers: int = 1,
     ra_col: str = "ra",
     dec_col: str = "dec",
-) -> None:
-    """Concat shard parts → one lake tile per Npix, then finalize metadata."""
+    staging_dir: Path | None = None,
+    tile_mode: TileMode = "append",
+    failures_log: Path | None = None,
+    compact: bool = False,
+    max_in_flight: int | None = None,
+    show_progress: bool = False,
+) -> dict[str, Any]:
+    """Concat shard parts → one lake tile per Npix, then finalize metadata.
+
+    Raises ``ValueError`` before writing anything if the shards were mapped
+    at another ``norder`` or the existing lake survey uses another order /
+    link-id spec.  Per-tile errors are appended to *failures_log* (JSONL);
+    finalize is skipped when any tile failed.  With *staging_dir*, each tile
+    is written there first and then moved to *catalog_root*.
+
+    Returns a summary with ``n_tiles``, ``n_tiles_failed``, ``actions``
+    (counts per written/merged/unchanged/skipped), ``finalized`` and
+    ``elapsed_s``.
+    """
+    shard_info = _check_shard_norder(shard_root, survey, norder)
+    if shard_info is None:
+        log.warning(
+            "No %s under %s; cannot verify link-id mode against the lake.",
+            _SHARD_INFO_FILENAME, shard_root / survey,
+        )
+        shard_info = {"norder": norder}
+    _check_against_catalog(shard_info, catalog_root)
+
+    t0 = time.monotonic()
+    actions: Counter[str] = Counter()
+    n_err = 0
     npix_groups = list(_iter_shard_parts(shard_root, survey, norder))
+
+    def _summary(finalized: bool) -> dict[str, Any]:
+        return {
+            "n_tiles": len(npix_groups),
+            "n_tiles_failed": n_err,
+            "actions": dict(actions),
+            "finalized": finalized,
+            "elapsed_s": time.monotonic() - t0,
+        }
+
     if not npix_groups:
         log.warning("No shard parts found under %s for survey %r.", shard_root, survey)
-        return
+        return _summary(False)
 
-    log.info("Reduce phase: %d Npix pixels to merge.", len(npix_groups))
-    t0 = time.monotonic()
-    n_ok = 0
-    n_err = 0
-
-    if n_workers <= 1:
-        for npix, parts in npix_groups:
-            try:
-                _, n_rows = _reduce_one_npix(
-                    npix, parts, catalog_root, norder, on_duplicate_id
-                )
-                n_ok += 1
-                log.debug("Npix=%d  %d rows from %d parts", npix, n_rows, len(parts))
-            except Exception as exc:  # noqa: BLE001
-                n_err += 1
-                log.error("FAIL Npix=%d: %s", npix, exc)
-    else:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {
-                pool.submit(
-                    _reduce_one_npix,
-                    npix,
-                    parts,
-                    catalog_root,
-                    norder,
-                    on_duplicate_id,
-                ): npix
-                for npix, parts in npix_groups
-            }
-            for fut in as_completed(futures):
-                npix = futures[fut]
-                try:
-                    _, n_rows = fut.result()
-                    n_ok += 1
-                    log.debug("Npix=%d done (%d rows)", npix, n_rows)
-                except Exception as exc:  # noqa: BLE001
-                    n_err += 1
-                    log.error("FAIL Npix=%d: %s", npix, exc)
-
-    elapsed = time.monotonic() - t0
     log.info(
-        "Reduce concat done: %d ok, %d errors in %.1f s.",
-        n_ok,
+        "Reduce phase: %d Npix pixels to merge (tile-mode=%s).",
+        len(npix_groups), tile_mode,
+    )
+    options = CatalogParquetOptions.compact() if compact else CatalogParquetOptions()
+    args = (catalog_root, norder, on_duplicate_id, staging_dir, tile_mode, options)
+
+    def _on_failure(npix: int, parts: list[Path], exc: BaseException) -> None:
+        nonlocal n_err
+        n_err += 1
+        log.error("FAIL Npix=%d: %s", npix, exc)
+        _append_failure(
+            failures_log,
+            _failure_entry(exc, npix=npix, parts=[str(p) for p in parts]),
+        )
+
+    pbar = _progress(len(npix_groups), "reduce", "tile", show_progress)
+    tasks = _run_tasks(
+        _reduce_one_npix,
+        (((npix, parts), (npix, parts, *args)) for npix, parts in npix_groups),
+        n_workers,
+        max_in_flight=max_in_flight,
+    )
+    try:
+        for (npix, parts), res, exc in tasks:
+            if exc is not None:
+                _on_failure(npix, parts, exc)
+            else:
+                _, n_rows, action = res
+                actions[action] += 1
+                log.debug("Npix=%d %s (%d rows, %d parts)", npix, action, n_rows, len(parts))
+            if pbar is not None:
+                pbar.update(1)
+    finally:
+        tasks.close()
+        if pbar is not None:
+            pbar.close()
+
+    log.info(
+        "Reduce concat done in %.1f s: %s, %d errors.",
+        time.monotonic() - t0,
+        ", ".join(f"{n} {a}" for a, n in sorted(actions.items())) or "nothing written",
         n_err,
-        elapsed,
     )
 
     if n_err:
-        raise RuntimeError(
-            f"Reduce phase finished with {n_err} tile error(s). See log above."
+        where = f" Failures: {failures_log}." if failures_log else ""
+        log.error(
+            "Reduce phase finished with %d tile error(s); finalize skipped. "
+            "Fix and re-run reduce (existing tiles are merged, not duplicated).%s",
+            n_err, where,
         )
+        return _summary(False)
 
     log.info("Running finalize_catalog_survey …")
     finalize_catalog_survey(
         catalog_root=catalog_root,
         survey_name=survey,
         norder=norder,
-        ra_col=ra_col,
-        dec_col=dec_col,
+        ra_col=shard_info.get("ra_column", ra_col),
+        dec_col=shard_info.get("dec_column", dec_col),
+        link_id_mode=shard_info.get("link_id_mode"),
+        allow_incomplete_link_id=shard_info.get("allow_incomplete_link_id"),
     )
     log.info("Reduce phase complete.")
+    return _summary(True)
 
 
 # ---------------------------------------------------------------------------
@@ -443,12 +806,9 @@ def _collect_fits_files(
             log.warning("No *.fits files found in %s", input_dir)
         return paths
     if file_list is not None:
-        paths = []
-        for line in file_list.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                paths.append(Path(line))
-        return paths
+        from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file
+
+        return paths_from_file_list_file(file_list)
     raise ValueError("Either --input-dir or --file-list is required for --phase map.")
 
 
@@ -459,7 +819,31 @@ def _collect_fits_files(
 try:
     import click
 
+    from data_lake.cli_utils import (
+        apply_fits_memmap_env,
+        config_option,
+        configure_cli_logging,
+        fits_memmap_option,
+        ingest_token_option,
+        load_optional_config,
+        logging_options,
+        pick,
+        progress_option,
+        require_ingest_permission,
+        require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
+        warn_high_parallelism_on_slow_storage,
+    )
+    from data_lake.ingest.catalog_cli_options import (
+        allow_incomplete_link_id_option,
+        tile_mode_option,
+    )
+
     @click.command("dl-ingest-from-shard")
+    @click.argument("output_root", type=click.Path(path_type=Path), required=False)
+    @config_option
+    @ingest_token_option
     @click.option(
         "--phase",
         type=click.Choice(["map", "reduce"], case_sensitive=False),
@@ -479,7 +863,7 @@ try:
         "file_list",
         type=click.Path(exists=True, dir_okay=False, path_type=Path),
         default=None,
-        help="(map) Text file with one FITS path per line.",
+        help="(map) Text file with one FITS path per line (relative to the list).",
     )
     # Shard / survey
     @click.option(
@@ -491,6 +875,7 @@ try:
     )
     @click.option(
         "--survey",
+        "survey_name",
         required=True,
         help="Survey name (e.g. Legacy_DR11_north). Used as sub-directory and lake survey name.",
     )
@@ -501,20 +886,27 @@ try:
         "--link-id-col",
         "link_id_col",
         default=None,
-        help="ID column (e.g. ls_id_dr11) or composite (TARGETID,SURVEY,PROGRAM).",
+        help=(
+            "(map, required) Survey object ID column (e.g. ls_id_dr11) or "
+            "composite (objid,brickname)."
+        ),
     )
     @click.option(
         "--norder",
         type=int,
-        default=7,
-        show_default=True,
-        help="HEALPix order for partitioning.",
+        default=None,
+        help=(
+            "HEALPix order. Default: the existing shard tree's order, else config "
+            "hats_order, else 5."
+        ),
     )
     @click.option(
         "--columns",
         default=None,
-        help="Comma-separated columns to keep (default: all).",
+        help="(map) Comma-separated columns to keep (default: all).",
     )
+    @allow_incomplete_link_id_option
+    @fits_memmap_option
     # Reduce options
     @click.option(
         "--on-duplicate-id",
@@ -522,112 +914,213 @@ try:
         type=click.Choice(["skip", "error", "last"], case_sensitive=False),
         default="skip",
         show_default=True,
-        help="(reduce) How to handle duplicate _source_id values within one tile.",
+        help=(
+            "(reduce) Duplicate _source_id policy, within the shards and against an "
+            "existing lake tile: skip keeps the first/existing row, last keeps the "
+            "newest, error aborts."
+        ),
+    )
+    @tile_mode_option(
+        default="append",
+        help=(
+            "(reduce) Existing lake tile: append merges it with the shard rows "
+            "(one rewrite per tile), skip leaves it untouched, overwrite replaces it."
+        ),
+    )
+    @click.option(
+        "--compact", is_flag=True,
+        help="(reduce) Smaller Parquet tiles (ZSTD-9, no stats/dictionary).",
     )
     @click.option(
         "--lake-root",
         "lake_root",
         type=click.Path(path_type=Path),
         default=None,
-        help="(reduce) Lake root directory. Defaults to shard-root/../lake.",
+        hidden=True,
+        help="Deprecated alias for the OUTPUT_ROOT argument.",
     )
     # Parallelism
     @click.option(
-        "--n-workers",
-        "n_workers",
-        type=int,
-        default=1,
-        show_default=True,
-        help="Worker processes (map: decode parallelism; reduce: tile concat parallelism).",
+        "--n-workers", default=4, show_default=True, type=int,
+        help="Worker processes (map: FITS decode; reduce: per-tile concat).",
     )
-    # Resume / misc
     @click.option(
-        "--allow-incomplete-link-id",
-        "allow_incomplete_link_id",
-        is_flag=True,
-        default=False,
-        help="Leave _source_id null when composite link-id parts are missing.",
+        "--max-in-flight",
+        default=None,
+        type=int,
+        help="Max tasks queued to workers at once (default: 2 × n_workers).",
     )
-    @click.option("-v", "--verbose", is_flag=True)
+    @click.option(
+        "--staging-dir",
+        "staging_dir",
+        type=click.Path(file_okay=False, path_type=Path),
+        default=None,
+        envvar="DATA_LAKE_STAGING_DIR",
+        show_envvar=True,
+        help=(
+            "Fast local scratch (e.g. $TMPDIR on node SSD). Each part/tile is "
+            "written here, then moved to --shard-root (map) or OUTPUT_ROOT "
+            "(reduce). Holds only ~n_workers files at a time; falls back to "
+            "direct writes when free space is short."
+        ),
+    )
+    # Resume / logging
+    @click.option(
+        "--checkpoint",
+        type=click.Path(dir_okay=False, path_type=Path),
+        default=None,
+        help="(map) JSONL checkpoint. Default: <shard-root>/<survey>/map_checkpoint.jsonl.",
+    )
+    @click.option(
+        "--no-skip-completed",
+        is_flag=True,
+        help="(map) Ignore the checkpoint; existing part files are still never rewritten.",
+    )
+    @click.option(
+        "--failures-log",
+        "failures_log",
+        type=click.Path(dir_okay=False, path_type=Path),
+        default=None,
+        help=(
+            "Append-only JSONL of failures (map: one line per FITS path; "
+            "reduce: one line per Npix with its part files)."
+        ),
+    )
+    @progress_option
+    @click.option(
+        "--log-file",
+        "log_file",
+        type=click.Path(dir_okay=False, path_type=Path),
+        default=None,
+        help="File for INFO+ logs (useful with --quiet for an audit trail).",
+    )
+    @logging_options
     def cli(
+        output_root: Path | None,
+        config_path: Path | None,
+        ingest_token: str | None,
         phase: str,
         input_dir: Path | None,
         file_list: Path | None,
         shard_root: Path,
-        survey: str,
+        survey_name: str,
         ra_col: str,
         dec_col: str,
         link_id_col: str | None,
-        norder: int,
+        norder: int | None,
         columns: str | None,
+        allow_incomplete_link_id: bool,
+        fits_memmap: str,
         on_duplicate_id: str,
+        tile_mode: str,
+        compact: bool,
         lake_root: Path | None,
         n_workers: int,
-        allow_incomplete_link_id: bool,
+        max_in_flight: int | None,
+        staging_dir: Path | None,
+        checkpoint: Path | None,
+        no_skip_completed: bool,
+        failures_log: Path | None,
+        show_progress: bool,
+        log_file: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Two-phase map-reduce catalog ingest for large FITS collections.
 
+        OUTPUT_ROOT is the lake root (default: lake.root from --config);
+        reduce writes tiles under OUTPUT_ROOT/catalogs/<survey>/.
+
         \b
-        PHASE MAP  – run one Slurm array task per RA folder:
+        PHASE MAP  – one Slurm array task per RA folder:
             dl-ingest-from-shard --phase map --input-dir /data/legacy/north/000 \\
                 --survey Legacy_DR11_north --shard-root $SCRATCH/shards \\
                 --ra-col ra --dec-col dec --link-id-col ls_id_dr11 \\
                 --norder 7 --n-workers 8
 
         \b
-        PHASE REDUCE – run once after the array completes:
-            dl-ingest-from-shard --phase reduce \\
+        PHASE REDUCE – once, after the array completes:
+            dl-ingest-from-shard /data/lake --phase reduce \\
                 --survey Legacy_DR11_north --shard-root $SCRATCH/shards \\
-                --lake-root /data/lake --norder 7 --n-workers 32
+                --n-workers 32
         """
-        import logging
-
-        logging.basicConfig(
-            level=logging.DEBUG if verbose else logging.INFO,
-            format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-            stream=sys.stderr,
+        validate_quiet_verbose(quiet, verbose)
+        cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose,
+                                    config_level=cfg.ingest.log_level if cfg else None),
+            log_file=log_file,
+            quiet=quiet,
         )
+        require_ingest_permission(cfg, ingest_token)
 
-        cols: Sequence[str] | None = (
-            [c.strip() for c in columns.split(",") if c.strip()]
-            if columns
-            else None
+        shard_info = _read_json(_shard_info_path(shard_root, survey_name)) or {}
+        n = pick(
+            norder,
+            shard_info.get("norder"),
+            pick(None, cfg.partitioning.hats_order if cfg else None, 5),
         )
-        on_dup: DuplicateIdMode = on_duplicate_id.lower()  # type: ignore[assignment]
+        cols = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
 
-        if phase == "map":
-            source_paths = _collect_fits_files(input_dir, file_list)
-            if not source_paths:
-                log.error("No input files found. Check --input-dir / --file-list.")
-                sys.exit(1)
-            run_map_phase(
-                source_paths=source_paths,
+        try:
+            if phase == "map":
+                if not link_id_col:
+                    raise click.UsageError("--link-id-col is required for --phase map.")
+                source_paths = _collect_fits_files(input_dir, file_list)
+                if not source_paths:
+                    raise click.UsageError(
+                        "No input files found. Check --input-dir / --file-list."
+                    )
+                apply_fits_memmap_env(fits_memmap)
+                warn_high_parallelism_on_slow_storage(n_workers, shard_root)
+                result = run_map_phase(
+                    source_paths=source_paths,
+                    shard_root=shard_root,
+                    survey=survey_name,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    norder=n,
+                    link_id_col=link_id_col,
+                    columns=cols,
+                    allow_incomplete_link_id=allow_incomplete_link_id,
+                    n_workers=n_workers,
+                    max_in_flight=max_in_flight,
+                    staging_dir=staging_dir,
+                    failures_log=failures_log,
+                    checkpoint_path=checkpoint,
+                    skip_completed=not no_skip_completed,
+                    show_progress=show_progress,
+                )
+                sys.exit(0 if result["n_files_failed"] == 0 else 1)
+
+            if lake_root is not None:
+                if output_root is not None and output_root != lake_root:
+                    raise click.UsageError(
+                        "OUTPUT_ROOT and --lake-root disagree; pass only OUTPUT_ROOT."
+                    )
+                log.warning("--lake-root is deprecated; pass the lake root as OUTPUT_ROOT.")
+                output_root = lake_root
+            lake = require_output_root(output_root, cfg, kind="catalogs")
+            warn_high_parallelism_on_slow_storage(n_workers, lake)
+            result = run_reduce_phase(
                 shard_root=shard_root,
-                survey=survey,
+                survey=survey_name,
+                catalog_root=lake / "catalogs" / survey_name,
+                norder=n,
+                on_duplicate_id=on_duplicate_id.lower(),  # type: ignore[arg-type]
+                n_workers=n_workers,
                 ra_col=ra_col,
                 dec_col=dec_col,
-                norder=norder,
-                link_id_col=link_id_col,
-                columns=cols,
-                allow_incomplete_link_id=allow_incomplete_link_id,
-                n_workers=n_workers,
+                staging_dir=staging_dir,
+                tile_mode=tile_mode.lower(),  # type: ignore[arg-type]
+                failures_log=failures_log,
+                compact=compact,
+                max_in_flight=max_in_flight,
+                show_progress=show_progress,
             )
-        else:  # reduce
-            if lake_root is None:
-                lake_root = shard_root.parent / "lake"
-                log.info("--lake-root not set; defaulting to %s", lake_root)
-            catalog_root = lake_root / "catalogs" / survey
-            run_reduce_phase(
-                shard_root=shard_root,
-                survey=survey,
-                catalog_root=catalog_root,
-                norder=norder,
-                on_duplicate_id=on_dup,
-                n_workers=n_workers,
-                ra_col=ra_col,
-                dec_col=dec_col,
-            )
+            sys.exit(0 if result["n_tiles_failed"] == 0 else 1)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
 
 except ImportError:
     # click not installed: module still importable for engine functions

@@ -71,7 +71,15 @@ Start a **new survey name** if an existing `norder=4` tree must be kept.
 
 **Slurm recipe**
 
+Like every `dl-ingest-*` command, both phases need a deployment config
+(`--config` or `$DATA_LAKE_CONFIG`) and the ingest token (`$LAKE_INGEST_TOKEN`).
+Reduce writes into the lake given as the `OUTPUT_ROOT` argument, defaulting to
+`lake.root` from the config.
+
 ```bash
+export DATA_LAKE_CONFIG=/path/to/lake_config.toml
+export LAKE_INGEST_TOKEN=...   # or --ingest-token
+
 # Prepare: list all RA folder paths (one per array task)
 ls -d /data/legacy/north/[0-9]* > ra_folders.txt
 
@@ -90,12 +98,16 @@ dl-ingest-from-shard --phase map \
 # Reduce job (single job, depends on array)
 #SBATCH --cpus-per-task=32 --mem=200G --time=1-00:00:00 --dependency=afterok:<array_jobid>
 
-dl-ingest-from-shard --phase reduce \
+dl-ingest-from-shard /data/lake --phase reduce \
   --survey Legacy_DR11_north \
   --shard-root $SCRATCH/shards \
-  --lake-root /data/lake \
-  --norder 7 --n-workers 32 --on-duplicate-id skip
+  --staging-dir "$TMPDIR/dl_stage" \
+  --n-workers 32 --on-duplicate-id skip
 ```
+
+Reduce takes `--norder` from the shard tree's `shard_info.json` when omitted. Both
+phases exit with status 1 if any file or tile failed. A settings mismatch exits with a
+one-line error instead of a traceback.
 
 **Expected throughput:** map ≈ 0.2–1 s/file (one FITS decode + one Parquet write per
 Npix hit); reduce ≈ O(n_pixels) with linear parallelism.  400 k files in hours of
@@ -105,19 +117,44 @@ array wall-clock, not 2 000 CPU-hours of serial append.
 
 | Flag | Phase | Default | Notes |
 |------|-------|---------|-------|
+| `OUTPUT_ROOT` (argument) | reduce | config `lake.root` | Lake root; tiles go to `catalogs/<survey>/`. `--lake-root` is a deprecated alias |
+| `--config` | both | `$DATA_LAKE_CONFIG` | Deployment config (required) |
+| `--ingest-token` | both | `$LAKE_INGEST_TOKEN` | Ingest operator token (required) |
 | `--phase` | both | required | `map` or `reduce` |
 | `--input-dir` | map | — | Non-recursive directory of `*.fits` (one RA folder) |
-| `--file-list` | map | — | Text file, one FITS path per line |
+| `--file-list` | map | — | Text file, one FITS path per line (relative paths resolve against the list) |
 | `--shard-root` | both | required | Root for immutable shard parts |
 | `--survey` | both | required | Survey name (also used as lake sub-directory) |
 | `--ra-col` / `--dec-col` | both | `ra` / `dec` | Sky coordinate columns |
-| `--link-id-col` | map | `None` | ID column or composite spec (e.g. `TARGETID,SURVEY,PROGRAM`) |
-| `--norder` | both | `7` | HEALPix order — must match between map and reduce |
+| `--link-id-col` | map | required | ID column or composite spec (e.g. `objid,brickname`) |
+| `--norder` | both | shard tree, then config `hats_order`, then 5 | HEALPix order; must match between map and reduce |
 | `--columns` | map | all | Comma-separated subset of columns to keep |
-| `--on-duplicate-id` | reduce | `skip` | `skip`, `last`, `error` |
-| `--lake-root` | reduce | `<shard-root>/../lake` | Lake root; `catalogs/<survey>` written here |
-| `--n-workers` | both | `1` | Worker processes |
 | `--allow-incomplete-link-id` | map | off | Null `_source_id` for rows with missing composite parts |
+| `--fits-memmap` | map | `auto` | FITS read policy (`$DATA_LAKE_FITS_MEMMAP`) |
+| `--on-duplicate-id` | reduce | `skip` | `skip` keeps the first/existing row, `last` keeps the newest, `error` aborts the tile |
+| `--tile-mode` | reduce | `append` | Existing lake tile: `append` merges (one rewrite per tile per reduce run), `skip` leaves it, `overwrite` replaces it |
+| `--compact` | reduce | off | Smaller tiles (ZSTD-9, no stats/dictionary) |
+| `--n-workers` | both | `4` | Worker processes |
+| `--max-in-flight` | both | `2 × n_workers` | Tasks queued to workers at once |
+| `--staging-dir` | both | `$DATA_LAKE_STAGING_DIR` | Fast local scratch; each file is written here then moved to the final area (holds ~`n_workers` files; falls back to direct write when space is short) |
+| `--checkpoint` | map | `<shard-root>/<survey>/map_checkpoint.jsonl` | JSONL of finished input files |
+| `--no-skip-completed` | map | off | Ignore the checkpoint (existing part files are still never rewritten) |
+| `--failures-log` | both | — | JSONL with `error` and `traceback`; map writes one line per FITS `path`, reduce one per `npix` with its `parts` |
+| `--progress/--no-progress` | both | on | tqdm progress bar |
+| `--log-file` | both | — | Append INFO+ logs to a file (with `-q`, the file still gets INFO) |
+| `-q` / `-v` | both | — | Terminal shows warnings only / DEBUG; mutually exclusive |
+
+**Adding to an existing survey:** map the new files into a fresh `--shard-root` and
+reduce with the default `--tile-mode append`. Each touched tile is read once, merged with
+the new rows, and rewritten once. Map records `norder` and `link_id_mode` in
+`<shard-root>/<survey>/shard_info.json`. Reduce aborts before writing anything if those
+disagree with `--norder` or with the existing survey's `catalog_info.json`, and map aborts
+if a later task uses another `--link-id-col` or `--norder` on the same shard tree.
+
+**Small local SSD:** keep `--shard-root` and the lake (`OUTPUT_ROOT`) on large shared storage and
+pass `--staging-dir $TMPDIR/dl_stage`. Writes go to the SSD first; finished files are
+moved atomically (cross-device copy to `<final>.tmp` then rename), so readers never see a
+partial tile and the SSD only needs room for the tiles currently in flight.
 
 ---
 
