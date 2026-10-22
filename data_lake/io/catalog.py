@@ -28,6 +28,8 @@ from data_lake.ingest.fits_to_parquet import (
     catalog_tile_schema_names,
     healpix_dir,
     match_schema_column,
+    native_id_column_from_mode,
+    parse_link_id_column_spec,
     resolve_redshift_column,
     resolve_link_id_column,
 )
@@ -147,6 +149,74 @@ class CatalogAccessor:
     def redshift_column(self) -> str | None:
         """Catalog column for redshift (e.g. ``Z`` for DESI), or ``None`` if absent."""
         return self._redshift_column
+
+    @property
+    def link_id_mode(self) -> str:
+        """``link_id_mode`` from ``catalog_info.json`` (e.g. ``composite:TARGETID,SURVEY,PROGRAM``)."""
+        return str(self._info.get("link_id_mode", ""))
+
+    @property
+    def link_id_component_columns(self) -> list[str]:
+        """Original catalog columns that define ``_source_id`` (single or composite).
+
+        Parsed from ``link_id_mode`` / ``native_id_column``.  Empty when the
+        survey uses sequential IDs with no recoverable native columns.
+        Only columns that still exist in the Parquet schema are returned.
+        """
+        mode = self.link_id_mode
+        spec = native_id_column_from_mode(mode) if mode else None
+        if not spec:
+            spec = self._info.get("native_id_column")
+        if not spec:
+            return []
+        parts = parse_link_id_column_spec(str(spec))
+        available = set(self.columns)
+        return [p for p in parts if p in available]
+
+    def values_for_source_ids(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        columns: Sequence[str],
+        *,
+        batch_size: int = 10_000,
+    ) -> dict[str, dict[int, object]]:
+        """Return ``{column: {source_id: value}}`` for the requested columns.
+
+        Used by spectrum/cutout subset extract to embed native link-id
+        columns (e.g. ``TARGETID``, ``SURVEY``, ``PROGRAM``) alongside
+        ``_source_id`` so exported Zarr/HDF5 files are self-contained.
+        """
+        cols = [c for c in columns if c]
+        if not cols:
+            return {}
+        missing = [c for c in cols if c not in self.columns]
+        if missing:
+            raise KeyError(
+                f"Column(s) {missing!r} not in catalog {self.survey_name!r}. "
+                f"Available: {self.columns[:30]}"
+            )
+
+        ids = np.unique(np.asarray(source_ids, dtype=np.int64))
+        if ids.size == 0:
+            return {c: {} for c in cols}
+
+        sid_col = self._link_id_column
+        sid_sql = _quote_sql_ident(sid_col)
+        col_sql = ", ".join(_quote_sql_ident(c) for c in cols)
+        out: dict[str, dict[int, object]] = {c: {} for c in cols}
+
+        for start in range(0, int(ids.size), batch_size):
+            chunk = ids[start : start + batch_size]
+            ids_csv = ",".join(str(int(s)) for s in chunk)
+            sql = (
+                f"SELECT {sid_sql}, {col_sql} FROM catalog "
+                f"WHERE {sid_sql} IN ({ids_csv})"
+            )
+            for row in self._con.execute(sql).fetchall():
+                sid = int(row[0])
+                for i, col in enumerate(cols):
+                    out[col][sid] = row[i + 1]
+        return out
 
     @property
     def schema(self) -> pa.Schema:

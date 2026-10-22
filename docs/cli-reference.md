@@ -18,6 +18,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-ingest-catalog` | Single FITS/CSV/Parquet/VOTable → HATS-partitioned Parquet; required: `--survey`, `--link-id-col` (source integer ID column), `--ra-col`, `--dec-col`; `--set-column NAME=VALUE` to inject constant columns before identity resolution (repeatable); `--defer-finalize`/`--lifecycle live` for incremental live surveys |
 | `dl-ingest-catalog-batch` | Parallel decode, single-thread writer (large file lists) |
 | `dl-ingest-catalog-from-list` | Sequential (default) or parallel catalog file-list ingest |
+| `dl-ingest-from-shard` | Two-phase map-reduce ingest for large FITS collections (e.g. Legacy Survey DR11): `--phase map` decodes FITS → immutable per-HEALPix Parquet parts; `--phase reduce` concatenates parts → lake tiles; see [batch-and-checkpoints.md](ingest/batch-and-checkpoints.md#two-phase-map-reduce-ingest-dl-ingest-from-shard) |
 | `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |
 | `dl-repair-catalog-metadata` | Repair/rebuild link IDs, `--check-only`, `--rebuild-link-id` |
 | `dl-recommend-catalog-norder` | Sample a catalog to suggest a good `--norder` |

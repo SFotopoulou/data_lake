@@ -9,19 +9,21 @@ The script auto-detects the modality from the Zarr group layout:
   • spectra  → arrays: flux, ivar, mask, wavelength, _source_id, redshift
   • cutouts  → arrays: images, wcs, _source_id
 
-Original identifier columns (e.g. TARGETID, SURVEY, PROGRAM) are resolved
-from the lake's Parquet catalog by joining on _source_id — the same way
-redshift is resolved during extraction.  No data_lake install is needed.
+Identifier columns (e.g. TARGETID, SURVEY, PROGRAM) are read from the subset
+itself when embedded at extract time (``link_id_columns`` attr).  Older
+extracts fall back to joining the lake Parquet on ``_source_id``.  No
+``data_lake`` install is needed to run this script.
 
 Usage
 -----
-    python read_zarr_subset.py subset.zarr                      # summary only
-    python read_zarr_subset.py subset.zarr --catalog out.fits   # TOPCAT catalog
-    python read_zarr_subset.py subset.zarr --plot-row 0         # plot row 0
-    python read_zarr_subset.py cutouts.zarr --show-cutout 0     # display cutout
+    python read_zarr_subset.py subset.zarr                         # summary only
+    python read_zarr_subset.py subset.zarr --catalog out.parquet   # preferred
+    python read_zarr_subset.py subset.zarr --catalog out.fits      # also OK
+    python read_zarr_subset.py subset.zarr --plot-row 0
+    python read_zarr_subset.py cutouts.zarr --show-cutout 0
 
-Requirements:  zarr, numpy, astropy, pyarrow
-               (matplotlib optional for --plot-row / --show-cutout)
+Requirements:  zarr, numpy, pyarrow
+               (astropy only for .fits catalog; matplotlib for plots)
 """
 
 from __future__ import annotations
@@ -207,14 +209,54 @@ def _lookup_id_columns(
     return out
 
 
+def resolve_id_columns_from_zarr(
+    root: zarr.Group,
+) -> tuple[list[str], dict[str, np.ndarray]]:
+    """Read embedded link-id columns from the subset itself (preferred).
+
+    Written by ``dl-extract-*-subset`` when a catalog was available at extract
+    time (attrs ``link_id_columns`` + peer arrays).
+    """
+    attrs = dict(root.attrs)
+    cols = attrs.get("link_id_columns")
+    if not cols:
+        return [], {}
+    # attrs may store lists as numpy arrays / JSON-ish
+    if isinstance(cols, np.ndarray):
+        cols = cols.tolist()
+    cols = [str(c) for c in cols]
+    available = set(root.array_keys())
+    present = [c for c in cols if c in available]
+    if not present:
+        return [], {}
+    if len(present) < len(cols):
+        print(
+            f"  NOTE: subset attrs list {cols} but only {present} arrays present.",
+            file=sys.stderr,
+        )
+    print(
+        f"  Using embedded link-id columns from subset: {present}"
+        + (f"  (mode={attrs.get('link_id_mode')})" if attrs.get("link_id_mode") else ""),
+        file=sys.stderr,
+    )
+
+    def _as_column(name: str) -> np.ndarray:
+        arr = np.asarray(root[name][:])
+        # Embedded strings are UTF-8 bytes (|S) for Zarr-v3 stability
+        if arr.dtype.kind == "S":
+            return np.asarray([b.decode("utf-8") for b in arr.tolist()], dtype=object)
+        return arr
+
+    return present, {c: _as_column(c) for c in present}
+
+
 def resolve_id_columns_from_lake(
     attrs: dict[str, Any],
     source_ids: np.ndarray,
 ) -> tuple[list[str], dict[str, np.ndarray]]:
-    """Try to resolve original identifier columns for *source_ids* from the lake.
+    """Fallback: resolve original identifier columns from the lake Parquet.
 
-    Returns (id_col_names, {col → array}).  Empty dict if the lake is
-    unreachable or the survey has no catalog.
+    Only used for older extracts that lack embedded ``link_id_columns``.
     """
     lake_root_str = attrs.get("source_lake_root", "")
     survey = attrs.get("source_survey", "")
@@ -238,10 +280,22 @@ def resolve_id_columns_from_lake(
         return [], {}
 
     norder = int(catalog_info.get("hats_order", 5))
-    print(f"  Resolving {id_cols} from {cat_root.name} catalog (norder={norder}) …",
+    print(f"  Resolving {id_cols} from lake catalog {cat_root.name} "
+          f"(norder={norder}; legacy extract without embedded IDs) …",
           file=sys.stderr)
     col_arrays = _lookup_id_columns(cat_root, norder, source_ids, id_cols)
     return id_cols, col_arrays
+
+
+def resolve_id_columns(
+    root: zarr.Group,
+    source_ids: np.ndarray,
+) -> tuple[list[str], dict[str, np.ndarray]]:
+    """Prefer embedded subset columns; fall back to lake join if needed."""
+    cols, arrays = resolve_id_columns_from_zarr(root)
+    if cols:
+        return cols, arrays
+    return resolve_id_columns_from_lake(dict(root.attrs), source_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -296,139 +350,176 @@ def print_summary(root: zarr.Group) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Catalog export
+# Catalog export (Parquet preferred; FITS optional)
 # ---------------------------------------------------------------------------
 
+_BATCH = 512  # rows per chunk when computing flux stats (keeps RAM bounded)
+
+
+def _write_table(cols: dict[str, Any], out_path: Path, meta: dict[str, Any]) -> None:
+    """Write *cols* as Parquet (default) or FITS, chosen by suffix."""
+    out_path = Path(out_path)
+    suffix = out_path.suffix.lower()
+
+    if suffix in {".fits", ".fit"}:
+        from astropy.table import Table
+
+        tbl = Table(cols)
+        for k, v in meta.items():
+            if v is not None and v != "":
+                tbl.meta[k] = v
+        tbl.write(str(out_path), format="fits", overwrite=True)
+    else:
+        # Default / .parquet / .pq / no suffix → Parquet
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        if suffix not in {".parquet", ".pq"}:
+            out_path = out_path.with_suffix(".parquet")
+        arrays = {}
+        for name, values in cols.items():
+            arr = np.asarray(values)
+            if arr.dtype == object:
+                arrays[name] = pa.array(arr.tolist(), type=pa.string())
+            else:
+                arrays[name] = pa.array(arr)
+        table = pa.table(arrays)
+        # Store light metadata as Parquet key/value strings
+        kv = {str(k).encode(): str(v).encode() for k, v in meta.items() if v not in (None, "")}
+        table = table.replace_schema_metadata(kv)
+        pq.write_table(table, str(out_path), compression="zstd")
+
+    print(f"Wrote catalog ({len(next(iter(cols.values())))} rows) → {out_path}")
+    print(f"  Columns: {list(cols)}")
+
+
+def _spectrum_flux_stats(root: zarr.Group, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Stream flux/ivar/mask in batches → (median_snr, median_flux, n_good_pix)."""
+    median_snr = np.empty(n, dtype=np.float32)
+    median_flux = np.empty(n, dtype=np.float32)
+    n_good_pix = np.empty(n, dtype=np.int32)
+
+    for start in range(0, n, _BATCH):
+        stop = min(start + _BATCH, n)
+        flux = np.asarray(root["flux"][start:stop])
+        ivar = np.asarray(root["ivar"][start:stop])
+        mask = np.asarray(root["mask"][start:stop])
+        good = mask == 0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            snr = np.where(ivar > 0, flux * np.sqrt(ivar), np.nan)
+        any_good = good.any(axis=1)
+        median_snr[start:stop] = np.where(
+            any_good, np.nanmedian(np.where(good, snr, np.nan), axis=1), np.nan
+        ).astype(np.float32)
+        median_flux[start:stop] = np.where(
+            any_good, np.nanmedian(np.where(good, flux, np.nan), axis=1), np.nan
+        ).astype(np.float32)
+        n_good_pix[start:stop] = good.sum(axis=1).astype(np.int32)
+    return median_snr, median_flux, n_good_pix
+
+
+def _cutout_flux_stats(root: zarr.Group, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Stream images in batches → (median_flux, max_flux). Never loads full cube."""
+    median_flux = np.empty(n, dtype=np.float32)
+    max_flux = np.empty(n, dtype=np.float32)
+
+    for start in range(0, n, _BATCH):
+        stop = min(start + _BATCH, n)
+        imgs = np.asarray(root["images"][start:stop])  # (k, B, H, W)
+        flat = imgs.reshape(stop - start, -1)
+        median_flux[start:stop] = np.nanmedian(flat, axis=1).astype(np.float32)
+        max_flux[start:stop] = np.nanmax(flat, axis=1).astype(np.float32)
+    return median_flux, max_flux
+
+
 def export_catalog(root: zarr.Group, out_path: Path) -> None:
-    """Write a FITS BINTABLE with one row per spectrum for TOPCAT.
-
-    Columns
-    -------
-    Original identifier columns (e.g. TARGETID, SURVEY, PROGRAM) are resolved
-    from the lake's Parquet catalog by joining on _source_id — the same
-    mechanism used to pull redshift during extraction.  If the lake is
-    unreachable, only _source_id is written.
-    """
-    from astropy.table import Table
-
+    """Write a per-spectrum scalar catalog (Parquet or FITS)."""
     attrs = dict(root.attrs)
-    n    = root["flux"].shape[0]
+    n = root["flux"].shape[0]
     wave = np.asarray(root["wavelength"])
-    flux = np.asarray(root["flux"])
-    ivar = np.asarray(root["ivar"])
-    mask = np.asarray(root["mask"])
+    if wave.ndim == 2:
+        wave_min = float(np.nanmin(wave[:, 0]))
+        wave_max = float(np.nanmax(wave[:, -1]))
+    else:
+        wave_min, wave_max = float(wave[0]), float(wave[-1])
+
     source_ids = np.asarray(root["_source_id"]).astype(np.int64)
+    median_snr, median_flux, n_good_pix = _spectrum_flux_stats(root, n)
+    id_col_names, id_col_arrays = resolve_id_columns(root, source_ids)
 
-    # Per-spectrum scalar summaries
-    good = mask == 0
-    with np.errstate(invalid="ignore", divide="ignore"):
-        snr_arr = np.where(ivar > 0, flux * np.sqrt(ivar), np.nan)
-
-    median_snr  = np.where(good.any(axis=1),
-                           np.nanmedian(np.where(good, snr_arr, np.nan), axis=1),
-                           np.nan).astype(np.float32)
-    median_flux = np.where(good.any(axis=1),
-                           np.nanmedian(np.where(good, flux, np.nan), axis=1),
-                           np.nan).astype(np.float32)
-    n_good_pix  = good.sum(axis=1).astype(np.int32)
-
-    # Resolve original identifier columns from the lake catalog (same path as redshift)
-    id_col_names, id_col_arrays = resolve_id_columns_from_lake(attrs, source_ids)
-
-    # Build output table: original ID cols first, then _source_id, then scalars
     cols: dict[str, Any] = {}
     for col in id_col_names:
         cols[col] = id_col_arrays[col]
-    cols["_source_id"]  = source_ids
-    cols["redshift"]    = np.asarray(root["redshift"]).astype(np.float32)
-    cols["median_snr"]  = median_snr
+    cols["_source_id"] = source_ids
+    cols["redshift"] = np.asarray(root["redshift"]).astype(np.float32)
+    cols["median_snr"] = median_snr
     cols["median_flux"] = median_flux
-    cols["n_good_pix"]  = n_good_pix
-    cols["wave_min_A"]  = np.full(n, float(wave[0]),  dtype=np.float32)
-    cols["wave_max_A"]  = np.full(n, float(wave[-1]), dtype=np.float32)
+    cols["n_good_pix"] = n_good_pix
+    cols["wave_min_A"] = np.full(n, wave_min, dtype=np.float32)
+    cols["wave_max_A"] = np.full(n, wave_max, dtype=np.float32)
 
-    tbl = Table(cols)
-    tbl.meta["SURVEY"]   = str(attrs.get("source_survey", ""))
-    tbl.meta["NPIX"]     = int(attrs.get("n_pix", len(wave)))
-    tbl.meta["WAVEMODE"] = str(attrs.get("wavelength_mode", "shared"))
-    tbl.meta["CREATED"]  = str(attrs.get("extract_created_utc", ""))
+    meta = {
+        "SURVEY": str(attrs.get("source_survey", "")),
+        "NPIX": int(attrs.get("n_pix", len(wave) if wave.ndim == 1 else wave.shape[-1])),
+        "WAVEMODE": str(attrs.get("wavelength_mode", "shared")),
+        "CREATED": str(attrs.get("extract_created_utc", "")),
+        "LINKID": ",".join(id_col_names) if id_col_names else "",
+    }
+    _write_table(cols, out_path, meta)
     if id_col_names:
-        tbl.meta["LINKID"] = ",".join(id_col_names)
-
-    tbl.write(str(out_path), format="fits", overwrite=True)
-    print(f"Wrote TOPCAT catalog ({n} rows) → {out_path}")
-    print(f"  Columns: {list(cols)}")
-    if id_col_names:
-        print(f"  Cross-match in TOPCAT: join your input FITS on "
-              f"{id_col_names[0] if len(id_col_names) == 1 else str(id_col_names)}.")
+        print(f"  Cross-match: join on "
+              f"{id_col_names[0] if len(id_col_names) == 1 else id_col_names}.")
     else:
-        print("  Cross-match in TOPCAT: join on _source_id (lake not accessible).")
+        print("  Cross-match: join on _source_id (lake not accessible).")
 
 
 def export_cutout_catalog(root: zarr.Group, out_path: Path) -> None:
-    """Write a per-cutout scalar FITS table for TOPCAT (WCS centre + flux stats)."""
-    from astropy.table import Table
-
+    """Write a per-cutout scalar catalog (WCS centre + streamed flux stats)."""
     attrs = dict(root.attrs)
     n = root["images"].shape[0]
     source_ids = np.asarray(root["_source_id"]).astype(np.int64)
 
-    # Decode WCS centre coords from stored structured bytes
+    # Decode WCS — small structured array, fine to loop
     crval1 = np.empty(n, dtype=np.float64)
     crval2 = np.empty(n, dtype=np.float64)
-    crpix1 = np.empty(n, dtype=np.float64)
-    crpix2 = np.empty(n, dtype=np.float64)
-    cd1_1  = np.empty(n, dtype=np.float64)
-    cd2_2  = np.empty(n, dtype=np.float64)
+    cd1_1 = np.empty(n, dtype=np.float64)
     naxis1 = np.empty(n, dtype=np.int32)
     naxis2 = np.empty(n, dtype=np.int32)
     for i in range(n):
         p = _parse_wcs_raw(root["wcs"][i])
         crval1[i] = p["crval1"]
         crval2[i] = p["crval2"]
-        crpix1[i] = p["crpix1"]
-        crpix2[i] = p["crpix2"]
-        cd1_1[i]  = p["cd1_1"]
-        cd2_2[i]  = p["cd2_2"]
+        cd1_1[i] = p["cd1_1"]
         naxis1[i] = p["naxis1"]
         naxis2[i] = p["naxis2"]
 
-    # Pixel scale from |CD1_1| diagonal (degrees → arcsec)
-    pix_scale_arcsec = np.abs(cd1_1) * 3600.0
-
-    # Per-cutout median flux across all bands and pixels
-    images = np.asarray(root["images"])
-    median_flux = np.nanmedian(images.reshape(n, -1), axis=1).astype(np.float32)
-    max_flux    = np.nanmax(images.reshape(n, -1), axis=1).astype(np.float32)
-
-    id_col_names, id_col_arrays = resolve_id_columns_from_lake(attrs, source_ids)
+    pix_scale_arcsec = (np.abs(cd1_1) * 3600.0).astype(np.float32)
+    median_flux, max_flux = _cutout_flux_stats(root, n)
+    id_col_names, id_col_arrays = resolve_id_columns(root, source_ids)
 
     cols: dict[str, Any] = {}
     for col in id_col_names:
         cols[col] = id_col_arrays[col]
-    cols["_source_id"]       = source_ids
-    cols["ra"]               = crval1.astype(np.float64)
-    cols["dec"]              = crval2.astype(np.float64)
-    cols["pix_scale_arcsec"] = pix_scale_arcsec.astype(np.float32)
-    cols["stamp_width_px"]   = naxis1
-    cols["stamp_height_px"]  = naxis2
-    cols["median_flux"]      = median_flux
-    cols["max_flux"]         = max_flux
+    cols["_source_id"] = source_ids
+    cols["ra"] = crval1
+    cols["dec"] = crval2
+    cols["pix_scale_arcsec"] = pix_scale_arcsec
+    cols["stamp_width_px"] = naxis1
+    cols["stamp_height_px"] = naxis2
+    cols["median_flux"] = median_flux
+    cols["max_flux"] = max_flux
 
-    tbl = Table(cols)
-    tbl.meta["SURVEY"]   = str(attrs.get("source_survey", ""))
-    tbl.meta["NBANDS"]   = int(attrs.get("n_bands", root["images"].shape[1]))
-    tbl.meta["CREATED"]  = str(attrs.get("extract_created_utc", ""))
+    meta = {
+        "SURVEY": str(attrs.get("source_survey", "")),
+        "NBANDS": int(attrs.get("n_bands", root["images"].shape[1])),
+        "CREATED": str(attrs.get("extract_created_utc", "")),
+        "LINKID": ",".join(id_col_names) if id_col_names else "",
+    }
+    _write_table(cols, out_path, meta)
     if id_col_names:
-        tbl.meta["LINKID"] = ",".join(id_col_names)
-
-    tbl.write(str(out_path), format="fits", overwrite=True)
-    print(f"Wrote TOPCAT cutout catalog ({n} rows) → {out_path}")
-    print(f"  Columns: {list(cols)}")
-    if id_col_names:
-        print(f"  Cross-match in TOPCAT: join on "
-              f"{id_col_names[0] if len(id_col_names) == 1 else str(id_col_names)}"
-              f" or ra/dec with a 1-arcsec cone.")
+        print(f"  Cross-match: join on "
+              f"{id_col_names[0] if len(id_col_names) == 1 else id_col_names}"
+              f" or ra/dec (1-arcsec cone).")
 
 
 def plot_spectrum(root: zarr.Group, row: int) -> None:
@@ -516,9 +607,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("zarr_path", help="Path to the .zarr directory")
-    ap.add_argument("--catalog", metavar="OUT.fits",
-                    help="Export a per-row scalar FITS for TOPCAT "
-                         "(spectra: flux stats; cutouts: WCS centre + flux stats).")
+    ap.add_argument(
+        "--catalog", metavar="OUT.parquet",
+        help=(
+            "Export a per-row scalar catalog for TOPCAT. "
+            "Prefer .parquet (memory-safe; TOPCAT opens Parquet natively). "
+            "Use .fits only for small subsets. "
+            "Spectra: flux stats + redshift; cutouts: WCS centre + flux stats."
+        ),
+    )
     ap.add_argument("--plot-row", metavar="N", type=int,
                     help="[spectra] Plot spectrum at row N (0-based).")
     ap.add_argument("--show-cutout", metavar="N", type=int,

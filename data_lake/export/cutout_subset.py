@@ -97,6 +97,15 @@ try:
         "--yes", is_flag=True,
         help="Skip confirmation prompt when --overwrite would delete existing output.",
     )
+    @click.option(
+        "--with-catalog/--no-with-catalog",
+        default=True,
+        show_default=True,
+        help=(
+            "Use the Parquet catalog for fast tile lookup and to embed native "
+            "link-id columns (TARGETID, SURVEY, …) into Zarr/HDF5 output."
+        ),
+    )
     @click.option("--lake-root", default=None, type=click.Path(path_type=Path))
     @config_option
     @progress_option
@@ -112,6 +121,7 @@ try:
         missing: str,
         overwrite: bool,
         yes: bool,
+        with_catalog: bool,
         lake_root: Path | None,
         config: Path | None,
         show_progress: bool,
@@ -123,17 +133,34 @@ try:
         FITS / CSV / Parquet with --target-id-col, or a composite spec such
         as TARGETID,SURVEY,PROGRAM (matched using the same hash as ingest).
         """
-        import sys
-
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
 
         cfg = load_optional_config(config)
         if lake_root is None:
             lake_root = Path(cfg.get("lake", {}).get("root", "."))
 
+        catalog_accessor = None
+        if with_catalog:
+            try:
+                from data_lake.io.catalog import CatalogAccessor
+
+                catalog_accessor = CatalogAccessor(lake_root, survey_name)
+                log.info(
+                    "Using catalog at %s for lookup + link-id embedding.",
+                    catalog_accessor._catalog_root,
+                )
+            except FileNotFoundError:
+                log.info(
+                    "No catalog for survey %r — tile-scan lookup; "
+                    "link-id columns will not be embedded.",
+                    survey_name,
+                )
+
         from data_lake.io.cutouts import CutoutAccessor
 
-        acc = CutoutAccessor(lake_root, survey_name)
+        acc = CutoutAccessor(
+            lake_root, survey_name, catalog_accessor=catalog_accessor,
+        )
 
         source_ids_raw = _read_target_ids(target_list, target_id_col)
         source_ids = source_ids_raw.tolist()

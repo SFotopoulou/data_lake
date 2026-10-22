@@ -458,7 +458,13 @@ class CutoutAccessor:
             sids = np.array([p[0] for p in pairs], dtype=np.int64)
             local_idxs = np.array([p[1] for p in pairs], dtype=np.int64)
             store = self._get_tile_store(npix)
-            images = store.get_images(local_idxs)
+            images = np.asarray(store.get_images(local_idxs))
+            # Ensure (k, B, H, W). Single-band tiles can come back as (k, H, W)
+            # when the read path squeezes a length-1 band axis.
+            if images.ndim == 3:
+                images = images[:, np.newaxis, ...]
+            elif images.ndim == 2:
+                images = images[np.newaxis, np.newaxis, ...]
             root = store._open()
             wcs_raw = [root["wcs"][int(i)] for i in local_idxs]
             yield sids, images, wcs_raw
@@ -583,6 +589,24 @@ class CutoutAccessor:
             "extract_created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "schema_version": "1",
         })
+
+        # Embed native link-id columns when a catalog accessor is available
+        if self._catalog is not None and n_out > 0:
+            from data_lake.export.link_id_embed import (
+                load_link_id_column_maps,
+                write_link_id_arrays_zarr,
+            )
+            from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN as _sid
+
+            ordered = np.asarray(out[_sid][:])
+            cols, maps = load_link_id_column_maps(self._catalog, ordered)
+            write_link_id_arrays_zarr(
+                out,
+                ordered,
+                cols,
+                maps,
+                link_id_mode=getattr(self._catalog, "link_id_mode", "") or "",
+            )
 
         return {
             "n_requested": n_requested,
@@ -787,6 +811,24 @@ class CutoutAccessor:
             hf.attrs["extract_created_utc"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             )
+
+            if self._catalog is not None and n_out > 0:
+                from data_lake.export.link_id_embed import (
+                    load_link_id_column_maps,
+                    write_link_id_arrays_hdf5,
+                )
+
+                ordered = np.asarray(ds_sid[:])
+                cols, maps = load_link_id_column_maps(self._catalog, ordered)
+                write_link_id_arrays_hdf5(
+                    hf,
+                    ordered,
+                    cols,
+                    maps,
+                    link_id_mode=getattr(self._catalog, "link_id_mode", "") or "",
+                    compression=compression,
+                    compression_opts=compression_opts,
+                )
 
         return {
             "n_requested": n_requested,

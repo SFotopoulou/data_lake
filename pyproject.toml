@@ -82,6 +82,7 @@ dl-validate-catalog-spectra-link = "data_lake.ingest.validate_catalog_spectra_li
 dl-validate-cutout-ingest = "data_lake.ingest.validate_cutout_ingest:cli"
 dl-widen-spectrum-tiles = "data_lake.ingest.widen_spectrum_tiles:cli"
 dl-ingest-catalog-from-list = "data_lake.ingest.file_list_ingest:cli_catalog_list"
+dl-ingest-from-shard       = "data_lake.ingest.catalog_shard_ingest:cli"
 dl-ingest-cutouts-from-list = "data_lake.ingest.file_list_ingest:cli_cutout_list"
 dl-ingest-spectra-from-list = "data_lake.ingest.file_list_ingest:cli_spectra_list"
 dl-rebuild-catalog-indices = "data_lake.ingest.update_catalog_indices:main"

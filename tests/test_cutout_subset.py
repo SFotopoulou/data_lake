@@ -241,6 +241,102 @@ class TestExtractSubsetToHdf5:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _write_catalog_with_link_ids(lake: Path, sources: list[tuple]) -> None:
+    """Write a minimal Parquet catalog so link-id columns can be embedded."""
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from data_lake.ingest.fits_to_parquet import assign_healpix, healpix_dir
+
+    cat_root = lake / "catalogs" / SURVEY
+    by_tile: dict[int, list] = {}
+    for sid, ra, dec, _flux in sources:
+        npix = int(assign_healpix(np.array([ra]), np.array([dec]), NORDER)[0])
+        by_tile.setdefault(npix, []).append((sid, ra, dec))
+
+    for npix, rows in by_tile.items():
+        tile_dir = cat_root / healpix_dir(NORDER, npix)
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        sids = [r[0] for r in rows]
+        pq.write_table(
+            pa.table({
+                "TARGETID": pa.array(sids, type=pa.int64()),
+                "SURVEY": pa.array(["main"] * len(sids)),
+                "PROGRAM": pa.array(["dark"] * len(sids)),
+                "_source_id": pa.array(sids, type=pa.int64()),
+                f"_healpix_norder{NORDER}": pa.array([npix] * len(sids), type=pa.int64()),
+            }),
+            tile_dir / f"Npix={npix}.parquet",
+        )
+    (cat_root / "catalog_info.json").write_text(json.dumps({
+        "hats_order": NORDER,
+        "link_id_mode": "composite:TARGETID,SURVEY,PROGRAM",
+        "link_id_column": "_source_id",
+        "native_id_column": "TARGETID,SURVEY,PROGRAM",
+    }))
+
+
+class TestEmbedLinkIdColumns:
+    def test_zarr_embeds_targetid_survey_program(self, cutout_lake: Path) -> None:
+        import zarr
+
+        from data_lake.io.catalog import CatalogAccessor
+
+        _write_catalog_with_link_ids(cutout_lake, SOURCES)
+        cat = CatalogAccessor(cutout_lake, SURVEY, norder=NORDER)
+        assert cat.link_id_component_columns == ["TARGETID", "SURVEY", "PROGRAM"]
+
+        acc = CutoutAccessor(
+            cutout_lake, SURVEY, norder=NORDER, catalog_accessor=cat,
+        )
+        out = cutout_lake / "embed.zarr"
+        result = acc.extract_subset_to_zarr(
+            [1001, 2001], out, show_progress=False,
+        )
+        assert result["n_written"] == 2
+
+        root = zarr.open_group(
+            store=zarr.storage.LocalStore(str(out)), mode="r", zarr_format=3,
+        )
+        assert list(root.attrs["link_id_columns"]) == ["TARGETID", "SURVEY", "PROGRAM"]
+        assert "TARGETID" in root
+        assert "SURVEY" in root
+        assert "PROGRAM" in root
+
+        id_to_row = result["id_to_row"]
+        tid = np.asarray(root["TARGETID"][:])
+        survey = np.asarray(root["SURVEY"][:])
+        assert int(tid[id_to_row[1001]]) == 1001
+        surv = survey[id_to_row[1001]]
+        if isinstance(surv, (bytes, np.bytes_)):
+            surv = surv.decode("utf-8")
+        assert str(surv) == "main"
+
+    def test_hdf5_embeds_link_id_columns(self, cutout_lake: Path) -> None:
+        pytest.importorskip("h5py")
+        import h5py
+
+        from data_lake.io.catalog import CatalogAccessor
+
+        _write_catalog_with_link_ids(cutout_lake, SOURCES)
+        cat = CatalogAccessor(cutout_lake, SURVEY, norder=NORDER)
+        acc = CutoutAccessor(
+            cutout_lake, SURVEY, norder=NORDER, catalog_accessor=cat,
+        )
+        out = cutout_lake / "embed.h5"
+        result = acc.extract_subset_to_hdf5([1001], out, show_progress=False)
+        assert result["n_written"] == 1
+        with h5py.File(str(out), "r") as hf:
+            assert "TARGETID" in hf
+            assert "SURVEY" in hf
+            assert list(hf.attrs["link_id_columns"]) == [
+                "TARGETID", "SURVEY", "PROGRAM",
+            ]
+            assert int(np.asarray(hf["TARGETID"][:])[0]) == 1001
+
+
 class TestExtractCutoutSubsetCli:
     def test_zarr_format(self, cutout_lake: Path) -> None:
         from click.testing import CliRunner

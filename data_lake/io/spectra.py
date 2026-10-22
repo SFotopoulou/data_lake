@@ -676,6 +676,20 @@ class SpectrumAccessor:
         )
         return z_map
 
+    def _build_catalog_link_id_maps(
+        self,
+        plan: _SubsetExtractionPlan,
+    ) -> tuple[list[str], dict[str, dict[int, object]], str]:
+        """Load native link-id columns from the catalog for embedding in the extract."""
+        from data_lake.export.link_id_embed import load_link_id_column_maps
+
+        if self._catalog is None:
+            return [], {}, ""
+        sids = self._source_ids_in_plan(plan)
+        cols, maps = load_link_id_column_maps(self._catalog, sids)
+        mode = getattr(self._catalog, "link_id_mode", "") or ""
+        return cols, maps, mode
+
     @staticmethod
     def _redshift_batch_for_sources(
         sorted_sids: np.ndarray,
@@ -920,8 +934,9 @@ class SpectrumAccessor:
               ivar/        (N_written, N_pix)  float32  sharded
               mask/        (N_written, N_pix)  uint8/16 sharded
               wavelength/  (N_pix,)            float64  shared grid
-              source_id/   (N_written,)        int64
+              _source_id/  (N_written,)        int64
               redshift/    (N_written,)        float32  (from catalog Z when available)
+              TARGETID/…   (N_written,)        native link-id cols when catalog present
 
         Parameters
         ----------
@@ -971,6 +986,7 @@ class SpectrumAccessor:
             source_ids, missing=missing, show_progress=show_progress,
         )
         z_map = self._build_catalog_redshift_map(plan)
+        link_cols, link_maps, link_mode = self._build_catalog_link_id_maps(plan)
         n_written = plan.n_written
         n_pix = plan.n_pix
         n_requested = plan.n_requested
@@ -1067,6 +1083,19 @@ class SpectrumAccessor:
             for j, sid in enumerate(sorted_sids.tolist()):
                 id_to_row[int(sid)] = write_offset + j
             write_offset += k
+
+        # Embed native link-id columns (self-contained extract; no lake needed later)
+        if link_cols:
+            from data_lake.export.link_id_embed import write_link_id_arrays_zarr
+            from data_lake.ingest.fits_to_parquet import LAKE_JOIN_ID_COLUMN as _sid
+
+            write_link_id_arrays_zarr(
+                out_root,
+                np.asarray(out_root[_sid][:]),
+                link_cols,
+                link_maps,
+                link_id_mode=link_mode,
+            )
 
         log.info(
             "Extracted %d/%d spectra → %s (skipped %d missing across %d tiles)",
@@ -1217,6 +1246,7 @@ class SpectrumAccessor:
             source_ids, missing=missing, show_progress=show_progress,
         )
         z_map = self._build_catalog_redshift_map(plan)
+        link_cols, link_maps, link_mode = self._build_catalog_link_id_maps(plan)
         n_written = plan.n_written
         n_pix = plan.n_pix
         per_source = plan.wavelength_mode == "per_source"
@@ -1288,6 +1318,18 @@ class SpectrumAccessor:
                 for j, sid in enumerate(sorted_sids.tolist()):
                     id_to_row[int(sid)] = write_offset + j
                 write_offset += k
+
+            if link_cols:
+                from data_lake.export.link_id_embed import write_link_id_arrays_hdf5
+
+                write_link_id_arrays_hdf5(
+                    f,
+                    np.asarray(sid_ds[:]),
+                    link_cols,
+                    link_maps,
+                    link_id_mode=link_mode,
+                    compression=compression,
+                )
 
         log.info(
             "Extracted %d/%d spectra → %s (HDF5)",

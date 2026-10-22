@@ -35,6 +35,92 @@ Cutout/spectrum ingest defaults to **`--on-duplicate skip`** so file-list and ba
 are idempotent. Use **`append`** only when you intentionally want duplicate Zarr rows.
 Catalog append uses **`--on-duplicate-id skip`** (default) with **`--tile-mode append`**.
 
+#### Two-phase map-reduce ingest (`dl-ingest-from-shard`)
+
+> **Use this instead of `dl-ingest-catalog-batch` when you have ≥ 50 k catalog FITS files
+> (e.g. Legacy Survey DR11, DES Sector catalogs).**
+
+**Why the append path does not scale**
+
+`dl-ingest-catalog-batch` and `dl-ingest-catalog-from-list` use a single-writer
+append model: for every source file, the main thread reads the existing Npix tile,
+deduplicates, concatenates, and rewrites it.  At `--norder 4`, one ~3.7° HEALPix
+pixel is shared by hundreds of bricks → later files rewrite ever-larger tiles →
+~20 s/file → 2 000 CPU-hours for 400 k files.  **Do not concatenate 400 k FITS into
+one large file first** — the merge step alone has a TB-scale OOM spike.
+
+**How the shard approach works**
+
+```
+FITS → decode_catalog_file_to_batches → immutable Npix shard parts   (phase map)
+Npix shard parts → one concat per Npix → lake tile                   (phase reduce)
+```
+
+- **Phase map** is embarrassingly parallel: each Slurm array task owns one RA folder
+  (no pixel overlap *within* one folder), writes `<shard-root>/<survey>/Norder=N/Dir=D/Npix=P/part-<stem>.parquet` and never modifies an existing part.
+  A JSONL checkpoint makes the phase resume-safe if a job is killed.
+- **Phase reduce** reads all parts for each Npix once, deduplicates (`--on-duplicate-id`), and writes the final lake tile.
+  Workers own disjoint Npix sets → no tile locking, linear parallelism.
+
+**Recommended norder**
+
+Run `dl-recommend-catalog-norder` on a few sample files with `--norder-max 8`.
+For tractor-format bricks (Legacy Survey), `--norder 6` or `7` is usually best:
+smaller tiles → smaller per-Npix concats in reduce, more parallel reduce tasks.
+Start a **new survey name** if an existing `norder=4` tree must be kept.
+
+**Slurm recipe**
+
+```bash
+# Prepare: list all RA folder paths (one per array task)
+ls -d /data/legacy/north/[0-9]* > ra_folders.txt
+
+# Map array job (one task per RA folder)
+#SBATCH --array=0-N%64
+#SBATCH --cpus-per-task=8 --mem=32G --time=4:00:00
+
+FOLDER=$(sed -n "$((SLURM_ARRAY_TASK_ID+1))p" ra_folders.txt)
+dl-ingest-from-shard --phase map \
+  --input-dir "$FOLDER" \
+  --survey Legacy_DR11_north \
+  --shard-root $SCRATCH/shards \
+  --ra-col ra --dec-col dec --link-id-col ls_id_dr11 \
+  --norder 7 --n-workers 8
+
+# Reduce job (single job, depends on array)
+#SBATCH --cpus-per-task=32 --mem=200G --time=1-00:00:00 --dependency=afterok:<array_jobid>
+
+dl-ingest-from-shard --phase reduce \
+  --survey Legacy_DR11_north \
+  --shard-root $SCRATCH/shards \
+  --lake-root /data/lake \
+  --norder 7 --n-workers 32 --on-duplicate-id skip
+```
+
+**Expected throughput:** map ≈ 0.2–1 s/file (one FITS decode + one Parquet write per
+Npix hit); reduce ≈ O(n_pixels) with linear parallelism.  400 k files in hours of
+array wall-clock, not 2 000 CPU-hours of serial append.
+
+**Flags reference**
+
+| Flag | Phase | Default | Notes |
+|------|-------|---------|-------|
+| `--phase` | both | required | `map` or `reduce` |
+| `--input-dir` | map | — | Non-recursive directory of `*.fits` (one RA folder) |
+| `--file-list` | map | — | Text file, one FITS path per line |
+| `--shard-root` | both | required | Root for immutable shard parts |
+| `--survey` | both | required | Survey name (also used as lake sub-directory) |
+| `--ra-col` / `--dec-col` | both | `ra` / `dec` | Sky coordinate columns |
+| `--link-id-col` | map | `None` | ID column or composite spec (e.g. `TARGETID,SURVEY,PROGRAM`) |
+| `--norder` | both | `7` | HEALPix order — must match between map and reduce |
+| `--columns` | map | all | Comma-separated subset of columns to keep |
+| `--on-duplicate-id` | reduce | `skip` | `skip`, `last`, `error` |
+| `--lake-root` | reduce | `<shard-root>/../lake` | Lake root; `catalogs/<survey>` written here |
+| `--n-workers` | both | `1` | Worker processes |
+| `--allow-incomplete-link-id` | map | off | Null `_source_id` for rows with missing composite parts |
+
+---
+
 #### Parallel catalog batch (large file lists)
 
 **Pre-flight:** run **`dl-check-fits-table-format --file-list <paths.txt>`** on FITS
