@@ -112,7 +112,7 @@ def test_bintable_extension_and_merged_sky_columns(tmp_path: Path) -> None:
 
 def test_read_catalog_sky_columns_matches_ingest_reader(tmp_path: Path) -> None:
     """Sky reader uses the same FITS Table path as catalog ingest."""
-    from data_lake.ingest.fits_to_parquet import _read_fits_catalog_table
+    from data_lake.ingest.fits_to_parquet import _read_fits_catalog_arrow
 
     n = 500
     rng = np.random.default_rng(1)
@@ -124,8 +124,8 @@ def test_read_catalog_sky_columns_matches_ingest_reader(tmp_path: Path) -> None:
         "delta_j2000_merged": dec,
     }).write(path, overwrite=True)
 
-    tbl = _read_fits_catalog_table(path)
-    ra_ingest = np.asarray(tbl["alpha_j2000_merged"], dtype=np.float64)
+    tbl = _read_fits_catalog_arrow(path)
+    ra_ingest = np.asarray(tbl.column("alpha_j2000_merged").to_numpy(), dtype=np.float64)
     ra_read, dec_read = read_catalog_sky_columns(
         path, "alpha_j2000_merged", "delta_j2000_merged"
     )

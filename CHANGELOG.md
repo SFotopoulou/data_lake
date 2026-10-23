@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--hdu` for multi-extension FITS catalogs** — `dl-ingest-catalog` (including `--streaming` / `--streaming-parallel`), `dl-ingest-catalog-batch`, `dl-ingest-catalog-from-list`, `dl-ingest-from-shard` (map), `dl-check-fits-table-format` and `dl-recommend-catalog-norder` select the table extension(s) to read: an index, `EXTNAME` or `EXTNAME,EXTVER` (case-insensitive), or `all` (every non-empty table HDU concatenated; column names must match). Also `$DATA_LAKE_FITS_HDU`. Default unchanged: first table HDU. Bad selections fail the file with a list of its HDUs. A non-default selection is recorded as `fits_hdu` in `catalog_info.json` / `shard_info.json`; a later ingest with a different `--hdu` warns.
+- **`dl-check-fits-table-format` flags multi-extension files** — reports `table HDU: 2 (of 3 table HDUs)` with a hint to use `--hdu`; counts are summed over the selected extensions.
+
+### Changed
+
+- **Streaming catalog ingest reads the same table HDU as the in-memory path** — previously `--streaming` took the first `BINTABLE` while the in-memory reader took the first table HDU of any kind (including ASCII tables); both now use the shared selector.
+
 ## [0.7.0] - 2026-10-23
 
 Upgrade notes (breaking changes, details under **Changed**):

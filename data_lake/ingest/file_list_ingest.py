@@ -137,6 +137,7 @@ try:
         config_option,
         configure_cli_logging,
         fits_memmap_option,
+        hdu_option,
         ingest_token_option,
         load_optional_config,
         logging_options,
@@ -235,6 +236,7 @@ try:
         help="Order file queue by parent directory when --n-workers > 1.",
     )
     @fits_memmap_option
+    @hdu_option
     @click.option(
         "--log-file",
         "log_file",
@@ -274,6 +276,7 @@ try:
         files_per_worker: int,
         partition_by_dir: bool,
         fits_memmap: str,
+        fits_hdu: str | None,
         log_file: Path | None,
         heartbeat_interval: int | None,
         quiet: bool,
@@ -328,6 +331,7 @@ try:
                 skip_completed=not no_skip_completed,
                 max_in_flight=max_in_flight,
                 fits_memmap=fits_memmap.lower(),
+                fits_hdu=fits_hdu,
                 files_per_worker=files_per_worker,
                 partition_by_dir=partition_by_dir,
             )
@@ -352,6 +356,7 @@ try:
                 columns=col_list,
                 compact=compact,
                 fits_memmap=fits_memmap.lower(),
+                fits_hdu=fits_hdu,
             )
 
         code = _run_file_list(

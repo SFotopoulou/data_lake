@@ -55,10 +55,14 @@ from data_lake.ingest.fits_to_parquet import (
     _merge_tile_tables,
     _read_catalog_tile,
     _write_catalog_parquet_tile,
+    check_fits_hdu_provenance,
     decode_catalog_file_to_batches,
+    describe_fits_hdu,
     finalize_catalog_survey,
     healpix_dir,
+    record_fits_hdu,
 )
+from data_lake.io.fits_read import catalog_fits_read_policy, parse_hdu_spec
 
 log = logging.getLogger(__name__)
 
@@ -162,13 +166,36 @@ def _check_shard_norder(shard_root: Path, survey: str, norder: int) -> dict | No
     return info
 
 
+#: shard_info keys where a later map task only warns on mismatch (others abort).
+_WARN_ONLY_SHARD_KEYS = frozenset({"fits_hdu"})
+
+
+def _warn_shard_fits_hdu(shard_root: Path, survey: str, fits_hdu: str | None) -> None:
+    """Warn when this map run selects another FITS HDU than the shard tree used."""
+    info = _read_json(_shard_info_path(shard_root, survey))
+    if info is None:
+        return
+    recorded = parse_hdu_spec(info.get("fits_hdu"))
+    if recorded != parse_hdu_spec(fits_hdu):
+        log.warning(
+            "Shard tree %s was mapped with --hdu %s; this run uses --hdu %s. "
+            "Rows from different FITS extensions will be mixed in one survey.",
+            _shard_info_path(shard_root, survey),
+            describe_fits_hdu(recorded), describe_fits_hdu(parse_hdu_spec(fits_hdu)),
+        )
+
+
 def _record_shard_info(shard_root: Path, survey: str, info: dict) -> None:
-    """Write ``shard_info.json`` once; abort if a later map task disagrees."""
+    """Write ``shard_info.json`` once; abort if a later map task disagrees.
+
+    Keys in :data:`_WARN_ONLY_SHARD_KEYS` are compared by the caller (warning only).
+    """
     path = _shard_info_path(shard_root, survey)
     existing = _read_json(path)
     if existing is not None:
         diffs = {
-            k: (existing.get(k), v) for k, v in info.items() if existing.get(k) != v
+            k: (existing.get(k), v) for k, v in info.items()
+            if k not in _WARN_ONLY_SHARD_KEYS and existing.get(k) != v
         }
         if diffs:
             raise ValueError(
@@ -289,6 +316,7 @@ def _map_one_file(
     columns: tuple[str, ...] | None,
     allow_incomplete_link_id: bool,
     staging_dir: Path | None = None,
+    fits_hdu: str | None = None,
 ) -> tuple[str, int, int, str]:
     """Decode one FITS file and write immutable Npix shard parts.
 
@@ -304,6 +332,7 @@ def _map_one_file(
         link_id_col=link_id_col,
         columns=list(columns) if columns else None,
         allow_incomplete_link_id=allow_incomplete_link_id,
+        fits_read_policy=catalog_fits_read_policy(None, fits_hdu),
     )
     options = CatalogParquetOptions()
     n_written = 0
@@ -405,6 +434,7 @@ def run_map_phase(
     checkpoint_path: Path | None = None,
     skip_completed: bool = True,
     show_progress: bool = False,
+    fits_hdu: str | None = None,
 ) -> dict[str, Any]:
     """Map FITS files → immutable Npix part files inside ``shard_root``.
 
@@ -413,12 +443,15 @@ def run_map_phase(
     is False; existing part files are never rewritten either way.
     With *staging_dir*, each part is written there first and then moved to
     ``shard_root``.  Per-file errors are appended to *failures_log* (JSONL).
+    *fits_hdu* selects the FITS table extension(s) of every file.
 
     Returns a summary with ``n_files``, ``n_files_skipped``, ``n_files_ok``,
     ``n_files_failed`` and ``elapsed_s``.  Raises ``ValueError`` when the
     settings disagree with the existing shard tree.
     """
+    fits_hdu = parse_hdu_spec(fits_hdu)
     _check_shard_norder(shard_root, survey, norder)
+    _warn_shard_fits_hdu(shard_root, survey, fits_hdu)
     checkpoint = checkpoint_path or _checkpoint_path(shard_root, survey)
     done = _load_checkpoint(checkpoint) if skip_completed else set()
 
@@ -441,6 +474,7 @@ def run_map_phase(
         columns=tuple(columns) if columns else None,
         allow_incomplete_link_id=allow_incomplete_link_id,
         staging_dir=staging_dir,
+        fits_hdu=fits_hdu,
     )
 
     t0 = time.monotonic()
@@ -460,6 +494,7 @@ def run_map_phase(
                     "ra_column": ra_col,
                     "dec_column": dec_col,
                     "allow_incomplete_link_id": allow_incomplete_link_id,
+                    "fits_hdu": fits_hdu,
                 },
             )
             info_recorded = True
@@ -700,6 +735,7 @@ def run_reduce_phase(
         )
         shard_info = {"norder": norder}
     _check_against_catalog(shard_info, catalog_root)
+    new_survey = check_fits_hdu_provenance(catalog_root, shard_info.get("fits_hdu"))
 
     t0 = time.monotonic()
     actions: Counter[str] = Counter()
@@ -783,6 +819,8 @@ def run_reduce_phase(
         link_id_mode=shard_info.get("link_id_mode"),
         allow_incomplete_link_id=shard_info.get("allow_incomplete_link_id"),
     )
+    if new_survey:
+        record_fits_hdu(catalog_root, shard_info.get("fits_hdu"))
     log.info("Reduce phase complete.")
     return _summary(True)
 
@@ -824,6 +862,7 @@ try:
         config_option,
         configure_cli_logging,
         fits_memmap_option,
+        hdu_option,
         ingest_token_option,
         load_optional_config,
         logging_options,
@@ -907,6 +946,7 @@ try:
     )
     @allow_incomplete_link_id_option
     @fits_memmap_option
+    @hdu_option
     # Reduce options
     @click.option(
         "--on-duplicate-id",
@@ -1011,6 +1051,7 @@ try:
         columns: str | None,
         allow_incomplete_link_id: bool,
         fits_memmap: str,
+        fits_hdu: str | None,
         on_duplicate_id: str,
         tile_mode: str,
         compact: bool,
@@ -1090,6 +1131,7 @@ try:
                     checkpoint_path=checkpoint,
                     skip_completed=not no_skip_completed,
                     show_progress=show_progress,
+                    fits_hdu=fits_hdu,
                 )
                 sys.exit(0 if result["n_files_failed"] == 0 else 1)
 

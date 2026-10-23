@@ -1302,12 +1302,44 @@ def _squeeze_fits_vector_column(arr: np.ndarray) -> np.ndarray:
 
 def _bintable_hdu_index(hdul) -> int:
     """Return the index of the first table HDU (skip PRIMARY)."""
-    from astropy.io.fits.hdu.table import _TableLikeHDU
+    from data_lake.io.fits_read import resolve_table_hdus
 
-    for idx, hdu in enumerate(hdul):
-        if isinstance(hdu, _TableLikeHDU):
-            return idx
-    raise ValueError("No BINTABLE / table HDU found in FITS file.")
+    return resolve_table_hdus(hdul, None)[0]
+
+
+def check_hdu_columns_match(hdul, indices: Sequence[int], *, source: str = "") -> None:
+    """Require every selected table HDU to share column names (same order)."""
+    if len(indices) < 2:
+        return
+    first = indices[0]
+    ref = [c.name.strip() for c in hdul[first].columns]
+    for idx in indices[1:]:
+        names = [c.name.strip() for c in hdul[idx].columns]
+        if [n.upper() for n in names] != [n.upper() for n in ref]:
+            missing = sorted(set(ref) - set(names))
+            extra = sorted(set(names) - set(ref))
+            where = f" in {source}" if source else ""
+            raise ValueError(
+                f"--hdu all: HDU {idx} ({hdul[idx].name}) columns differ from HDU "
+                f"{first} ({hdul[first].name}){where}. Missing: {missing[:10]}; "
+                f"extra: {extra[:10]}"
+                + ("; same names, different order" if not missing and not extra else "")
+                + ". Select one extension with --hdu NAME or INDEX."
+            )
+
+
+def _concat_hdu_tables(tables: list[pa.Table], *, source: str = "") -> pa.Table:
+    """Concatenate per-HDU Arrow tables with numeric/string type promotion."""
+    if len(tables) == 1:
+        return tables[0]
+    try:
+        return pa.concat_tables(tables, promote_options="permissive")
+    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+        where = f" in {source}" if source else ""
+        raise ValueError(
+            f"--hdu all: table extensions{where} have incompatible column types ({exc}). "
+            "Select one extension with --hdu NAME or INDEX."
+        ) from exc
 
 
 def _is_packed_vector_bintable(hdu) -> bool:
@@ -1416,31 +1448,36 @@ def read_catalog_sky_columns(
     path: Path | str,
     ra_col: str,
     dec_col: str,
+    *,
+    fits_read_policy=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Read RA/Dec arrays the same way catalog ingest does.
 
-    FITS: uses the catalog BINTABLE HDU and astropy column scaling (BSCALE/TZERO).
+    FITS: uses the selected table HDU(s) (``fits_read_policy.table_hdu``) and
+    astropy column scaling (BSCALE/TZERO).
     Other formats: full read via :func:`_read_source_table` then sky columns.
     """
     path = Path(path)
     if is_catalog_fits_path(path):
-        from data_lake.io.fits_read import open_fits
+        from data_lake.io.fits_read import FitsReadPolicy, open_fits, resolve_table_hdus
 
-        with open_fits(path) as hdul:
-            idx = _bintable_hdu_index(hdul)
-            hdu = hdul[idx]
-            if _is_packed_vector_bintable(hdu):
-                tbl = _read_packed_vector_fits(path, hdu_index=idx)
-            else:
-                # Same reader as ingest: correct HDU + FITS BSCALE/TZERO handling.
-                tbl = Table.read(hdul, hdu=idx, format="fits", memmap=True)
-            ra_name = resolve_catalog_column_name(tbl.colnames, ra_col)
-            dec_name = resolve_catalog_column_name(tbl.colnames, dec_col)
-            return (
-                _sky_arrays_to_float64(tbl[ra_name]),
-                _sky_arrays_to_float64(tbl[dec_name]),
-            )
+        policy = fits_read_policy or FitsReadPolicy.from_env()
+        ras: list[np.ndarray] = []
+        decs: list[np.ndarray] = []
+        with open_fits(path, policy) as hdul:
+            for idx in resolve_table_hdus(hdul, policy.table_hdu, source=path.name):
+                hdu = hdul[idx]
+                if _is_packed_vector_bintable(hdu):
+                    tbl = _read_packed_vector_fits(path, hdu_index=idx)
+                else:
+                    # Same reader as ingest: correct HDU + FITS BSCALE/TZERO handling.
+                    tbl = Table.read(hdul, hdu=idx, format="fits", memmap=True)
+                ra_name = resolve_catalog_column_name(tbl.colnames, ra_col)
+                dec_name = resolve_catalog_column_name(tbl.colnames, dec_col)
+                ras.append(_sky_arrays_to_float64(tbl[ra_name]))
+                decs.append(_sky_arrays_to_float64(tbl[dec_name]))
+        return np.concatenate(ras), np.concatenate(decs)
 
     table = _read_source_table(path)
     names = list(table.schema.names)
@@ -1456,42 +1493,60 @@ def read_catalog_sky_columns(
     return _arrow_sky(ra_name), _arrow_sky(dec_name)
 
 
-def catalog_source_row_count(path: Path | str) -> int:
+def catalog_source_row_count(path: Path | str, *, fits_read_policy=None) -> int:
     """Row count for a catalog input file (FITS header or Parquet footer)."""
     path = Path(path)
     suffix = path.suffix.lower()
-    name = path.name.lower()
     if suffix in {".parquet", ".pq"}:
         return int(pq.read_metadata(str(path)).num_rows)
     if is_catalog_fits_path(path):
-        from data_lake.io.fits_read import open_fits
+        from data_lake.io.fits_read import FitsReadPolicy, open_fits, resolve_table_hdus
 
-        with open_fits(path) as hdul:
-            idx = _bintable_hdu_index(hdul)
-            hdu = hdul[idx]
-            if _is_packed_vector_bintable(hdu):
-                return len(_read_packed_vector_fits(path, hdu_index=idx))
-            data = hdu.data
-            if data is not None:
-                return len(data)
-            return int(hdu.header.get("NAXIS2", 0))
+        policy = fits_read_policy or FitsReadPolicy.from_env()
+        total = 0
+        with open_fits(path, policy) as hdul:
+            for idx in resolve_table_hdus(hdul, policy.table_hdu, source=path.name):
+                hdu = hdul[idx]
+                if _is_packed_vector_bintable(hdu):
+                    total += len(_read_packed_vector_fits(path, hdu_index=idx))
+                    continue
+                data = hdu.data
+                total += len(data) if data is not None else int(hdu.header.get("NAXIS2", 0))
+        return total
     return len(_read_source_table(path))
 
 
-def _read_fits_catalog_table(path: Path, *, fits_read_policy=None) -> Table:
-    """Read a catalog FITS BINTABLE, including GALEX packed-vector layout."""
+def _read_fits_catalog_arrow(path: Path, *, fits_read_policy=None) -> pa.Table:
+    """Read the selected catalog table HDU(s) as one Arrow table.
+
+    Handles GALEX packed-vector layout; with ``table_hdu="all"`` every non-empty
+    table extension is read and concatenated (column names must match).
+    """
     from astropy.table import Table
 
-    from data_lake.io.fits_read import FitsReadPolicy, open_fits, resolve_memmap
+    from data_lake.io.fits_read import (
+        FitsReadPolicy,
+        open_fits,
+        resolve_memmap,
+        resolve_table_hdus,
+    )
 
     policy = fits_read_policy or FitsReadPolicy.from_env()
+    parts: list[pa.Table] = []
     with open_fits(path, policy) as hdul:
-        idx = _bintable_hdu_index(hdul)
-        hdu = hdul[idx]
-        if _is_packed_vector_bintable(hdu):
-            return _read_packed_vector_fits(path, hdu_index=idx)
-        log.info("Reading %s as FITS (HDU %d) …", path.name, idx)
-        return Table.read(hdul, hdu=idx, format="fits", memmap=resolve_memmap(path, policy))
+        indices = resolve_table_hdus(hdul, policy.table_hdu, source=path.name)
+        check_hdu_columns_match(hdul, indices, source=path.name)
+        for idx in indices:
+            hdu = hdul[idx]
+            if _is_packed_vector_bintable(hdu):
+                tbl = _read_packed_vector_fits(path, hdu_index=idx)
+            else:
+                log.info("Reading %s as FITS (HDU %d) …", path.name, idx)
+                tbl = Table.read(
+                    hdul, hdu=idx, format="fits", memmap=resolve_memmap(path, policy),
+                )
+            parts.append(_astropy_table_to_arrow(tbl))
+    return _concat_hdu_tables(parts, source=path.name)
 
 
 def _open_text_for_sniff(path: Path):
@@ -1567,9 +1622,7 @@ def _read_source_table(path: Path, *, fits_read_policy=None) -> pa.Table:
         return pq.read_table(str(path))
 
     if name.endswith(".fits.gz") or suffix in {".fit", ".fits", ".fz"}:
-        return _astropy_table_to_arrow(
-            _read_fits_catalog_table(path, fits_read_policy=fits_read_policy)
-        )
+        return _read_fits_catalog_arrow(path, fits_read_policy=fits_read_policy)
     elif suffix in {".xml", ".vot", ".votable"}:
         fmt = "votable"
     elif suffix == ".ecsv":
@@ -2456,6 +2509,7 @@ def ingest_catalog(
     defer_finalize: bool = False,
     lifecycle: str | None = None,
     set_columns: dict[str, pa.Scalar] | None = None,
+    fits_hdu: str | None = None,
 ) -> None:
     """
     Ingest a single FITS/VOTable file into HATS-partitioned Parquet.
@@ -2506,6 +2560,10 @@ def ingest_catalog(
         When True, composite or string ``--link-id-col`` rows with any missing
         link part keep null ``_source_id`` (catalog row retained, not linked to
         spectra).  Recorded in ``catalog_info.json`` for rebuild/repair.
+    fits_hdu:
+        FITS table HDU selector: ``None`` (first table HDU), an index, an
+        EXTNAME (``"OBJECTS"`` / ``"SCI,2"``), or ``"all"`` (every non-empty
+        table extension; column names must match).  Ignored for non-FITS input.
     """
     source_path = Path(source_path)
     output_root = Path(output_root)
@@ -2519,14 +2577,50 @@ def ingest_catalog(
     )
     resolved_tile_mode: TileMode = tile_mode if tile_mode is not None else "skip"
 
-    from data_lake.io.fits_read import FitsReadPolicy, parse_memmap_mode
+    from data_lake.io.fits_read import catalog_fits_read_policy
 
-    env_policy = FitsReadPolicy.from_env()
-    fits_read_policy = FitsReadPolicy(
-        memmap=parse_memmap_mode(fits_memmap),
-        small_file_bytes=env_policy.small_file_bytes,
-        parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
-    )
+    fits_read_policy = catalog_fits_read_policy(fits_memmap, fits_hdu)
+    new_survey = check_fits_hdu_provenance(catalog_root, fits_read_policy.table_hdu)
+    try:
+        _ingest_catalog_dispatch(
+            source_path, catalog_root, survey_name,
+            ra_col=ra_col, dec_col=dec_col, norder=norder, link_id_col=link_id_col,
+            tile_mode=resolved_tile_mode, on_duplicate_id=on_duplicate_id,
+            streaming=streaming, columns=columns, pq_opts=pq_opts,
+            allow_incomplete_link_id=allow_incomplete_link_id,
+            fits_memmap=fits_memmap, fits_read_policy=fits_read_policy,
+            streaming_parallel=streaming_parallel, defer_finalize=defer_finalize,
+            lifecycle=lifecycle, set_columns=set_columns,
+        )
+    finally:
+        if new_survey:
+            record_fits_hdu(catalog_root, fits_read_policy.table_hdu)
+
+
+def _ingest_catalog_dispatch(
+    source_path: Path,
+    catalog_root: Path,
+    survey_name: str,
+    *,
+    ra_col: str,
+    dec_col: str,
+    norder: int,
+    link_id_col: str | None,
+    tile_mode: TileMode,
+    on_duplicate_id: DuplicateIdMode,
+    streaming: bool,
+    columns: Sequence[str] | None,
+    pq_opts: CatalogParquetOptions,
+    allow_incomplete_link_id: bool,
+    fits_memmap: str,
+    fits_read_policy,
+    streaming_parallel: int,
+    defer_finalize: bool,
+    lifecycle: str | None,
+    set_columns: dict[str, pa.Scalar] | None,
+) -> None:
+    """Body of :func:`ingest_catalog` once paths, options and read policy are resolved."""
+    resolved_tile_mode = tile_mode
 
     if streaming_parallel > 1 and not streaming:
         streaming = True
@@ -2554,6 +2648,7 @@ def ingest_catalog(
                 fits_memmap=fits_memmap,
                 defer_finalize=defer_finalize,
                 lifecycle=lifecycle,
+                fits_hdu=fits_read_policy.table_hdu,
             )
             return
         _ingest_catalog_streaming(
@@ -2785,32 +2880,47 @@ def _ingest_catalog_streaming(
     log.info("Reading %s as fits (streaming, memmapped) …", source_path.name)
 
     with open_fits(str(source_path), policy) as hdul:
-        from astropy.io import fits
+        from data_lake.io.fits_read import resolve_table_hdus
 
-        bintable_hdu = next(
-            (hdu for hdu in hdul if isinstance(hdu, fits.BinTableHDU)), None
-        )
-        if bintable_hdu is None:
-            raise ValueError(f"No BINTABLE HDU found in {source_path.name}")
-
-        data = bintable_hdu.data
-        n_rows = len(data)
-        row_end_eff = n_rows if row_end is None else min(int(row_end), n_rows)
-        row_start_eff = max(0, int(row_start))
-        if row_start_eff >= row_end_eff:
-            log.info("Streaming row range [%d, %d) is empty; nothing to do.", row_start_eff, row_end_eff)
-            return None
-        if row_start_eff > 0 or row_end_eff < n_rows:
-            data = data[row_start_eff:row_end_eff]
-            n_rows = len(data)
-            log.info(
-                "Streaming row shard [%d, %d): %d rows × %d columns",
-                row_start_eff, row_end_eff, n_rows, len(data.dtype.names),
+        hdu_indices = resolve_table_hdus(hdul, policy.table_hdu, source=source_path.name)
+        check_hdu_columns_match(hdul, hdu_indices, source=source_path.name)
+        has_row_range = row_start > 0 or row_end is not None
+        if has_row_range and len(hdu_indices) > 1:
+            raise ValueError(
+                "Streaming row ranges apply to one table HDU; got "
+                f"{len(hdu_indices)} HDUs ({policy.table_hdu!r}). Shard per HDU instead."
             )
-        col_names = list(data.dtype.names)
+
+        # One entry per selected HDU: memmapped data (row-sliced when requested).
+        hdu_data: list[tuple[int, object]] = []
+        for hdu_idx in hdu_indices:
+            data = hdul[hdu_idx].data
+            if data is None:
+                continue
+            n_hdu = len(data)
+            row_end_eff = n_hdu if row_end is None else min(int(row_end), n_hdu)
+            row_start_eff = max(0, int(row_start))
+            if row_start_eff >= row_end_eff:
+                log.info(
+                    "Streaming row range [%d, %d) of HDU %d is empty; nothing to do.",
+                    row_start_eff, row_end_eff, hdu_idx,
+                )
+                continue
+            if row_start_eff > 0 or row_end_eff < n_hdu:
+                data = data[row_start_eff:row_end_eff]
+                log.info(
+                    "Streaming row shard [%d, %d) of HDU %d: %d rows × %d columns",
+                    row_start_eff, row_end_eff, hdu_idx, len(data), len(data.dtype.names),
+                )
+            hdu_data.append((hdu_idx, data))
+        if not hdu_data:
+            return None
+
+        col_names = list(hdu_data[0][1].dtype.names)
+        n_rows = sum(len(d) for _, d in hdu_data)
         log.info(
-            "FITS BINTABLE: %d rows × %d columns (memmapped)",
-            n_rows, len(col_names),
+            "FITS table HDU(s) %s: %d rows × %d columns (memmapped)",
+            [i for i, _ in hdu_data], n_rows, len(col_names),
         )
 
         try:
@@ -2823,8 +2933,14 @@ def _ingest_catalog_streaming(
                 f"{'…' if len(col_names) > 20 else ''}"
             ) from exc
 
-        ra = np.ascontiguousarray(np.asarray(data[ra_name], dtype=np.float64))
-        dec = np.ascontiguousarray(np.asarray(data[dec_name], dtype=np.float64))
+        ra = np.ascontiguousarray(np.concatenate([
+            np.asarray(d[ra_name], dtype=np.float64) for _, d in hdu_data
+        ]))
+        dec = np.ascontiguousarray(np.concatenate([
+            np.asarray(d[dec_name], dtype=np.float64) for _, d in hdu_data
+        ]))
+        # Global row r belongs to hdu_data[k] with local row r - hdu_offsets[k].
+        hdu_offsets = np.cumsum([0] + [len(d) for _, d in hdu_data])
 
         if not link_id_col:
             raise ValueError(
@@ -2886,14 +3002,20 @@ def _ingest_catalog_streaming(
             n_tile = e - s
             row_idx = sort_order[s:e]
 
-            # Materialise only this tile's rows from the memmap using sequential
+            # Materialise only this tile's rows from the memmap(s) using sequential
             # file-order reads when row indices are not contiguous.
-            if fits_read_cols is not None:
-                chunk = materialize_fits_columns(data, row_idx, fits_read_cols)
-            else:
-                chunk = materialize_fits_rows(data, row_idx)
-            astropy_chunk = Table(chunk, copy=False)
-            tile_table = _astropy_table_to_arrow(astropy_chunk)
+            hdu_of_row = np.searchsorted(hdu_offsets, row_idx, side="right") - 1
+            pieces: list[pa.Table] = []
+            for k, (_, data) in enumerate(hdu_data):
+                local = row_idx[hdu_of_row == k] - hdu_offsets[k]
+                if local.size == 0:
+                    continue
+                if fits_read_cols is not None:
+                    chunk = materialize_fits_columns(data, local, fits_read_cols)
+                else:
+                    chunk = materialize_fits_rows(data, local)
+                pieces.append(_astropy_table_to_arrow(Table(chunk, copy=False)))
+            tile_table = _concat_hdu_tables(pieces, source=source_path.name)
 
             tile_table = _apply_set_columns(tile_table, set_columns or {})
             tile_table, tile_sid_mode = ensure_catalog_source_ids(
@@ -3015,6 +3137,8 @@ class StreamingShardConfig:
     parquet_options: CatalogParquetOptions
     allow_incomplete_link_id: bool
     fits_memmap: str = "auto"
+    #: Single table HDU index for this row range (resolved by the launcher).
+    fits_hdu: str | None = None
 
 
 def _streaming_shard_worker(config: StreamingShardConfig) -> tuple[str, str | None]:
@@ -3022,16 +3146,11 @@ def _streaming_shard_worker(config: StreamingShardConfig) -> tuple[str, str | No
     import tempfile
 
     from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
-    from data_lake.io.fits_read import FitsReadPolicy, parse_memmap_mode
+    from data_lake.io.fits_read import catalog_fits_read_policy
 
     apply_parallel_worker_logging_after_heavy_imports()
     spool = Path(tempfile.mkdtemp(prefix="dl_stream_spool_"))
-    env_policy = FitsReadPolicy.from_env()
-    fits_read_policy = FitsReadPolicy(
-        memmap=parse_memmap_mode(config.fits_memmap),
-        small_file_bytes=env_policy.small_file_bytes,
-        parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
-    )
+    fits_read_policy = catalog_fits_read_policy(config.fits_memmap, config.fits_hdu)
     sid_mode = _ingest_catalog_streaming(
         Path(config.source_path),
         Path(config.catalog_root),
@@ -3072,34 +3191,32 @@ def _ingest_catalog_streaming_parallel(
     fits_memmap: str = "auto",
     defer_finalize: bool = False,
     lifecycle: str | None = None,
+    fits_hdu: str | None = None,
 ) -> None:
     """Parallel row-range shards of streaming FITS catalog ingest."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     from data_lake.cli_utils import init_parallel_ingest_subprocess
-    from data_lake.io.fits_read import open_fits, default_fits_read_policy
+    from data_lake.io.fits_read import catalog_fits_read_policy, open_fits, resolve_table_hdus
 
     if streaming_parallel < 2:
         raise ValueError("streaming_parallel must be >= 2")
     if tile_mode != "append":
         raise ValueError("streaming parallel ingest requires tile_mode='append'")
 
-    policy = default_fits_read_policy(fits_memmap)
+    policy = catalog_fits_read_policy(fits_memmap, fits_hdu)
     with open_fits(str(source_path), policy) as hdul:
-        from astropy.io import fits
+        hdu_indices = resolve_table_hdus(hdul, policy.table_hdu, source=source_path.name)
+        check_hdu_columns_match(hdul, hdu_indices, source=source_path.name)
+        hdu_rows = [(idx, len(hdul[idx].data)) for idx in hdu_indices if hdul[idx].data is not None]
 
-        bintable_hdu = next(
-            (hdu for hdu in hdul if isinstance(hdu, fits.BinTableHDU)), None
-        )
-        if bintable_hdu is None:
-            raise ValueError(f"No BINTABLE HDU found in {source_path.name}")
-        n_rows = len(bintable_hdu.data)
-
-    chunk = (n_rows + streaming_parallel - 1) // streaming_parallel
+    n_rows = sum(n for _, n in hdu_rows)
+    chunk = max(1, (n_rows + streaming_parallel - 1) // streaming_parallel)
+    # (hdu_index, row_start, row_end); each shard reads one HDU.
     ranges = [
-        (i * chunk, min(n_rows, (i + 1) * chunk))
-        for i in range(streaming_parallel)
-        if i * chunk < n_rows
+        (idx, start, min(n_hdu, start + chunk))
+        for idx, n_hdu in hdu_rows
+        for start in range(0, n_hdu, chunk)
     ]
 
     import shutil
@@ -3123,12 +3240,16 @@ def _ingest_catalog_streaming_parallel(
             parquet_options=parquet_options,
             allow_incomplete_link_id=allow_incomplete_link_id,
             fits_memmap=fits_memmap,
+            fits_hdu=str(hdu_idx),
         )
-        for rs, re in ranges
+        for hdu_idx, rs, re in ranges
     ]
+    if not configs:
+        log.info("No rows in %s; nothing to ingest.", source_path.name)
+        return
 
     with ProcessPoolExecutor(
-        max_workers=len(configs),
+        max_workers=min(streaming_parallel, len(configs)),
         initializer=init_parallel_ingest_subprocess,
     ) as pool:
         futures = [pool.submit(_streaming_shard_worker, cfg) for cfg in configs]
@@ -3224,6 +3345,61 @@ def _write_catalog_info(
         json.dump(info, fh, indent=2)
 
 
+CATALOG_INFO_FITS_HDU = "fits_hdu"
+# One mismatch warning per (survey, recorded, requested) per process (file lists).
+_FITS_HDU_WARNED: set[tuple[str, str | None, str | None]] = set()
+
+
+def describe_fits_hdu(spec: str | None) -> str:
+    return "first table HDU (default)" if spec is None else repr(spec)
+
+
+def check_fits_hdu_provenance(catalog_root: Path | str, fits_hdu: str | None) -> bool:
+    """Warn when *fits_hdu* differs from the survey's recorded ``fits_hdu``.
+
+    Returns True when the survey has no ``catalog_info.json`` yet, i.e. this run
+    creates it and should call :func:`record_fits_hdu` afterwards.  A missing
+    key on an existing survey means it was ingested with the default selection.
+    """
+    from data_lake.io.fits_read import parse_hdu_spec
+
+    info_path = Path(catalog_root) / "catalog_info.json"
+    if not info_path.is_file():
+        return True
+    try:
+        with open(info_path) as fh:
+            recorded = json.load(fh).get(CATALOG_INFO_FITS_HDU)
+    except (OSError, json.JSONDecodeError):
+        return False
+    wanted = parse_hdu_spec(fits_hdu)
+    key = (str(Path(catalog_root).resolve()), recorded, wanted)
+    if parse_hdu_spec(recorded) != wanted and key not in _FITS_HDU_WARNED:
+        _FITS_HDU_WARNED.add(key)
+        log.warning(
+            "Survey %s was ingested with --hdu %s; this run uses --hdu %s. "
+            "Rows from different FITS extensions will be mixed in one survey.",
+            Path(catalog_root).name, describe_fits_hdu(recorded), describe_fits_hdu(wanted),
+        )
+    return False
+
+
+def record_fits_hdu(catalog_root: Path | str, fits_hdu: str | None) -> None:
+    """Store a non-default ``fits_hdu`` in ``catalog_info.json`` (no-op otherwise)."""
+    from data_lake.io.fits_read import parse_hdu_spec
+
+    spec = parse_hdu_spec(fits_hdu)
+    info_path = Path(catalog_root) / "catalog_info.json"
+    if spec is None or not info_path.is_file():
+        return
+    with open(info_path) as fh:
+        info = json.load(fh)
+    info[CATALOG_INFO_FITS_HDU] = spec
+    tmp = info_path.with_suffix(f".json.{os.getpid()}.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(info, fh, indent=2)
+    os.replace(tmp, info_path)
+
+
 # ---------------------------------------------------------------------------
 # Batch ingest: multiple files → single survey
 # ---------------------------------------------------------------------------
@@ -3240,6 +3416,7 @@ def ingest_catalog_batch(
     tile_mode: TileMode | None = None,
     on_duplicate_id: DuplicateIdMode = "skip",
     allow_incomplete_link_id: bool = False,
+    fits_hdu: str | None = None,
 ) -> None:
     """Ingest multiple source files into the same survey catalog.
 
@@ -3259,6 +3436,7 @@ def ingest_catalog_batch(
             tile_mode=tile_mode,
             on_duplicate_id=on_duplicate_id,
             allow_incomplete_link_id=allow_incomplete_link_id,
+            fits_hdu=fits_hdu,
         )
 
 
@@ -3281,6 +3459,7 @@ try:
         resolve_log_level,
         validate_quiet_verbose,
         fits_memmap_option,
+        hdu_option,
     )
 
     @click.command("dl-ingest-catalog")
@@ -3333,6 +3512,7 @@ try:
              "(implies --streaming when N > 0; requires --tile-mode append).",
     )
     @fits_memmap_option
+    @hdu_option
     @click.option(
         "--columns",
         default=None,
@@ -3400,6 +3580,7 @@ try:
         streaming: bool,
         streaming_parallel: int,
         fits_memmap: str,
+        fits_hdu: str | None,
         columns: str | None,
         compact: bool,
         compression_level: int | None,
@@ -3476,6 +3657,7 @@ try:
             parquet_options=pq_opts,
             compact=compact,
             fits_memmap=fits_memmap.lower(),
+            fits_hdu=fits_hdu,
             defer_finalize=defer_finalize,
             lifecycle=(
                 "live" if (defer_finalize and lifecycle is None)

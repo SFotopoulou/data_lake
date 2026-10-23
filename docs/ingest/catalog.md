@@ -82,6 +82,42 @@ If any file is **`packed-vector`**, expect long ingest times and high RAM per
 worker; parallel whole-file ingest is a poor fit. Re-export as row-normal FITS
 (STILTS `col=false`) or Parquet, then ingest. See [Performance tuning](../performance.md).
 
+### Multi-extension FITS (`--hdu`)
+
+By default every catalog command reads the **first table HDU** of each FITS file
+(PRIMARY and image extensions are skipped). When a file holds several table
+extensions (per-CCD or per-field tables, an `OBJECTS` table next to a `SUMMARY`
+table, `EXTVER`-numbered copies), choose the extension with `--hdu`. The option is
+the same on `dl-ingest-catalog`, `dl-ingest-catalog-batch`,
+`dl-ingest-catalog-from-list`, `dl-ingest-from-shard` (map phase),
+`dl-check-fits-table-format` and `dl-recommend-catalog-norder`, and can be set
+once with `$DATA_LAKE_FITS_HDU`.
+
+| `--hdu` value | Reads |
+|---------------|-------|
+| *(omitted)* | First table HDU |
+| `2` | HDU index 2 (must be a table) |
+| `OBJECTS` | The table with `EXTNAME=OBJECTS` (case-insensitive; error if several match) |
+| `OBJECTS,2` | `EXTNAME=OBJECTS`, `EXTVER=2` |
+| `all` | Every non-empty table HDU, concatenated. Column names must match in every extension; numeric widths are promoted. Otherwise the file fails with a message naming the extension |
+
+A missing or non-table selection fails that file with an error listing the file's
+HDUs (`index:EXTNAME(type)`); in batch and shard runs it lands in `--failures-log`.
+
+`dl-check-fits-table-format` reports `table HDU: 2 (of 3 table HDUs)` and a hint when a
+file has more table extensions than the selection reads, so run it first:
+
+```bash
+dl-check-fits-table-format --file-list files.txt              # what the default reads
+dl-check-fits-table-format --file-list files.txt --hdu all    # sources across all tables
+dl-ingest-catalog-batch files.txt --survey MY_SURVEY --link-id-col OBJID --hdu OBJECTS
+```
+
+A non-default selection is recorded as `fits_hdu` in `catalog_info.json` (and in
+`shard_info.json` for map-reduce). A later ingest into the same survey with a
+different `--hdu` logs a warning but still runs, since mixing extensions may be
+intended.
+
 ### Concatenate FITS shards (pre-ingest)
 
 Some surveys ship as **many small row-normal BINTABLE files** in one directory

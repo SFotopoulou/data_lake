@@ -64,6 +64,30 @@ def fits_memmap_option(f: F) -> F:
     )(f)
 
 
+def _parse_hdu_option(ctx, param, value):  # noqa: ARG001 - click callback signature
+    from data_lake.io.fits_read import parse_hdu_spec
+
+    try:
+        return parse_hdu_spec(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
+def hdu_option(f: F) -> F:
+    """Add ``--hdu`` (also reads ``$DATA_LAKE_FITS_HDU``) to catalog FITS CLIs."""
+    return click.option(
+        "--hdu",
+        "fits_hdu",
+        default=None,
+        envvar="DATA_LAKE_FITS_HDU",
+        callback=_parse_hdu_option,
+        metavar="INDEX|NAME[,VER]|all",
+        help="FITS table extension to ingest: index (2), EXTNAME (OBJECTS or SCI,2), "
+             "or 'all' (every non-empty table HDU; column names must match). "
+             "Default: first table HDU. Ignored for non-FITS inputs.",
+    )(f)
+
+
 def progress_option(f: F) -> F:
     """Add ``--progress/--no-progress`` (progress on by default) to a click command."""
     return click.option(

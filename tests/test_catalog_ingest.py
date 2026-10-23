@@ -1133,7 +1133,7 @@ class TestPackedVectorFits:
 
     def test_read_packed_vector_fits(self, tmp_path: Path) -> None:
         fitsio = pytest.importorskip("fitsio")
-        from data_lake.ingest.fits_to_parquet import _read_fits_catalog_table
+        from data_lake.ingest.fits_to_parquet import _read_fits_catalog_arrow
 
         n = 50
         objid = np.arange(1_000, 1_000 + n, dtype=np.int64)
@@ -1154,9 +1154,9 @@ class TestPackedVectorFits:
         row["dec"][0] = dec
         fitsio.write(str(path), row, extname="photoobjall_test")
 
-        tbl = _read_fits_catalog_table(path)
-        assert len(tbl) == n
-        assert int(tbl["objid"][0]) == 1000
+        tbl = _read_fits_catalog_arrow(path)
+        assert tbl.num_rows == n
+        assert tbl.column("objid")[0].as_py() == 1000
 
 
 # ---------------------------------------------------------------------------

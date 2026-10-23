@@ -23,12 +23,10 @@ from data_lake.ingest.fits_to_parquet import (
     read_catalog_sky_columns,
 )
 from data_lake.ingest.fits_to_parquet import (
-    _bintable_hdu_index as _fits_bintable_hdu_index,
-)
-from data_lake.ingest.fits_to_parquet import (
     _is_packed_vector_bintable,
     _read_packed_vector_fits,
 )
+from data_lake.io.fits_read import FitsReadPolicy, catalog_fits_read_policy
 
 log = logging.getLogger(__name__)
 
@@ -73,12 +71,13 @@ class NorderRecommendation:
     note: str | None = None
 
 
-def _bintable_column_names(path: Path) -> list[str]:
-    """Return column names from the catalog BINTABLE HDU (for error hints)."""
-    from data_lake.io.fits_read import open_fits
+def _bintable_column_names(path: Path, policy: FitsReadPolicy | None = None) -> list[str]:
+    """Return column names from the selected catalog table HDU (for error hints)."""
+    from data_lake.io.fits_read import open_fits, resolve_table_hdus
 
-    with open_fits(path) as hdul:
-        idx = _fits_bintable_hdu_index(hdul)
+    policy = policy or FitsReadPolicy.from_env()
+    with open_fits(path, policy) as hdul:
+        idx = resolve_table_hdus(hdul, policy.table_hdu, source=path.name)[0]
         hdu = hdul[idx]
         if _is_packed_vector_bintable(hdu):
             tbl = _read_packed_vector_fits(path, hdu_index=idx)
@@ -126,8 +125,9 @@ def _read_ra_dec_sample(
     *,
     max_rows: int | None,
     rng: np.random.Generator,
+    policy: FitsReadPolicy | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    ra, dec = read_catalog_sky_columns(path, ra_col, dec_col)
+    ra, dec = read_catalog_sky_columns(path, ra_col, dec_col, fits_read_policy=policy)
     n = ra.size
     if max_rows is not None and n > max_rows:
         pick = rng.choice(n, size=max_rows, replace=False)
@@ -160,14 +160,18 @@ def recommend_catalog_norder(
     target_min: int = DEFAULT_TARGET_MIN,
     target_max: int = DEFAULT_TARGET_MAX,
     seed: int = 0,
+    fits_hdu: str | None = None,
 ) -> NorderRecommendation:
     """
     Scan catalog FITS files and recommend ``--norder`` for ingest.
 
     Uses a random subsample of RA/Dec (``sample_rows`` cap) and total row counts
     from FITS headers to estimate mean rows per occupied HEALPix pixel.
+    *fits_hdu* selects table HDU(s) like catalog ingest ``--hdu``.
     """
     import healpy as hp  # noqa: F401 — ensure available
+
+    policy = catalog_fits_read_policy(None, fits_hdu)
 
     files = _collect_paths(paths, file_list=file_list, glob_pattern=glob_pattern)
     if not files:
@@ -187,7 +191,7 @@ def recommend_catalog_norder(
 
     for path in files:
         try:
-            n = catalog_source_row_count(path)
+            n = catalog_source_row_count(path, fits_read_policy=policy)
         except Exception as exc:
             msg = f"{path.name}: row count — {exc}"
             log.warning("Skip %s", msg)
@@ -199,7 +203,7 @@ def recommend_catalog_norder(
         take = min(rows_left, max(1, sample_rows // max(len(files), 1)))
         try:
             ra, dec = _read_ra_dec_sample(
-                path, ra_col, dec_col, max_rows=take, rng=rng
+                path, ra_col, dec_col, max_rows=take, rng=rng, policy=policy,
             )
         except Exception as exc:
             msg = f"{path.name}: RA/Dec — {exc}"
@@ -219,7 +223,7 @@ def recommend_catalog_norder(
         probe = fits_files[0] if fits_files else (files[0] if files else None)
         if probe is not None:
             try:
-                cols = _bintable_column_names(probe)
+                cols = _bintable_column_names(probe, policy)
                 if cols:
                     hint = (
                         f" First file ({probe.name}) columns include: "
@@ -339,6 +343,8 @@ def format_recommendation_report(rec: NorderRecommendation) -> str:
 try:
     import click
 
+    from data_lake.cli_utils import hdu_option
+
     @click.command("dl-recommend-catalog-norder")
     @click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
     @click.option(
@@ -368,6 +374,7 @@ try:
         help="Aim for this mean rows per occupied HEALPix pixel.",
     )
     @click.option("--seed", default=0, show_default=True)
+    @hdu_option
     @click.option("-v", "--verbose", is_flag=True)
     @click.option("-q", "--quiet", is_flag=True, default=False,
                   help="Suppress INFO output (default is already WARNING for this tool).")
@@ -383,6 +390,7 @@ try:
         norder_max: int,
         target_rows_per_tile: int,
         seed: int,
+        fits_hdu: str | None,
         verbose: bool,
         quiet: bool,
     ) -> None:
@@ -406,6 +414,7 @@ try:
             norder_max=norder_max,
             target_rows_per_tile=target_rows_per_tile,
             seed=seed,
+            fits_hdu=fits_hdu,
         )
         click.echo(format_recommendation_report(rec))
 

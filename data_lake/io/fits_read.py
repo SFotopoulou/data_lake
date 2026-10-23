@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
 
 import numpy as np
 
 MemmapMode = Literal["auto", "on", "off"]
+
+FITS_HDU_ENV = "DATA_LAKE_FITS_HDU"
+HDU_ALL = "all"
 
 DEFAULT_SMALL_FILE_BYTES = 8 * 1024 * 1024
 DEFAULT_PARALLEL_CATALOG_MAX_BYTES = 512 * 1024 * 1024
@@ -30,11 +33,13 @@ class FitsReadPolicy:
     parallel_catalog_max_bytes: int = DEFAULT_PARALLEL_CATALOG_MAX_BYTES
     lazy_load_hdus: bool = False
     ignore_missing_simple: bool = True
+    #: Catalog table HDU selector (see :func:`parse_hdu_spec`); None = first table HDU.
+    table_hdu: str | None = None
 
     @classmethod
-    def for_sniff(cls) -> FitsReadPolicy:
+    def for_sniff(cls, table_hdu: str | None = None) -> FitsReadPolicy:
         """Header-only open for format detection (no data read)."""
-        return cls(memmap="off", lazy_load_hdus=True)
+        return cls(memmap="off", lazy_load_hdus=True, table_hdu=parse_hdu_spec(table_hdu))
 
     @classmethod
     def from_env(cls) -> FitsReadPolicy:
@@ -53,6 +58,7 @@ class FitsReadPolicy:
             memmap=memmap,
             small_file_bytes=small,
             parallel_catalog_max_bytes=parallel_max,
+            table_hdu=parse_hdu_spec(os.environ.get(FITS_HDU_ENV)),
         )
 
 
@@ -65,16 +71,116 @@ def parse_memmap_mode(value: str | None) -> MemmapMode:
     raise ValueError(f"fits memmap mode must be auto, on, or off; got {value!r}")
 
 
-def default_fits_read_policy(memmap: str | None = None) -> FitsReadPolicy:
-    """Build a read policy from env defaults, optionally overriding memmap mode."""
-    env = FitsReadPolicy.from_env()
-    if memmap is None:
-        return env
-    return FitsReadPolicy(
-        memmap=parse_memmap_mode(memmap),
-        small_file_bytes=env.small_file_bytes,
-        parallel_catalog_max_bytes=env.parallel_catalog_max_bytes,
-    )
+def parse_hdu_spec(value: str | int | None) -> str | None:
+    """Normalise a ``--hdu`` value.
+
+    Accepted forms: ``None`` / ``""`` (first table HDU), ``"all"`` (every
+    non-empty table HDU), an integer index (``"2"``), an EXTNAME (``"OBJECTS"``),
+    or ``"EXTNAME,EXTVER"`` (``"SCI,2"``).  Names are matched case-insensitively.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() == HDU_ALL:
+        return HDU_ALL
+    if text.lstrip("-").isdigit():
+        if int(text) < 0:
+            raise ValueError(f"--hdu index must be >= 0; got {value!r}")
+        return str(int(text))
+    name, sep, ver = text.partition(",")
+    name = name.strip()
+    if not name:
+        raise ValueError(f"--hdu name is empty in {value!r}")
+    if sep:
+        ver = ver.strip()
+        if not ver.isdigit():
+            raise ValueError(f"--hdu EXTVER must be an integer in {value!r}")
+        return f"{name},{int(ver)}"
+    return name
+
+
+def _describe_hdus(hdul) -> str:
+    parts = []
+    for i, hdu in enumerate(hdul):
+        name = (hdu.name or "").strip() or "-"
+        ver = getattr(hdu, "ver", 1)
+        label = f"{name},{ver}" if ver and ver != 1 else name
+        parts.append(f"{i}:{label}({type(hdu).__name__})")
+    return ", ".join(parts)
+
+
+def _hdu_rows(hdu) -> int:
+    return int(hdu.header.get("NAXIS2", 0) or 0)
+
+
+def resolve_table_hdus(hdul, spec: str | None = None, *, source: str = "") -> list[int]:
+    """Return the table HDU indices selected by *spec* (see :func:`parse_hdu_spec`).
+
+    ``None`` → ``[first table HDU]``; ``"all"`` → every table HDU with rows (the
+    first table HDU when all are empty).  Raises ``ValueError`` listing the
+    file's HDUs when the selection does not exist or is not a table.
+    """
+    from astropy.io.fits.hdu.table import _TableLikeHDU
+
+    spec = parse_hdu_spec(spec)
+    where = f" in {source}" if source else ""
+    tables = [i for i, hdu in enumerate(hdul) if isinstance(hdu, _TableLikeHDU)]
+    if not tables:
+        raise ValueError(f"No BINTABLE / table HDU found{where}. HDUs: {_describe_hdus(hdul)}")
+    if spec is None:
+        return [tables[0]]
+    if spec == HDU_ALL:
+        non_empty = [i for i in tables if _hdu_rows(hdul[i]) > 0]
+        return non_empty or [tables[0]]
+
+    if spec.isdigit():
+        idx = int(spec)
+        if idx >= len(hdul):
+            raise ValueError(
+                f"--hdu {idx} out of range{where} ({len(hdul)} HDUs: {_describe_hdus(hdul)})"
+            )
+    else:
+        name, _, ver = spec.partition(",")
+        want_ver = int(ver) if ver else None
+        matches = [
+            i for i, hdu in enumerate(hdul)
+            if (hdu.name or "").strip().upper() == name.upper()
+            and (want_ver is None or int(getattr(hdu, "ver", 1) or 1) == want_ver)
+        ]
+        if not matches:
+            raise ValueError(f"--hdu {spec!r} not found{where}. HDUs: {_describe_hdus(hdul)}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"--hdu {spec!r} is ambiguous{where} (HDUs {matches}); "
+                "pass NAME,EXTVER or an index. HDUs: " + _describe_hdus(hdul)
+            )
+        idx = matches[0]
+    if idx not in tables:
+        raise ValueError(
+            f"--hdu {spec!r}{where} selects HDU {idx} ({type(hdul[idx]).__name__}), "
+            f"not a table. HDUs: {_describe_hdus(hdul)}"
+        )
+    return [idx]
+
+
+def default_fits_read_policy(
+    memmap: str | None = None,
+    table_hdu: str | None = None,
+) -> FitsReadPolicy:
+    """Build a read policy from env defaults, optionally overriding memmap / HDU."""
+    policy = FitsReadPolicy.from_env()
+    if memmap is not None:
+        policy = replace(policy, memmap=parse_memmap_mode(memmap))
+    if table_hdu is not None:
+        policy = replace(policy, table_hdu=parse_hdu_spec(table_hdu))
+    return policy
+
+
+def catalog_fits_read_policy(memmap: str | None, table_hdu: str | None) -> FitsReadPolicy:
+    """Read policy for catalog workers: *table_hdu* is authoritative (None = first table)."""
+    return replace(default_fits_read_policy(memmap), table_hdu=parse_hdu_spec(table_hdu))
 
 
 def resolve_memmap(path: Path | str, policy: FitsReadPolicy) -> bool:

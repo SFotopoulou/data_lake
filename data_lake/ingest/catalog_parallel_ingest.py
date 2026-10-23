@@ -33,10 +33,13 @@ from data_lake.ingest.fits_to_parquet import (
     finalize_catalog_survey,
     _remove_stale_parquet_tmp_files,
     _write_tile_for_mode,
+    check_fits_hdu_provenance,
     decode_catalog_file_to_batches,
     healpix_dir,
     normalize_catalog_table_types,
+    record_fits_hdu,
 )
+from data_lake.io.fits_read import parse_hdu_spec
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ class CatalogDecodeConfig:
     allow_incomplete_link_id: bool
     columns: tuple[str, ...] | None
     fits_memmap: str = "auto"
+    fits_hdu: str | None = None
 
 
 @dataclass
@@ -92,14 +96,9 @@ def _decode_one_catalog(path_str: str, config: CatalogDecodeConfig) -> CatalogWo
     apply_parallel_worker_logging_after_heavy_imports()
     t0 = time.perf_counter()
     cols = list(config.columns) if config.columns else None
-    from data_lake.io.fits_read import FitsReadPolicy, parse_memmap_mode
+    from data_lake.io.fits_read import catalog_fits_read_policy
 
-    env_policy = FitsReadPolicy.from_env()
-    fits_read_policy = FitsReadPolicy(
-        memmap=parse_memmap_mode(config.fits_memmap),
-        small_file_bytes=env_policy.small_file_bytes,
-        parallel_catalog_max_bytes=env_policy.parallel_catalog_max_bytes,
-    )
+    fits_read_policy = catalog_fits_read_policy(config.fits_memmap, config.fits_hdu)
     batches_raw, sid_mode, n_rows = decode_catalog_file_to_batches(
         path_str,
         ra_col=config.ra_col,
@@ -194,9 +193,12 @@ def ingest_catalogs_parallel(
     fits_memmap: str = "auto",
     files_per_worker: int = 1,
     partition_by_dir: bool = False,
+    fits_hdu: str | None = None,
 ) -> dict:
     """Ingest many catalog files with parallel decode and a single-thread writer.
 
+    *fits_hdu* selects the FITS table extension in every file (see
+    :func:`data_lake.io.fits_read.parse_hdu_spec`).
     Returns a summary dict (counts, failures, elapsed_s).
     """
     if n_workers < 1:
@@ -230,8 +232,70 @@ def ingest_catalogs_parallel(
         allow_incomplete_link_id=allow_incomplete_link_id,
         columns=tuple(columns) if columns else None,
         fits_memmap=fits_memmap,
+        fits_hdu=parse_hdu_spec(fits_hdu),
     )
     decoder = decoder or _decode_catalog_batch_safe
+    new_survey = check_fits_hdu_provenance(catalog_root, decode_cfg.fits_hdu)
+    try:
+        return _run_parallel_catalog_ingest(
+            file_paths,
+            output_root=output_root,
+            catalog_root=catalog_root,
+            survey_name=survey_name,
+            n_workers=n_workers,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            norder=norder,
+            link_id_col=link_id_col,
+            allow_incomplete_link_id=allow_incomplete_link_id,
+            resolved_tile_mode=resolved_tile_mode,
+            on_duplicate_id=on_duplicate_id,
+            pq_opts=pq_opts,
+            checkpoint_path=checkpoint_path,
+            failures_log=failures_log,
+            show_progress=show_progress,
+            skip_completed=skip_completed,
+            max_in_flight=max_in_flight,
+            executor_factory=executor_factory,
+            decoder=decoder,
+            heartbeat=heartbeat,
+            files_per_worker=files_per_worker,
+            partition_by_dir=partition_by_dir,
+            decode_cfg=decode_cfg,
+        )
+    finally:
+        if new_survey:
+            record_fits_hdu(catalog_root, decode_cfg.fits_hdu)
+
+
+def _run_parallel_catalog_ingest(
+    file_paths: Sequence[Path | str],
+    *,
+    output_root: Path,
+    catalog_root: Path,
+    survey_name: str,
+    n_workers: int,
+    ra_col: str,
+    dec_col: str,
+    norder: int,
+    link_id_col: str | None,
+    allow_incomplete_link_id: bool,
+    resolved_tile_mode: TileMode,
+    on_duplicate_id: DuplicateIdMode,
+    pq_opts: CatalogParquetOptions,
+    checkpoint_path: Path | str | None,
+    failures_log: Path | str | None,
+    show_progress: bool,
+    skip_completed: bool,
+    max_in_flight: int | None,
+    executor_factory: Callable[[int], Executor] | None,
+    decoder: Callable[[str, CatalogDecodeConfig], CatalogWorkerResult],
+    heartbeat: "Any | None",
+    files_per_worker: int,
+    partition_by_dir: bool,
+    decode_cfg: CatalogDecodeConfig,
+) -> dict:
+    """Body of :func:`ingest_catalogs_parallel` after options are resolved."""
 
     from data_lake.cli_utils import warn_high_parallelism_on_slow_storage
     from data_lake.ingest.file_list_ingest import _append_checkpoint, _load_completed
@@ -529,6 +593,7 @@ try:
         config_option,
         configure_cli_logging,
         fits_memmap_option,
+        hdu_option,
         ingest_token_option,
         load_optional_config,
         logging_options,
@@ -612,6 +677,7 @@ try:
         help="Ignore checkpoint when deciding which files to run.",
     )
     @fits_memmap_option
+    @hdu_option
     @click.option(
         "--log-file",
         "log_file",
@@ -644,6 +710,7 @@ try:
         show_progress: bool,
         no_skip_completed: bool,
         fits_memmap: str,
+        fits_hdu: str | None,
         log_file: Path | None,
         quiet: bool,
         verbose: bool,
@@ -684,6 +751,7 @@ try:
             skip_completed=not no_skip_completed,
             max_in_flight=max_in_flight,
             fits_memmap=fits_memmap.lower(),
+            fits_hdu=fits_hdu,
             files_per_worker=files_per_worker,
             partition_by_dir=partition_by_dir,
         )

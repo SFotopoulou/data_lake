@@ -72,6 +72,7 @@ lake/
 *.parquet
 *.fits
 !tests/**/*.fits
+TODO.md
 
 # uv lockfile is fine to commit, but keep its cache out
 .uv-cache/

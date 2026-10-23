@@ -15,8 +15,8 @@ from typing import Sequence
 
 from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file
 from data_lake.ingest.fits_to_parquet import (
-    _bintable_hdu_index,
     _is_packed_vector_bintable,
+    check_hdu_columns_match,
     estimate_bintable_source_count,
     is_catalog_fits_path,
 )
@@ -28,7 +28,11 @@ class FitsTableFormatReport:
     ok: bool
     format: str
     file_size_bytes: int | None = None
+    #: First selected table HDU (all selected ones are in ``hdu_indices``).
     hdu_index: int | None = None
+    hdu_indices: tuple[int, ...] | None = None
+    #: Table HDUs in the file (selected or not); >1 means multi-extension.
+    n_table_hdus: int | None = None
     naxis2: int | None = None
     n_columns: int | None = None
     est_source_count: int | None = None
@@ -49,8 +53,16 @@ def _human_size(n_bytes: int | None) -> str:
     return f"{n_bytes} B"
 
 
-def inspect_fits_table_format(path: Path | str) -> FitsTableFormatReport:
-    """Classify one catalog FITS file using headers only (no column reads)."""
+def inspect_fits_table_format(
+    path: Path | str,
+    *,
+    fits_hdu: str | None = None,
+) -> FitsTableFormatReport:
+    """Classify one catalog FITS file using headers only (no column reads).
+
+    *fits_hdu* selects table HDU(s) exactly like catalog ingest ``--hdu``;
+    counts are summed over the selection.
+    """
     path = Path(path)
     try:
         size = path.stat().st_size
@@ -72,15 +84,24 @@ def inspect_fits_table_format(path: Path | str) -> FitsTableFormatReport:
         )
 
     try:
-        from data_lake.io.fits_read import FitsReadPolicy, open_fits
+        from astropy.io.fits.hdu.table import _TableLikeHDU
 
-        with open_fits(path, FitsReadPolicy.for_sniff()) as hdul:
-            idx = _bintable_hdu_index(hdul)
-            hdu = hdul[idx]
-            packed = _is_packed_vector_bintable(hdu)
-            naxis2 = int(hdu.header.get("NAXIS2", 0))
+        from data_lake.io.fits_read import FitsReadPolicy, open_fits, resolve_table_hdus
+
+        policy = FitsReadPolicy.for_sniff(fits_hdu)
+        with open_fits(path, policy) as hdul:
+            indices = resolve_table_hdus(hdul, policy.table_hdu, source=path.name)
+            check_hdu_columns_match(hdul, indices, source=path.name)
+            n_tables = sum(1 for h in hdul if isinstance(h, _TableLikeHDU))
+            hdu = hdul[indices[0]]
+            packed = any(_is_packed_vector_bintable(hdul[i]) for i in indices)
+            naxis2 = sum(int(hdul[i].header.get("NAXIS2", 0)) for i in indices)
             n_columns = len(hdu.columns) if hdu.columns is not None else 0
-            est_sources = estimate_bintable_source_count(hdu, packed=packed)
+            counts = [
+                estimate_bintable_source_count(hdul[i], packed=_is_packed_vector_bintable(hdul[i]))
+                for i in indices
+            ]
+            est_sources = None if any(c is None for c in counts) else sum(counts)
             if packed:
                 fmt = "packed-vector"
                 ingest_path = "fitsio column-by-column (slow; all columns read)"
@@ -96,12 +117,19 @@ def inspect_fits_table_format(path: Path | str) -> FitsTableFormatReport:
                     "Normal one-row-per-source BINTABLE. Suitable for parallel ingest "
                     "(within DATA_LAKE_PARALLEL_CATALOG_MAX_BYTES) and --streaming."
                 )
+            if n_tables > len(indices):
+                hint = (
+                    f"File has {n_tables} table HDUs; ingest reads HDU(s) "
+                    f"{list(indices)}. Use --hdu NAME|INDEX|all to choose. " + hint
+                )
             return FitsTableFormatReport(
                 path=str(path),
                 ok=True,
                 format=fmt,
                 file_size_bytes=size,
-                hdu_index=idx,
+                hdu_index=indices[0],
+                hdu_indices=tuple(indices),
+                n_table_hdus=n_tables,
                 naxis2=naxis2,
                 n_columns=n_columns,
                 est_source_count=est_sources,
@@ -147,7 +175,12 @@ def format_report_text(rep: FitsTableFormatReport) -> str:
         [
             f"  format:     {rep.format}",
             f"  file size:  {_human_size(rep.file_size_bytes)}",
-            f"  table HDU:  {rep.hdu_index}",
+            "  table HDU:  "
+            + (
+                ", ".join(str(i) for i in rep.hdu_indices)
+                if rep.hdu_indices else str(rep.hdu_index)
+            )
+            + (f" (of {rep.n_table_hdus} table HDUs)" if (rep.n_table_hdus or 0) > 1 else ""),
             f"  NAXIS2:     {rep.naxis2}",
             f"  columns:    {rep.n_columns}",
         ]
@@ -161,8 +194,12 @@ def format_report_text(rep: FitsTableFormatReport) -> str:
     return "\n".join(lines)
 
 
-def inspect_many(paths: Sequence[Path | str]) -> list[FitsTableFormatReport]:
-    return [inspect_fits_table_format(p) for p in paths]
+def inspect_many(
+    paths: Sequence[Path | str],
+    *,
+    fits_hdu: str | None = None,
+) -> list[FitsTableFormatReport]:
+    return [inspect_fits_table_format(p, fits_hdu=fits_hdu) for p in paths]
 
 
 def format_summary_text(reports: Sequence[FitsTableFormatReport]) -> str:
@@ -195,6 +232,8 @@ def format_summary_text(reports: Sequence[FitsTableFormatReport]) -> str:
 try:
     import click
 
+    from data_lake.cli_utils import hdu_option
+
     @click.command("dl-check-fits-table-format")
     @click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
     @click.option(
@@ -210,18 +249,20 @@ try:
         show_default=True,
         help="Print aggregate counts when inspecting multiple files.",
     )
+    @hdu_option
     def cli(
         paths: tuple[Path, ...],
         file_list: Path | None,
         as_json: bool,
         summary: bool,
+        fits_hdu: str | None,
     ) -> None:
         """Report FITS BINTABLE layout (standard vs vector)."""
         resolved = resolve_inspect_paths(paths, file_list=file_list)
         if not resolved:
             raise click.UsageError("Provide FITS path(s) and/or --file-list.")
 
-        reports = inspect_many(resolved)
+        reports = inspect_many(resolved, fits_hdu=fits_hdu)
         if as_json:
             for rep in reports:
                 click.echo(json.dumps(asdict(rep), ensure_ascii=False))

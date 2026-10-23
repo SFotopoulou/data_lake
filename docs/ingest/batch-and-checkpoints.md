@@ -9,6 +9,7 @@
 | `dl-ingest-catalog` | `--tile-mode` | `append`, `replace` | Default `append`; `replace` overwrites existing tile |
 | `dl-ingest-catalog` | `--streaming` | flag | FITS-only; bounded RAM; not available on batch path |
 | `dl-ingest-catalog` | `--fits-memmap` | `auto`, `on`, `off` | FITS read policy (default `auto`: mmap files ≥ 8 MiB) |
+| `dl-ingest-catalog`, `-batch`, `-from-list`, `dl-ingest-from-shard` | `--hdu` | index, `EXTNAME[,EXTVER]`, `all` | FITS table extension(s) per file; default first table HDU; `$DATA_LAKE_FITS_HDU` ([multi-extension FITS](catalog.md#multi-extension-fits---hdu)) |
 | `dl-ingest-catalog-from-list` | `--on-duplicate-id` | same | same |
 | `dl-ingest-catalog-from-list` | `--allow-incomplete-link-id` | flag | Same semantics as single-file command; forwarded to parallel path when `--n-workers > 1` |
 | `dl-ingest-catalog-from-list` | `--tile-mode` | `skip`, `overwrite`, `append` | Sequential default `skip`; parallel default `append` (when omitted with `--n-workers > 1`) |
@@ -156,6 +157,7 @@ array wall-clock, not 2 000 CPU-hours of serial append.
 | `--columns` | map | all | Comma-separated subset of columns to keep |
 | `--allow-incomplete-link-id` | map | off | Null `_source_id` for rows with missing composite parts |
 | `--fits-memmap` | map | `auto` | FITS read policy (`$DATA_LAKE_FITS_MEMMAP`) |
+| `--hdu` | map | first table HDU | Table extension: index, `EXTNAME[,EXTVER]`, or `all` (`$DATA_LAKE_FITS_HDU`); recorded in `shard_info.json`, carried to the lake by reduce |
 | `--on-duplicate-id` | reduce | `skip` | `skip` keeps the first/existing row, `last` keeps the newest, `error` aborts the tile |
 | `--tile-mode` | reduce | `append` | Existing lake tile: `append` merges (one rewrite per tile per reduce run), `skip` leaves it, `overwrite` replaces it |
 | `--compact` | reduce | off | Smaller tiles (ZSTD-9, no stats/dictionary) |
