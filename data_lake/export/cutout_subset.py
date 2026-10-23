@@ -123,7 +123,7 @@ try:
         yes: bool,
         with_catalog: bool,
         lake_root: Path | None,
-        config: Path | None,
+        config_path: Path | None,
         show_progress: bool,
         verbose: bool,
     ) -> None:
@@ -135,9 +135,14 @@ try:
         """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
 
-        cfg = load_optional_config(config)
+        cfg = load_optional_config(config_path)
         if lake_root is None:
-            lake_root = Path(cfg.get("lake", {}).get("root", "."))
+            if cfg is None:
+                raise click.UsageError(
+                    "--lake-root is required when no lake config is provided. "
+                    "Either pass it explicitly, set $DATA_LAKE_CONFIG, or use --config."
+                )
+            lake_root = cfg.lake.root
 
         catalog_accessor = None
         if with_catalog:

@@ -7,8 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-23
+
+Upgrade notes (breaking changes, details under **Changed**):
+
+- Python **3.12+** is required.
+- DESI coadd spectra now default to `--link-id-col TARGETID,SURVEY,PROGRAM`; ingest the matching catalog with the same spec, or pass `--link-id-col TARGETID` to keep the old key.
+- `dl-describe-lake --from-area` is gone; use `dl-region --from-area`.
+
 ### Added
 
+- **`dl-ingest-from-shard`** — two-phase map-reduce catalog ingest for many input files that share lake tiles (Legacy Survey bricks, RA/Dec patches, unsorted run folders). `--phase map` decodes FITS into immutable per-HEALPix Parquet parts (embarrassingly parallel; one Slurm array task per folder or file-list chunk, resumable through a JSONL checkpoint); `--phase reduce` builds each lake tile once and finalizes the survey. Writes every row twice regardless of how many files feed a tile, versus ~(k+1)/2× for batch append with k files per tile. Reduce merges into existing tiles (`--tile-mode append|skip|overwrite`) and aborts before writing when `--norder` or the link-id spec disagrees with the shard tree or the existing survey. `--staging-dir` (`$DATA_LAKE_STAGING_DIR`) buffers writes on a small local SSD and publishes atomically to the final area. Same conventions as other `dl-ingest-*` commands: optional positional `OUTPUT_ROOT` (config `lake.root` fallback), `--config`, ingest token, `-q/-v`, `--log-file`, `--failures-log`, bounded `--n-workers` / `--max-in-flight`.
+- **`dl-extract-cutout-subset`** — export a curated cutout ID list to flat Zarr, per-source FITS (full WCS), or HDF5; `--target-id-col` accepts composite specs.
+- **Link-id columns embedded in subset exports** — `dl-extract-spectra-subset` and `dl-extract-cutout-subset` Zarr/HDF5 outputs carry the native ID columns behind `_source_id` (e.g. `TARGETID`, `SURVEY`, `PROGRAM`) as peer arrays, with `link_id_columns` / `link_id_mode` attrs, so extracts join in TOPCAT without the lake.
+- **`dl-extract-spectra-subset` catalog FITS beyond 100k sources** — large catalog-layout FITS extracts are written as temporary parts and merged: `--fits-chunk-rows`, `--keep-part-files`, `--yes/-y` (skip the multi-part prompt), and `--force-many-fits-parts` to exceed 100 parts (hard cap 10 000).
+- **`dl-describe-crossmatch`** — list or describe sky and column crossmatch trees (`--name`, `--radius-arcsec`, `--match-mode column --match-col-a/b`, `--recount`, `--json`).
+- **`dl-preview-sources`** — peek at the first N sources of a catalog, spectra, or cutout survey (`-n`, `-c COL`, `-o`, `--format`).
+- **`dl-plot-spectrum`** — 1D spectrum figure for one source (`--extra viz`), with `--clip-sigma` (default 10; median ± N×MAD-σ y-limits, `0` disables).
+- **`dl-describe-survey` shows the native ID column** behind `_source_id` (e.g. `join: '_source_id' (from TARGETID)`).
+- **Ingest advisor picks the catalog helper from the file layout** — `recommend_ingest` (Python and MCP) accepts `layout` (`spatial`, `unsorted`, `partitioned`) or `file_area_deg2` with `norder`, estimates files per tile, and recommends `dl-ingest-from-shard` above the break-even (~3 files per tile) with a map-array Slurm script plus a dependent reduce script in the new `extra_slurm_scripts` field. Without layout information the batch recommendation is unchanged and a warning explains what to pass.
+- **`dl-mcp-lake` inventory tools** — `describe_lake`, `describe_survey`, `list_products`, `list_homogenize_recipes` now also served by the lake explorer, so it no longer needs `dl-mcp-docs` running. Deployment guide in `docs/mcp-deploy.md`.
+- **Scripts** (no install needed):
+  - `scripts/read_zarr_subset.py` — read a spectra or cutout Zarr subset (auto-detects modality), print a summary, export an ID catalog to Parquet/FITS, plot a spectrum or show a cutout.
+  - `scripts/concatenate_fits.py` and `scripts/concatenate_fits_folders.sh` — merge row-normal catalog FITS shards per folder (`--dry-run`, `--summary`, skips existing outputs). For moderate inputs only; use `dl-ingest-from-shard` for large brick-style surveys.
+  - `scripts/list_legacy_tractor_urls.py` — list Legacy Survey tractor FITS URLs from the NERSC portal tree.
 - **`dl-ingest-catalog --set-column NAME=VALUE`** — inject a constant column into every row *before* identity resolution, so composite `--link-id-col` specs can reference values that are not present in the source file (e.g. `VISIT`). Repeatable; auto-infers int64/float64/string, or use `NAME:TYPE=VALUE` to force a type (`int`, `float`, `str`, `bool`). Provenance is stored in `catalog_info.json` as `set_columns: {NAME: VALUE}`. `--tile-mode append` raises a clear error when the on-disk tile schema does not match (all runs for a survey must use the same injected columns from the first write).
 
 ### Changed
@@ -17,8 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: minimum Python version is 3.12** — `requires-python = ">=3.12"`; install docs use `uv venv --python 3.12`.
 - **Breaking: `dl-describe-lake --from-area` removed** — describe-lake is lake-wide only. Use `dl-region --from-area AREA --modalities …,crossmatch` (optionally `--count`) for area-scoped inventory including crossmatch trees.
 - **`dl-region` crossmatch discovery** — `crossmatch` is a discoverable modality (`--modalities catalog,spectra,crossmatch`); tile indices include `*.crossmatch.json`; `--count` sums Parquet footers for catalog and crossmatch overlap tiles. Default modalities remain catalog-only.
+- **One composite link-id rule across all `dl-*` helpers** — cutout ingest (`--link-id-col`), `dl-generate-cutout-fits` (`--id-col`), header-based spectra ingest, and subset extracts (`--target-id-col`) accept comma-separated composite specs such as `TARGETID,SURVEY,PROGRAM` and hash them exactly like catalog and DESI ingest. Header keywords are matched case-insensitively. Single-column IDs hash as before.
+- **Parallel catalog ingest error messages** name the failing input file.
+- **Docs: choosing a catalog ingest command** — `docs/ingest/catalog.md` opens with a decision table based on how input files are laid out on disk (files per tile), with worked examples; batch, logging, quickstart and MCP guides link to it.
 
 ### Fixed
+
+- **"Too many open files" in long extracts, gathers and DESI ingest** — Zarr stores are now closed after each tile (`data_lake.io.zarr_close.close_zarr_group`) in spectra/cutout readers, `dl-extract-spectra-subset`, FITS export, `dl-gather`, and DESI parallel ingest.
 
 - **`dl-region` spectra row estimates always `~0`** — `spectrum_info.json` from ingest often omits `total_rows` / `total_spectra`, so estimates fell through to 0 even when overlap tiles existed. Discovery now accepts `total_spectra` (and cutout equivalents), falls back to the same Zarr `_source_id` length sum used by `dl-describe-lake`, and `--count` sums those lengths over overlap tiles. New spectrum ingest writes `total_rows` into the sidecar when known.
 - **`dl-describe-lake --kind ingested` omitted spectra/cutouts** — registry rows for those modalities now set provenance `kind` (default `ingested`; homogenized products keep `product`). Stale `surveys.parquet` with null `kind` on spectra/cutouts is coalesced to `ingested` at filter/display time, so `--kind ingested` lists catalogs and spectra without requiring a refresh (refresh still rewrites the on-disk column).
@@ -211,6 +238,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-survey catalog (Parquet/HATS), cutout, and 1-D spectrum (Zarr v3) ingest.
 - Lake registry, crossmatch, validation, and export tooling.
 
+[Unreleased]: https://github.com/SFotopoulou/data_lake/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/SFotopoulou/data_lake/compare/v0.6.0...v0.7.0
 [0.4.1]: https://github.com/SFotopoulou/data_lake/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/SFotopoulou/data_lake/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/SFotopoulou/data_lake/compare/v0.2.0...v0.3.0
