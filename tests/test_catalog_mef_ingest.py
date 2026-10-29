@@ -281,3 +281,54 @@ class TestCli:
         )
         assert result.exit_code != 0
         assert "--hdu at least twice" in result.output
+
+
+def _load_flatten_script():
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "flatten_fits_mef.py"
+    spec = importlib.util.spec_from_file_location("flatten_fits_mef", script)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestFlattenFitsMefScript:
+    def test_writes_parquet_with_vector_and_keys_once(self, mef: Path, tmp_path: Path) -> None:
+        flatten = _load_flatten_script()
+        dest = tmp_path / "flat.parquet"
+        n_rows, n_cols, labels = flatten.flatten_fits_mef(mef, dest)
+        assert labels == ("METADATA", "SPECPHOT", "FASTSPEC")
+        assert n_rows == N
+        table = pq.read_table(dest)
+        assert table.num_rows == N
+        assert table.num_columns == n_cols
+        names = table.schema.names
+        assert names.count("TARGETID") == 1
+        assert "RA" in names and "COEFF" in names and "SNR_B" in names
+        coeff = table.schema.field("COEFF").type
+        assert pa.types.is_fixed_size_list(coeff) and coeff.list_size == 5
+        meta = table.schema.metadata or {}
+        assert meta[b"data_lake.fits_hdu"] == b"join:METADATA+SPECPHOT+FASTSPEC"
+
+    def test_cli_dry_run_and_default_output(self, mef: Path) -> None:
+        flatten = _load_flatten_script()
+        result = flatten.main([str(mef), "--dry-run"])
+        assert result == 0
+        dest = mef.with_suffix(".parquet")
+        result = flatten.main([str(mef)])
+        assert result == 0
+        assert dest.is_file()
+
+    def test_file_list_output_dir(self, tmp_path: Path) -> None:
+        flatten = _load_flatten_script()
+        a = _write_joined_mef(tmp_path / "a.fits", n=N, id0=1)
+        b = _write_joined_mef(tmp_path / "b.fits", n=N, id0=1 + N)
+        lst = tmp_path / "files.txt"
+        lst.write_text(f"{a}\n{b}\n")
+        out = tmp_path / "flat"
+        assert flatten.main(["--file-list", str(lst), "--output-dir", str(out)]) == 0
+        assert (out / "a.parquet").is_file()
+        assert (out / "b.parquet").is_file()
+        assert pq.read_table(out / "a.parquet").num_rows == N

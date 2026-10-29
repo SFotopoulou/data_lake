@@ -153,9 +153,17 @@ dl-ingest-catalog-mef data/spectroscopy/fastspec-iron-cmx-other.fits \
   --link-id-col TARGETID,SURVEY,PROGRAM
 ```
 
-`dl-check-fits-table-format` hints at this command when table HDUs share
-columns and `NAXIS2` but the schemas are not identical. Use `--hdu all` only
-when the extensions really are the same table stacked.
+To flatten the same files **outside** the lake (one Parquet table per MEF, for
+TOPCAT or a later `dl-ingest-catalog`):
+
+```bash
+python scripts/flatten_fits_mef.py data/spectroscopy/fastspec-iron-cmx-other.fits
+python scripts/flatten_fits_mef.py --file-list files.txt --output-dir ./flat
+```
+
+`dl-check-fits-table-format` hints at `dl-ingest-catalog-mef` when table HDUs
+share columns and `NAXIS2` but the schemas are not identical. Use `--hdu all`
+only when the extensions really are the same table stacked.
 
 ### Concatenate FITS shards (pre-ingest)
 
