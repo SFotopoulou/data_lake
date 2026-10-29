@@ -19,6 +19,7 @@ from data_lake.ingest.fits_to_parquet import (
     _is_packed_vector_bintable,
     check_hdu_columns_match,
     estimate_bintable_source_count,
+    inspect_joinable_table_hdus,
     is_catalog_fits_path,
 )
 
@@ -127,7 +128,13 @@ def inspect_fits_table_format(
             warnings.simplefilter("always")
             with open_fits(path, policy) as hdul:
                 indices = resolve_table_hdus(hdul, policy.table_hdu, source=path.name)
-                check_hdu_columns_match(hdul, indices, source=path.name)
+                join_hint = inspect_joinable_table_hdus(hdul)
+                try:
+                    check_hdu_columns_match(hdul, indices, source=path.name)
+                except ValueError as exc:
+                    if join_hint:
+                        raise ValueError(f"{exc} {join_hint}") from None
+                    raise
                 n_tables = sum(1 for h in hdul if isinstance(h, _TableLikeHDU))
                 hdu = hdul[indices[0]]
                 packed = any(_is_packed_vector_bintable(hdul[i]) for i in indices)
@@ -163,7 +170,9 @@ def inspect_fits_table_format(
                     "Normal one-row-per-source BINTABLE. Suitable for parallel ingest "
                     "(within DATA_LAKE_PARALLEL_CATALOG_MAX_BYTES) and --streaming."
                 )
-            if n_tables > len(indices):
+            if join_hint:
+                hint = join_hint + " " + hint
+            elif n_tables > len(indices):
                 hint = (
                     f"File has {n_tables} table HDUs; ingest reads HDU(s) "
                     f"{list(indices)}. Use --hdu NAME|INDEX|all to choose. " + hint

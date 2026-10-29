@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`dl-ingest-catalog-mef`** — horizontal join of row-aligned FITS table extensions that share columns (FastSpec-style `METADATA` + `SPECPHOT` + `FASTSPEC`, and any similar MEF). Shared keys are kept from the first HDU; remaining columns are appended. One file or `--file-list` (sequential, default `--tile-mode append`). Provenance is `fits_hdu: "join:EXT+EXT+…"`. `--hdu all` remains the vertical stack for identical schemas.
 - **`--hdu` for multi-extension FITS catalogs** — `dl-ingest-catalog` (including `--streaming` / `--streaming-parallel`), `dl-ingest-catalog-batch`, `dl-ingest-catalog-from-list`, `dl-ingest-from-shard` (map), `dl-check-fits-table-format` and `dl-recommend-catalog-norder` select the table extension(s) to read: an index, `EXTNAME` or `EXTNAME,EXTVER` (case-insensitive), or `all` (every non-empty table HDU concatenated; column names must match). Also `$DATA_LAKE_FITS_HDU`. Default unchanged: first table HDU. Bad selections fail the file with a list of its HDUs. A non-default selection is recorded as `fits_hdu` in `catalog_info.json` / `shard_info.json`; a later ingest with a different `--hdu` warns.
-- **`dl-check-fits-table-format` flags multi-extension files** — reports `table HDU: 2 (of 3 table HDUs)` with a hint to use `--hdu`; counts are summed over the selected extensions.
+- **`dl-check-fits-table-format` flags multi-extension files** — reports `table HDU: 2 (of 3 table HDUs)` with a hint to use `--hdu`; counts are summed over the selected extensions. When table HDUs share columns and `NAXIS2` but not the same schema, the hint is `dl-ingest-catalog-mef` instead of `--hdu all`.
 - **`dl-check-fits-table-format` reports truncated FITS** — Astropy's "file may have been truncated" warning is recorded on that file's report (with the path) instead of printed without a name. A header-only size check catches the same case when Astropy does not seek past EOF. The command exits 1 when any file warns.
 
 ### Changed

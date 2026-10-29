@@ -1342,6 +1342,251 @@ def _concat_hdu_tables(tables: list[pa.Table], *, source: str = "") -> pa.Table:
         ) from exc
 
 
+JOIN_HDU_PREFIX = "join:"
+
+
+def joined_fits_hdu_spec(ext_names: Sequence[str]) -> str:
+    """Provenance string for a horizontal MEF join (``join:METADATA+FASTSPEC``)."""
+    return JOIN_HDU_PREFIX + "+".join(ext_names)
+
+
+def _hdu_ext_label(hdu) -> str:
+    name = (hdu.name or "").strip()
+    ver = int(getattr(hdu, "ver", 1) or 1)
+    if not name:
+        return str(getattr(hdu, "index", "?"))
+    if ver != 1:
+        return f"{name},{ver}"
+    return name
+
+
+def _col_name_map(names: Sequence[str]) -> dict[str, str]:
+    """Uppercased stripped name → original column name; last wins on duplicates."""
+    return {n.strip().upper(): n for n in names}
+
+
+def _first_mismatch_row(left, right) -> int | None:
+    """Index of the first row where *left* and *right* differ; ``None`` if equal.
+
+    FITS string columns are compared stripped.  Floats use ``nan``-aware equality.
+    """
+    a = np.asarray(left)
+    b = np.asarray(right)
+    if a.shape != b.shape:
+        return 0
+    n = a.shape[0]
+    if n == 0:
+        return None
+    if a.ndim > 1:
+        for i in range(n):
+            ai, bi = a[i], b[i]
+            if ai.dtype.kind in "USO" or bi.dtype.kind in "USO":
+                if np.char.strip(np.asarray(ai, dtype="U")).tolist() != np.char.strip(
+                    np.asarray(bi, dtype="U")
+                ).tolist():
+                    return i
+            elif not np.array_equal(ai, bi, equal_nan=True):
+                return i
+        return None
+    if a.dtype.kind in "USO" or b.dtype.kind in "USO":
+        sa = np.char.strip(np.asarray(a, dtype="U"))
+        sb = np.char.strip(np.asarray(b, dtype="U"))
+        bad = np.flatnonzero(sa != sb)
+        return int(bad[0]) if bad.size else None
+    if np.issubdtype(a.dtype, np.floating) or np.issubdtype(b.dtype, np.floating):
+        bad = np.flatnonzero(
+            ~np.isclose(a.astype(np.float64), b.astype(np.float64), equal_nan=True)
+        )
+        return int(bad[0]) if bad.size else None
+    bad = np.flatnonzero(a != b)
+    return int(bad[0]) if bad.size else None
+
+
+def inspect_joinable_table_hdus(hdul) -> str | None:
+    """Hint when table HDUs look like a row-aligned join, not ``--hdu all``.
+
+    Returns a message when there are ≥2 non-empty table HDUs with the same
+    ``NAXIS2``, a non-empty column-name intersection, and schemas that are not
+    identical.  ``None`` otherwise.
+    """
+    from astropy.io.fits.hdu.table import _TableLikeHDU
+
+    from data_lake.io.fits_read import _hdu_rows
+
+    tables = [
+        hdu for hdu in hdul
+        if isinstance(hdu, _TableLikeHDU) and _hdu_rows(hdu) > 0 and hdu.columns is not None
+    ]
+    if len(tables) < 2:
+        return None
+    n0 = _hdu_rows(tables[0])
+    if any(_hdu_rows(h) != n0 for h in tables[1:]):
+        return None
+    maps = [_col_name_map(c.name for c in hdu.columns) for hdu in tables]
+    shared = set(maps[0])
+    for m in maps[1:]:
+        shared &= set(m)
+    if not shared:
+        return None
+    names0 = [c.name.strip().upper() for c in tables[0].columns]
+    if all([c.name.strip().upper() for c in h.columns] == names0 for h in tables[1:]):
+        return None
+    labels = ", ".join(_hdu_ext_label(h) for h in tables)
+    keys = ", ".join(sorted(maps[0][k] for k in shared))
+    return (
+        f"Table HDUs {labels} share columns ({keys}) and {n0} rows each; "
+        "use dl-ingest-catalog-mef to join them horizontally. "
+        "--hdu all stacks rows and requires identical column names."
+    )
+
+
+def read_joined_catalog_hdus(
+    path: Path | str,
+    *,
+    extensions: Sequence[str] | None = None,
+    key_cols: Sequence[str] | None = None,
+    fits_read_policy=None,
+) -> tuple[pa.Table, tuple[str, ...]]:
+    """Horizontally join row-aligned FITS table extensions.
+
+    Default: every non-empty table HDU, file order.  *extensions* is a list of
+    ``--hdu`` specs (index, EXTNAME, or EXTNAME,EXTVER); at least two required.
+    Shared columns are the case-insensitive name intersection, optionally
+    narrowed by *key_cols*.  Those values must match row by row (FITS strings
+    compared stripped).  Shared columns are kept from the first HDU only.
+
+    Returns ``(table, extension_labels)``.
+    """
+    from astropy.table import Table
+
+    from data_lake.io.fits_read import (
+        FitsReadPolicy,
+        HDU_ALL,
+        _describe_hdus,
+        open_fits,
+        resolve_memmap,
+        resolve_table_hdus,
+    )
+
+    path = Path(path)
+    policy = fits_read_policy or FitsReadPolicy.from_env()
+    where = f" in {path.name}"
+    with open_fits(path, policy) as hdul:
+        if extensions:
+            indices: list[int] = []
+            for spec in extensions:
+                hit = resolve_table_hdus(hdul, spec, source=path.name)
+                for idx in hit:
+                    if idx not in indices:
+                        indices.append(idx)
+        else:
+            indices = resolve_table_hdus(hdul, HDU_ALL, source=path.name)
+        if len(indices) < 2:
+            raise ValueError(
+                f"Joined catalog ingest needs ≥2 table HDUs{where}; "
+                f"found {len(indices)}. HDUs: {_describe_hdus(hdul)}"
+            )
+
+        labels = tuple(_hdu_ext_label(hdul[i]) for i in indices)
+        n_rows = [int(hdul[i].header.get("NAXIS2", 0) or 0) for i in indices]
+        if len(set(n_rows)) != 1:
+            detail = ", ".join(f"{lab}={n}" for lab, n in zip(labels, n_rows, strict=True))
+            raise ValueError(
+                f"Joined catalog ingest requires the same row count in every "
+                f"selected HDU{where}; got {detail}."
+            )
+
+        col_maps = [_col_name_map(c.name for c in hdul[i].columns) for i in indices]
+        intersection = set(col_maps[0])
+        for m in col_maps[1:]:
+            intersection &= set(m)
+
+        if key_cols:
+            wanted = [c.strip() for c in key_cols if c.strip()]
+            if not wanted:
+                raise ValueError("--key-cols is empty.")
+            shared_upper: list[str] = []
+            for name in wanted:
+                key = name.upper()
+                missing = [
+                    labels[j] for j, m in enumerate(col_maps) if key not in m
+                ]
+                if missing:
+                    raise ValueError(
+                        f"--key-cols {name!r} not in HDU(s) {', '.join(missing)}{where}."
+                    )
+                shared_upper.append(key)
+            extra = sorted(intersection - set(shared_upper))
+            if extra:
+                shown = ", ".join(col_maps[0][k] for k in extra[:10])
+                raise ValueError(
+                    f"Non-key column(s) {shown} appear on more than one HDU{where}. "
+                    "Pass them in --key-cols, rename, or drop the extra copies."
+                )
+        else:
+            if not intersection:
+                raise ValueError(
+                    f"Selected table HDUs{where} share no column names "
+                    f"({', '.join(labels)}). Cannot join."
+                )
+            shared_upper = [u for u in col_maps[0] if u in intersection]
+
+        astropy_tables: list[Table] = []
+        for idx in indices:
+            hdu = hdul[idx]
+            if _is_packed_vector_bintable(hdu):
+                astropy_tables.append(_read_packed_vector_fits(path, hdu_index=idx))
+            else:
+                astropy_tables.append(
+                    Table.read(
+                        hdul, hdu=idx, format="fits",
+                        memmap=resolve_memmap(path, policy),
+                    )
+                )
+
+        first = astropy_tables[0]
+        first_map = _col_name_map(first.colnames)
+        shared_orig = [first_map[u] for u in shared_upper]
+        for j, tbl in enumerate(astropy_tables[1:], start=1):
+            other_map = _col_name_map(tbl.colnames)
+            for u, orig in zip(shared_upper, shared_orig, strict=True):
+                other_name = other_map[u]
+                bad = _first_mismatch_row(first[orig], tbl[other_name])
+                if bad is not None:
+                    raise ValueError(
+                        f"Shared column {orig!r} differs at row {bad} between "
+                        f"{labels[0]} and {labels[j]}{where}."
+                    )
+
+        keep_upper = set(shared_upper)
+        parts: list[pa.Table] = [_astropy_table_to_arrow(first)]
+        used_upper = {n.strip().upper() for n in parts[0].schema.names}
+        for tbl, lab in zip(astropy_tables[1:], labels[1:], strict=True):
+            drop = [n for n in tbl.colnames if n.strip().upper() in keep_upper]
+            rest = tbl[ [n for n in tbl.colnames if n not in drop] ] if drop else tbl
+            arrow = _astropy_table_to_arrow(rest)
+            collisions = [
+                n for n in arrow.schema.names if n.strip().upper() in used_upper
+            ]
+            if collisions:
+                raise ValueError(
+                    f"Column(s) {collisions[:10]} from HDU {lab} collide with "
+                    f"an earlier extension{where}."
+                )
+            parts.append(arrow)
+            used_upper.update(n.strip().upper() for n in arrow.schema.names)
+
+        joined = parts[0]
+        for extra in parts[1:]:
+            for name in extra.schema.names:
+                joined = joined.append_column(name, extra.column(name))
+        log.info(
+            "Joined %s HDUs %s → %d rows × %d columns",
+            path.name, "+".join(labels), joined.num_rows, joined.num_columns,
+        )
+        return joined, labels
+
+
 def _is_packed_vector_bintable(hdu) -> bool:
     """True when the table is one FITS row of long per-column vectors (GALEX photoobjall)."""
     from astropy.io.fits.hdu.table import _TableLikeHDU
@@ -2673,6 +2918,47 @@ def _ingest_catalog_dispatch(
 
     table = _read_source_table(source_path, fits_read_policy=fits_read_policy)
     log.info("Loaded %d rows × %d columns", len(table), len(table.schema))
+    ingest_catalog_table(
+        table,
+        catalog_root,
+        survey_name,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        norder=norder,
+        link_id_col=link_id_col,
+        tile_mode=resolved_tile_mode,
+        on_duplicate_id=on_duplicate_id,
+        columns=columns,
+        parquet_options=pq_opts,
+        allow_incomplete_link_id=allow_incomplete_link_id,
+        defer_finalize=defer_finalize,
+        lifecycle=lifecycle,
+        set_columns=set_columns,
+    )
+
+
+def ingest_catalog_table(
+    table: pa.Table,
+    catalog_root: Path,
+    survey_name: str,
+    *,
+    ra_col: str,
+    dec_col: str,
+    norder: int,
+    link_id_col: str | None,
+    tile_mode: TileMode,
+    on_duplicate_id: DuplicateIdMode = "skip",
+    columns: Sequence[str] | None = None,
+    parquet_options: CatalogParquetOptions | None = None,
+    allow_incomplete_link_id: bool = False,
+    defer_finalize: bool = False,
+    lifecycle: str | None = None,
+    set_columns: dict[str, pa.Scalar] | None = None,
+) -> None:
+    """Write an in-memory catalog table to HATS tiles (no FITS I/O)."""
+    catalog_root = Path(catalog_root)
+    catalog_root.mkdir(parents=True, exist_ok=True)
+    pq_opts = parquet_options or CatalogParquetOptions()
 
     table = _apply_set_columns(table, set_columns or {})
     table, sid_mode = ensure_catalog_source_ids(
@@ -2713,7 +2999,7 @@ def _ingest_catalog_dispatch(
         if _write_tile_for_mode(
             out_file,
             tile_table,
-            tile_mode=resolved_tile_mode,
+            tile_mode=tile_mode,
             on_duplicate_id=on_duplicate_id,
             link_id_col=link_id_col,
             parquet_options=pq_opts,
@@ -2742,6 +3028,72 @@ def _ingest_catalog_dispatch(
         set_columns=set_columns,
     )
     log.info("Catalog written to %s", catalog_root)
+
+
+def ingest_catalog_mef(
+    source_path: Path | str,
+    output_root: Path | str,
+    survey_name: str,
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    norder: int = 5,
+    link_id_col: str | None = None,
+    tile_mode: TileMode | None = None,
+    on_duplicate_id: DuplicateIdMode = "skip",
+    columns: Sequence[str] | None = None,
+    parquet_options: CatalogParquetOptions | None = None,
+    compact: bool = False,
+    allow_incomplete_link_id: bool = False,
+    fits_memmap: str = "auto",
+    extensions: Sequence[str] | None = None,
+    key_cols: Sequence[str] | None = None,
+) -> None:
+    """Ingest a row-aligned multi-extension FITS catalog (horizontal join).
+
+    Table extensions are joined on shared columns; see
+    :func:`read_joined_catalog_hdus`.  Tiles are written with
+    :func:`ingest_catalog_table`.  *tile_mode* defaults to ``append``.
+    """
+    from data_lake.io.fits_read import catalog_fits_read_policy
+
+    source_path = Path(source_path)
+    output_root = Path(output_root)
+    catalog_root = output_root / "catalogs" / survey_name
+    catalog_root.mkdir(parents=True, exist_ok=True)
+    _remove_stale_parquet_tmp_files(catalog_root)
+    pq_opts = (
+        CatalogParquetOptions.compact()
+        if compact
+        else (parquet_options or CatalogParquetOptions())
+    )
+    resolved_tile_mode: TileMode = tile_mode if tile_mode is not None else "append"
+    policy = catalog_fits_read_policy(fits_memmap, None)
+    table, labels = read_joined_catalog_hdus(
+        source_path,
+        extensions=extensions,
+        key_cols=key_cols,
+        fits_read_policy=policy,
+    )
+    spec = joined_fits_hdu_spec(labels)
+    new_survey = check_fits_hdu_provenance(catalog_root, spec)
+    try:
+        ingest_catalog_table(
+            table,
+            catalog_root,
+            survey_name,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            norder=norder,
+            link_id_col=link_id_col,
+            tile_mode=resolved_tile_mode,
+            on_duplicate_id=on_duplicate_id,
+            columns=columns,
+            parquet_options=pq_opts,
+            allow_incomplete_link_id=allow_incomplete_link_id,
+        )
+    finally:
+        if new_survey:
+            record_fits_hdu(catalog_root, spec)
 
 
 def catalog_table_to_tile_batches(
@@ -3354,6 +3706,24 @@ def describe_fits_hdu(spec: str | None) -> str:
     return "first table HDU (default)" if spec is None else repr(spec)
 
 
+def _normalize_fits_hdu_record(spec: str | None) -> str | None:
+    """Normalise a stored or requested ``fits_hdu`` value.
+
+    ``join:EXT+EXT`` provenance is stored as-is so commas in ``EXTNAME,EXTVER``
+    are not parsed as a single ``--hdu`` spec.
+    """
+    from data_lake.io.fits_read import parse_hdu_spec
+
+    if spec is None:
+        return None
+    text = str(spec).strip()
+    if not text:
+        return None
+    if text.lower().startswith(JOIN_HDU_PREFIX):
+        return JOIN_HDU_PREFIX + text[len(JOIN_HDU_PREFIX):]
+    return parse_hdu_spec(text)
+
+
 def check_fits_hdu_provenance(catalog_root: Path | str, fits_hdu: str | None) -> bool:
     """Warn when *fits_hdu* differs from the survey's recorded ``fits_hdu``.
 
@@ -3361,8 +3731,6 @@ def check_fits_hdu_provenance(catalog_root: Path | str, fits_hdu: str | None) ->
     creates it and should call :func:`record_fits_hdu` afterwards.  A missing
     key on an existing survey means it was ingested with the default selection.
     """
-    from data_lake.io.fits_read import parse_hdu_spec
-
     info_path = Path(catalog_root) / "catalog_info.json"
     if not info_path.is_file():
         return True
@@ -3371,23 +3739,22 @@ def check_fits_hdu_provenance(catalog_root: Path | str, fits_hdu: str | None) ->
             recorded = json.load(fh).get(CATALOG_INFO_FITS_HDU)
     except (OSError, json.JSONDecodeError):
         return False
-    wanted = parse_hdu_spec(fits_hdu)
-    key = (str(Path(catalog_root).resolve()), recorded, wanted)
-    if parse_hdu_spec(recorded) != wanted and key not in _FITS_HDU_WARNED:
+    wanted = _normalize_fits_hdu_record(fits_hdu)
+    recorded_n = _normalize_fits_hdu_record(recorded)
+    key = (str(Path(catalog_root).resolve()), recorded_n, wanted)
+    if recorded_n != wanted and key not in _FITS_HDU_WARNED:
         _FITS_HDU_WARNED.add(key)
         log.warning(
             "Survey %s was ingested with --hdu %s; this run uses --hdu %s. "
             "Rows from different FITS extensions will be mixed in one survey.",
-            Path(catalog_root).name, describe_fits_hdu(recorded), describe_fits_hdu(wanted),
+            Path(catalog_root).name, describe_fits_hdu(recorded_n), describe_fits_hdu(wanted),
         )
     return False
 
 
 def record_fits_hdu(catalog_root: Path | str, fits_hdu: str | None) -> None:
     """Store a non-default ``fits_hdu`` in ``catalog_info.json`` (no-op otherwise)."""
-    from data_lake.io.fits_read import parse_hdu_spec
-
-    spec = parse_hdu_spec(fits_hdu)
+    spec = _normalize_fits_hdu_record(fits_hdu)
     info_path = Path(catalog_root) / "catalog_info.json"
     if spec is None or not info_path.is_file():
         return

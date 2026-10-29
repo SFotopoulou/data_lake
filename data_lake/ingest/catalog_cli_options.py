@@ -66,6 +66,7 @@ except ImportError:
     allow_incomplete_link_id_option = None  # type: ignore[assignment]
     from_list_tile_mode_option = None  # type: ignore[assignment]
     batch_tile_mode_option = None  # type: ignore[assignment]
+    tile_mode_option = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------

@@ -119,6 +119,44 @@ A non-default selection is recorded as `fits_hdu` in `catalog_info.json` (and in
 different `--hdu` logs a warning but still runs, since mixing extensions may be
 intended.
 
+### Joined-extension catalogs (`dl-ingest-catalog-mef`)
+
+`--hdu all` **stacks rows**. It needs the same column names in every table
+HDU. Files such as FastSpec (`METADATA` + `SPECPHOT` + `FASTSPEC`) are the
+other shape: the same objects in the same order, a few shared key columns,
+coordinates on one extension, measurements on the others.
+
+`dl-ingest-catalog-mef` joins those extensions **horizontally** into one
+table, then writes tiles with the usual catalog path. It is not a FastSpec
+reader: any MEF whose table HDUs share columns and the same row count uses it.
+
+Join rule:
+
+- Default: every non-empty table HDU, file order. Repeatable `--hdu NAME`
+  restricts the set (at least two).
+- Every selected HDU must have the same row count.
+- Shared columns are the case-insensitive name intersection (at least one).
+  `--key-cols` narrows that set; any other name that still appears on more
+  than one HDU is an error.
+- Shared values must match row by row (FITS strings compared stripped).
+- Shared columns are kept from the first HDU; remaining columns are appended.
+  Vector columns (e.g. length-5 `COEFF`) stay as they are.
+
+There is no streaming path. One file, or `--file-list` (sequential; default
+`--tile-mode append` so the list accumulates into one survey). Provenance is
+recorded as `fits_hdu: "join:METADATA+SPECPHOT+FASTSPEC"` (the extensions
+actually used).
+
+```bash
+dl-ingest-catalog-mef data/spectroscopy/fastspec-iron-cmx-other.fits \
+  --survey FASTSPEC_IRON --ra-col RA --dec-col DEC \
+  --link-id-col TARGETID,SURVEY,PROGRAM
+```
+
+`dl-check-fits-table-format` hints at this command when table HDUs share
+columns and `NAXIS2` but the schemas are not identical. Use `--hdu all` only
+when the extensions really are the same table stacked.
+
 ### Concatenate FITS shards (pre-ingest)
 
 Some surveys ship as **many small row-normal BINTABLE files** in one directory
