@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
@@ -38,6 +39,8 @@ class FitsTableFormatReport:
     est_source_count: int | None = None
     ingest_path: str | None = None
     hint: str | None = None
+    #: Astropy FITS warnings for this file (truncation, and similar), one string each.
+    warnings: tuple[str, ...] = ()
     error: str | None = None
 
 
@@ -51,6 +54,37 @@ def _human_size(n_bytes: int | None) -> str:
     if n_bytes >= 1024:
         return f"{n_bytes / 1024:.1f} KiB"
     return f"{n_bytes} B"
+
+
+def _unique_warning_texts(caught: Sequence[warnings.WarningMessage]) -> tuple[str, ...]:
+    seen: list[str] = []
+    for item in caught:
+        text = str(item.message).strip()
+        if text and text not in seen:
+            seen.append(text)
+    return tuple(seen)
+
+
+def _truncation_warning(path: Path, hdul, on_disk: int) -> str | None:
+    """Header-claimed file size vs bytes on disk.
+
+    Astropy only warns when something seeks past EOF, which a header-only
+    probe often never does. Compare ``datLoc + datSpan`` ourselves so a short
+    file is reported with its path.
+    """
+    expected = 0
+    for hdu in hdul:
+        info = hdu.fileinfo()
+        if not info:
+            continue
+        end = int(info.get("datLoc") or 0) + int(info.get("datSpan") or 0)
+        expected = max(expected, end)
+    if expected > on_disk:
+        return (
+            "File may have been truncated: actual file length "
+            f"({on_disk}) is smaller than the expected size ({expected}) ({path})"
+        )
+    return None
 
 
 def inspect_fits_table_format(
@@ -89,19 +123,31 @@ def inspect_fits_table_format(
         from data_lake.io.fits_read import FitsReadPolicy, open_fits, resolve_table_hdus
 
         policy = FitsReadPolicy.for_sniff(fits_hdu)
-        with open_fits(path, policy) as hdul:
-            indices = resolve_table_hdus(hdul, policy.table_hdu, source=path.name)
-            check_hdu_columns_match(hdul, indices, source=path.name)
-            n_tables = sum(1 for h in hdul if isinstance(h, _TableLikeHDU))
-            hdu = hdul[indices[0]]
-            packed = any(_is_packed_vector_bintable(hdul[i]) for i in indices)
-            naxis2 = sum(int(hdul[i].header.get("NAXIS2", 0)) for i in indices)
-            n_columns = len(hdu.columns) if hdu.columns is not None else 0
-            counts = [
-                estimate_bintable_source_count(hdul[i], packed=_is_packed_vector_bintable(hdul[i]))
-                for i in indices
-            ]
-            est_sources = None if any(c is None for c in counts) else sum(counts)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with open_fits(path, policy) as hdul:
+                indices = resolve_table_hdus(hdul, policy.table_hdu, source=path.name)
+                check_hdu_columns_match(hdul, indices, source=path.name)
+                n_tables = sum(1 for h in hdul if isinstance(h, _TableLikeHDU))
+                hdu = hdul[indices[0]]
+                packed = any(_is_packed_vector_bintable(hdul[i]) for i in indices)
+                naxis2 = sum(int(hdul[i].header.get("NAXIS2", 0)) for i in indices)
+                n_columns = len(hdu.columns) if hdu.columns is not None else 0
+                counts = [
+                    estimate_bintable_source_count(
+                        hdul[i], packed=_is_packed_vector_bintable(hdul[i]),
+                    )
+                    for i in indices
+                ]
+                est_sources = None if any(c is None for c in counts) else sum(counts)
+                fits_warnings = _unique_warning_texts(caught)
+                short = _truncation_warning(path, hdul, size)
+                if short is not None and not any("truncated" in w.lower() for w in fits_warnings):
+                    fits_warnings = (*fits_warnings, short)
+                label = str(path)
+                fits_warnings = tuple(
+                    w if label in w else f"{w} ({label})" for w in fits_warnings
+                )
             if packed:
                 fmt = "packed-vector"
                 ingest_path = "fitsio column-by-column (slow; all columns read)"
@@ -135,6 +181,7 @@ def inspect_fits_table_format(
                 est_source_count=est_sources,
                 ingest_path=ingest_path,
                 hint=hint,
+                warnings=fits_warnings,
             )
     except Exception as exc:
         return FitsTableFormatReport(
@@ -191,6 +238,8 @@ def format_report_text(rep: FitsTableFormatReport) -> str:
         lines.append(f"  ingest:     {rep.ingest_path}")
     if rep.hint:
         lines.append(f"  hint:       {rep.hint}")
+    for warning in rep.warnings:
+        lines.append(f"  warning:    {warning}")
     return "\n".join(lines)
 
 
@@ -207,6 +256,7 @@ def format_summary_text(reports: Sequence[FitsTableFormatReport]) -> str:
     packed = sum(1 for r in reports if r.format == "packed-vector")
     standard = sum(1 for r in reports if r.format == "standard-bintable")
     errors = sum(1 for r in reports if not r.ok)
+    n_warnings = sum(1 for r in reports if r.warnings)
     total_bytes = sum(r.file_size_bytes for r in reports if r.file_size_bytes is not None)
     sized = sum(1 for r in reports if r.file_size_bytes is not None)
     sources_known = [r for r in reports if r.est_source_count is not None]
@@ -214,8 +264,13 @@ def format_summary_text(reports: Sequence[FitsTableFormatReport]) -> str:
 
     parts = [
         f"Summary: {len(reports)} file(s); "
-        f"{standard} standard-bintable, {packed} packed-vector, {errors} error(s).",
+        f"{standard} standard-bintable, {packed} packed-vector, {errors} error(s), "
+        f"{n_warnings} with FITS warning(s).",
     ]
+    if n_warnings:
+        parts.append(
+            "Header source counts for warned files can be larger than the bytes on disk."
+        )
     if sized:
         parts.append(f"Total size: {_human_size(total_bytes)} ({sized} file(s)).")
     if sources_known:
@@ -273,7 +328,7 @@ try:
             if summary and len(reports) > 1:
                 click.echo(format_summary_text(reports))
 
-        sys.exit(0 if all(r.ok for r in reports) else 1)
+        sys.exit(0 if all(r.ok and not r.warnings for r in reports) else 1)
 
 except ImportError:
     cli = None  # type: ignore[misc, assignment]

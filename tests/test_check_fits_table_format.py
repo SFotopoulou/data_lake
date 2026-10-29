@@ -109,6 +109,7 @@ class TestInspectFitsTableFormat:
         assert "2 file(s)" in summary
         assert "Total size:" in summary
         assert "Total sources (est.): 5" in summary
+        assert "0 with FITS warning" in summary
 
         if cli is None:
             pytest.skip("click not installed")
@@ -120,3 +121,32 @@ class TestInspectFitsTableFormat:
         assert result2.exit_code == 0
         assert "Total sources (est.): 5" in result2.output
         assert "Total size:" in result2.output
+
+    def test_truncated_file_names_the_path(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.ingest.check_fits_table_format import cli, format_report_text
+
+        path = tmp_path / "short.fits"
+        _write_standard_fits(
+            Table({"id": list(range(5000)), "ra": [1.0] * 5000, "dec": [2.0] * 5000}),
+            path,
+        )
+        data = path.read_bytes()
+        path.write_bytes(data[: len(data) // 2])
+
+        rep = inspect_fits_table_format(path)
+        assert rep.ok
+        assert rep.warnings
+        assert any("truncated" in w.lower() for w in rep.warnings)
+        assert str(path) in rep.warnings[0]
+        text = format_report_text(rep)
+        assert text.startswith(str(path))
+        assert "warning:" in text
+
+        if cli is None:
+            pytest.skip("click not installed")
+        result = CliRunner().invoke(cli, [str(path), "--no-summary"])
+        assert result.exit_code == 1
+        assert str(path) in result.output
+        assert "truncated" in result.output.lower()

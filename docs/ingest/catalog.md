@@ -56,6 +56,7 @@ and reports how the lake will read each file:
 | `sources` | Estimated source count from `NAXIS2` or `TDIMn` |
 | `file size` | On-disk bytes (useful for parallel worker RAM planning) |
 | `ingest` | Fast memmap/streaming path vs slow column-by-column reader |
+| `warning` | FITS warnings for that file, including a truncated file (on-disk length shorter than the header size). The path is in the message. The command exits 1 when any file warns |
 
 With a file list, the summary line aggregates **total size** and **total estimated
 sources** across all files — use that baseline to verify ingestion completed as
