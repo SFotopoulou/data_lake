@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`dl-check-fits-table-format` flags multi-extension files** — reports `table HDU: 2 (of 3 table HDUs)` with a hint to use `--hdu`; counts are summed over the selected extensions. When table HDUs share columns and `NAXIS2` but not the same schema, the hint is `dl-ingest-catalog-mef` instead of `--hdu all`.
 - **`dl-check-fits-table-format` reports truncated FITS** — Astropy's "file may have been truncated" warning is recorded on that file's report (with the path) instead of printed without a name. A header-only size check catches the same case when Astropy does not seek past EOF. The command exits 1 when any file warns.
 
+### Fixed
+
+- **Catalog `_metadata` and vector columns** — float32 vs float64 inside list columns (FITS vectors such as `COEFF`) is promoted to float64 before `FileMetaData.append_row_groups`. Scalar columns were already promoted; list values were not, so finalize raised `AppendRowGroups requires equal schemas` on `COEFF.list.element`.
+
 ### Changed
 
 - **Streaming catalog ingest reads the same table HDU as the in-memory path** — previously `--streaming` took the first `BINTABLE` while the in-memory reader took the first table HDU of any kind (including ASCII tables); both now use the shared selector.

@@ -2076,19 +2076,42 @@ def _read_catalog_tile(path: Path) -> pa.Table:
     return pq.ParquetFile(str(path)).read()
 
 
+def _canonical_list_type(dtype: pa.DataType, inner: pa.DataType) -> pa.DataType:
+    """Rebuild *dtype* with a new value type, keeping list kind and size."""
+    if pa.types.is_fixed_size_list(dtype):
+        return pa.list_(inner, dtype.list_size)
+    if pa.types.is_large_list(dtype):
+        return pa.large_list(inner)
+    if getattr(pa.types, "is_list_view", lambda _t: False)(dtype):
+        return pa.list_view(inner)
+    return pa.list_(inner)
+
+
 def canonical_arrow_type(dtype: pa.DataType) -> pa.DataType:
-    """Map a column type to the catalog-wide canonical numeric storage type."""
+    """Map a column type to the catalog-wide canonical numeric storage type.
+
+    Scalar floats become float64 and integers int64.  The same rule applies to
+    values inside list / large-list / fixed-size-list columns (FITS vector
+    columns such as ``COEFF``), so one tile cannot store ``list<float>`` while
+    another stores ``list<double>``.
+    """
     if pa.types.is_floating(dtype):
         return pa.float64()
     if pa.types.is_integer(dtype) or pa.types.is_unsigned_integer(dtype):
         return pa.int64()
     if pa.types.is_boolean(dtype):
         return pa.bool_()
-    if pa.types.is_fixed_size_list(dtype):
+    nested = (
+        pa.types.is_fixed_size_list(dtype)
+        or pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or getattr(pa.types, "is_list_view", lambda _t: False)(dtype)
+    )
+    if nested:
         inner = canonical_arrow_type(dtype.value_type)
         if inner.equals(dtype.value_type):
             return dtype
-        return pa.list_(inner, dtype.list_size)
+        return _canonical_list_type(dtype, inner)
     return dtype
 
 
@@ -2123,7 +2146,8 @@ def normalize_catalog_table_types(table: pa.Table) -> pa.Table:
     """Coerce numeric columns to float64 / int64 so multi-file ingest shares one schema.
 
     Survey batches (AllWISE, GALEX, …) often ship the same column as ``E`` (float32)
-    in one FITS file and ``D`` (float64) in another.  Normalizing on ingest avoids
+    in one FITS file and ``D`` (float64) in another.  Vector columns (``COEFF``
+    and similar) do the same inside a list.  Normalizing on ingest avoids
     append failures and stops the first file from locking a narrower Parquet type.
     """
     if table.num_rows == 0:

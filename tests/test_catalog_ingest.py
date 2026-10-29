@@ -913,6 +913,32 @@ class TestNumericTypeNormalization:
         for path in catalog_root.rglob("Npix=*.parquet"):
             assert pq.read_schema(str(path)).field("flux").type == pa.float64()
 
+    def test_metadata_regen_promotes_list_element_float(self, tmp_path: Path) -> None:
+        """COEFF as list<float> vs list<double> must not break _metadata."""
+        from data_lake.ingest.fits_to_parquet import (
+            _regenerate_metadata_from_all_tiles,
+            healpix_dir,
+        )
+
+        catalog_root = tmp_path / "catalogs" / "coeff_mix"
+        norder = 5
+        for npix, value_type in ((100, pa.float32()), (10_500, pa.float64())):
+            tile_dir = catalog_root / healpix_dir(norder, npix)
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            coeff = pa.array([[1.0, 2.0, 3.0, 4.0, 5.0]], type=pa.list_(value_type))
+            tbl = pa.table({
+                "_source_id": pa.array([npix], type=pa.int64()),
+                "COEFF": coeff,
+            })
+            pq.write_table(tbl, tile_dir / f"Npix={npix}.parquet")
+
+        _regenerate_metadata_from_all_tiles(catalog_root)
+        assert (catalog_root / "_metadata").is_file()
+        for path in catalog_root.rglob("Npix=*.parquet"):
+            ctype = pq.read_schema(str(path)).field("COEFF").type
+            assert pa.types.is_list(ctype)
+            assert ctype.value_type == pa.float64()
+
 
 class TestTileMode:
     def _ingest_two(
