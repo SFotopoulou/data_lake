@@ -1289,7 +1289,7 @@ def strip_catalog_column_names(table: pa.Table) -> pa.Table:
     return table
 
 
-_TFORM_REPEAT_RE = re.compile(r"^\d+[A-Za-z]$")
+_TFORM_REPEAT_RE = re.compile(r"^(\d*)([A-Za-z])$")
 
 
 def _squeeze_fits_vector_column(arr: np.ndarray) -> np.ndarray:
@@ -1587,24 +1587,50 @@ def read_joined_catalog_hdus(
         return joined, labels
 
 
+def _tdim_parts(dim) -> list[int]:
+    if not dim:
+        return []
+    return [int(x) for x in str(dim).strip("()").split(",") if x.strip()]
+
+
+def _column_vector_repeat(col) -> int | None:
+    """Numeric TFORM repeat, or None for character columns and odd formats.
+
+    ``nA`` is a fixed string width, not a vector of sources.  A bare ``D`` is
+    repeat 1.  ``TDIM`` ``(N)`` or ``(1, N)`` overrides the repeat when it
+    describes a source-axis vector.
+    """
+    match = _TFORM_REPEAT_RE.match(str(col.format).strip())
+    if match is None or match.group(2).upper() == "A":
+        return None
+    repeat = int(match.group(1) or "1")
+    parts = _tdim_parts(col.dim)
+    if len(parts) >= 2 and parts[1] > 1:
+        return parts[1]
+    if len(parts) == 1 and parts[0] > 1:
+        return parts[0]
+    return repeat
+
+
 def _is_packed_vector_bintable(hdu) -> bool:
-    """True when the table is one FITS row of long per-column vectors (GALEX photoobjall)."""
+    """True when the table is one FITS row of long per-column vectors (GALEX photoobjall).
+
+    Every numeric column must share one repeat ``N > 1`` (the source count).
+    A normal catalog row with ``NAXIS2=1`` is not packed: it has scalar columns
+    (``D``, ``K``, …) and, in tractor files, short per-object vectors of
+    different widths (``5E``, ``8E``, ``25E``) plus ``nA`` strings.
+    """
     from astropy.io.fits.hdu.table import _TableLikeHDU
 
     if not isinstance(hdu, _TableLikeHDU) or hdu.columns is None:
         return False
     if int(hdu.header.get("NAXIS2", 0)) != 1:
         return False
-    for col in hdu.columns:
-        fmt = str(col.format).strip()
-        if _TFORM_REPEAT_RE.match(fmt):
-            return True
-        dim = col.dim
-        if dim:
-            parts = [int(x) for x in str(dim).strip("()").split(",") if x.strip()]
-            if len(parts) >= 2 and parts[1] > 1:
-                return True
-    return False
+    repeats = [
+        repeat for col in hdu.columns
+        if (repeat := _column_vector_repeat(col)) is not None
+    ]
+    return bool(repeats) and min(repeats) > 1 and len(set(repeats)) == 1
 
 
 def estimate_bintable_source_count(hdu, *, packed: bool | None = None) -> int | None:
@@ -1616,19 +1642,12 @@ def estimate_bintable_source_count(hdu, *, packed: bool | None = None) -> int | 
         return n if n > 0 else None
     if hdu.columns is None:
         return None
-    for col in hdu.columns:
-        fmt = str(col.format).strip()
-        if _TFORM_REPEAT_RE.match(fmt):
-            repeat = int(re.match(r"^(\d+)", fmt).group(1))  # type: ignore[union-attr]
-            if repeat > 0:
-                return repeat
-        dim = col.dim
-        if dim:
-            parts = [int(x) for x in str(dim).strip("()").split(",") if x.strip()]
-            if len(parts) >= 2 and parts[1] > 1:
-                return parts[1]
-            if len(parts) == 1 and parts[0] > 1:
-                return parts[0]
+    repeats = {
+        repeat for col in hdu.columns
+        if (repeat := _column_vector_repeat(col)) is not None and repeat > 1
+    }
+    if len(repeats) == 1:
+        return repeats.pop()
     return None
 
 
@@ -1651,7 +1670,12 @@ def _read_packed_vector_fits(path: Path, *, hdu_index: int) -> Table:
     with fitsio.FITS(str(path)) as fits:
         hdu = fits[hdu_index]
         for name in hdu.get_colnames():
-            cols[name.strip()] = _squeeze_fits_vector_column(hdu[name][:])
+            arr = _squeeze_fits_vector_column(hdu[name][:])
+            if getattr(arr, "ndim", 0) == 0:
+                arr = np.reshape(arr, (1,))
+            cols[name.strip()] = arr
+    if not cols:
+        raise ValueError(f"Packed FITS {path.name} HDU {hdu_index} has no columns.")
     n = len(next(iter(cols.values())))
     for name, arr in cols.items():
         if len(arr) != n:

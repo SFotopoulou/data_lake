@@ -1184,6 +1184,40 @@ class TestPackedVectorFits:
         assert tbl.num_rows == n
         assert tbl.column("objid")[0].as_py() == 1000
 
+    def test_one_source_row_with_short_vectors_is_not_packed(self, tmp_path: Path) -> None:
+        """NAXIS2=1 tractor brick: scalars plus 5E/8E cells, not a GALEX packed table."""
+        from astropy.io import fits
+
+        from data_lake.ingest.fits_to_parquet import (
+            _is_packed_vector_bintable,
+            _read_fits_catalog_arrow,
+            estimate_bintable_source_count,
+        )
+
+        cols = [
+            fits.Column(name="brickname", format="8A", array=np.array(["2393m415"])),
+            fits.Column(name="ra", format="D", array=np.array([239.3])),
+            fits.Column(name="dec", format="D", array=np.array([-41.5])),
+            fits.Column(name="dchisq", format="5E", array=np.arange(5, dtype=np.float32).reshape(1, 5)),
+            fits.Column(name="apflux_g", format="8E", array=np.arange(8, dtype=np.float32).reshape(1, 8)),
+        ]
+        path = tmp_path / "tractor_one.fits"
+        fits.HDUList([
+            fits.PrimaryHDU(),
+            fits.BinTableHDU.from_columns(cols, name="CATALOG"),
+        ]).writeto(path, overwrite=True)
+
+        with fits.open(path) as hdul:
+            hdu = hdul[1]
+            assert not _is_packed_vector_bintable(hdu)
+            assert estimate_bintable_source_count(hdu) == 1
+
+        table = _read_fits_catalog_arrow(path)
+        assert table.num_rows == 1
+        assert table.schema.field("dchisq").type.list_size == 5
+        assert table.schema.field("apflux_g").type.list_size == 8
+        assert table.column("ra")[0].as_py() == 239.3
+
 
 # ---------------------------------------------------------------------------
 # --set-column: parse_set_column_spec

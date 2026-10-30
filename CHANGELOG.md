@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Catalog `_metadata` and vector columns** — float32 vs float64 inside list columns (FITS vectors such as `COEFF`) is promoted to float64 before `FileMetaData.append_row_groups`. Scalar columns were already promoted; list values were not, so finalize raised `AppendRowGroups requires equal schemas` on `COEFF.list.element`.
+- **One-row tractor catalogs are not packed-vector** — `NAXIS2=1` with short per-object vectors (`5E`, `8E`) and `nA` strings (a Legacy Survey brick with a single source) was read as a GALEX/colfits column-store. The packed reader then raised `TypeError: len() of unsized object` on a scalar column. Packed layout is now only when every numeric column shares one repeat greater than 1.
 
 ### Changed
 
