@@ -629,6 +629,82 @@ class TestExtractSubsetToZarr:
         assert result.exit_code != 0
         assert "must be a .fits file" in (result.output or str(result.exception))
 
+    def test_cli_rejects_where_and_target_list(self, synthetic_lake: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.spectra_subset import cli
+
+        ids_file = synthetic_lake / "ids_conflict.txt"
+        ids_file.write_text("101\n")
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--survey", SURVEY,
+                "--target-list", str(ids_file),
+                "--where", "SPECTYPE = 'STAR'",
+                "--lake-root", str(synthetic_lake),
+                "--output", str(synthetic_lake / "conflict.zarr"),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "not both" in result.output
+
+    def test_cli_where_limit(self, synthetic_lake: Path) -> None:
+        from click.testing import CliRunner
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from data_lake.export.spectra_subset import cli
+        from data_lake.ingest.fits_to_parquet import healpix_dir
+
+        cat_root = synthetic_lake / "catalogs" / SURVEY
+        by_tile: dict[int, list[tuple[int, str]]] = {}
+        spectype = {101: "STAR", 102: "GALAXY", 103: "STAR", 201: "STAR", 202: "QSO"}
+        for sid, ra, dec, _z in SOURCES:
+            npix = int(assign_healpix(np.array([ra]), np.array([dec]), NORDER)[0])
+            by_tile.setdefault(npix, []).append((sid, spectype[sid]))
+        for npix, rows in by_tile.items():
+            tile_dir = cat_root / healpix_dir(NORDER, npix)
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            sids = [r[0] for r in rows]
+            types = [r[1] for r in rows]
+            pq.write_table(
+                pa.table({
+                    "TARGETID": pa.array(sids, type=pa.int64()),
+                    LAKE_JOIN_ID_COLUMN: pa.array(sids, type=pa.int64()),
+                    "SPECTYPE": pa.array(types, type=pa.string()),
+                    f"_healpix_norder{NORDER}": pa.array([npix] * len(sids), type=pa.int64()),
+                    "_spectrum_index": pa.array(range(len(sids)), type=pa.int64()),
+                }),
+                tile_dir / f"Npix={npix}.parquet",
+            )
+        (cat_root / "catalog_info.json").write_text(
+            json.dumps({
+                "hats_order": NORDER,
+                "link_id_mode": "column:TARGETID",
+                "link_id_column": LAKE_JOIN_ID_COLUMN,
+                "native_id_column": "TARGETID",
+            })
+        )
+
+        out = synthetic_lake / "where_stars.parquet"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--survey", SURVEY,
+                "--where", "SPECTYPE = 'STAR'",
+                "--limit", "2",
+                "--lake-root", str(synthetic_lake),
+                "--format", "parquet",
+                "--output", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert out.is_file()
+        tbl = pq.read_table(out)
+        assert tbl.num_rows == 2
+
     def test_deduplicates_input(self, synthetic_lake: Path):
         """Duplicate requested IDs collapse to one output row."""
         from data_lake.io.spectra import SpectrumAccessor

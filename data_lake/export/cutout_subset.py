@@ -50,9 +50,22 @@ try:
         help="Survey name (must match the ingested directory under cutouts/).",
     )
     @click.option(
-        "--target-list", "target_list", required=True,
+        "--target-list", "target_list", required=False, default=None,
         type=click.Path(exists=True, dir_okay=False, path_type=Path),
-        help="File of source IDs to extract (FITS / CSV / Parquet / plain-text int).",
+        help="File of source IDs to extract (FITS / CSV / Parquet / plain-text int). "
+             "Mutually exclusive with --where.",
+    )
+    @click.option(
+        "--where", "where_sql", default=None,
+        help=(
+            "DuckDB boolean expression over the survey catalog "
+            "(e.g. \"upper(trim(SPECTYPE)) = 'STAR'\"). "
+            "Mutually exclusive with --target-list."
+        ),
+    )
+    @click.option(
+        "--limit", "row_limit", type=int, default=None,
+        help="Maximum cutouts to extract after --where (or from --target-list).",
     )
     @click.option(
         "--target-id-col", default="_source_id", show_default=True,
@@ -112,7 +125,9 @@ try:
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         survey_name: str,
-        target_list: Path,
+        target_list: Path | None,
+        where_sql: str | None,
+        row_limit: int | None,
         target_id_col: str,
         output_format: str,
         output_path: Path,
@@ -130,8 +145,9 @@ try:
         """Export a curated cutout subset from the lake.
 
         SOURCE IDs may be supplied as a plain-text file (one int per line),
-        FITS / CSV / Parquet with --target-id-col, or a composite spec such
-        as TARGETID,SURVEY,PROGRAM (matched using the same hash as ingest).
+        FITS / CSV / Parquet with --target-id-col, a composite spec such
+        as TARGETID,SURVEY,PROGRAM (matched using the same hash as ingest),
+        or a catalog --where predicate (mutually exclusive with --target-list).
         """
         logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
 
@@ -144,6 +160,20 @@ try:
                 )
             lake_root = cfg.lake.root
 
+        from data_lake.export.row_filter import (
+            CUTOUT_INDEX_COLUMN,
+            load_extract_source_ids,
+        )
+
+        if target_list is not None and where_sql:
+            raise click.UsageError("Use --target-list or --where, not both.")
+        if target_list is None and not where_sql:
+            raise click.UsageError("Pass --target-list or --where.")
+        if where_sql and not with_catalog:
+            raise click.UsageError(
+                "--where requires the survey catalog (do not pass --no-with-catalog)."
+            )
+
         catalog_accessor = None
         if with_catalog:
             try:
@@ -155,6 +185,11 @@ try:
                     catalog_accessor._catalog_root,
                 )
             except FileNotFoundError:
+                if where_sql:
+                    raise click.ClickException(
+                        f"No catalog found for survey {survey_name!r}; "
+                        "--where requires an ingested catalog."
+                    ) from None
                 log.info(
                     "No catalog for survey %r — tile-scan lookup; "
                     "link-id columns will not be embedded.",
@@ -167,12 +202,27 @@ try:
             lake_root, survey_name, catalog_accessor=catalog_accessor,
         )
 
-        source_ids_raw = _read_target_ids(target_list, target_id_col)
+        try:
+            source_ids_raw = load_extract_source_ids(
+                catalog_accessor=catalog_accessor,
+                target_list=target_list,
+                target_id_col=target_id_col,
+                where_sql=where_sql,
+                row_limit=row_limit,
+                index_column=CUTOUT_INDEX_COLUMN,
+                read_target_ids=_read_target_ids,
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
         source_ids = source_ids_raw.tolist()
-        click.echo(
-            f"Loaded {len(source_ids):,} source IDs from {target_list.name} "
-            f"(column: {target_id_col!r})"
-        )
+        if where_sql:
+            click.echo(f"Selected {len(source_ids):,} source IDs via --where")
+        else:
+            assert target_list is not None
+            click.echo(
+                f"Loaded {len(source_ids):,} source IDs from {target_list.name} "
+                f"(column: {target_id_col!r})"
+            )
 
         if output_path.exists() and not overwrite:
             raise click.ClickException(

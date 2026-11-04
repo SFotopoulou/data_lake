@@ -25,6 +25,13 @@ Example
         --format zarr \\
         --output /scratch/qso_subset.zarr
 
+    dl-extract-spectra-subset \\
+        --survey DESI_DR1 \\
+        --where "upper(trim(SPECTYPE)) = 'STAR'" \\
+        --limit 1000 \\
+        --format zarr \\
+        --output /scratch/desi_stars_1000.zarr
+
     dl-extract-spectra-subset ... --format parquet --output /scratch/qso.parquet
     dl-extract-spectra-subset ... --format hdf5 --output /scratch/qso_subset.h5
     dl-extract-spectra-subset ... --format fits --output /scratch/qso_fits/
@@ -175,10 +182,23 @@ try:
         help="Source survey name (must match the ingested directory under spectra/).",
     )
     @click.option(
-        "--target-list", "target_list", required=True,
+        "--target-list", "target_list", required=False, default=None,
         type=click.Path(exists=True, dir_okay=False, path_type=Path),
         help="File containing the source IDs to extract "
-             "(FITS / CSV / Parquet / plain-text).",
+             "(FITS / CSV / Parquet / plain-text). "
+             "Mutually exclusive with --where.",
+    )
+    @click.option(
+        "--where", "where_sql", default=None,
+        help=(
+            "DuckDB boolean expression over the survey catalog "
+            "(e.g. \"upper(trim(SPECTYPE)) = 'STAR'\"). "
+            "Mutually exclusive with --target-list."
+        ),
+    )
+    @click.option(
+        "--limit", "row_limit", type=int, default=None,
+        help="Maximum spectra to extract after --where (or from --target-list).",
     )
     @click.option(
         "--target-id-col", default="TARGETID", show_default=True,
@@ -276,7 +296,9 @@ try:
     @click.option("-v", "--verbose", is_flag=True)
     def cli(
         survey_name: str,
-        target_list: Path,
+        target_list: Path | None,
+        where_sql: str | None,
+        row_limit: int | None,
         target_id_col: str,
         output_format: str,
         output_path: Path,
@@ -298,7 +320,10 @@ try:
         show_progress: bool,
         verbose: bool,
     ) -> None:
-        """Extract a curated subset of spectra (Zarr, Parquet, HDF5, or FITS)."""
+        """Extract a curated subset of spectra (Zarr, Parquet, HDF5, or FITS).
+
+        Pass --target-list or --where (catalog predicate), not both.
+        """
         logging.basicConfig(
             level=logging.DEBUG if verbose else logging.INFO,
             format="[%(asctime)s] %(name)-22s %(levelname)-7s %(message)s",
@@ -342,10 +367,19 @@ try:
                 calibration.output_flux_unit or "scaled",
             )
 
-        log.info("Reading source IDs from %s (column=%s) …", target_list, target_id_col)
-        source_ids = _read_target_ids(target_list, target_id_col)
-        n_unique = int(np.unique(source_ids).size)
-        log.info("Loaded %d source IDs (%d unique).", source_ids.size, n_unique)
+        from data_lake.export.row_filter import (
+            SPECTRUM_INDEX_COLUMN,
+            load_extract_source_ids,
+        )
+
+        if target_list is not None and where_sql:
+            raise click.UsageError("Use --target-list or --where, not both.")
+        if target_list is None and not where_sql:
+            raise click.UsageError("Pass --target-list or --where.")
+        if where_sql and not with_catalog:
+            raise click.UsageError(
+                "--where requires the survey catalog (do not pass --no-with-catalog)."
+            )
 
         catalog_accessor = None
         if with_catalog:
@@ -355,10 +389,39 @@ try:
                 log.info("Using catalog at %s for fast index lookup.",
                          catalog_accessor._catalog_root)
             except FileNotFoundError:
+                if where_sql:
+                    raise click.ClickException(
+                        f"No catalog found for survey {survey_name!r}; "
+                        "--where requires an ingested catalog."
+                    ) from None
                 log.info(
                     "No catalog found for survey %r — using tile-scan lookup.",
                     survey_name,
                 )
+
+        try:
+            source_ids = load_extract_source_ids(
+                catalog_accessor=catalog_accessor,
+                target_list=target_list,
+                target_id_col=target_id_col,
+                where_sql=where_sql,
+                row_limit=row_limit,
+                index_column=SPECTRUM_INDEX_COLUMN,
+                read_target_ids=_read_target_ids,
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+        n_unique = int(np.unique(source_ids).size)
+        if where_sql:
+            log.info(
+                "Selected %d source IDs (%d unique) via --where.",
+                source_ids.size, n_unique,
+            )
+        else:
+            log.info(
+                "Loaded %d source IDs (%d unique) from %s (column=%s).",
+                source_ids.size, n_unique, target_list, target_id_col,
+            )
 
         from data_lake.io.spectra import SpectrumAccessor
 

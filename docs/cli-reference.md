@@ -58,9 +58,9 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-extract-spectra-subset` | Export a curated ID list → flat Zarr / Parquet / HDF5 / FITS; progress on by default (`--no-progress` to disable) |
-| `dl-extract-cutout-subset` | Export a curated cutout ID list → flat Zarr / per-source FITS (with full WCS) / HDF5; `--format zarr\|fits\|hdf5`, `--target-id-col` supports composite specs |
-| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; `--all-columns` for full schema; progress on by default (`--no-progress` to disable) |
+| `dl-extract-spectra-subset` | Export a curated ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / Parquet / HDF5 / FITS; progress on by default (`--no-progress` to disable) |
+| `dl-extract-cutout-subset` | Export a curated cutout ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / per-source FITS (with full WCS) / HDF5; `--format zarr\|fits\|hdf5`, `--target-id-col` supports composite specs |
+| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; `--all-columns` for full schema; `--where` / `--limit` on lake catalogs; progress on by default (`--no-progress` to disable) |
 | `dl-extract-spplate-catalog` | Build a specObj-style catalog from spPlate files |
 | `dl-pack-tile` | Package one HEALPix tile as a `.tar` for sharing |
 

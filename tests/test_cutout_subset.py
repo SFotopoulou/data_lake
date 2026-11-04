@@ -376,3 +376,19 @@ class TestExtractCutoutSubsetCli:
         ])
         assert result.exit_code == 0, result.output
         assert any(out_dir.glob("cutout_*.fits"))
+
+    def test_rejects_where_and_target_list(self, cutout_lake: Path) -> None:
+        from click.testing import CliRunner
+        from data_lake.export.cutout_subset import cli
+
+        ids_file = cutout_lake / "ids_conflict.txt"
+        ids_file.write_text("1001\n")
+        result = CliRunner().invoke(cli, [
+            "--survey", SURVEY,
+            "--target-list", str(ids_file),
+            "--where", "TARGETID > 0",
+            "--output", str(cutout_lake / "conflict.zarr"),
+            "--lake-root", str(cutout_lake),
+        ])
+        assert result.exit_code != 0
+        assert "not both" in result.output

@@ -22,6 +22,10 @@ Example
     dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \\
         -c source_id -c ra -c dec -o desi_sky.parquet
 
+    dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \\
+        -c TARGETID -c Z --where "upper(trim(SPECTYPE)) = 'STAR'" \\
+        --limit 1000 -o desi_stars.parquet
+
     # 290M+ rows: tiled export (bounded RAM, parallel-friendly)
     dl-extract-catalog --lake-root /data/lake --survey GAIA_DR3 \\
         --output-dir /scratch/gaia_sky/ -c source_id -c ra -c dec
@@ -194,6 +198,27 @@ def filter_valid_sky_rows(
 
 def _sql_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def _projected_select_sql(
+    mapping: Sequence[tuple[str, str]],
+    from_sql: str,
+    *,
+    where_sql: str | None = None,
+    extra_predicates: Sequence[str] = (),
+    row_limit: int | None = None,
+) -> str:
+    """``SELECT src AS out FROM … [WHERE user AND extra] [LIMIT n]``."""
+    from data_lake.export.row_filter import compose_where_clause, format_limit
+
+    col_sql = ", ".join(
+        f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping
+    )
+    return (
+        f"SELECT {col_sql} FROM {from_sql}"
+        f"{compose_where_clause(where_sql, extra_predicates)}"
+        f"{format_limit(row_limit)}"
+    )
 
 
 def _read_catalog_tile(
@@ -444,6 +469,8 @@ def stream_extract_from_lake_catalog(
     show_progress: bool = False,
     require_homogenized: bool = False,
     write_homogenize_provenance: bool = True,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> ExtractResult:
     """Stream column projection from lake Parquet tiles without loading the full survey."""
     if output is None and output_dir is None:
@@ -494,6 +521,8 @@ def stream_extract_from_lake_catalog(
                 valid_sky_only=valid_sky_only,
                 ra_col=ra_col,
                 dec_col=dec_col,
+                where_sql=where_sql,
+                row_limit=row_limit,
             )
             return _finalize_lake_extract_result(
                 result,
@@ -520,6 +549,8 @@ def stream_extract_from_lake_catalog(
         ra_col=ra_col,
         dec_col=dec_col,
         show_progress=show_progress,
+        where_sql=where_sql,
+        row_limit=row_limit,
     )
     return _finalize_lake_extract_result(
         result,
@@ -551,7 +582,7 @@ def _duckdb_sky_predicate(
     ra_col: str | None,
     dec_col: str | None,
 ) -> str:
-    dummy = pa.table({out: pa.array([0.0], type=pa.float64()) for _, out in mapping[:1]})
+    dummy = pa.table({out: pa.array([0.0], type=pa.float64()) for _, out in mapping})
     ra_name, dec_name = _resolve_sky_output_names(dummy, ra_col=ra_col, dec_col=dec_col)
     ra_sql = _sql_ident(ra_name)
     dec_sql = _sql_ident(dec_name)
@@ -571,15 +602,21 @@ def _stream_lake_via_duckdb(
     valid_sky_only: bool,
     ra_col: str | None,
     dec_col: str | None,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> ExtractResult:
     import duckdb
 
-    col_sql = ", ".join(
-        f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping
-    )
-    where = ""
+    extra: list[str] = []
     if valid_sky_only:
-        where = f" WHERE {_duckdb_sky_predicate(mapping, ra_col=ra_col, dec_col=dec_col)}"
+        extra.append(_duckdb_sky_predicate(mapping, ra_col=ra_col, dec_col=dec_col))
+    select_sql = _projected_select_sql(
+        mapping,
+        "read_parquet($files, hive_partitioning=false)",
+        where_sql=where_sql,
+        extra_predicates=extra,
+        row_limit=row_limit,
+    )
 
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -601,8 +638,7 @@ def _stream_lake_via_duckdb(
         # Explicit file list avoids hive_partitioning on Norder=/Dir= paths and
         # dodges COPY placeholder ordering quirks with read vs write targets.
         con.execute(
-            f"COPY (SELECT {col_sql} FROM read_parquet($files, hive_partitioning=false)"
-            f"{where}) {copy_to}",
+            f"COPY ({select_sql}) {copy_to}",
             {"files": files, "out": str(output)},
         )
         n_rows = int(
@@ -620,6 +656,68 @@ def _stream_lake_via_duckdb(
     )
 
 
+def _filter_tile_via_duckdb(
+    tile_path: Path,
+    mapping: Sequence[tuple[str, str]],
+    *,
+    where_sql: str | None,
+    row_limit: int | None,
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+    connection,
+) -> pa.Table:
+    extra: list[str] = []
+    if valid_sky_only:
+        extra.append(_duckdb_sky_predicate(mapping, ra_col=ra_col, dec_col=dec_col))
+    sql = _projected_select_sql(
+        mapping,
+        "read_parquet(?, hive_partitioning=false)",
+        where_sql=where_sql,
+        extra_predicates=extra,
+        row_limit=row_limit,
+    )
+    raw = connection.execute(sql, [str(Path(tile_path).resolve())]).arrow()
+    if isinstance(raw, pa.RecordBatchReader):
+        return raw.read_all()
+    return raw
+
+
+def _tile_extract_chunk(
+    tile_path: Path,
+    mapping: Sequence[tuple[str, str]],
+    *,
+    src_cols: Sequence[str],
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+    where_sql: str | None,
+    remaining_limit: int | None,
+    duckdb_con,
+) -> pa.Table:
+    """Project and filter one lake tile (Arrow path, or DuckDB when WHERE/LIMIT)."""
+    if where_sql is not None or remaining_limit is not None:
+        chunk = _filter_tile_via_duckdb(
+            tile_path,
+            mapping,
+            where_sql=where_sql,
+            row_limit=remaining_limit,
+            valid_sky_only=valid_sky_only,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            connection=duckdb_con,
+        )
+        return _canonicalize_column_types(chunk)
+    raw = _canonicalize_column_types(_read_catalog_tile(tile_path, src_cols))
+    return _process_tile_chunk(
+        raw,
+        mapping,
+        valid_sky_only=valid_sky_only,
+        ra_col=ra_col,
+        dec_col=dec_col,
+    )
+
+
 def _iter_lake_extract_chunks(
     catalog_root: Path,
     tiles: Sequence[Path],
@@ -630,6 +728,8 @@ def _iter_lake_extract_chunks(
     ra_col: str | None,
     dec_col: str | None,
     show_progress: bool,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> Iterator[pa.Table]:
     """Yield projected catalog chunks one HEALPix tile at a time."""
     iterator: Iterable[Path] = tiles
@@ -641,17 +741,34 @@ def _iter_lake_extract_chunks(
         except ImportError:
             pass
 
-    for tile_path in iterator:
-        raw = _canonicalize_column_types(_read_catalog_tile(tile_path, src_cols))
-        chunk = _process_tile_chunk(
-            raw,
-            mapping,
-            valid_sky_only=valid_sky_only,
-            ra_col=ra_col,
-            dec_col=dec_col,
-        )
-        if chunk.num_rows > 0:
-            yield chunk
+    duckdb_con = None
+    remaining = row_limit
+    try:
+        if where_sql is not None or remaining is not None:
+            import duckdb
+
+            duckdb_con = duckdb.connect(database=":memory:")
+        for tile_path in iterator:
+            if remaining is not None and remaining <= 0:
+                break
+            chunk = _tile_extract_chunk(
+                tile_path,
+                mapping,
+                src_cols=src_cols,
+                valid_sky_only=valid_sky_only,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                where_sql=where_sql,
+                remaining_limit=remaining,
+                duckdb_con=duckdb_con,
+            )
+            if chunk.num_rows > 0:
+                if remaining is not None:
+                    remaining -= chunk.num_rows
+                yield chunk
+    finally:
+        if duckdb_con is not None:
+            duckdb_con.close()
 
 
 def _csv_cell(value: object) -> str:
@@ -815,6 +932,8 @@ def _stream_lake_tile_by_tile(
     ra_col: str | None,
     dec_col: str | None,
     show_progress: bool,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> ExtractResult:
     chunk_iter = _iter_lake_extract_chunks(
         catalog_root,
@@ -825,6 +944,8 @@ def _stream_lake_tile_by_tile(
         ra_col=ra_col,
         dec_col=dec_col,
         show_progress=show_progress,
+        where_sql=where_sql,
+        row_limit=row_limit,
     )
 
     if output_dir is not None:
@@ -840,23 +961,40 @@ def _stream_lake_tile_by_tile(
                 iterator = tqdm(tiles, unit="tile", desc="extract")
             except ImportError:
                 pass
-        for tile_path in iterator:
-            raw = _canonicalize_column_types(_read_catalog_tile(tile_path, src_cols))
-            chunk = _process_tile_chunk(
-                raw,
-                mapping,
-                valid_sky_only=valid_sky_only,
-                ra_col=ra_col,
-                dec_col=dec_col,
-            )
-            if chunk.num_rows == 0:
-                continue
-            rel = tile_path.relative_to(catalog_root)
-            out_path = output_dir / rel
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            pq.write_table(chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL)
-            n_rows += chunk.num_rows
-            n_written_tiles += 1
+        duckdb_con = None
+        remaining = row_limit
+        try:
+            if where_sql is not None or remaining is not None:
+                import duckdb
+
+                duckdb_con = duckdb.connect(database=":memory:")
+            for tile_path in iterator:
+                if remaining is not None and remaining <= 0:
+                    break
+                chunk = _tile_extract_chunk(
+                    tile_path,
+                    mapping,
+                    src_cols=src_cols,
+                    valid_sky_only=valid_sky_only,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    where_sql=where_sql,
+                    remaining_limit=remaining,
+                    duckdb_con=duckdb_con,
+                )
+                if chunk.num_rows == 0:
+                    continue
+                if remaining is not None:
+                    remaining -= chunk.num_rows
+                rel = tile_path.relative_to(catalog_root)
+                out_path = output_dir / rel
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                pq.write_table(chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL)
+                n_rows += chunk.num_rows
+                n_written_tiles += 1
+        finally:
+            if duckdb_con is not None:
+                duckdb_con.close()
         log.info(
             "Streamed %d row(s) from %d tile(s) → %s",
             n_rows,
@@ -890,6 +1028,8 @@ def _stream_lake_tile_by_tile(
                     ra_col=ra_col,
                     dec_col=dec_col,
                     show_progress=show_progress,
+                    where_sql=where_sql,
+                    row_limit=row_limit,
                 ),
                 tmp_pq,
                 schema=unified_schema,
@@ -919,6 +1059,8 @@ def extract_from_lake_catalog(
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> pa.Table:
     """In-memory lake extract (small catalogs / tests only)."""
     import tempfile
@@ -944,6 +1086,8 @@ def extract_from_lake_catalog(
             ra_col=ra_col,
             dec_col=dec_col,
             engine="tiles",
+            where_sql=where_sql,
+            row_limit=row_limit,
         )
         if result.n_rows == 0:
             return pa.table({out_name: pa.array([], type=pa.float64()) for _, out_name in mapping})
@@ -1189,12 +1333,18 @@ def extract_catalog(
     show_progress: bool = False,
     require_homogenized: bool = False,
     write_homogenize_provenance: bool = True,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> ExtractResult | pa.Table:
     """Extract columns and write output; returns summary or small in-memory table."""
     if all_columns and specs:
         raise ValueError("use all_columns or column specs, not both")
     if not all_columns and not specs:
         raise ValueError("pass column specs or all_columns=True")
+    if (where_sql or row_limit is not None) and lake_root is None:
+        raise ValueError("--where and --limit require --lake-root/--survey")
+    if row_limit is not None and int(row_limit) < 1:
+        raise ValueError("--limit must be a positive integer")
     column_specs: Sequence[str] = specs or ()
 
     if lake_root is not None:
@@ -1218,6 +1368,8 @@ def extract_catalog(
             show_progress=show_progress,
             require_homogenized=require_homogenized,
             write_homogenize_provenance=write_homogenize_provenance,
+            where_sql=where_sql,
+            row_limit=row_limit,
         )
         return result
 
@@ -1335,6 +1487,23 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
 @click.option("--ra-col", default=None, help="RA column for --valid-sky-only (default: auto).")
 @click.option("--dec-col", default=None, help="Dec column for --valid-sky-only (default: auto).")
 @click.option(
+    "--where",
+    "where_sql",
+    default=None,
+    help=(
+        "DuckDB boolean expression over catalog columns "
+        "(lake --survey / --from-product only). "
+        "Example: \"upper(trim(SPECTYPE)) = 'STAR'\"."
+    ),
+)
+@click.option(
+    "--limit",
+    "row_limit",
+    type=int,
+    default=None,
+    help="Maximum rows to write after --where (tile order, no ORDER BY).",
+)
+@click.option(
     "--add-input-path",
     is_flag=True,
     help="Add input_path column when merging multiple catalog files.",
@@ -1371,6 +1540,8 @@ def cli(
     valid_sky_only: bool,
     ra_col: str | None,
     dec_col: str | None,
+    where_sql: str | None,
+    row_limit: int | None,
     add_input_path: bool,
     streaming: bool,
     batch_rows: int,
@@ -1433,6 +1604,19 @@ def cli(
         raise click.ClickException("--streaming is for raw FITS input, not --lake-root.")
     if streaming and len(all_paths) != 1:
         raise click.ClickException("--streaming requires exactly one input FITS file.")
+    if (where_sql or row_limit is not None) and lake_root is None:
+        raise click.ClickException(
+            "--where and --limit apply to lake catalogs (--survey / --from-product) only."
+        )
+    if row_limit is not None and row_limit < 1:
+        raise click.ClickException("--limit must be a positive integer.")
+    if where_sql:
+        from data_lake.export.row_filter import validate_predicate
+
+        try:
+            where_sql = validate_predicate(where_sql)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     fmt: OutputFormat | None = (
         output_format.lower()  # type: ignore[assignment]
@@ -1460,6 +1644,8 @@ def cli(
         show_progress=show_progress,
         require_homogenized=require_homogenized,
         write_homogenize_provenance=not no_homogenize_provenance,
+        where_sql=where_sql,
+        row_limit=row_limit,
     )
 
     if isinstance(result, ExtractResult):

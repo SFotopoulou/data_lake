@@ -48,6 +48,16 @@ dl-extract-spectra-subset \
 # For DESI coadds ingested with the default composite key, pass
 # TARGETID,SURVEY,PROGRAM (not TARGETID alone).
 
+# Filter the ingested catalog instead of building an ID list.
+# ``_spectrum_index >= 0`` is applied automatically so --limit counts readable spectra.
+dl-extract-spectra-subset \
+    --survey DESI_DR1 \
+    --where "upper(trim(SPECTYPE)) = 'STAR'" \
+    --limit 1000 \
+    --format zarr \
+    --output /scratch/desi_stars_1000.zarr \
+    --apply-survey-calibration
+
 # One Parquet file (one row per spectrum; wavelength in file metadata)
 dl-extract-spectra-subset ... --format parquet --output /scratch/qso_subset.parquet
 

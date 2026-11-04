@@ -132,6 +132,103 @@ class TestExtractFromLake:
         assert result.n_rows == 2
         assert set(pq.read_table(out).column_names) == {"source_id", "ra", "dec"}
 
+    def _star_lake(self, tmp_path: Path) -> Path:
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "STARS" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "TARGETID": pa.array([11, 12, 13, 14], type=pa.int64()),
+                "SPECTYPE": pa.array(["STAR", "GALAXY", "STAR", "QSO"], type=pa.string()),
+                "Z": pa.array([0.0, 0.5, 0.0, 1.2], type=pa.float64()),
+                "ra": pa.array([10.0, 11.0, -9999.0, 13.0], type=pa.float64()),
+                "dec": pa.array([0.5, 0.6, -9999.0, 0.8], type=pa.float64()),
+                "_healpix_norder5": pa.array([1, 1, 1, 1], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "STARS" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 4}',
+        )
+        return lake
+
+    def test_where_on_column_not_exported(self, tmp_path: Path) -> None:
+        lake = self._star_lake(tmp_path)
+        out = tmp_path / "stars.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID", "Z"],
+            lake_root=lake,
+            survey="STARS",
+            engine="tiles",
+            where_sql="SPECTYPE = 'STAR'",
+        )
+        assert isinstance(result, ExtractResult)
+        tbl = pq.read_table(out)
+        assert tbl.column_names == ["TARGETID", "Z"]
+        assert tbl.num_rows == 2
+        assert tbl.column("TARGETID").to_pylist() == [11, 13]
+
+    def test_limit(self, tmp_path: Path) -> None:
+        lake = self._star_lake(tmp_path)
+        out = tmp_path / "lim.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID"],
+            lake_root=lake,
+            survey="STARS",
+            engine="tiles",
+            row_limit=2,
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        assert pq.read_table(out).column("TARGETID").to_pylist() == [11, 12]
+
+    def test_limit_with_valid_sky_only(self, tmp_path: Path) -> None:
+        lake = self._star_lake(tmp_path)
+        out = tmp_path / "sky.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID", "ra", "dec"],
+            lake_root=lake,
+            survey="STARS",
+            engine="tiles",
+            valid_sky_only=True,
+            row_limit=2,
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        assert pq.read_table(out).column("TARGETID").to_pylist() == [11, 12]
+
+    def test_where_duckdb_engine(self, tmp_path: Path) -> None:
+        lake = self._star_lake(tmp_path)
+        out = tmp_path / "duck.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID", "Z"],
+            lake_root=lake,
+            survey="STARS",
+            engine="duckdb",
+            where_sql="SPECTYPE = 'STAR'",
+            row_limit=1,
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 1
+        assert pq.read_table(out).column("TARGETID").to_pylist() == [11]
+
+    def test_where_rejects_semicolon(self, tmp_path: Path) -> None:
+        lake = self._star_lake(tmp_path)
+        with pytest.raises(ValueError, match="single boolean"):
+            extract_catalog(
+                output=tmp_path / "bad.parquet",
+                specs=["TARGETID"],
+                lake_root=lake,
+                survey="STARS",
+                engine="tiles",
+                where_sql="SPECTYPE = 'STAR'; SELECT 1",
+            )
+
     def test_homogenized_product_export(self, tmp_path: Path) -> None:
         import json
 
@@ -573,6 +670,24 @@ class TestExtractCatalogCli:
         )
         assert result.exit_code == 0, result.output
         assert pq.read_table(out).column_names == ["ra"]
+
+    def test_cli_rejects_where_on_raw_file(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        cat = tmp_path / "cat.fits"
+        _write_fits_catalog(cat)
+        result = CliRunner().invoke(
+            cli,
+            [
+                str(cat), "-o", str(tmp_path / "out.parquet"),
+                "-c", "TARGETID",
+                "--where", "Z > 0",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "lake catalog" in result.output.lower() or "lake catalogs" in result.output.lower()
 
 
 class TestFilterValidSky:
