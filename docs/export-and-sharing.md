@@ -1,5 +1,66 @@
 # Export and sharing
 
+### Catalog by survey name, then spectra / cutouts
+
+`dl-extract-catalog --survey NAME` reads the ingested lake catalog (not a raw
+file). Keep `_source_id` in the extract: that is the join key for the same
+survey’s spectra and cutouts. For a **partner** survey, positional-match first
+(`dl-crossmatch` or STILTS) and extract with the partner’s `_source_id`
+(`source_id_b` in a match tree).
+
+```bash
+# $DATA_LAKE_CONFIG supplies --lake-root when set
+
+# 1. Catalog from the lake survey name
+dl-extract-catalog --survey DESI_DR1 \
+  -c _source_id -c TARGET_RA -c TARGET_DEC -c SPECTYPE -c Z \
+  --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
+  -o /scratch/desi_stars.parquet
+
+# 2a. Same survey — spectra and cutouts via _source_id
+dl-extract-spectra-subset --survey DESI_DR1 \
+  --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
+  --format zarr --output /scratch/desi_stars.zarr \
+  --apply-survey-calibration
+
+dl-extract-cutout-subset --survey DESI_DR1 \
+  --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
+  --output /scratch/desi_stars_cutouts.zarr
+
+# 2b. Partner survey — positional match, then that survey’s modalities
+dl-extract-catalog --survey EUCLID_DR1 \
+  -c _source_id -c ra -c dec -o /scratch/euclid_sky.parquet
+
+dl-crossmatch DESI_DR1 EUCLID_DR1 "$LAKE" --radius-arcsec 1.0
+# Tree: crossmatch/DESI_DR1_x_EUCLID_DR1__r1.0/  (source_id_a, source_id_b)
+
+duckdb -c "
+COPY (
+  SELECT m.source_id_b
+  FROM read_parquet('/scratch/desi_stars.parquet') s
+  JOIN read_parquet('$LAKE/crossmatch/DESI_DR1_x_EUCLID_DR1__r1.0/**/*.parquet',
+                    hive_partitioning=false) m
+    ON s._source_id = m.source_id_a
+) TO '/scratch/desi_x_euclid.parquet' (FORMAT PARQUET);
+"
+
+dl-extract-cutout-subset --survey EUCLID_DR1 \
+  --target-list /scratch/desi_x_euclid.parquet --target-id-col source_id_b \
+  --output /scratch/euclid_matched_cutouts.zarr
+
+dl-extract-spectra-subset --survey EUCLID_DR1 \
+  --target-list /scratch/desi_x_euclid.parquet --target-id-col source_id_b \
+  --output /scratch/euclid_matched_spectra.zarr
+```
+
+STILTS on the two catalog extracts (`tskymatch2` on `TARGET_RA`/`TARGET_DEC`
+vs `ra`/`dec`) is the same idea when you do not want an in-lake match tree —
+see [Crossmatch](discovery/crossmatch.md#associations-with-stilts).
+
+Worked notebooks: [`02_spectrum_workflow.ipynb`](../notebooks/02_spectrum_workflow.ipynb)
+§6, [`03_cutout_ingest.ipynb`](../notebooks/03_cutout_ingest.ipynb) §6b,
+[`14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb) §8.
+
 ### Extract a curated subset into one flat Zarr
 
 Once spectra are ingested, you can materialise a self-contained Zarr

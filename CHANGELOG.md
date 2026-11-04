@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Catalog-then-modalities examples** — docs and notebooks (`02`, `03`, `14`) show `dl-extract-catalog --survey` then spectra/cutouts via `_source_id` or a positional partner match (`source_id_b`).
 - **Streaming catalog ingest reads the same table HDU as the in-memory path** — previously `--streaming` took the first `BINTABLE` while the in-memory reader took the first table HDU of any kind (including ASCII tables); both now use the shared selector.
 
 ## [0.7.0] - 2026-10-23

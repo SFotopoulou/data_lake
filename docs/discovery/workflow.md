@@ -98,6 +98,34 @@ dl-validate-homogenization --product euclid_north_ab_v1 --transform phot_ab_v1
 dl-validate-homogenization --ab-coverage   # find missing phot_ab_v1 recipes
 ```
 
+## Catalog-first extract (same survey or positional partner)
+
+When you already know the lake survey name, skip the region/gather product and
+pull a catalog, then modalities. Full flags: [Export and sharing](../export-and-sharing.md#catalog-by-survey-name-then-spectra--cutouts).
+
+```bash
+# 1. Catalog from --survey (not a positional file path)
+dl-extract-catalog --survey DESI_DR1 \
+  -c _source_id -c TARGET_RA -c TARGET_DEC -c SPECTYPE -c Z \
+  --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
+  -o /scratch/desi_stars.parquet
+
+# 2a. Same survey: spectra / cutouts join on _source_id
+dl-extract-spectra-subset --survey DESI_DR1 \
+  --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
+  --output /scratch/desi_stars.zarr --apply-survey-calibration
+dl-extract-cutout-subset --survey DESI_DR1 \
+  --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
+  --output /scratch/desi_stars_cutouts.zarr
+
+# 2b. Partner survey: positional match, then partner _source_id (source_id_b)
+dl-crossmatch DESI_DR1 EUCLID_DR1 "$LAKE" --radius-arcsec 1.0
+# join desi_stars._source_id = source_id_a → source_id_b, then:
+dl-extract-cutout-subset --survey EUCLID_DR1 \
+  --target-list /scratch/desi_x_euclid.parquet --target-id-col source_id_b \
+  --output /scratch/euclid_matched_cutouts.zarr
+```
+
 ## Related docs
 
 - [Area plans (`dl-area`)](areas-cli.md) — attach crossmatch/gather/homogenize blocks

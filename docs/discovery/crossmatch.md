@@ -101,6 +101,33 @@ dl-extract-catalog --lake-root /data/lake --survey EUCLID_north_joined \
 # -o writes one merged file; --output-dir writes a HATS tile tree (Parquet only)
 ```
 
+**Catalog then spectra / cutouts.** Extract by **lake survey name** (`--survey`),
+keep `_source_id`, then either pull that survey’s Zarr rows or positional-match
+to a partner and pull *its* rows. See
+[Export and sharing](../export-and-sharing.md#catalog-by-survey-name-then-spectra--cutouts).
+
+```bash
+dl-extract-catalog --survey DESI_DR1 \
+  -c _source_id -c TARGET_RA -c TARGET_DEC -c SPECTYPE \
+  --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
+  -o /scratch/desi_stars.parquet
+
+# Same survey
+dl-extract-spectra-subset --survey DESI_DR1 \
+  --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
+  --output /scratch/desi_stars.zarr
+dl-extract-cutout-subset --survey DESI_DR1 \
+  --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
+  --output /scratch/desi_stars_cutouts.zarr
+
+# Partner survey (match tree: source_id_a = DESI, source_id_b = EUCLID)
+dl-crossmatch DESI_DR1 EUCLID_DR1 /data/lake --radius-arcsec 1.0
+# join extract._source_id = source_id_a, then:
+dl-extract-cutout-subset --survey EUCLID_DR1 \
+  --target-list /scratch/desi_x_euclid.parquet --target-id-col source_id_b \
+  --output /scratch/euclid_matched_cutouts.zarr
+```
+
 **Very large surveys** — avoid materialising hundreds of millions of rows in
 one process. Prefer **in-lake cross-match** (``dl-crossmatch``) which streams
 tile-by-tile like ingest. Use ``dl-extract-catalog`` only when an external tool
