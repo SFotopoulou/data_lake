@@ -1,8 +1,8 @@
 """Catalog row predicates for ``dl-extract-*`` ``--where`` / ``--limit``.
 
-``--where`` is a DuckDB boolean expression over ingested catalog columns.
+``--where`` is a DuckDB boolean expression over catalog (or plugmap) columns.
 It is always wrapped as ``WHERE (<predicate>)`` and is never executed as its
-own statement.  ``--limit`` caps rows after the predicate (tile order, no
+own statement.  ``--limit`` caps rows after the predicate (input order, no
 ``ORDER BY``).
 """
 
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
+import pyarrow as pa
 
 if TYPE_CHECKING:
     from data_lake.io.catalog import CatalogAccessor
@@ -74,6 +75,47 @@ def format_limit(limit: int | None) -> str:
     if int(limit) < 1:
         raise ValueError("--limit must be a positive integer")
     return f" LIMIT {int(limit)}"
+
+
+def _arrow_from_duckdb(raw: object) -> pa.Table:
+    if isinstance(raw, pa.RecordBatchReader):
+        return raw.read_all()
+    return raw  # type: ignore[return-value]
+
+
+def filter_arrow_table(
+    table: pa.Table,
+    *,
+    where: str | None = None,
+    limit: int | None = None,
+    extra_predicates: Sequence[str] = (),
+    select_sql: str | None = None,
+) -> pa.Table:
+    """Apply ``--where`` / ``--limit`` to an in-memory Arrow table via DuckDB.
+
+    *select_sql* is a DuckDB SELECT list (default ``*``).  Use it to project
+    columns while filtering on columns that are not exported.
+    """
+    if where is None and not extra_predicates and limit is None and select_sql is None:
+        return table
+    import duckdb
+
+    cols = select_sql if select_sql else "*"
+    sql = (
+        f"SELECT {cols} FROM extract_rows"
+        f"{compose_where_clause(where, extra_predicates)}"
+        f"{format_limit(limit)}"
+    )
+    log.info("In-memory extract filter: %s", sql)
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.register("extract_rows", table)
+        try:
+            return _arrow_from_duckdb(con.execute(sql).arrow())
+        except Exception as exc:
+            raise ValueError(f"invalid --where: {exc}") from exc
+    finally:
+        con.close()
 
 
 def source_ids_from_catalog(

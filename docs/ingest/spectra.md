@@ -225,6 +225,11 @@ dl-extract-spplate-catalog --file-list spplate_paths.txt -o all_plugmaps.parquet
 dl-extract-spplate-catalog --file-list spplate_paths.txt \
   --subtract-catalog /path/to/lake --survey SDSS_DR17 \
   -o missing_from_specobj.parquet
+
+# Plugmap predicate + cap
+dl-extract-spplate-catalog --file-list spplate_paths.txt \
+  --where "upper(trim(objtype)) = 'GALAXY'" --limit 1000 \
+  -o galaxies.parquet
 ```
 
 Output columns: ``plate``, ``mjd``, ``fiberid``, ``ra``, ``dec`` (plus

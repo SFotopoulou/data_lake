@@ -101,6 +101,27 @@ class TestExtractFromFile:
         assert table.num_rows == 2
         assert pq.read_table(out).num_rows == 2
 
+    def test_where_and_limit_on_raw_file(self, tmp_path: Path) -> None:
+        cat = tmp_path / "cat.fits"
+        tbl = Table({
+            "TARGETID": [100, 200, 300],
+            "RA": [120.0, 120.1, 120.2],
+            "DEC": [45.0, 45.1, 45.2],
+            "Z": [0.1, 0.2, 0.3],
+            "SPECTYPE": ["STAR", "GALAXY", "STAR"],
+        })
+        tbl.write(cat, format="fits", overwrite=True)
+        out = tmp_path / "stars.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID", "Z"],
+            paths=[cat],
+            where_sql="upper(trim(SPECTYPE)) = 'STAR'",
+            row_limit=1,
+        )
+        assert result.num_rows == 1
+        assert pq.read_table(out).column("TARGETID").to_pylist() == [100]
+
 
 class TestExtractFromLake:
     def test_lake_catalog(self, tmp_path: Path) -> None:
@@ -671,23 +692,25 @@ class TestExtractCatalogCli:
         assert result.exit_code == 0, result.output
         assert pq.read_table(out).column_names == ["ra"]
 
-    def test_cli_rejects_where_on_raw_file(self, tmp_path: Path) -> None:
+    def test_cli_where_on_raw_file(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
 
         from data_lake.export.catalog_extract import cli
 
         cat = tmp_path / "cat.fits"
         _write_fits_catalog(cat)
+        out = tmp_path / "out.parquet"
         result = CliRunner().invoke(
             cli,
             [
-                str(cat), "-o", str(tmp_path / "out.parquet"),
+                str(cat), "-o", str(out),
                 "-c", "TARGETID",
-                "--where", "Z > 0",
+                "--where", "Z > 0.15",
+                "--limit", "1",
             ],
         )
-        assert result.exit_code != 0
-        assert "lake catalog" in result.output.lower() or "lake catalogs" in result.output.lower()
+        assert result.exit_code == 0, result.output
+        assert pq.read_table(out).column("TARGETID").to_pylist() == [200]
 
 
 class TestFilterValidSky:

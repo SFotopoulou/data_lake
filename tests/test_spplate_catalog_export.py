@@ -37,6 +37,11 @@ def _write_minimal_spplate(
         fits.Column(name="FIBERID", format="J", array=fiberid),
         fits.Column(name="RA", format="D", array=np.linspace(120.0, 121.0, n_fiber)),
         fits.Column(name="DEC", format="D", array=np.full(n_fiber, 45.0)),
+        fits.Column(
+            name="OBJTYPE",
+            format="8A",
+            array=np.array(["GALAXY", "STAR", "GALAXY", "QSO"][:n_fiber]),
+        ),
     ]
     hdus = [
         phdu,
@@ -108,3 +113,17 @@ class TestSpplateCatalogExport:
         out = filter_rows_not_in_catalog(tbl, {(1, 2, 10)})
         assert out.num_rows == 1
         assert out.column("fiberid")[0].as_py() == 99
+
+    def test_where_and_limit(self, tmp_path: Path) -> None:
+        sp = tmp_path / "spPlate-1960-53289.fits"
+        _write_minimal_spplate(sp, plate=1960, mjd=53289, n_fiber=4)
+        out = tmp_path / "galaxies.parquet"
+        tbl = extract_spplate_catalog(
+            [sp],
+            out,
+            where_sql="upper(trim(objtype)) = 'GALAXY'",
+            row_limit=1,
+        )
+        assert tbl.num_rows == 1
+        assert tbl.column("objtype").to_pylist() == ["GALAXY"]
+        assert tbl.column("fiberid").to_pylist() == [1]

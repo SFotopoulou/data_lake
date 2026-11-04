@@ -253,6 +253,8 @@ def extract_spplate_catalog(
     dec_col: str = "DEC",
     subtract_catalog_root: Path | str | None = None,
     subtract_survey: str | None = None,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> pa.Table:
     """
     Build a plugmap catalog table and optionally write it to disk.
@@ -277,6 +279,10 @@ def extract_spplate_catalog(
             subtract_survey,
             len(keys),
         )
+    if where_sql is not None or row_limit is not None:
+        from data_lake.export.row_filter import filter_arrow_table
+
+        table = filter_arrow_table(table, where=where_sql, limit=row_limit)
     write_catalog_table(table, output)
     return table
 
@@ -318,6 +324,22 @@ import click
     default=None,
     help="Survey name for --subtract-catalog (required with that flag).",
 )
+@click.option(
+    "--where",
+    "where_sql",
+    default=None,
+    help=(
+        "DuckDB boolean expression over plugmap columns "
+        "(e.g. \"upper(trim(objtype)) = 'GALAXY'\")."
+    ),
+)
+@click.option(
+    "--limit",
+    "row_limit",
+    type=int,
+    default=None,
+    help="Maximum rows to write after --where (file order, no ORDER BY).",
+)
 @click.option("-v", "--verbose", is_flag=True)
 def cli(
     paths: tuple[Path, ...],
@@ -328,6 +350,8 @@ def cli(
     dec_col: str,
     catalog_root: Path | None,
     subtract_survey: str | None,
+    where_sql: str | None,
+    row_limit: int | None,
     verbose: bool,
 ) -> None:
     """Export ra/dec/plate/mjd/fiberid from spPlate PLUGMAP (HDU 5)."""
@@ -344,14 +368,28 @@ def cli(
 
     if catalog_root is not None and not subtract_survey:
         raise click.ClickException("--survey is required with --subtract-catalog.")
+    if row_limit is not None and row_limit < 1:
+        raise click.ClickException("--limit must be a positive integer.")
+    if where_sql:
+        from data_lake.export.row_filter import validate_predicate
 
-    table = extract_spplate_catalog(
-        all_paths,
-        output,
-        active_only=active_only,
-        ra_col=ra_col,
-        dec_col=dec_col,
-        subtract_catalog_root=catalog_root,
-        subtract_survey=subtract_survey,
-    )
+        try:
+            where_sql = validate_predicate(where_sql)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    try:
+        table = extract_spplate_catalog(
+            all_paths,
+            output,
+            active_only=active_only,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            subtract_catalog_root=catalog_root,
+            subtract_survey=subtract_survey,
+            where_sql=where_sql,
+            row_limit=row_limit,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"Wrote {table.num_rows} row(s) to {output}")

@@ -12,6 +12,7 @@ import pytest
 from data_lake.export.row_filter import (
     CUTOUT_INDEX_COLUMN,
     SPECTRUM_INDEX_COLUMN,
+    filter_arrow_table,
     load_extract_source_ids,
     source_ids_from_catalog,
     validate_predicate,
@@ -99,6 +100,23 @@ class TestSourceIdsFromCatalog:
             index_column="_not_a_column",
         )
         assert list(ids) == [1, 3, 4]
+
+
+class TestFilterArrowTable:
+    def test_where_project_and_limit(self) -> None:
+        tbl = pa.table({
+            "TARGETID": [1, 2, 3],
+            "SPECTYPE": ["STAR", "GALAXY", "STAR"],
+            "Z": [0.0, 0.5, 0.1],
+        })
+        out = filter_arrow_table(
+            tbl,
+            where="SPECTYPE = 'STAR'",
+            limit=1,
+            select_sql='"TARGETID", "Z"',
+        )
+        assert out.column_names == ["TARGETID", "Z"]
+        assert out.column("TARGETID").to_pylist() == [1]
 
 
 class TestLoadExtractSourceIds:

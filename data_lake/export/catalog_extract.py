@@ -26,6 +26,10 @@ Example
         -c TARGETID -c Z --where "upper(trim(SPECTYPE)) = 'STAR'" \\
         --limit 1000 -o desi_stars.parquet
 
+    dl-extract-catalog zall-pix-iron.fits -c TARGETID -c Z \\
+        --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \\
+        -o desi_stars.parquet
+
     # 290M+ rows: tiled export (bounded RAM, parallel-friendly)
     dl-extract-catalog --lake-root /data/lake --survey GAIA_DR3 \\
         --output-dir /scratch/gaia_sky/ -c source_id -c ra -c dec
@@ -576,6 +580,16 @@ def _finalize_lake_extract_result(
     return result
 
 
+def _sky_predicate_sql(ra_name: str, dec_name: str) -> str:
+    ra_sql = _sql_ident(ra_name)
+    dec_sql = _sql_ident(dec_name)
+    return (
+        f"isfinite({ra_sql}) AND isfinite({dec_sql}) "
+        f"AND {dec_sql} BETWEEN -90 AND 90 "
+        f"AND {ra_sql} > -9000 AND {dec_sql} > -9000"
+    )
+
+
 def _duckdb_sky_predicate(
     mapping: Sequence[tuple[str, str]],
     *,
@@ -584,12 +598,37 @@ def _duckdb_sky_predicate(
 ) -> str:
     dummy = pa.table({out: pa.array([0.0], type=pa.float64()) for _, out in mapping})
     ra_name, dec_name = _resolve_sky_output_names(dummy, ra_col=ra_col, dec_col=dec_col)
-    ra_sql = _sql_ident(ra_name)
-    dec_sql = _sql_ident(dec_name)
-    return (
-        f"isfinite({ra_sql}) AND isfinite({dec_sql}) "
-        f"AND {dec_sql} BETWEEN -90 AND 90 "
-        f"AND {ra_sql} > -9000 AND {dec_sql} > -9000"
+    return _sky_predicate_sql(ra_name, dec_name)
+
+
+def _apply_extract_filter(
+    table: pa.Table,
+    mapping: Sequence[tuple[str, str]],
+    *,
+    where_sql: str | None,
+    row_limit: int | None,
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+) -> pa.Table:
+    """Project *mapping* and apply ``--where`` / sky / ``--limit`` via DuckDB."""
+    from data_lake.export.row_filter import filter_arrow_table
+
+    extra: list[str] = []
+    if valid_sky_only:
+        ra_name, dec_name = _resolve_sky_output_names(
+            table, ra_col=ra_col, dec_col=dec_col,
+        )
+        extra.append(_sky_predicate_sql(ra_name, dec_name))
+    col_sql = ", ".join(
+        f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping
+    )
+    return filter_arrow_table(
+        table,
+        where=where_sql,
+        limit=row_limit,
+        extra_predicates=extra,
+        select_sql=col_sql,
     )
 
 
@@ -1102,12 +1141,25 @@ def extract_from_catalog_path(
     valid_sky_only: bool = False,
     ra_col: str | None = None,
     dec_col: str | None = None,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> pa.Table:
     """Read one catalog file and return the selected columns (in memory)."""
     table = _read_source_table(Path(path))
     effective_specs = specs_from_schema(
         table.schema.names, all_columns=all_columns, specs=specs,
     )
+    mapping = resolve_column_specs(table.schema.names, effective_specs)
+    if where_sql is not None or row_limit is not None:
+        return _apply_extract_filter(
+            table,
+            mapping,
+            where_sql=where_sql,
+            row_limit=row_limit,
+            valid_sky_only=valid_sky_only,
+            ra_col=ra_col,
+            dec_col=dec_col,
+        )
     out = select_catalog_columns(table, effective_specs)
     if valid_sky_only:
         out = filter_valid_sky_rows(out, ra_col=ra_col, dec_col=dec_col)
@@ -1125,6 +1177,8 @@ def stream_extract_from_fits_catalog(
     dec_col: str | None = None,
     batch_rows: int = _FITS_STREAM_BATCH_ROWS,
     fits_memmap: str = "auto",
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> ExtractResult:
     """Stream a large FITS BINTABLE to Parquet in row batches."""
     from astropy.table import Table
@@ -1156,21 +1210,39 @@ def stream_extract_from_fits_catalog(
         mapping = resolve_column_specs(list(names), effective_specs)
         src_cols = [src for src, _ in mapping]
         out_names = tuple(out for _, out in mapping)
+        batch_cols = list(names) if where_sql else src_cols
+        remaining = row_limit
 
         for start in range(0, n_total, batch_rows):
+            if remaining is not None and remaining <= 0:
+                break
             stop = min(start + batch_rows, n_total)
-            batch_tbl = Table({col: data[col][start:stop] for col in src_cols})
+            batch_tbl = Table({col: data[col][start:stop] for col in batch_cols})
             from data_lake.ingest.fits_to_parquet import _astropy_table_to_arrow
 
-            chunk = _process_tile_chunk(
-                _astropy_table_to_arrow(batch_tbl),
-                mapping,
-                valid_sky_only=valid_sky_only,
-                ra_col=ra_col,
-                dec_col=dec_col,
-            )
+            raw_arrow = _astropy_table_to_arrow(batch_tbl)
+            if where_sql is not None or remaining is not None:
+                chunk = _apply_extract_filter(
+                    raw_arrow,
+                    mapping,
+                    where_sql=where_sql,
+                    row_limit=remaining,
+                    valid_sky_only=valid_sky_only,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
+            else:
+                chunk = _process_tile_chunk(
+                    raw_arrow,
+                    mapping,
+                    valid_sky_only=valid_sky_only,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
             if chunk.num_rows == 0:
                 continue
+            if remaining is not None:
+                remaining -= chunk.num_rows
             if writer is None:
                 output.parent.mkdir(parents=True, exist_ok=True)
                 writer = pq.ParquetWriter(
@@ -1203,6 +1275,8 @@ def extract_from_catalog_paths(
     streaming: bool = False,
     output: Path | None = None,
     batch_rows: int = _FITS_STREAM_BATCH_ROWS,
+    where_sql: str | None = None,
+    row_limit: int | None = None,
 ) -> pa.Table | ExtractResult:
     """Concatenate extracts from multiple catalog files."""
     path_list = [Path(p) for p in paths]
@@ -1223,10 +1297,15 @@ def extract_from_catalog_paths(
             ra_col=ra_col,
             dec_col=dec_col,
             batch_rows=batch_rows,
+            where_sql=where_sql,
+            row_limit=row_limit,
         )
 
     tables: list[pa.Table] = []
+    remaining = row_limit
     for p in path_list:
+        if remaining is not None and remaining <= 0:
+            break
         chunk = extract_from_catalog_path(
             p,
             specs,
@@ -1234,6 +1313,8 @@ def extract_from_catalog_paths(
             valid_sky_only=valid_sky_only,
             ra_col=ra_col,
             dec_col=dec_col,
+            where_sql=where_sql,
+            row_limit=remaining,
         )
         if add_input_path:
             chunk = chunk.append_column(
@@ -1242,6 +1323,8 @@ def extract_from_catalog_paths(
             )
         tables.append(chunk)
         log.info("Read %d row(s) from %s", chunk.num_rows, p.name)
+        if remaining is not None:
+            remaining -= chunk.num_rows
 
     if len(tables) == 1:
         return tables[0]
@@ -1341,8 +1424,6 @@ def extract_catalog(
         raise ValueError("use all_columns or column specs, not both")
     if not all_columns and not specs:
         raise ValueError("pass column specs or all_columns=True")
-    if (where_sql or row_limit is not None) and lake_root is None:
-        raise ValueError("--where and --limit require --lake-root/--survey")
     if row_limit is not None and int(row_limit) < 1:
         raise ValueError("--limit must be a positive integer")
     column_specs: Sequence[str] = specs or ()
@@ -1389,6 +1470,8 @@ def extract_catalog(
         streaming=streaming,
         output=Path(output) if output is not None else None,
         batch_rows=batch_rows,
+        where_sql=where_sql,
+        row_limit=row_limit,
     )
     if isinstance(raw_result, ExtractResult):
         return raw_result
@@ -1492,7 +1575,7 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     default=None,
     help=(
         "DuckDB boolean expression over catalog columns "
-        "(lake --survey / --from-product only). "
+        "(lake or raw files). "
         "Example: \"upper(trim(SPECTYPE)) = 'STAR'\"."
     ),
 )
@@ -1604,10 +1687,6 @@ def cli(
         raise click.ClickException("--streaming is for raw FITS input, not --lake-root.")
     if streaming and len(all_paths) != 1:
         raise click.ClickException("--streaming requires exactly one input FITS file.")
-    if (where_sql or row_limit is not None) and lake_root is None:
-        raise click.ClickException(
-            "--where and --limit apply to lake catalogs (--survey / --from-product) only."
-        )
     if row_limit is not None and row_limit < 1:
         raise click.ClickException("--limit must be a positive integer.")
     if where_sql:
