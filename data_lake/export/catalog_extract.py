@@ -26,6 +26,10 @@ Example
         -c TARGETID -c Z --where "upper(trim(SPECTYPE)) = 'STAR'" \\
         --limit 1000 -o desi_stars.parquet
 
+    dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \\
+        --target-list qso_ids.fits --target-id-col TARGETID \\
+        --all-columns -o desi_qso_catalog.parquet
+
     dl-extract-catalog zall-pix-iron.fits -c TARGETID -c Z \\
         --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \\
         -o desi_stars.parquet
@@ -64,6 +68,7 @@ _SKY_RA_ALIASES = ("ra", "ra_deg", "radeg", "raj2000", "ra_obj")
 _SKY_DEC_ALIASES = ("dec", "dec_deg", "decdeg", "dej2000", "dec_obj")
 _LARGE_OUTPUT_ROW_WARN = 5_000_000
 _FITS_STREAM_BATCH_ROWS = 1_000_000
+_TARGET_IDS_RELATION = "extract_target_ids"
 
 
 @dataclass(frozen=True)
@@ -202,6 +207,54 @@ def filter_valid_sky_rows(
 
 def _sql_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def _prepare_source_id_filter(
+    catalog_root: Path,
+    schema_names: Sequence[str],
+    source_ids: np.ndarray | None,
+) -> tuple[np.ndarray | None, str | None]:
+    """Return unique ``_source_id`` values and a DuckDB membership predicate.
+
+    *source_ids* are lake join ids (the same int64 values ``--target-list``
+    resolves).  The predicate references a relation registered with
+    :func:`_register_target_ids`.
+    """
+    if source_ids is None:
+        return None, None
+    from data_lake.ingest.fits_to_parquet import resolve_link_id_column
+
+    try:
+        link_col = resolve_link_id_column(catalog_root, schema_names=list(schema_names))
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+    ids = np.unique(np.asarray(source_ids, dtype=np.int64))
+    predicate = (
+        f"{_sql_ident(link_col)} IN (SELECT id FROM {_TARGET_IDS_RELATION})"
+    )
+    log.info(
+        "Target-list filter: %d unique id(s) on column %s",
+        int(ids.size),
+        link_col,
+    )
+    return ids, predicate
+
+
+def _register_target_ids(connection, source_ids: np.ndarray) -> None:
+    """Register *source_ids* as ``extract_target_ids(id)`` on a DuckDB connection."""
+    connection.register(
+        _TARGET_IDS_RELATION,
+        pa.table({"id": pa.array(np.asarray(source_ids, dtype=np.int64), type=pa.int64())}),
+    )
+
+
+def _connect_extract_duckdb(source_ids: np.ndarray | None):
+    import duckdb
+
+    connection = duckdb.connect(database=":memory:")
+    if source_ids is not None:
+        _register_target_ids(connection, source_ids)
+    return connection
 
 
 def _projected_select_sql(
@@ -475,6 +528,7 @@ def stream_extract_from_lake_catalog(
     write_homogenize_provenance: bool = True,
     where_sql: str | None = None,
     row_limit: int | None = None,
+    source_ids: np.ndarray | None = None,
 ) -> ExtractResult:
     """Stream column projection from lake Parquet tiles without loading the full survey."""
     if output is None and output_dir is None:
@@ -498,6 +552,9 @@ def stream_extract_from_lake_catalog(
     mapping = resolve_column_specs(schema_names, effective_specs)
     src_cols = [src for src, _ in mapping]
     out_names = tuple(out for _, out in mapping)
+    source_ids, id_predicate = _prepare_source_id_filter(
+        catalog_root, schema_names, source_ids,
+    )
 
     fmt: OutputFormat = "parquet"
     if output is not None:
@@ -527,6 +584,8 @@ def stream_extract_from_lake_catalog(
                 dec_col=dec_col,
                 where_sql=where_sql,
                 row_limit=row_limit,
+                source_ids=source_ids,
+                id_predicate=id_predicate,
             )
             return _finalize_lake_extract_result(
                 result,
@@ -555,6 +614,8 @@ def stream_extract_from_lake_catalog(
         show_progress=show_progress,
         where_sql=where_sql,
         row_limit=row_limit,
+        source_ids=source_ids,
+        id_predicate=id_predicate,
     )
     return _finalize_lake_extract_result(
         result,
@@ -643,12 +704,14 @@ def _stream_lake_via_duckdb(
     dec_col: str | None,
     where_sql: str | None = None,
     row_limit: int | None = None,
+    source_ids: np.ndarray | None = None,
+    id_predicate: str | None = None,
 ) -> ExtractResult:
-    import duckdb
-
     extra: list[str] = []
     if valid_sky_only:
         extra.append(_duckdb_sky_predicate(mapping, ra_col=ra_col, dec_col=dec_col))
+    if id_predicate:
+        extra.append(id_predicate)
     select_sql = _projected_select_sql(
         mapping,
         "read_parquet($files, hive_partitioning=false)",
@@ -672,7 +735,7 @@ def _stream_lake_via_duckdb(
     else:
         raise ValueError(f"DuckDB lake export does not support {output_format!r}")
 
-    con = duckdb.connect(database=":memory:")
+    con = _connect_extract_duckdb(source_ids)
     try:
         # Explicit file list avoids hive_partitioning on Norder=/Dir= paths and
         # dodges COPY placeholder ordering quirks with read vs write targets.
@@ -705,10 +768,13 @@ def _filter_tile_via_duckdb(
     ra_col: str | None,
     dec_col: str | None,
     connection,
+    id_predicate: str | None = None,
 ) -> pa.Table:
     extra: list[str] = []
     if valid_sky_only:
         extra.append(_duckdb_sky_predicate(mapping, ra_col=ra_col, dec_col=dec_col))
+    if id_predicate:
+        extra.append(id_predicate)
     sql = _projected_select_sql(
         mapping,
         "read_parquet(?, hive_partitioning=false)",
@@ -733,9 +799,12 @@ def _tile_extract_chunk(
     where_sql: str | None,
     remaining_limit: int | None,
     duckdb_con,
+    id_predicate: str | None = None,
 ) -> pa.Table:
     """Project and filter one lake tile (Arrow path, or DuckDB when WHERE/LIMIT)."""
-    if where_sql is not None or remaining_limit is not None:
+    if id_predicate is not None and duckdb_con is None:
+        raise RuntimeError("target-list filter requires a DuckDB connection")
+    if where_sql is not None or remaining_limit is not None or id_predicate is not None:
         chunk = _filter_tile_via_duckdb(
             tile_path,
             mapping,
@@ -745,6 +814,7 @@ def _tile_extract_chunk(
             ra_col=ra_col,
             dec_col=dec_col,
             connection=duckdb_con,
+            id_predicate=id_predicate,
         )
         return _canonicalize_column_types(chunk)
     raw = _canonicalize_column_types(_read_catalog_tile(tile_path, src_cols))
@@ -769,6 +839,8 @@ def _iter_lake_extract_chunks(
     show_progress: bool,
     where_sql: str | None = None,
     row_limit: int | None = None,
+    source_ids: np.ndarray | None = None,
+    id_predicate: str | None = None,
 ) -> Iterator[pa.Table]:
     """Yield projected catalog chunks one HEALPix tile at a time."""
     iterator: Iterable[Path] = tiles
@@ -783,10 +855,8 @@ def _iter_lake_extract_chunks(
     duckdb_con = None
     remaining = row_limit
     try:
-        if where_sql is not None or remaining is not None:
-            import duckdb
-
-            duckdb_con = duckdb.connect(database=":memory:")
+        if where_sql is not None or remaining is not None or id_predicate is not None:
+            duckdb_con = _connect_extract_duckdb(source_ids)
         for tile_path in iterator:
             if remaining is not None and remaining <= 0:
                 break
@@ -800,6 +870,7 @@ def _iter_lake_extract_chunks(
                 where_sql=where_sql,
                 remaining_limit=remaining,
                 duckdb_con=duckdb_con,
+                id_predicate=id_predicate,
             )
             if chunk.num_rows > 0:
                 if remaining is not None:
@@ -973,6 +1044,8 @@ def _stream_lake_tile_by_tile(
     show_progress: bool,
     where_sql: str | None = None,
     row_limit: int | None = None,
+    source_ids: np.ndarray | None = None,
+    id_predicate: str | None = None,
 ) -> ExtractResult:
     chunk_iter = _iter_lake_extract_chunks(
         catalog_root,
@@ -985,6 +1058,8 @@ def _stream_lake_tile_by_tile(
         show_progress=show_progress,
         where_sql=where_sql,
         row_limit=row_limit,
+        source_ids=source_ids,
+        id_predicate=id_predicate,
     )
 
     if output_dir is not None:
@@ -1003,10 +1078,8 @@ def _stream_lake_tile_by_tile(
         duckdb_con = None
         remaining = row_limit
         try:
-            if where_sql is not None or remaining is not None:
-                import duckdb
-
-                duckdb_con = duckdb.connect(database=":memory:")
+            if where_sql is not None or remaining is not None or id_predicate is not None:
+                duckdb_con = _connect_extract_duckdb(source_ids)
             for tile_path in iterator:
                 if remaining is not None and remaining <= 0:
                     break
@@ -1020,6 +1093,7 @@ def _stream_lake_tile_by_tile(
                     where_sql=where_sql,
                     remaining_limit=remaining,
                     duckdb_con=duckdb_con,
+                    id_predicate=id_predicate,
                 )
                 if chunk.num_rows == 0:
                     continue
@@ -1069,6 +1143,8 @@ def _stream_lake_tile_by_tile(
                     show_progress=show_progress,
                     where_sql=where_sql,
                     row_limit=row_limit,
+                    source_ids=source_ids,
+                    id_predicate=id_predicate,
                 ),
                 tmp_pq,
                 schema=unified_schema,
@@ -1100,6 +1176,7 @@ def extract_from_lake_catalog(
     dec_col: str | None = None,
     where_sql: str | None = None,
     row_limit: int | None = None,
+    source_ids: np.ndarray | None = None,
 ) -> pa.Table:
     """In-memory lake extract (small catalogs / tests only)."""
     import tempfile
@@ -1127,6 +1204,7 @@ def extract_from_lake_catalog(
             engine="tiles",
             where_sql=where_sql,
             row_limit=row_limit,
+            source_ids=source_ids,
         )
         if result.n_rows == 0:
             return pa.table({out_name: pa.array([], type=pa.float64()) for _, out_name in mapping})
@@ -1418,6 +1496,7 @@ def extract_catalog(
     write_homogenize_provenance: bool = True,
     where_sql: str | None = None,
     row_limit: int | None = None,
+    source_ids: np.ndarray | None = None,
 ) -> ExtractResult | pa.Table:
     """Extract columns and write output; returns summary or small in-memory table."""
     if all_columns and specs:
@@ -1426,6 +1505,10 @@ def extract_catalog(
         raise ValueError("pass column specs or all_columns=True")
     if row_limit is not None and int(row_limit) < 1:
         raise ValueError("--limit must be a positive integer")
+    if source_ids is not None and where_sql:
+        raise ValueError("use --target-list or --where, not both")
+    if source_ids is not None and lake_root is None:
+        raise ValueError("--target-list requires an ingested catalog (--survey)")
     column_specs: Sequence[str] = specs or ()
 
     if lake_root is not None:
@@ -1451,6 +1534,7 @@ def extract_catalog(
             write_homogenize_provenance=write_homogenize_provenance,
             where_sql=where_sql,
             row_limit=row_limit,
+            source_ids=source_ids,
         )
         return result
 
@@ -1570,6 +1654,26 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
 @click.option("--ra-col", default=None, help="RA column for --valid-sky-only (default: auto).")
 @click.option("--dec-col", default=None, help="Dec column for --valid-sky-only (default: auto).")
 @click.option(
+    "--target-list",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "File of source IDs to keep (FITS, CSV, Parquet, or plain text). "
+        "IDs are resolved with the same link-id rule as ingest and matched to "
+        "catalog _source_id. Requires --survey. Mutually exclusive with --where."
+    ),
+)
+@click.option(
+    "--target-id-col",
+    default="TARGETID",
+    show_default=True,
+    help=(
+        "Column in --target-list carrying source IDs, or a comma-separated "
+        "composite matching catalog --link-id-col (e.g. TARGETID,SURVEY,PROGRAM). "
+        "Ignored for plain-text files."
+    ),
+)
+@click.option(
     "--where",
     "where_sql",
     default=None,
@@ -1623,6 +1727,8 @@ def cli(
     valid_sky_only: bool,
     ra_col: str | None,
     dec_col: str | None,
+    target_list: Path | None,
+    target_id_col: str,
     where_sql: str | None,
     row_limit: int | None,
     add_input_path: bool,
@@ -1632,7 +1738,11 @@ def cli(
     verbose: bool,
     config_path: Path | None,
 ) -> None:
-    """Export selected catalog columns for catalog–catalog association (sky matching)."""
+    """Export selected catalog columns for catalog–catalog association (sky matching).
+
+    Pass --target-list to keep rows whose _source_id matches an external ID file
+    (same resolution as dl-extract-spectra-subset). Mutually exclusive with --where.
+    """
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
 
     all_paths: list[Path] = list(paths)
@@ -1648,6 +1758,8 @@ def cli(
         raise click.ClickException("Use --all-columns or -c, not both.")
     if not all_columns and not columns:
         raise click.ClickException("Pass -c or --all-columns.")
+    if target_list is not None and where_sql:
+        raise click.ClickException("Use --target-list or --where, not both.")
 
     cfg = load_optional_config(config_path)
     if lake_root is None and survey is not None:
@@ -1689,6 +1801,10 @@ def cli(
         raise click.ClickException("--streaming requires exactly one input FITS file.")
     if row_limit is not None and row_limit < 1:
         raise click.ClickException("--limit must be a positive integer.")
+    if target_list is not None and lake_root is None:
+        raise click.ClickException(
+            "--target-list requires an ingested catalog (--survey)."
+        )
     if where_sql:
         from data_lake.export.row_filter import validate_predicate
 
@@ -1696,6 +1812,23 @@ def cli(
             where_sql = validate_predicate(where_sql)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
+
+    source_ids = None
+    if target_list is not None:
+        from data_lake.export.spectra_subset import _read_target_ids
+
+        try:
+            loaded = _read_target_ids(target_list, target_id_col)
+        except (ValueError, KeyError, OSError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        source_ids = np.unique(np.asarray(loaded, dtype=np.int64))
+        log.info(
+            "Loaded %d source ID(s) (%d unique) from %s (column=%s).",
+            int(np.asarray(loaded).size),
+            int(source_ids.size),
+            target_list,
+            target_id_col,
+        )
 
     fmt: OutputFormat | None = (
         output_format.lower()  # type: ignore[assignment]
@@ -1725,6 +1858,7 @@ def cli(
         write_homogenize_provenance=not no_homogenize_provenance,
         where_sql=where_sql,
         row_limit=row_limit,
+        source_ids=source_ids,
     )
 
     if isinstance(result, ExtractResult):

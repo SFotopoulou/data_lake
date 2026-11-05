@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -237,6 +238,117 @@ class TestExtractFromLake:
         assert isinstance(result, ExtractResult)
         assert result.n_rows == 1
         assert pq.read_table(out).column("TARGETID").to_pylist() == [11]
+
+    def _id_lake(self, tmp_path: Path) -> Path:
+        lake = tmp_path / "lake"
+        survey = lake / "catalogs" / "IDS"
+        for npix, ids in ((1, [11, 12]), (2, [13, 14])):
+            tile_dir = survey / "Norder=5" / "Dir=0"
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            pq.write_table(
+                pa.table({
+                    "_source_id": pa.array(ids, type=pa.int64()),
+                    "TARGETID": pa.array(ids, type=pa.int64()),
+                    "Z": pa.array([float(i) / 10 for i in ids], type=pa.float64()),
+                    "_healpix_norder5": pa.array([npix, npix], type=pa.int64()),
+                }),
+                tile_dir / f"Npix={npix}.parquet",
+            )
+        (survey / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "column:TARGETID", "total_rows": 4}',
+        )
+        return lake
+
+    def test_target_list_filters_source_id(self, tmp_path: Path) -> None:
+        lake = self._id_lake(tmp_path)
+        out = tmp_path / "subset.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID", "Z"],
+            lake_root=lake,
+            survey="IDS",
+            engine="tiles",
+            source_ids=np.array([12, 14, 99], dtype=np.int64),
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 2
+        tbl = pq.read_table(out)
+        assert tbl.column("TARGETID").to_pylist() == [12, 14]
+        assert "_source_id" not in tbl.column_names
+
+    def test_target_list_duckdb_engine(self, tmp_path: Path, caplog) -> None:
+        lake = self._id_lake(tmp_path)
+        out = tmp_path / "subset.parquet"
+        with caplog.at_level("WARNING"):
+            result = extract_catalog(
+                output=out,
+                specs=["Z"],
+                lake_root=lake,
+                survey="IDS",
+                engine="duckdb",
+                source_ids=np.array([11, 11, 13], dtype=np.int64),
+                row_limit=1,
+            )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 1
+        assert pq.read_table(out).column("Z").to_pylist() == [1.1]
+        assert "falling back" not in caplog.text
+
+    def test_target_list_output_dir(self, tmp_path: Path) -> None:
+        lake = self._id_lake(tmp_path)
+        out_dir = tmp_path / "tiles"
+        result = extract_catalog(
+            output_dir=out_dir,
+            specs=["TARGETID"],
+            lake_root=lake,
+            survey="IDS",
+            engine="tiles",
+            source_ids=np.array([14], dtype=np.int64),
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 1
+        assert result.n_tiles == 1
+        written = list(out_dir.rglob("Npix=*.parquet"))
+        assert len(written) == 1
+        assert pq.read_table(written[0]).column("TARGETID").to_pylist() == [14]
+
+    def test_target_list_empty_writes_no_rows(self, tmp_path: Path) -> None:
+        lake = self._id_lake(tmp_path)
+        out = tmp_path / "empty.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID"],
+            lake_root=lake,
+            survey="IDS",
+            engine="duckdb",
+            source_ids=np.array([], dtype=np.int64),
+        )
+        assert isinstance(result, ExtractResult)
+        assert result.n_rows == 0
+
+    def test_target_list_rejected_with_where(self, tmp_path: Path) -> None:
+        lake = self._id_lake(tmp_path)
+        with pytest.raises(ValueError, match="not both"):
+            extract_catalog(
+                output=tmp_path / "bad.parquet",
+                specs=["TARGETID"],
+                lake_root=lake,
+                survey="IDS",
+                where_sql="Z > 0",
+                source_ids=np.array([11], dtype=np.int64),
+            )
+
+    def test_target_list_requires_lake(self, tmp_path: Path) -> None:
+        cat = tmp_path / "cat.fits"
+        _write_fits_catalog(cat)
+        with pytest.raises(ValueError, match="ingested catalog"):
+            extract_catalog(
+                output=tmp_path / "bad.parquet",
+                specs=["TARGETID"],
+                paths=[cat],
+                source_ids=np.array([100], dtype=np.int64),
+            )
 
     def test_where_rejects_semicolon(self, tmp_path: Path) -> None:
         lake = self._star_lake(tmp_path)
@@ -654,6 +766,53 @@ class TestExtractCatalogCli:
         result = CliRunner().invoke(cli, ["-o", "out.parquet"])
         assert result.exit_code != 0
         assert "--all-columns" in result.output
+
+    def test_cli_target_list(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        lake = TestExtractFromLake()._id_lake(tmp_path)
+        ids = tmp_path / "ids.parquet"
+        pq.write_table(
+            pa.table({"TARGETID": pa.array([12, 14, 12], type=pa.int64())}),
+            ids,
+        )
+        out = tmp_path / "out.parquet"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--lake-root", str(lake),
+                "--survey", "IDS",
+                "-c", "TARGETID",
+                "--target-list", str(ids),
+                "--target-id-col", "TARGETID",
+                "-o", str(out),
+                "--engine", "tiles",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert pq.read_table(out).column("TARGETID").to_pylist() == [12, 14]
+
+    def test_cli_target_list_rejects_where(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        ids = tmp_path / "ids.parquet"
+        ids.write_bytes(b"")
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--survey", "IDS",
+                "-c", "TARGETID",
+                "--target-list", str(ids),
+                "--where", "Z > 0",
+                "-o", str(tmp_path / "out.parquet"),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "not both" in result.output
 
     def test_cli_lake_root_from_config(self, tmp_path: Path, monkeypatch) -> None:
         import textwrap
