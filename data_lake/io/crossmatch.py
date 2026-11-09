@@ -1186,7 +1186,7 @@ def _crossmatch_one_tile(
 
     t1 = time.perf_counter()
     if b_cache is not None and b_cache.enabled:
-        df_b = b_cache.get_tiles(acc_b, b_pixels, cols_b, hp_col=hp_col_b)
+        df_b = b_cache.get_tiles(acc_b, b_pixels, cols_b)
         df_b = filter_sky_bbox(
             df_b,
             ra_col=ra_col_b,
@@ -2047,6 +2047,8 @@ class _BTileJoinCache:
     hits: int = 0
     misses: int = 0
     _entries: OrderedDict[int, pl.DataFrame] = field(default_factory=OrderedDict)
+    # Empty / absent B tiles: remembered, but kept out of max_tiles.
+    _empty: OrderedDict[int, pl.DataFrame] = field(default_factory=OrderedDict)
     _bytes: int = 0
 
     def __post_init__(self) -> None:
@@ -2069,16 +2071,25 @@ class _BTileJoinCache:
 
     def get(self, npix_b: int) -> pl.DataFrame | None:
         key = int(npix_b)
-        cached = self._entries.get(key)
-        if cached is not None:
-            self._entries.move_to_end(key)
-            self.hits += 1
-            return cached
+        for entries in (self._entries, self._empty):
+            cached = entries.get(key)
+            if cached is not None:
+                entries.move_to_end(key)
+                self.hits += 1
+                return cached
         self.misses += 1
         return None
 
     def put(self, npix_b: int, df: pl.DataFrame) -> None:
+        from data_lake.io.crossmatch_b_cache import EMPTY_TILE_KEYS_MAX
+
         key = int(npix_b)
+        if df.is_empty():
+            self._empty[key] = df
+            self._empty.move_to_end(key)
+            while len(self._empty) > EMPTY_TILE_KEYS_MAX:
+                self._empty.popitem(last=False)
+            return
         new_bytes = self._estimate_bytes(df)
         if key in self._entries:
             self._bytes -= self._estimate_bytes(self._entries[key])

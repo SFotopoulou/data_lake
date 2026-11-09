@@ -101,8 +101,8 @@ class TestCrossmatchBTileCache:
 
         cache = CrossmatchBTileCache(CrossmatchBTileCacheConfig(max_tiles=8))
         cols = ["id", "ra", "dec", "_healpix_norder5"]
-        a = cache.get_tiles(acc, [7], cols, hp_col="_healpix_norder5")
-        b = cache.get_tiles(acc, [7], cols, hp_col="_healpix_norder5")
+        a = cache.get_tiles(acc, [7], cols)
+        b = cache.get_tiles(acc, [7], cols)
         assert a.height == 2
         assert b.height == 2
         assert cache.misses == 1
@@ -120,8 +120,8 @@ class TestCrossmatchBTileCache:
         acc.sources_in_healpix_pixels.return_value = df
         cache = CrossmatchBTileCache(CrossmatchBTileCacheConfig(enabled=False))
         cols = ["id", "ra", "dec", "_healpix_norder5"]
-        cache.get_tiles(acc, [3], cols, hp_col="_healpix_norder5")
-        cache.get_tiles(acc, [3], cols, hp_col="_healpix_norder5")
+        cache.get_tiles(acc, [3], cols)
+        cache.get_tiles(acc, [3], cols)
         assert acc.sources_in_healpix_pixels.call_count == 2
 
 
@@ -143,16 +143,55 @@ class TestCrossmatchBTileCacheReporting:
         cols = [LAKE_JOIN_ID_COLUMN, "ra", "dec", hp_col]
         with caplog.at_level(logging.DEBUG, logger="data_lake.io.crossmatch_b_cache"):
             with CatalogAccessor(lake, "B", norder=norder) as acc:
-                cache.get_tiles(acc, [100], cols, hp_col=hp_col)
-                cache.get_tiles(acc, [101], cols, hp_col=hp_col)
-                cache.get_tiles(acc, [999], cols, hp_col=hp_col)
+                cache.get_tiles(acc, [100], cols)
+                cache.get_tiles(acc, [101], cols)
+                cache.get_tiles(acc, [999], cols)
 
         fetched = [r.getMessage() for r in caplog.records if "MiB on disk" in r.getMessage()]
         assert len(fetched) == 2
         assert fetched[0].startswith("B tile Npix=100: 1 row(s)")
         assert any("evicted Npix=100" in r.getMessage() for r in caplog.records)
-        assert cache.evictions == 2
-        assert "2 eviction(s)" in cache.summary()
+        # The absent tile 999 must not push 101 out of a one-tile cache.
+        assert cache.evictions == 1
+        assert cache.n_tiles == 1
+        assert "1 eviction(s)" in cache.summary()
+        assert "1 empty tile(s) remembered" in cache.summary()
+
+
+class TestCrossmatchBTileCachePerTileReads:
+    def test_misses_read_one_tile_per_query_and_empty_is_remembered(self) -> None:
+        frames = {
+            7: pl.DataFrame({"id": [1, 2], "ra": [10.0, 11.0], "dec": [0.0, 0.1]}),
+            8: pl.DataFrame({"id": [3], "ra": [12.0], "dec": [0.2]}),
+            9: pl.DataFrame(),
+        }
+        acc = MagicMock()
+        acc.sources_in_healpix_pixels.side_effect = lambda px, **_: frames[px[0]]
+        acc._empty_result.return_value = pl.DataFrame()
+
+        cache = CrossmatchBTileCache(CrossmatchBTileCacheConfig(max_tiles=2))
+        out = cache.get_tiles(acc, [7, 8, 9], ["id", "ra", "dec"])
+        assert out["id"].to_list() == [1, 2, 3]
+        assert [c.args[0] for c in acc.sources_in_healpix_pixels.call_args_list] == [
+            [7], [8], [9],
+        ]
+        assert cache.n_tiles == 2
+
+        again = cache.get_tiles(acc, [7, 8, 9], ["id", "ra", "dec"])
+        assert again.height == 3
+        assert acc.sources_in_healpix_pixels.call_count == 3
+        assert cache.hits == 3
+        assert cache.evictions == 0
+
+    def test_column_join_cache_keeps_empty_out_of_tile_cap(self) -> None:
+        from data_lake.io.crossmatch import _BTileJoinCache
+
+        cache = _BTileJoinCache(max_tiles=1, max_bytes=1 << 30)
+        full = pl.DataFrame({"__match_key_b": ["a"], "source_id_b": [1], "healpix_npix_b": [5]})
+        cache.put(5, full)
+        cache.put(6, full.head(0))
+        assert cache.get(5) is full
+        assert cache.get(6) is not None and cache.get(6).is_empty()
 
 
 class TestBuildCrossmatchBCacheParity:

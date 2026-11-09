@@ -265,15 +265,23 @@ def _projected_select_sql(
     extra_predicates: Sequence[str] = (),
     row_limit: int | None = None,
 ) -> str:
-    """``SELECT src AS out FROM … [WHERE user AND extra] [LIMIT n]``."""
+    """``SELECT src AS out FROM … [WHERE user AND extra] [ORDER BY … LIMIT n]``.
+
+    *from_sql* must be a ``read_parquet`` scan.  With a limit, rows are ordered
+    by file then row (DuckDB ``file_index`` / ``file_row_number``) so the cap
+    keeps the first rows in tile order; parallel filters and semi-joins do not
+    preserve that order on their own.
+    """
     from data_lake.export.row_filter import compose_where_clause, format_limit
 
     col_sql = ", ".join(
         f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping
     )
+    order_sql = " ORDER BY file_index, file_row_number" if row_limit is not None else ""
     return (
         f"SELECT {col_sql} FROM {from_sql}"
         f"{compose_where_clause(where_sql, extra_predicates)}"
+        f"{order_sql}"
         f"{format_limit(row_limit)}"
     )
 
@@ -1688,7 +1696,7 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     "row_limit",
     type=int,
     default=None,
-    help="Maximum rows to write after --where (tile order, no ORDER BY).",
+    help="Maximum rows to write after --where (first rows in tile order).",
 )
 @click.option(
     "--add-input-path",

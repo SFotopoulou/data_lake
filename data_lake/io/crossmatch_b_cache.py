@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
 
+EMPTY_TILE_KEYS_MAX = 65_536
+"""Bound on remembered empty / absent B tiles (a few MiB of keys)."""
+
 
 def tile_file_bytes(acc: CatalogAccessor, npix: int) -> int:
     """On-disk size of one catalog tile Parquet (0 when absent)."""
@@ -90,6 +93,9 @@ class CrossmatchBTileCache:
     def __init__(self, config: CrossmatchBTileCacheConfig | None = None) -> None:
         self._config = config or CrossmatchBTileCacheConfig()
         self._entries: OrderedDict[tuple[int, tuple[str, ...]], Any] = OrderedDict()
+        # Tiles absent on disk or with no rows: remembered so they are not
+        # re-queried, but kept out of max_tiles (they hold no data).
+        self._empty: OrderedDict[tuple[int, tuple[str, ...]], None] = OrderedDict()
         self._bytes = 0
         self.hits = 0
         self.misses = 0
@@ -113,7 +119,8 @@ class CrossmatchBTileCache:
             f"{self.hits} hit(s), {self.misses} miss(es), {self.evictions} eviction(s); "
             f"largest tile {self.max_tile_bytes / _MIB:.1f} MiB in RAM; "
             f"holding {self.n_tiles}/{self._config.max_tiles} tile(s), "
-            f"{self._bytes / _MIB:.0f}/{self._config.max_bytes / _MIB:.0f} MiB"
+            f"{self._bytes / _MIB:.0f}/{self._config.max_bytes / _MIB:.0f} MiB, "
+            f"{len(self._empty)} empty tile(s) remembered"
         )
 
     def _log_fetched(self, acc_b: CatalogAccessor, npix: int, df: Any) -> None:
@@ -140,10 +147,13 @@ class CrossmatchBTileCache:
         acc_b: CatalogAccessor,
         npix_list: Sequence[int],
         columns: list[str],
-        *,
-        hp_col: str,
     ) -> Any:
-        """Return concatenated rows for *npix_list*, using the LRU when enabled."""
+        """Return concatenated rows for *npix_list*, using the LRU when enabled.
+
+        Each missing tile is read with its own query, so a miss holds one copy
+        of each tile (the cached frame) rather than a combined frame plus a
+        per-tile split of it.
+        """
         import polars as pl
 
         npix_ints = [int(n) for n in npix_list]
@@ -156,7 +166,6 @@ class CrossmatchBTileCache:
             )
 
         col_key = tuple(columns)
-        need_fetch: list[int] = []
         parts: list[Any] = []
 
         for npix in npix_ints:
@@ -165,39 +174,32 @@ class CrossmatchBTileCache:
             if cached is not None:
                 self._entries.move_to_end(key)
                 self.hits += 1
-                if not cached.is_empty():
-                    parts.append(cached)
-            else:
-                self.misses += 1
-                need_fetch.append(npix)
-
-        if need_fetch:
-            fetched = acc_b.sources_in_healpix_pixels(
-                need_fetch, columns=columns, fmt="polars",
-            )
-            if fetched.is_empty():
-                for npix in need_fetch:
-                    self._put((npix, col_key), fetched.head(0))
-            elif hp_col in fetched.columns:
-                for npix in need_fetch:
-                    chunk = fetched.filter(pl.col(hp_col) == npix)
-                    self._put((npix, col_key), chunk)
-                    self._log_fetched(acc_b, npix, chunk)
-                    if not chunk.is_empty():
-                        parts.append(chunk)
-            elif len(need_fetch) == 1:
-                self._put((need_fetch[0], col_key), fetched)
-                self._log_fetched(acc_b, need_fetch[0], fetched)
-                parts.append(fetched)
-            else:
-                # No healpix column to split — do not cache; return fetched as-is.
-                return fetched
+                parts.append(cached)
+                continue
+            if key in self._empty:
+                self._empty.move_to_end(key)
+                self.hits += 1
+                continue
+            self.misses += 1
+            df = acc_b.sources_in_healpix_pixels([npix], columns=columns, fmt="polars")
+            if df.is_empty():
+                self._put_empty(key)
+                continue
+            self._put(key, df)
+            self._log_fetched(acc_b, npix, df)
+            parts.append(df)
 
         if not parts:
             return acc_b._empty_result("polars", columns)
         if len(parts) == 1:
             return parts[0]
         return pl.concat(parts, how="vertical_relaxed")
+
+    def _put_empty(self, key: tuple[int, tuple[str, ...]]) -> None:
+        self._empty[key] = None
+        self._empty.move_to_end(key)
+        while len(self._empty) > EMPTY_TILE_KEYS_MAX:
+            self._empty.popitem(last=False)
 
     def _put(self, key: tuple[int, tuple[str, ...]], df: Any) -> None:
         if key in self._entries:
