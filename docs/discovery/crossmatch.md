@@ -165,14 +165,21 @@ modes) keeps a per-worker LRU of **full** B tiles (defaults from
 `data_lake.knobs.PARTNER_TILE_CACHE_*`: 48 tiles / 512 MiB — same policy as
 `dl-gather`’s partner cache). Sky mode applies the A-tile RA/Dec bbox in memory.
 Disable with `--no-b-cache`, or tune with `--b-cache-tiles` / `--b-cache-mib`.
-Process workers do **not** share a cache; raise `--tiles-per-worker` (e.g. 4–16)
-so each worker sees spatially local A tiles and hits the cache. Integer lake
-`_source_id` columns are coerced with a vectorized fast path (no per-row Python
-loop).
+
+**Worker scheduling:** pending survey-A tiles are sorted by a coarse nested
+parent (then `npix`), then split into **at most `--n-workers` mega-strips**.
+Each process runs **one strip with one long-lived B-cache** (not one short job
+per handful of tiles). `--tiles-per-worker` is only a **heartbeat** interval
+inside that strip (`1` → log about every 50 tiles). Processes do **not** share
+caches. Integer lake `_source_id` columns use a vectorized fast path.
+
+Phase timing (`a_read` / `b_load` / `match` / `write`) and B-cache hit/miss
+counts are logged at the end of a run and stored under `perf` in
+`crossmatch_info.json`.
 
 ```bash
 dl-crossmatch SURVEY_A SURVEY_B /data/lake \
-  --radius-arcsec 1.0 --n-workers 8 --tiles-per-worker 8
+  --radius-arcsec 1.0 --n-workers 8 --tiles-per-worker 50
 
 # Compare without B-tile reuse (slower on HDD/NFS)
 dl-crossmatch SURVEY_A SURVEY_B /data/lake --no-b-cache --overwrite
@@ -264,9 +271,10 @@ dl-describe-crossmatch EUCLID_DR1 2MASS_PSC /data/lake --radius-arcsec 1.0 --rec
 For area-scoped crossmatch discovery (tile overlap and exact `--count`), use
 `dl-region --from-area AREA --modalities catalog,spectra,crossmatch --count`.
 
-**Worker batching:** ``--tiles-per-worker`` (default 1) runs multiple survey-A
-HEALPix tiles per worker process, amortizing DuckDB catalog registration. Try
-4–16 on large surveys with ``--n-workers`` set to CPU core count.
+**Worker batching:** pending A tiles are partitioned into ``--n-workers``
+mega-strips (one job / one B-cache per process). ``--tiles-per-worker`` only
+controls in-strip heartbeat logging. Set ``--n-workers`` to CPU core count on
+large surveys; prefer fewer workers on HDD/NFS when B I/O dominates.
 
 Lake exports read **one HEALPix tile at a time** (or use DuckDB
 ``COPY`` via ``--engine duckdb`` for a single Parquet file). Prefer
@@ -297,12 +305,12 @@ Example: `crossmatch/EUCLID_DR1_x_DESI_DR1__col_TARGETID__TARGETID/`
 
 If you know that matched IDs can span arbitrary sky positions, pre-partition both catalogs by the shared key outside the lake before ingesting.
 
-**Performance and progress:** Progress bars are on by default (`--no-progress` to disable).  `--n-workers` / `--tiles-per-worker` apply to column mode.  When progress is disabled, a log line is emitted every 50 tiles (and every 30 s in parallel mode) with tile count and row count so far.
+**Performance and progress:** Progress bars are on by default (`--no-progress` to disable).  Column mode uses the same mega-strip partitioning and B-cache lifetime as sky mode.  When progress is disabled, workers log heartbeats inside each strip.
 
 ```bash
 dl-crossmatch A B /data/lake \
   --match-mode column --match-col-a ID --match-col-b ID \
-  --n-workers 4 --tiles-per-worker 8
+  --n-workers 4
 ```
 
 **Limitations:**

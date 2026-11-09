@@ -810,6 +810,51 @@ class TestCLI:
         assert result.exit_code != 0
         assert "mutually exclusive" in result.output
 
+    def test_broken_pool_fails_the_killer_and_keeps_the_rest(self, monkeypatch) -> None:
+        from concurrent.futures.process import BrokenProcessPool
+
+        from data_lake.ingest import catalog_shard_ingest as shard
+
+        class _Fut:
+            def __init__(self, key: str, boom: bool) -> None:
+                self.key = key
+                self.boom = boom
+
+            def result(self):
+                if self.boom:
+                    raise BrokenProcessPool("worker killed")
+                return self.key
+
+        class _Pool:
+            def __init__(self, max_workers: int) -> None:
+                self.alive = True
+
+            def submit(self, fn, *args):
+                key = args[0]
+                boom = key == "bad"
+                if boom:
+                    self.alive = False
+                return _Fut(key, boom)
+
+            def shutdown(self, **kwargs) -> None:
+                return None
+
+        monkeypatch.setattr(shard, "ProcessPoolExecutor", _Pool)
+        monkeypatch.setattr(shard, "wait", lambda fs, return_when=None: (set(fs), set()))
+
+        out = list(shard._run_tasks(
+            lambda x: x,
+            [(k, (k,)) for k in ("a", "bad", "b")],
+            n_workers=2,
+            max_in_flight=2,
+        ))
+        by_key = {key: (res, exc) for key, res, exc in out}
+        assert set(by_key) == {"a", "bad", "b"}
+        assert by_key["a"][1] is None and by_key["a"][0] == "a"
+        assert by_key["b"][1] is None and by_key["b"][0] == "b"
+        assert isinstance(by_key["bad"][1], RuntimeError)
+        assert "killed abruptly" in str(by_key["bad"][1])
+
     def test_map_no_input_exits_nonzero(self, deployment, tmp_path):
         result = _invoke([
             "--phase", "map",

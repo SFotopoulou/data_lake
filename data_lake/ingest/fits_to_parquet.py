@@ -3614,6 +3614,7 @@ def _ingest_catalog_streaming_parallel(
 ) -> None:
     """Parallel row-range shards of streaming FITS catalog ingest."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures.process import BrokenProcessPool
 
     from data_lake.cli_utils import init_parallel_ingest_subprocess
     from data_lake.io.fits_read import catalog_fits_read_policy, open_fits, resolve_table_hdus
@@ -3627,7 +3628,11 @@ def _ingest_catalog_streaming_parallel(
     with open_fits(str(source_path), policy) as hdul:
         hdu_indices = resolve_table_hdus(hdul, policy.table_hdu, source=source_path.name)
         check_hdu_columns_match(hdul, hdu_indices, source=source_path.name)
-        hdu_rows = [(idx, len(hdul[idx].data)) for idx in hdu_indices if hdul[idx].data is not None]
+        hdu_rows = [
+            (idx, n)
+            for idx in hdu_indices
+            if (n := int(hdul[idx].header.get("NAXIS2", 0) or 0)) > 0
+        ]
 
     n_rows = sum(n for _, n in hdu_rows)
     chunk = max(1, (n_rows + streaming_parallel - 1) // streaming_parallel)
@@ -3667,16 +3672,33 @@ def _ingest_catalog_streaming_parallel(
         log.info("No rows in %s; nothing to ingest.", source_path.name)
         return
 
-    with ProcessPoolExecutor(
+    pool = ProcessPoolExecutor(
         max_workers=min(streaming_parallel, len(configs)),
         initializer=init_parallel_ingest_subprocess,
-    ) as pool:
-        futures = [pool.submit(_streaming_shard_worker, cfg) for cfg in configs]
+    )
+    try:
+        futures = {pool.submit(_streaming_shard_worker, cfg): cfg for cfg in configs}
         for fut in as_completed(futures):
-            spool, shard_sid = fut.result()
+            cfg = futures[fut]
+            try:
+                spool, shard_sid = fut.result()
+            except BrokenProcessPool as exc:
+                raise RuntimeError(
+                    f"A worker process was killed while reading "
+                    f"{source_path.name} rows {cfg.row_start}:{cfg.row_end} "
+                    f"(HDU {cfg.fits_hdu}, {streaming_parallel} workers). "
+                    "The process died abruptly, which is usually out of memory "
+                    "or a native crash in cfitsio. Retry with a lower "
+                    "--streaming-parallel, or omit it."
+                ) from exc
             spool_dirs.append(Path(spool))
             if sid_mode is None and shard_sid is not None:
                 sid_mode = shard_sid
+    finally:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            log.debug("Shutdown of streaming process pool failed", exc_info=True)
 
     try:
         for spool in spool_dirs:

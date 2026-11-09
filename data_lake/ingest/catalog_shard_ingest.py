@@ -37,8 +37,9 @@ import shutil
 import sys
 import time
 import traceback
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
@@ -358,6 +359,12 @@ def _map_one_file(
 # ---------------------------------------------------------------------------
 
 
+_WORKER_KILLED = (
+    "Worker process was killed abruptly (often out of memory, or a native "
+    "crash in cfitsio/fitsio) while this input was the only task running."
+)
+
+
 def _run_tasks(
     fn: Callable[..., Any],
     items: Iterable[tuple[Any, tuple]],
@@ -369,6 +376,9 @@ def _run_tasks(
 
     At most *max_in_flight* (default ``2 * n_workers``) tasks are queued at
     once.  Closing the generator early cancels work not yet started.
+
+    If a worker is killed, in-flight tasks are retried one at a time so the
+    input that killed the process is recorded and the rest of the run continues.
     """
     if n_workers <= 1:
         for key, args in items:
@@ -381,31 +391,90 @@ def _run_tasks(
         return
 
     limit = max(max_in_flight or 2 * n_workers, n_workers)
-    todo = iter(items)
+    todo: deque[tuple[Any, tuple]] = deque(items)
+    # Tasks that were in flight when a worker died. Run one at a time.
+    isolate: deque[tuple[Any, tuple]] = deque()
     pool = ProcessPoolExecutor(max_workers=n_workers)
-    in_flight: dict[Future, Any] = {}
+    in_flight: dict[Future, tuple[Any, tuple]] = {}
 
-    def _submit_next() -> None:
-        for key, args in todo:
-            in_flight[pool.submit(fn, *args)] = key
-            return
+    def _shutdown(executor: ProcessPoolExecutor) -> None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            log.debug("Shutdown of process pool failed", exc_info=True)
+
+    submit_breaks = 0
+
+    def _fill() -> None:
+        nonlocal pool, submit_breaks
+        cap = 1 if isolate else limit
+        while len(in_flight) < cap and (isolate or todo):
+            key, args = isolate.popleft() if isolate else todo.popleft()
+            try:
+                fut = pool.submit(fn, *args)
+            except BrokenProcessPool:
+                if isolate:
+                    isolate.appendleft((key, args))
+                else:
+                    todo.appendleft((key, args))
+                submit_breaks += 1
+                if submit_breaks > 8:
+                    raise RuntimeError(
+                        "Process pool broke on every submit. " + _WORKER_KILLED
+                    ) from None
+                _shutdown(pool)
+                pool = ProcessPoolExecutor(max_workers=n_workers)
+                continue
+            submit_breaks = 0
+            in_flight[fut] = (key, args)
+
+    def _on_pool_broken() -> Iterator[tuple[Any, Any, BaseException | None]]:
+        nonlocal pool
+        lost = list(in_flight.values())
+        in_flight.clear()
+        _shutdown(pool)
+        pool = ProcessPoolExecutor(max_workers=n_workers)
+        if len(lost) == 1:
+            key, _args = lost[0]
+            log.error("Worker died on %s. %s", key, _WORKER_KILLED)
+            return iter((
+                (key, None, RuntimeError(f"{_WORKER_KILLED} Item: {key}")),
+            ))
+        log.warning(
+            "A worker died with %d tasks in flight. Retrying those one at a time "
+            "to find the input that killed it.",
+            len(lost),
+        )
+        isolate.extend(lost)
+        return iter(())
 
     try:
-        for _ in range(limit):
-            _submit_next()
+        _fill()
         while in_flight:
-            finished, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            try:
+                finished, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
+            except BrokenProcessPool:
+                yield from _on_pool_broken()
+                _fill()
+                continue
+            broken = False
             for fut in finished:
-                key = in_flight.pop(fut)
-                _submit_next()
+                key, args = in_flight.pop(fut)
                 try:
                     res = fut.result()
+                except BrokenProcessPool:
+                    in_flight[fut] = (key, args)
+                    broken = True
+                    break
                 except Exception as exc:  # noqa: BLE001
                     yield key, None, exc
                 else:
                     yield key, res, None
+            if broken:
+                yield from _on_pool_broken()
+            _fill()
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        _shutdown(pool)
 
 
 def _progress(total: int, desc: str, unit: str, enabled: bool):

@@ -77,8 +77,11 @@ memmap policy and worker guidance on HDD vs NVMe.
 ## Crossmatch
 
 - Default **`dl-crossmatch`** is tile-parallel on CPU (`astropy` backend).
-- Amortize DuckDB startup: **`--tiles-per-worker 8`** with **`--n-workers`** tuned
-  to CPU cores.
+- Pending A tiles are **parent-sorted** then split into **`--n-workers` mega-strips**
+  (one B-tile LRU per process for the whole strip). **`--tiles-per-worker`** is a
+  heartbeat interval only, not a job size.
+- Check logged phase timing / `crossmatch_info.json` `perf` (`b_load` vs `match`)
+  before raising workers or switching to GPU.
 - GPU: **`--match-backend rapids --n-workers 1 --gpu-id 0`** (requires
   `uv sync --extra rapids`).
 - Use a coarser **`--norder-b`** when science allows to shrink survey-B candidates.
