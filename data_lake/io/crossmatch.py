@@ -43,6 +43,7 @@ import re
 import time
 from collections import OrderedDict
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Sequence
@@ -248,6 +249,159 @@ def partition_pending_among_workers(
         strips.append(tuple(tiles[i : i + sz]))
         i += sz
     return strips
+
+
+def partition_pending_by_cost(
+    pending: Sequence[int],
+    costs: Sequence[float],
+    n_strips: int,
+) -> list[tuple[int, ...]]:
+    """Split pending (already in sky order) into contiguous strips of ~equal cost.
+
+    Strips stay contiguous so each keeps the B-tile cache warm; boundaries are
+    placed where the running cost crosses ``k × total / n_strips``.  Returns at
+    most ``n_strips`` non-empty strips; zero total cost falls back to equal
+    tile counts.
+    """
+    if n_strips < 1:
+        raise ValueError("n_strips must be >= 1")
+    tiles = [int(p) for p in pending]
+    if len(costs) != len(tiles):
+        raise ValueError("costs must have one entry per pending tile")
+    if not tiles:
+        return []
+    n_strips = min(int(n_strips), len(tiles))
+    weights = [max(0.0, float(c)) for c in costs]
+    total = sum(weights)
+    if total <= 0.0:
+        return partition_pending_among_workers(tiles, n_strips)
+
+    strips: list[tuple[int, ...]] = []
+    start = 0
+    running = 0.0
+    for i, w in enumerate(weights):
+        running += w
+        remaining_tiles = len(tiles) - (i + 1)
+        remaining_strips = n_strips - len(strips) - 1
+        boundary = total * (len(strips) + 1) / n_strips
+        if remaining_strips > 0 and (
+            running >= boundary or remaining_tiles == remaining_strips
+        ):
+            strips.append(tuple(tiles[start : i + 1]))
+            start = i + 1
+    strips.append(tuple(tiles[start:]))
+    return [s for s in strips if s]
+
+
+def _catalog_rows_per_byte(
+    catalog_root: Path,
+    norder: int,
+    npix_sample: Sequence[int],
+    *,
+    max_sample: int = 16,
+) -> float:
+    """Rows per on-disk byte from a few tile footers (tiles share one schema)."""
+    rows = 0
+    size = 0
+    step = max(1, len(npix_sample) // max_sample)
+    for npix in list(npix_sample)[::step][:max_sample]:
+        path = catalog_root / healpix_dir(norder, int(npix)) / f"Npix={int(npix)}.parquet"
+        try:
+            size += path.stat().st_size
+            rows += pq.read_metadata(str(path)).num_rows
+        except OSError:
+            continue
+    return rows / size if size > 0 else 0.0
+
+
+def estimate_crossmatch_tile_costs(
+    lake_root: Path | str,
+    survey_a: str,
+    survey_b: str,
+    pending: Sequence[int],
+    *,
+    norder_a: int,
+    norder_b: int,
+    radius_rad: float,
+) -> list[float]:
+    """Estimated work per survey-A tile: A rows plus B rows in its covering tiles.
+
+    Rows are estimated from file sizes (one ``stat`` per tile) scaled by a
+    rows-per-byte ratio sampled from a few footers, so no per-tile Parquet
+    footer is parsed.  Matching cost grows with both sides (KD-tree build on B,
+    queries from A), so dense A *or* dense B tiles weigh more.
+    """
+    from data_lake.schema_registry import resolve_catalog_root
+
+    lake_root = Path(lake_root)
+    root_a = resolve_catalog_root(lake_root, survey_a)
+    root_b = resolve_catalog_root(lake_root, survey_b)
+    nside_a = hp.order2nside(norder_a)
+    nside_b = hp.order2nside(norder_b)
+
+    def tile_bytes(root: Path, norder: int, npix: int) -> int:
+        path = root / healpix_dir(norder, npix) / f"Npix={npix}.parquet"
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    covering = [
+        healpix_pixels_covering_tile(nside_a, int(p), radius_rad, nside_b=nside_b)
+        for p in pending
+    ]
+    b_bytes: dict[int, int] = {}
+    for pixels in covering:
+        for p in pixels:
+            if p not in b_bytes:
+                b_bytes[p] = tile_bytes(root_b, norder_b, p)
+    a_bytes = [tile_bytes(root_a, norder_a, int(p)) for p in pending]
+
+    rpb_a = _catalog_rows_per_byte(root_a, norder_a, [p for p, b in zip(pending, a_bytes) if b])
+    rpb_b = _catalog_rows_per_byte(root_b, norder_b, [p for p, b in b_bytes.items() if b])
+    return [
+        a * rpb_a + sum(b_bytes[p] for p in pixels) * rpb_b
+        for a, pixels in zip(a_bytes, covering)
+    ]
+
+
+def plan_crossmatch_strips(
+    lake_root: Path | str,
+    survey_a: str,
+    survey_b: str,
+    pending: Sequence[int],
+    *,
+    norder_a: int,
+    norder_b: int,
+    radius_rad: float,
+    n_workers: int,
+    strips_per_worker: int,
+) -> list[tuple[int, ...]]:
+    """Cost-balanced contiguous strips, heaviest first (for dynamic dispatch).
+
+    ``n_workers × strips_per_worker`` strips are handed to the pool as workers
+    free up, so dense sky regions no longer leave other workers idle at the end.
+    """
+    if strips_per_worker < 1:
+        raise ValueError("strips_per_worker must be >= 1")
+    costs = estimate_crossmatch_tile_costs(
+        lake_root, survey_a, survey_b, pending,
+        norder_a=norder_a, norder_b=norder_b, radius_rad=radius_rad,
+    )
+    strips = partition_pending_by_cost(pending, costs, n_workers * strips_per_worker)
+    cost_of = dict(zip((int(p) for p in pending), costs))
+    strip_costs = [sum(cost_of[p] for p in s) for s in strips]
+    order = sorted(range(len(strips)), key=lambda i: strip_costs[i], reverse=True)
+    if strip_costs:
+        mean = sum(strip_costs) / len(strip_costs)
+        log.info(
+            "Work balancing: %d strip(s) on %d worker(s); estimated strip cost "
+            "max/mean %.2f",
+            len(strips),
+            n_workers,
+            (max(strip_costs) / mean) if mean > 0 else 1.0,
+        )
+    return [strips[i] for i in order]
 
 
 def _heartbeat_interval(tiles_per_worker: int) -> int:
@@ -1288,6 +1442,22 @@ def _terminal_log_level() -> int:
     return min(levels) if levels else root.getEffectiveLevel()
 
 
+def _crossmatch_mp_context():
+    """Start workers from a clean process, never by forking this one.
+
+    The parent may already run DuckDB / Arrow / Polars thread pools (an earlier
+    crossmatch, cost estimation, a library caller); forking a multi-threaded
+    process can deadlock the child on locks held by those threads.
+    """
+    import multiprocessing as mp
+
+    if "forkserver" in mp.get_all_start_methods():
+        ctx = mp.get_context("forkserver")
+        ctx.set_forkserver_preload(["data_lake.io.crossmatch"])
+        return ctx
+    return mp.get_context("spawn")
+
+
 def _init_crossmatch_worker(log_level: int) -> None:
     """Pool initializer: keep worker logs on stderr at the parent's level.
 
@@ -1308,6 +1478,55 @@ def _init_crossmatch_worker(log_level: int) -> None:
         handler.setLevel(log_level)
         root.addHandler(handler)
     root.setLevel(min(root.getEffectiveLevel(), log_level))
+    global _REUSE_WORKER_STATE
+    _REUSE_WORKER_STATE = True
+
+
+# Pool workers run several strips; keeping accessors and the B cache between
+# strips avoids reopening catalogs (one aggregate _metadata read each) and a
+# cold cache per strip.  Only enabled inside pool processes, where the lake
+# does not change for the lifetime of the pool.
+_REUSE_WORKER_STATE = False
+_worker_state: tuple[tuple, CatalogAccessor, CatalogAccessor, Any] | None = None
+
+
+def _close_worker_state() -> None:
+    global _worker_state
+    if _worker_state is not None:
+        _, acc_a, acc_b, _ = _worker_state
+        for acc in (acc_a, acc_b):
+            try:
+                acc.close()
+            except Exception:
+                pass
+    _worker_state = None
+
+
+@contextmanager
+def _worker_resources(key: tuple, lake_root: Path, survey_a: str, norder_a: int,
+                      survey_b: str, norder_b: int, make_cache):
+    """Yield ``(acc_a, acc_b, cache)``; reused across strips in pool workers."""
+    global _worker_state
+    if _REUSE_WORKER_STATE and _worker_state is not None and _worker_state[0] == key:
+        yield _worker_state[1:]
+        return
+    _close_worker_state()
+    acc_a = CatalogAccessor(lake_root, survey_a, norder=norder_a)
+    try:
+        acc_b = CatalogAccessor(lake_root, survey_b, norder=norder_b)
+    except Exception:
+        acc_a.close()
+        raise
+    cache = make_cache()
+    if _REUSE_WORKER_STATE:
+        _worker_state = (key, acc_a, acc_b, cache)
+        yield acc_a, acc_b, cache
+        return
+    try:
+        yield acc_a, acc_b, cache
+    finally:
+        acc_a.close()
+        acc_b.close()
 
 
 def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResult:
@@ -1326,16 +1545,26 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
         n_tiles_written = 0
         phase = CrossmatchPhaseStats()
         heartbeat = _heartbeat_interval(getattr(config, "heartbeat_tiles", 1) or 1)
-        b_cache = CrossmatchBTileCache(
-            CrossmatchBTileCacheConfig(
-                enabled=config.b_cache_enabled,
-                max_tiles=config.b_cache_max_tiles,
-                max_bytes=config.b_cache_max_bytes,
-            )
+        key = (
+            "sky", config.lake_root, config.survey_a, config.norder_a,
+            config.survey_b, config.norder_b, config.b_cache_enabled,
+            config.b_cache_max_tiles, config.b_cache_max_bytes,
         )
 
-        with CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a, \
-             CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b:
+        def make_cache() -> CrossmatchBTileCache:
+            return CrossmatchBTileCache(
+                CrossmatchBTileCacheConfig(
+                    enabled=config.b_cache_enabled,
+                    max_tiles=config.b_cache_max_tiles,
+                    max_bytes=config.b_cache_max_bytes,
+                )
+            )
+
+        with _worker_resources(
+            key, lake_root, config.survey_a, config.norder_a,
+            config.survey_b, config.norder_b, make_cache,
+        ) as (acc_a, acc_b, b_cache):
+            hits0, misses0 = b_cache.hits, b_cache.misses
             n_list = len(config.npix_a_list)
             for i, npix_a in enumerate(config.npix_a_list, start=1):
                 n_rows = _crossmatch_one_tile(
@@ -1366,10 +1595,10 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
                         n_list,
                         n_match_rows,
                     )
-        phase.b_cache_hits = int(b_cache.hits)
-        phase.b_cache_misses = int(b_cache.misses)
-        if b_cache.enabled:
-            log.debug("Worker strip B-cache: %s", b_cache.summary())
+            phase.b_cache_hits = int(b_cache.hits - hits0)
+            phase.b_cache_misses = int(b_cache.misses - misses0)
+            if b_cache.enabled:
+                log.debug("Worker strip B-cache: %s", b_cache.summary())
         return CrossmatchTileResult(
             n_match_rows,
             n_tiles_written,
@@ -1540,6 +1769,7 @@ def build_crossmatch(
     b_cache_max_tiles: int | None = None,
     b_cache_max_mib: int | None = None,
     memory_budget_bytes: int | None = None,
+    strips_per_worker: int = 4,
 ) -> CrossmatchResult:
     """
     Build a precomputed cross-match between two surveys.
@@ -1574,8 +1804,12 @@ def build_crossmatch(
         Show a tqdm progress bar over survey-A tiles when available.
     n_workers:
         Parallel worker processes for disjoint survey-A tiles (default 1).
-        Pending tiles are split into at most ``n_workers`` contiguous mega-strips
-        (one job / one B-tile cache per process).
+    strips_per_worker:
+        With ``n_workers > 1``, pending tiles are split into
+        ``n_workers × strips_per_worker`` contiguous strips of about equal
+        estimated cost (A rows plus B rows in covering tiles) and handed out
+        heaviest first as workers free up.  Each worker keeps its accessors and
+        B-tile cache across strips.  ``1`` gives one strip per worker.
     tiles_per_worker:
         Heartbeat / log interval inside each mega-strip (not a separate job size).
         ``1`` means log about every 50 tiles.
@@ -1599,6 +1833,8 @@ def build_crossmatch(
     """
     if n_workers < 1:
         raise ValueError("n_workers must be >= 1")
+    if strips_per_worker < 1:
+        raise ValueError("strips_per_worker must be >= 1")
     validate_match_backend(match_backend)
     if match_backend == "rapids":
         warn_rapids_worker_config(n_workers=n_workers, gpu_id=gpu_id)
@@ -1788,10 +2024,13 @@ def build_crossmatch(
             log.debug("B-cache: %s", b_tile_cache.summary())
         _log_phase_stats(f"Cross-match {survey_a} × {survey_b}", phase_stats)
     else:
-        # One mega-strip job per process so the B-tile LRU lives for the whole strip.
-        worker_tiles = partition_pending_among_workers(pending, n_workers)
+        worker_tiles = plan_crossmatch_strips(
+            lake_root, survey_a, survey_b, pending,
+            norder_a=norder_a, norder_b=norder_b, radius_rad=radius_rad,
+            n_workers=n_workers, strips_per_worker=strips_per_worker,
+        )
         log.info(
-            "Parallel cross-match: %d mega-strip job(s) for %d pending tile(s) "
+            "Parallel cross-match: %d strip job(s) for %d pending tile(s) "
             "(≤ %d workers; heartbeat every %d tile(s))",
             len(worker_tiles),
             len(pending),
@@ -1835,6 +2074,7 @@ def build_crossmatch(
 
         with ProcessPoolExecutor(
             max_workers=n_workers,
+            mp_context=_crossmatch_mp_context(),
             initializer=_init_crossmatch_worker,
             initargs=(_terminal_log_level(),),
         ) as pool:
@@ -2282,19 +2522,26 @@ def _column_crossmatch_tile_worker(
         n_match_rows = 0
         n_tiles_written = 0
         heartbeat = _heartbeat_interval(config.heartbeat_tiles)
-        b_cache = (
-            _BTileJoinCache(
+        key = (
+            "column", config.lake_root, config.survey_a, config.norder_a,
+            config.survey_b, config.norder_b, config.match_col_a, config.match_col_b,
+            config.b_cache_enabled, config.b_cache_max_tiles, config.b_cache_max_bytes,
+        )
+
+        def make_cache() -> _BTileJoinCache | None:
+            if not config.b_cache_enabled:
+                return None
+            return _BTileJoinCache(
                 max_tiles=config.b_cache_max_tiles,
                 max_bytes=config.b_cache_max_bytes,
             )
-            if config.b_cache_enabled
-            else None
-        )
 
-        with (
-            CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a,
-            CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b,
-        ):
+        with _worker_resources(
+            key, lake_root, config.survey_a, config.norder_a,
+            config.survey_b, config.norder_b, make_cache,
+        ) as (acc_a, acc_b, b_cache):
+            hits0 = b_cache.hits if b_cache is not None else 0
+            misses0 = b_cache.misses if b_cache is not None else 0
             n_list = len(config.npix_a_list)
             for i, npix_a in enumerate(config.npix_a_list, start=1):
                 n_rows = _column_crossmatch_one_tile(
@@ -2319,11 +2566,13 @@ def _column_crossmatch_tile_worker(
                         n_list,
                         n_match_rows,
                     )
+            hits = int(b_cache.hits - hits0) if b_cache is not None else 0
+            misses = int(b_cache.misses - misses0) if b_cache is not None else 0
         return CrossmatchTileResult(
             n_match_rows,
             n_tiles_written,
-            b_cache_hits=int(b_cache.hits) if b_cache is not None else 0,
-            b_cache_misses=int(b_cache.misses) if b_cache is not None else 0,
+            b_cache_hits=hits,
+            b_cache_misses=misses,
         )
     except Exception as exc:
         log.exception("Column crossmatch worker failed for tiles %s", config.npix_a_list[:8])
@@ -2424,6 +2673,7 @@ def build_column_crossmatch(
     b_cache_max_tiles: int | None = None,
     b_cache_max_mib: int | None = None,
     memory_budget_bytes: int | None = None,
+    strips_per_worker: int = 4,
 ) -> CrossmatchResult:
     """Build a column-equality crossmatch between two surveys.
 
@@ -2471,7 +2721,11 @@ def build_column_crossmatch(
     memory_budget_bytes:
         Same as :func:`build_crossmatch`: total memory split across workers to
         size each worker's DuckDB ``memory_limit``.
+    strips_per_worker:
+        Same as :func:`build_crossmatch`: cost-balanced strips per worker.
     """
+    if strips_per_worker < 1:
+        raise ValueError("strips_per_worker must be >= 1")
     from data_lake.knobs import (
         PARTNER_TILE_CACHE_MAX_BYTES,
         PARTNER_TILE_CACHE_MAX_TILES,
@@ -2559,9 +2813,13 @@ def build_column_crossmatch(
     phase_stats = CrossmatchPhaseStats()
 
     if n_workers > 1:
-        worker_tiles = partition_pending_among_workers(pending, n_workers)
+        worker_tiles = plan_crossmatch_strips(
+            lake_root, survey_a, survey_b, pending,
+            norder_a=norder_a, norder_b=norder_b, radius_rad=pad_rad,
+            n_workers=n_workers, strips_per_worker=strips_per_worker,
+        )
         log.info(
-            "Column parallel: %d mega-strip job(s) for %d pending tile(s)",
+            "Column parallel: %d strip job(s) for %d pending tile(s)",
             len(worker_tiles),
             n_pending,
         )
@@ -2597,6 +2855,7 @@ def build_column_crossmatch(
 
         with ProcessPoolExecutor(
             max_workers=n_workers,
+            mp_context=_crossmatch_mp_context(),
             initializer=_init_crossmatch_worker,
             initargs=(_terminal_log_level(),),
         ) as pool:
@@ -2755,6 +3014,7 @@ def execute_crossmatch_plan(
     b_cache_max_tiles: int | None = None,
     b_cache_max_mib: int | None = None,
     memory_budget_bytes: int | None = None,
+    strips_per_worker: int = 4,
 ) -> list[CrossmatchResult]:
     """Execute a crossmatch plan (base catalog x N partners), optionally region-bounded.
 
@@ -2828,6 +3088,7 @@ def execute_crossmatch_plan(
                 b_cache_max_tiles=b_cache_max_tiles,
                 b_cache_max_mib=b_cache_max_mib,
                 memory_budget_bytes=memory_budget_bytes,
+                strips_per_worker=strips_per_worker,
             )
         else:
             radius = partner.get("radius_arcsec")
@@ -2851,6 +3112,7 @@ def execute_crossmatch_plan(
                 b_cache_max_tiles=b_cache_max_tiles,
                 b_cache_max_mib=b_cache_max_mib,
                 memory_budget_bytes=memory_budget_bytes,
+                strips_per_worker=strips_per_worker,
             )
         results.append(result)
     return results
@@ -3049,9 +3311,20 @@ try:
         show_default=True,
         type=int,
         help=(
-            "Heartbeat interval inside each worker mega-strip (log every N tiles). "
-            "Pending tiles are split into at most --n-workers long strips so the "
-            "B-tile cache lives for the whole strip. 1 → log about every 50 tiles."
+            "Heartbeat interval inside each worker strip (log every N tiles). "
+            "1 → log about every 50 tiles."
+        ),
+    )
+    @click.option(
+        "--strips-per-worker",
+        default=4,
+        show_default=True,
+        type=int,
+        help=(
+            "With --n-workers > 1, split pending tiles into n-workers × N contiguous "
+            "strips of about equal estimated cost (A rows + B rows in covering "
+            "tiles), handed out heaviest first as workers free up. Workers keep "
+            "their B-tile cache across strips. 1 → one strip per worker."
         ),
     )
     @click.option(
@@ -3152,6 +3425,7 @@ try:
         show_progress: bool,
         n_workers: int,
         tiles_per_worker: int,
+        strips_per_worker: int,
         match_backend: str,
         gpu_id: int,
         export_parquet: Path | None,
@@ -3186,6 +3460,8 @@ try:
             raise click.ClickException("--n-workers must be >= 1")
         if tiles_per_worker < 1:
             raise click.ClickException("--tiles-per-worker must be >= 1")
+        if strips_per_worker < 1:
+            raise click.ClickException("--strips-per-worker must be >= 1")
         if gpu_id < 0:
             raise click.ClickException("--gpu-id must be >= 0")
 
@@ -3245,6 +3521,7 @@ try:
                     b_cache_max_tiles=b_cache_tiles,
                     b_cache_max_mib=b_cache_mib,
                     memory_budget_bytes=memory_budget_bytes,
+                    strips_per_worker=strips_per_worker,
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
@@ -3296,6 +3573,7 @@ try:
                     b_cache_max_tiles=b_cache_tiles,
                     b_cache_max_mib=b_cache_mib,
                     memory_budget_bytes=memory_budget_bytes,
+                    strips_per_worker=strips_per_worker,
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
@@ -3359,6 +3637,7 @@ try:
             b_cache_max_tiles=b_cache_tiles,
             b_cache_max_mib=b_cache_mib,
             memory_budget_bytes=memory_budget_bytes,
+            strips_per_worker=strips_per_worker,
         )
         backend_note = result.match_backend
         if result.match_backend == "rapids":

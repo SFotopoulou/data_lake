@@ -77,8 +77,11 @@ memmap policy and worker guidance on HDD vs NVMe.
 ## Crossmatch
 
 - Default **`dl-crossmatch`** is tile-parallel on CPU (`astropy` backend).
-- Pending A tiles are **parent-sorted** then split into **`--n-workers` mega-strips**
-  (one B-tile LRU per process for the whole strip). **`--tiles-per-worker`** is a
+- Pending A tiles are **parent-sorted** then cut into **`--n-workers ×
+  --strips-per-worker`** cost-balanced contiguous strips (default 4 per worker),
+  dispatched heaviest first; each worker keeps one B-tile LRU across its strips.
+  Compare the summed phase time ÷ workers with wall time: a large gap means idle
+  workers, so raise `--strips-per-worker`. **`--tiles-per-worker`** is a
   heartbeat interval only, not a job size.
 - Check logged phase timing / `crossmatch_info.json` `perf` (`b_load` vs `match`)
   before raising workers or switching to GPU.

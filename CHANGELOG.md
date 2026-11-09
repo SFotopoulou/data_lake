@@ -18,8 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`dl-crossmatch --verbose` reports survey-B tile sizes** — one DEBUG line per fetched B tile (rows, MiB on disk, MiB in RAM, cache fill vs `--b-cache-tiles` / `--b-cache-mib`), per evicted tile, per A tile (B tiles and on-disk MiB it needs, rows left after the bbox, read/load/match seconds), and a cache summary per worker strip (hits, misses, evictions, largest tile).
 
+- **`dl-crossmatch --strips-per-worker N` (default 4)** — with `--n-workers > 1`, pending tiles are cut into `n_workers × N` contiguous strips of about equal estimated cost (A rows plus B rows in covering tiles) and dispatched heaviest first, instead of one equal-count strip per worker. Dense regions previously left the other workers idle for about a third of the run. Workers keep their catalog accessors and B-cache across strips. Also on `build_crossmatch`, `build_column_crossmatch`, and `execute_crossmatch_plan`.
+
 ### Fixed
 
+- **Parallel crossmatch could hang after earlier DuckDB/Polars work in the same process** — workers were forked from a parent whose thread pools were already running (for example a second crossmatch in one Python session), which can deadlock the child. Crossmatch pools now start workers with `forkserver` (`spawn` where unavailable). Scripts calling `build_crossmatch(n_workers > 1)` need an `if __name__ == "__main__":` guard.
 - **Catalog column lookups re-read `_metadata` every time** — `CatalogAccessor.schema` (behind `columns` / `resolve_column`) parsed the aggregate `_metadata` footer on every call, several times per tile read. For wide catalogs with many tiles that is seconds per call: a Legacy DR11 south × DESI crossmatch went from about 28 s to about 0.17 s per tile once the schema is cached (re-read only when `_metadata` changes). Also speeds up `dl-gather`, extracts, and column crossmatch.
 - **Crossmatch B-cache: empty tiles no longer use cache slots** — B tiles absent on disk or without rows are remembered separately, so they are not re-queried and do not count against `--b-cache-tiles` (sky and column mode).
 - **Crossmatch B-cache: one copy per miss** — missing B tiles are read one query per tile instead of one combined query split per tile, which held the fetched rows twice.

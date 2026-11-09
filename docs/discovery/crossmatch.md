@@ -172,11 +172,18 @@ evictions mean the B tiles one A tile needs (about 9 at the same order) do not
 fit, so every A tile re-reads them.
 
 **Worker scheduling:** pending survey-A tiles are sorted by a coarse nested
-parent (then `npix`), then split into **at most `--n-workers` mega-strips**.
-Each process runs **one strip with one long-lived B-cache** (not one short job
-per handful of tiles). `--tiles-per-worker` is only a **heartbeat** interval
-inside that strip (`1` → log about every 50 tiles). Processes do **not** share
-caches. Integer lake `_source_id` columns use a vectorized fast path.
+parent (then `npix`) and cut into **`--n-workers × --strips-per-worker`
+contiguous strips** (default 4 per worker) of about equal **estimated cost**:
+A rows plus B rows in the covering tiles, estimated from file sizes and a few
+footers. Strips are handed out **heaviest first** as workers free up, so a
+dense sky region no longer leaves the other workers idle at the end. Each
+worker keeps its catalog accessors and B-cache across the strips it runs.
+`--strips-per-worker 1` restores one strip per worker. `--tiles-per-worker` is
+only a **heartbeat** interval inside a strip (`1` → log about every 50 tiles).
+Processes do **not** share caches. Workers start from a fresh process
+(`forkserver`), so scripts that call `build_crossmatch(n_workers > 1)` need an
+`if __name__ == "__main__":` guard. Integer lake `_source_id` columns use a
+vectorized fast path.
 
 **DuckDB limits per worker:** each worker's DuckDB connections get
 `available CPUs / --n-workers` threads and a quarter of
