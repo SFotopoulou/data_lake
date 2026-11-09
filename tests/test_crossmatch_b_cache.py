@@ -125,6 +125,36 @@ class TestCrossmatchBTileCache:
         assert acc.sources_in_healpix_pixels.call_count == 2
 
 
+class TestCrossmatchBTileCacheReporting:
+    def test_debug_reports_sizes_and_evictions(self, tmp_path: Path, caplog) -> None:
+        import logging
+
+        from data_lake.io.catalog import CatalogAccessor
+
+        lake = tmp_path / "lake"
+        norder = 5
+        hp_col = f"_healpix_norder{norder}"
+        for npix in (100, 101):
+            _write_catalog_tile(
+                lake, "B", norder=norder, npix=npix,
+                source_ids=[npix], ra=[30.0], dec=[5.0],
+            )
+        cache = CrossmatchBTileCache(CrossmatchBTileCacheConfig(max_tiles=1))
+        cols = [LAKE_JOIN_ID_COLUMN, "ra", "dec", hp_col]
+        with caplog.at_level(logging.DEBUG, logger="data_lake.io.crossmatch_b_cache"):
+            with CatalogAccessor(lake, "B", norder=norder) as acc:
+                cache.get_tiles(acc, [100], cols, hp_col=hp_col)
+                cache.get_tiles(acc, [101], cols, hp_col=hp_col)
+                cache.get_tiles(acc, [999], cols, hp_col=hp_col)
+
+        fetched = [r.getMessage() for r in caplog.records if "MiB on disk" in r.getMessage()]
+        assert len(fetched) == 2
+        assert fetched[0].startswith("B tile Npix=100: 1 row(s)")
+        assert any("evicted Npix=100" in r.getMessage() for r in caplog.records)
+        assert cache.evictions == 2
+        assert "2 eviction(s)" in cache.summary()
+
+
 class TestBuildCrossmatchBCacheParity:
     def test_cache_on_vs_off_same_matches(self, tmp_path: Path) -> None:
         lake = tmp_path / "lake"

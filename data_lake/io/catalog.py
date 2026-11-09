@@ -18,7 +18,6 @@ import logging
 from pathlib import Path
 from typing import Literal, Sequence
 
-import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -33,6 +32,7 @@ from data_lake.ingest.fits_to_parquet import (
     resolve_redshift_column,
     resolve_link_id_column,
 )
+from data_lake.io.duckdb_limits import connect as connect_duckdb
 from data_lake.schema_registry import resolve_catalog_root
 
 log = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ class CatalogAccessor:
         self._redshift_column: str | None = resolve_redshift_column(self.columns)
 
         # DuckDB in-process connection (no file, memory only)
-        self._con = duckdb.connect(database=":memory:")
+        self._con = connect_duckdb(":memory:")
         # Register the full Parquet glob as a view once so queries are cheap
         self._glob = str(self._catalog_root / f"Norder={self.norder}" / "**" / "*.parquet")
         self._con.execute(f"CREATE OR REPLACE VIEW catalog AS SELECT * FROM parquet_scan('{self._glob}')")
@@ -715,7 +715,7 @@ class MultiCatalogAccessor:
     def __init__(self, lake_root: Path | str, surveys: list[str]) -> None:
         self.lake_root = Path(lake_root)
         self._accessors: dict[str, CatalogAccessor] = {}
-        self._con = duckdb.connect(":memory:")
+        self._con = connect_duckdb(":memory:")
         for name in surveys:
             acc = CatalogAccessor(lake_root, name)
             glob = str(acc._catalog_root / f"Norder={acc.norder}" / "**" / "*.parquet")

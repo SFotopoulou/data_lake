@@ -60,6 +60,13 @@ from data_lake.io.crossmatch_matchers import (
     validate_match_backend,
     warn_rapids_worker_config,
 )
+from data_lake.io.duckdb_limits import (
+    DuckDBLimits,
+    connect as connect_duckdb,
+    per_worker_limits,
+    process_limits,
+    set_process_limits,
+)
 from data_lake.ingest.fits_to_parquet import healpix_dir, _ZSTD_LEVEL
 
 log = logging.getLogger(__name__)
@@ -132,6 +139,7 @@ class CrossmatchTileConfig:
     b_cache_max_tiles: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_TILES
     b_cache_max_bytes: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_BYTES
     heartbeat_tiles: int = 1  # log every N tiles inside the mega-strip
+    duckdb_limits: DuckDBLimits | None = None
 
 
 @dataclass(frozen=True)
@@ -1201,6 +1209,21 @@ def _crossmatch_one_tile(
             dec_max=dec_max,
         )
     t_b_load = time.perf_counter() - t1
+    if log.isEnabledFor(logging.DEBUG):
+        from data_lake.io.crossmatch_b_cache import tile_file_bytes
+
+        b_sizes = [s for p in b_pixels if (s := tile_file_bytes(acc_b, p)) > 0]
+        log.debug(
+            "A tile Npix=%d: %d A row(s); %d B tile(s), %.1f MiB on disk, "
+            "%d B row(s) in bbox; A read %.2f s, B load %.2f s",
+            npix_a,
+            ra_a.size,
+            len(b_sizes),
+            sum(b_sizes) / (1024 * 1024),
+            df_b.height,
+            t_a_read,
+            t_b_load,
+        )
     if df_b.is_empty():
         if phase_stats is not None:
             phase_stats.add_tile(t_a_read_s=t_a_read, t_b_load_s=t_b_load)
@@ -1217,6 +1240,7 @@ def _crossmatch_one_tile(
         gpu_id=gpu_id,
     )
     t_match = time.perf_counter() - t2
+    log.debug("A tile Npix=%d: %d match(es) in %.2f s", npix_a, matched_a.size, t_match)
     if matched_a.size == 0:
         if phase_stats is not None:
             phase_stats.add_tile(
@@ -1254,14 +1278,45 @@ def _crossmatch_one_tile(
     return table.num_rows
 
 
+def _terminal_log_level() -> int:
+    """Lowest level any root handler emits in this (parent) process."""
+    root = logging.getLogger()
+    levels = [
+        h.level for h in root.handlers
+        if not isinstance(h, logging.NullHandler) and h.level > logging.NOTSET
+    ]
+    return min(levels) if levels else root.getEffectiveLevel()
+
+
+def _init_crossmatch_worker(log_level: int) -> None:
+    """Pool initializer: keep worker logs on stderr at the parent's level.
+
+    Forked workers inherit the parent's handlers; spawned ones start with none.
+    """
+    import sys
+
+    from data_lake.cli_utils import configure_warning_filters
+
+    configure_warning_filters()
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(
+            fmt="[%(asctime)s] %(process)d %(name)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        handler.setLevel(log_level)
+        root.addHandler(handler)
+    root.setLevel(min(root.getEffectiveLevel(), log_level))
+
+
 def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResult:
-    from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
     from data_lake.io.crossmatch_b_cache import (
         CrossmatchBTileCache,
         CrossmatchBTileCacheConfig,
     )
 
-    apply_parallel_worker_logging_after_heavy_imports()
+    set_process_limits(config.duckdb_limits)
     try:
         lake_root = Path(config.lake_root)
         out_root = Path(config.out_root)
@@ -1313,6 +1368,8 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
                     )
         phase.b_cache_hits = int(b_cache.hits)
         phase.b_cache_misses = int(b_cache.misses)
+        if b_cache.enabled:
+            log.debug("Worker strip B-cache: %s", b_cache.summary())
         return CrossmatchTileResult(
             n_match_rows,
             n_tiles_written,
@@ -1405,10 +1462,8 @@ def load_crossmatch_table(
     if not files:
         return _empty_crossmatch_table(norder)
 
-    import duckdb
-
     glob = _crossmatch_parquet_glob(out_root, norder)
-    con = duckdb.connect(":memory:")
+    con = connect_duckdb(":memory:")
     try:
         result = con.execute(f"SELECT * FROM parquet_scan('{glob}')").arrow()
     finally:
@@ -1484,6 +1539,7 @@ def build_crossmatch(
     b_cache: bool = True,
     b_cache_max_tiles: int | None = None,
     b_cache_max_mib: int | None = None,
+    memory_budget_bytes: int | None = None,
 ) -> CrossmatchResult:
     """
     Build a precomputed cross-match between two surveys.
@@ -1530,6 +1586,11 @@ def build_crossmatch(
     export_parquet / export_fits:
         If set, after the HATS tiles are written, consolidate all match rows into
         a single Parquet or FITS file at these paths (in addition to the tile layout).
+    memory_budget_bytes:
+        Total memory for the run, split across ``n_workers`` to size each
+        worker's DuckDB ``memory_limit`` (see
+        :func:`data_lake.io.duckdb_limits.per_worker_limits`).  Default: the
+        smallest of physical RAM, the cgroup limit, and the Slurm allocation.
 
     Returns
     -------
@@ -1650,6 +1711,8 @@ def build_crossmatch(
         else int(b_cache_max_mib)
     )
     b_cache_max_bytes = max(1, mib_cap) * 1024 * 1024
+    duckdb_limits = per_worker_limits(n_workers, memory_budget_bytes=memory_budget_bytes)
+    log.info("DuckDB per worker: %s", duckdb_limits.describe())
     if n_workers > 1:
         log.info(
             "Cross-match %s × %s: %d tile(s) to compute with %d workers (%d skipped)",
@@ -1687,7 +1750,8 @@ def build_crossmatch(
                 max_bytes=b_cache_max_bytes,
             )
         )
-        with CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a, \
+        with process_limits(duckdb_limits), \
+             CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a, \
              CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b:
             log.info(
                 "ID columns: %s (%r) × %s (%r)",
@@ -1720,10 +1784,10 @@ def build_crossmatch(
                     n_match_rows += n_rows
         phase_stats.b_cache_hits = int(b_tile_cache.hits)
         phase_stats.b_cache_misses = int(b_tile_cache.misses)
+        if b_tile_cache.enabled:
+            log.debug("B-cache: %s", b_tile_cache.summary())
         _log_phase_stats(f"Cross-match {survey_a} × {survey_b}", phase_stats)
     else:
-        from data_lake.cli_utils import init_parallel_ingest_subprocess
-
         # One mega-strip job per process so the B-tile LRU lives for the whole strip.
         worker_tiles = partition_pending_among_workers(pending, n_workers)
         log.info(
@@ -1755,6 +1819,7 @@ def build_crossmatch(
                 b_cache_max_tiles=tiles_cap,
                 b_cache_max_bytes=b_cache_max_bytes,
                 heartbeat_tiles=tiles_per_worker,
+                duckdb_limits=duckdb_limits,
             )
             for tiles in worker_tiles
         ]
@@ -1770,7 +1835,8 @@ def build_crossmatch(
 
         with ProcessPoolExecutor(
             max_workers=n_workers,
-            initializer=init_parallel_ingest_subprocess,
+            initializer=_init_crossmatch_worker,
+            initargs=(_terminal_log_level(),),
         ) as pool:
             future_to_n_tiles: dict[Future, int] = {}
             futures = []
@@ -2101,6 +2167,7 @@ class ColumnCrossmatchTileConfig:
     b_cache_max_tiles: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_TILES
     b_cache_max_bytes: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_BYTES
     heartbeat_tiles: int = 1
+    duckdb_limits: DuckDBLimits | None = None
 
 
 def _column_crossmatch_one_tile(
@@ -2196,9 +2263,7 @@ def _column_crossmatch_one_tile(
 def _column_crossmatch_tile_worker(
     config: ColumnCrossmatchTileConfig,
 ) -> CrossmatchTileResult:
-    from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
-
-    apply_parallel_worker_logging_after_heavy_imports()
+    set_process_limits(config.duckdb_limits)
     try:
         lake_root = Path(config.lake_root)
         out_root = Path(config.out_root)
@@ -2347,6 +2412,7 @@ def build_column_crossmatch(
     b_cache: bool = True,
     b_cache_max_tiles: int | None = None,
     b_cache_max_mib: int | None = None,
+    memory_budget_bytes: int | None = None,
 ) -> CrossmatchResult:
     """Build a column-equality crossmatch between two surveys.
 
@@ -2391,6 +2457,9 @@ def build_column_crossmatch(
     b_cache / b_cache_max_tiles / b_cache_max_mib:
         Same partner-tile LRU policy as sky crossmatch
         (:mod:`data_lake.knobs.PARTNER_TILE_CACHE_*`).
+    memory_budget_bytes:
+        Same as :func:`build_crossmatch`: total memory split across workers to
+        size each worker's DuckDB ``memory_limit``.
     """
     from data_lake.knobs import (
         PARTNER_TILE_CACHE_MAX_BYTES,
@@ -2408,6 +2477,8 @@ def build_column_crossmatch(
         else int(b_cache_max_mib)
     )
     b_cache_max_bytes = max(1, mib_cap) * 1024 * 1024
+    duckdb_limits = per_worker_limits(n_workers, memory_budget_bytes=memory_budget_bytes)
+    log.info("DuckDB per worker: %s", duckdb_limits.describe())
     from data_lake.schema_registry import resolve_catalog_root
     validate_match_column(match_col_a, "--match-col-a")
     validate_match_column(match_col_b, "--match-col-b")
@@ -2500,6 +2571,7 @@ def build_column_crossmatch(
                 b_cache_max_tiles=tiles_cap,
                 b_cache_max_bytes=b_cache_max_bytes,
                 heartbeat_tiles=tiles_per_worker,
+                duckdb_limits=duckdb_limits,
             )
             for tiles in worker_tiles
         ]
@@ -2512,7 +2584,11 @@ def build_column_crossmatch(
             except ImportError:
                 pass
 
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_crossmatch_worker,
+            initargs=(_terminal_log_level(),),
+        ) as pool:
             future_to_n: dict[Future, int] = {}
             for cfg in configs:
                 fut = pool.submit(_column_crossmatch_tile_worker, cfg)
@@ -2550,6 +2626,7 @@ def build_column_crossmatch(
                 pass
 
         with (
+            process_limits(duckdb_limits),
             CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a,
             CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b,
         ):
@@ -2666,6 +2743,7 @@ def execute_crossmatch_plan(
     b_cache: bool = True,
     b_cache_max_tiles: int | None = None,
     b_cache_max_mib: int | None = None,
+    memory_budget_bytes: int | None = None,
 ) -> list[CrossmatchResult]:
     """Execute a crossmatch plan (base catalog x N partners), optionally region-bounded.
 
@@ -2738,6 +2816,7 @@ def execute_crossmatch_plan(
                 b_cache=b_cache,
                 b_cache_max_tiles=b_cache_max_tiles,
                 b_cache_max_mib=b_cache_max_mib,
+                memory_budget_bytes=memory_budget_bytes,
             )
         else:
             radius = partner.get("radius_arcsec")
@@ -2760,6 +2839,7 @@ def execute_crossmatch_plan(
                 b_cache=b_cache,
                 b_cache_max_tiles=b_cache_max_tiles,
                 b_cache_max_mib=b_cache_max_mib,
+                memory_budget_bytes=memory_budget_bytes,
             )
         results.append(result)
     return results
@@ -2817,7 +2897,6 @@ class CrossmatchAccessor:
         norder: int | None = None,
         radius_arcsec: float | None = None,
     ) -> None:
-        import duckdb
         self.lake_root = Path(lake_root)
         self.survey_a = survey_a
         self.survey_b = survey_b
@@ -2833,7 +2912,7 @@ class CrossmatchAccessor:
                 self._info = json.load(fh)
 
         self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
-        self._con = duckdb.connect(":memory:")
+        self._con = connect_duckdb(":memory:")
         glob = str(self._xm_root / f"Norder={self.norder}" / "**" / "*.parquet")
         self._con.execute(
             f"CREATE OR REPLACE VIEW xmatch AS SELECT * FROM parquet_scan('{glob}')"
@@ -3030,6 +3109,18 @@ try:
         type=int,
         help="Max survey-B tile cache size in MiB per worker.",
     )
+    @click.option(
+        "--memory-budget-gb",
+        type=float,
+        default=None,
+        help=(
+            "Total memory for this run, split across --n-workers to size each "
+            "worker's DuckDB memory_limit. Default: smallest of physical RAM, "
+            "the cgroup limit, and the Slurm allocation. DuckDB threads are "
+            "always split as available CPUs / --n-workers. Override either with "
+            "$DATA_LAKE_DUCKDB_THREADS / $DATA_LAKE_DUCKDB_MEMORY_LIMIT_MIB."
+        ),
+    )
     @logging_options
     def cli(
         survey_a: str | None,
@@ -3060,6 +3151,7 @@ try:
         b_cache: bool,
         b_cache_tiles: int,
         b_cache_mib: int,
+        memory_budget_gb: float | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -3091,6 +3183,11 @@ try:
             raise click.ClickException("--b-cache-tiles must be >= 1")
         if b_cache_mib < 1:
             raise click.ClickException("--b-cache-mib must be >= 1")
+        if memory_budget_gb is not None and memory_budget_gb <= 0:
+            raise click.ClickException("--memory-budget-gb must be > 0")
+        memory_budget_bytes = (
+            int(memory_budget_gb * 1024**3) if memory_budget_gb is not None else None
+        )
 
         # ---- column mode: dl-crossmatch A B [LAKE] --match-mode column ... ----
         if match_mode == "column":
@@ -3136,6 +3233,7 @@ try:
                     b_cache=b_cache,
                     b_cache_max_tiles=b_cache_tiles,
                     b_cache_max_mib=b_cache_mib,
+                    memory_budget_bytes=memory_budget_bytes,
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
@@ -3186,6 +3284,7 @@ try:
                     b_cache=b_cache,
                     b_cache_max_tiles=b_cache_tiles,
                     b_cache_max_mib=b_cache_mib,
+                    memory_budget_bytes=memory_budget_bytes,
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
@@ -3248,6 +3347,7 @@ try:
             b_cache=b_cache,
             b_cache_max_tiles=b_cache_tiles,
             b_cache_max_mib=b_cache_mib,
+            memory_budget_bytes=memory_budget_bytes,
         )
         backend_note = result.match_backend
         if result.match_backend == "rapids":

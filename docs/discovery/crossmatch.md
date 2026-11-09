@@ -165,6 +165,11 @@ modes) keeps a per-worker LRU of **full** B tiles (defaults from
 `data_lake.knobs.PARTNER_TILE_CACHE_*`: 48 tiles / 512 MiB — same policy as
 `dl-gather`’s partner cache). Sky mode applies the A-tile RA/Dec bbox in memory.
 Disable with `--no-b-cache`, or tune with `--b-cache-tiles` / `--b-cache-mib`.
+`--b-cache-mib` caps the **in-memory** Polars frames (id, RA, Dec, HEALPix
+columns only), not the Parquet file size. Run with `--verbose` to see each B
+tile's rows, on-disk and in-RAM size, evictions, and a per-worker summary; many
+evictions mean the B tiles one A tile needs (about 9 at the same order) do not
+fit, so every A tile re-reads them.
 
 **Worker scheduling:** pending survey-A tiles are sorted by a coarse nested
 parent (then `npix`), then split into **at most `--n-workers` mega-strips**.
@@ -172,6 +177,16 @@ Each process runs **one strip with one long-lived B-cache** (not one short job
 per handful of tiles). `--tiles-per-worker` is only a **heartbeat** interval
 inside that strip (`1` → log about every 50 tiles). Processes do **not** share
 caches. Integer lake `_source_id` columns use a vectorized fast path.
+
+**DuckDB limits per worker:** each worker's DuckDB connections get
+`available CPUs / --n-workers` threads and a quarter of
+`--memory-budget-gb / --n-workers` as `memory_limit`
+(`data_lake.knobs.DUCKDB_WORKER_MEMORY_FRACTION`). The default budget is the
+smallest of physical RAM, the cgroup limit, and the Slurm allocation. Without
+these limits every connection takes all cores and 80 % of the node's RAM, so
+`--n-workers > 1` oversubscribes the node and can get workers killed
+(`BrokenProcessPool`). Override with `$DATA_LAKE_DUCKDB_THREADS` and
+`$DATA_LAKE_DUCKDB_MEMORY_LIMIT_MIB`; the chosen values are logged at start.
 
 Phase timing (`a_read` / `b_load` / `match` / `write`) and B-cache hit/miss
 counts are logged at the end of a run and stored under `perf` in

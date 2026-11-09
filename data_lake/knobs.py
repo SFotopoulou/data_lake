@@ -41,6 +41,14 @@ PARTNER_TILE_CACHE_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MiB
 """Shared by sky crossmatch B-cache, column-XM B-cache, and dl-gather partner cache."""
 
 # ---------------------------------------------------------------------------
+# DuckDB per-worker limits (see data_lake.io.duckdb_limits)
+# ---------------------------------------------------------------------------
+
+DUCKDB_WORKER_MEMORY_FRACTION: float = 0.25
+"""Share of each worker's memory budget given to DuckDB; the rest is left for
+Polars frames, partner caches, and the matcher."""
+
+# ---------------------------------------------------------------------------
 # Zarr shard sizing
 # ---------------------------------------------------------------------------
 

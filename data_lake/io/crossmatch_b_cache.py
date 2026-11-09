@@ -6,6 +6,7 @@ overlapping B pixels. Callers apply the A-tile bbox filter in memory.
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,6 +14,19 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from data_lake.io.catalog import CatalogAccessor
+
+log = logging.getLogger(__name__)
+
+_MIB = 1024 * 1024
+
+
+def tile_file_bytes(acc: CatalogAccessor, npix: int) -> int:
+    """On-disk size of one catalog tile Parquet (0 when absent)."""
+    path = acc._tile_parquet_path(int(npix))
+    try:
+        return path.stat().st_size if path is not None else 0
+    except OSError:
+        return 0
 
 
 @dataclass
@@ -79,10 +93,47 @@ class CrossmatchBTileCache:
         self._bytes = 0
         self.hits = 0
         self.misses = 0
+        self.evictions = 0
+        self.max_tile_bytes = 0
 
     @property
     def enabled(self) -> bool:
         return self._config.enabled
+
+    @property
+    def n_bytes(self) -> int:
+        return self._bytes
+
+    @property
+    def n_tiles(self) -> int:
+        return len(self._entries)
+
+    def summary(self) -> str:
+        return (
+            f"{self.hits} hit(s), {self.misses} miss(es), {self.evictions} eviction(s); "
+            f"largest tile {self.max_tile_bytes / _MIB:.1f} MiB in RAM; "
+            f"holding {self.n_tiles}/{self._config.max_tiles} tile(s), "
+            f"{self._bytes / _MIB:.0f}/{self._config.max_bytes / _MIB:.0f} MiB"
+        )
+
+    def _log_fetched(self, acc_b: CatalogAccessor, npix: int, df: Any) -> None:
+        if not log.isEnabledFor(logging.DEBUG):
+            return
+        disk = tile_file_bytes(acc_b, npix)
+        if disk == 0:
+            return
+        log.debug(
+            "B tile Npix=%d: %d row(s), %.1f MiB on disk, %.1f MiB in RAM; "
+            "cache %d/%d tile(s), %.0f/%.0f MiB",
+            npix,
+            df.height,
+            disk / _MIB,
+            _estimate_df_bytes(df) / _MIB,
+            self.n_tiles,
+            self._config.max_tiles,
+            self._bytes / _MIB,
+            self._config.max_bytes / _MIB,
+        )
 
     def get_tiles(
         self,
@@ -131,10 +182,12 @@ class CrossmatchBTileCache:
                 for npix in need_fetch:
                     chunk = fetched.filter(pl.col(hp_col) == npix)
                     self._put((npix, col_key), chunk)
+                    self._log_fetched(acc_b, npix, chunk)
                     if not chunk.is_empty():
                         parts.append(chunk)
             elif len(need_fetch) == 1:
                 self._put((need_fetch[0], col_key), fetched)
+                self._log_fetched(acc_b, need_fetch[0], fetched)
                 parts.append(fetched)
             else:
                 # No healpix column to split — do not cache; return fetched as-is.
@@ -151,7 +204,9 @@ class CrossmatchBTileCache:
             self._bytes -= _estimate_df_bytes(self._entries[key])
             del self._entries[key]
         self._entries[key] = df
-        self._bytes += _estimate_df_bytes(df)
+        nbytes = _estimate_df_bytes(df)
+        self._bytes += nbytes
+        self.max_tile_bytes = max(self.max_tile_bytes, nbytes)
         self._entries.move_to_end(key)
         self._evict()
 
@@ -160,5 +215,8 @@ class CrossmatchBTileCache:
             len(self._entries) > self._config.max_tiles
             or self._bytes > self._config.max_bytes
         ):
-            _, old_df = self._entries.popitem(last=False)
-            self._bytes -= _estimate_df_bytes(old_df)
+            (old_npix, _), old_df = self._entries.popitem(last=False)
+            old_bytes = _estimate_df_bytes(old_df)
+            self._bytes -= old_bytes
+            self.evictions += 1
+            log.debug("B-cache evicted Npix=%d (%.1f MiB)", old_npix, old_bytes / _MIB)
