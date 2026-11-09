@@ -128,6 +128,9 @@ class CrossmatchTileConfig:
     out_root: str
     match_backend: MatchBackend = "astropy"
     gpu_id: int = 0
+    b_cache_enabled: bool = True
+    b_cache_max_tiles: int = 48
+    b_cache_max_bytes: int = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -933,10 +936,44 @@ def filter_survey_a_tiles_overlapping_survey_b(
 
 
 def _catalog_ids_to_int64(values) -> np.ndarray:
-    """Coerce catalog ID column values to int64 for cross-match output."""
-    from data_lake.ingest.fits_to_parquet import normalize_object_id
+    """Coerce catalog ID column values to int64 for cross-match output.
 
-    return np.asarray([normalize_object_id(v) for v in values], dtype=np.int64)
+    Fast path for integer / decimal-string lake IDs; falls back to per-element
+    :func:`~data_lake.ingest.fits_to_parquet.normalize_object_id` for mixed labels.
+    """
+    from data_lake.ingest.fits_to_parquet import (
+        normalize_object_id,
+        storage_int64_from_uint64_array,
+    )
+
+    # Polars Series
+    if hasattr(values, "dtype") and hasattr(values, "to_numpy") and hasattr(values, "null_count"):
+        if values.null_count() > 0:
+            raise ValueError("object ID column contains nulls")
+        dtype_name = str(values.dtype)
+        if dtype_name in ("Int64", "Int32", "Int16", "Int8"):
+            return np.asarray(values.to_numpy(), dtype=np.int64)
+        if dtype_name in ("UInt64", "UInt32", "UInt16", "UInt8"):
+            return storage_int64_from_uint64_array(values.to_numpy())
+        if dtype_name in ("Utf8", "String"):
+            try:
+                casted = values.cast("Int64", strict=True)
+                return np.asarray(casted.to_numpy(), dtype=np.int64)
+            except Exception:
+                pass  # fall through to slow path
+
+    arr = np.asarray(values)
+    if arr.dtype == object or arr.dtype.kind in ("U", "S"):
+        return np.asarray([normalize_object_id(v) for v in arr.tolist()], dtype=np.int64)
+    if np.issubdtype(arr.dtype, np.floating):
+        raise ValueError(
+            "object ID column is floating-point; re-ingest with an int64 ID column."
+        )
+    if np.issubdtype(arr.dtype, np.unsignedinteger):
+        return storage_int64_from_uint64_array(arr)
+    if np.issubdtype(arr.dtype, np.integer):
+        return np.asarray(arr, dtype=np.int64)
+    return np.asarray([normalize_object_id(v) for v in arr.tolist()], dtype=np.int64)
 
 
 _CROSSMATCH_DENSE_TILE_WARN = 50_000
@@ -959,8 +996,11 @@ def _crossmatch_one_tile(
     acc_b: CatalogAccessor,
     match_backend: MatchBackend = "astropy",
     gpu_id: int = 0,
+    b_cache: "CrossmatchBTileCache | None" = None,
 ) -> int:
     """Match one survey-A tile; write Parquet. Returns number of match rows."""
+    from data_lake.io.crossmatch_b_cache import filter_sky_bbox
+
     nside_a = hp.order2nside(norder_a)
     nside_b = hp.order2nside(norder_b)
     hp_col = f"_healpix_norder{norder_a}"
@@ -983,7 +1023,7 @@ def _crossmatch_one_tile(
             npix_a,
             ra_a.size,
         )
-    ids_a = _catalog_ids_to_int64(df_a[id_col_a].to_list())
+    ids_a = _catalog_ids_to_int64(df_a[id_col_a])
 
     b_pixels = healpix_pixels_covering_tile(
         nside_a, npix_a, radius_rad, nside_b=nside_b,
@@ -996,24 +1036,38 @@ def _crossmatch_one_tile(
     hp_col_b = f"_healpix_norder{norder_b}"
     cols_b = [id_col_b, ra_col_b, dec_col_b, hp_col_b]
     ra_min, ra_max, dec_min, dec_max = _source_bbox_deg(ra_a, dec_a, radius_deg)
-    df_b = acc_b.sources_in_healpix_pixels(
-        b_pixels,
-        columns=cols_b,
-        fmt="polars",
-        ra_col=ra_col_b,
-        dec_col=dec_col_b,
-        ra_min=ra_min,
-        ra_max=ra_max,
-        dec_min=dec_min,
-        dec_max=dec_max,
-    )
+
+    if b_cache is not None and b_cache.enabled:
+        df_b = b_cache.get_tiles(acc_b, b_pixels, cols_b, hp_col=hp_col_b)
+        df_b = filter_sky_bbox(
+            df_b,
+            ra_col=ra_col_b,
+            dec_col=dec_col_b,
+            ra_min=ra_min,
+            ra_max=ra_max,
+            dec_min=dec_min,
+            dec_max=dec_max,
+        )
+    else:
+        df_b = acc_b.sources_in_healpix_pixels(
+            b_pixels,
+            columns=cols_b,
+            fmt="polars",
+            ra_col=ra_col_b,
+            dec_col=dec_col_b,
+            ra_min=ra_min,
+            ra_max=ra_max,
+            dec_min=dec_min,
+            dec_max=dec_max,
+        )
     if df_b.is_empty():
         return 0
     ra_b = df_b[ra_col_b].to_numpy().astype(np.float64)
     dec_b = df_b[dec_col_b].to_numpy().astype(np.float64)
-    ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
+    ids_b = _catalog_ids_to_int64(df_b[id_col_b])
+    hp_b = np.asarray(df_b[hp_col_b].to_numpy(), dtype=np.int64)
 
-    matched_a, matched_b, sep = match_sky_nn_within_radius(
+    matched_a, matched_b, sep, idx_b = match_sky_nn_within_radius(
         ra_a, dec_a, ids_a, ra_b, dec_b, ids_b, radius_deg,
         backend=match_backend,
         gpu_id=gpu_id,
@@ -1021,14 +1075,7 @@ def _crossmatch_one_tile(
     if matched_a.size == 0:
         return 0
 
-    id_to_npix_b = dict(zip(
-        df_b[id_col_b].to_list(),
-        df_b[hp_col_b].to_list(),
-    ))
-    npix_b_matched = np.array(
-        [int(id_to_npix_b[b]) for b in matched_b],
-        dtype=np.int64,
-    )
+    npix_b_matched = hp_b[idx_b]
 
     table = pa.table({
         "source_id_a": pa.array(matched_a, type=pa.int64()),
@@ -1051,6 +1098,10 @@ def _crossmatch_one_tile(
 
 def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResult:
     from data_lake.cli_utils import apply_parallel_worker_logging_after_heavy_imports
+    from data_lake.io.crossmatch_b_cache import (
+        CrossmatchBTileCache,
+        CrossmatchBTileCacheConfig,
+    )
 
     apply_parallel_worker_logging_after_heavy_imports()
     try:
@@ -1060,6 +1111,13 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
         radius_rad = np.radians(radius_deg)
         n_match_rows = 0
         n_tiles_written = 0
+        b_cache = CrossmatchBTileCache(
+            CrossmatchBTileCacheConfig(
+                enabled=config.b_cache_enabled,
+                max_tiles=config.b_cache_max_tiles,
+                max_bytes=config.b_cache_max_bytes,
+            )
+        )
 
         with CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a, \
              CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b:
@@ -1079,6 +1137,7 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
                     acc_b=acc_b,
                     match_backend=config.match_backend,
                     gpu_id=config.gpu_id,
+                    b_cache=b_cache,
                 )
                 n_match_rows += n_rows
                 if n_rows > 0:
@@ -1245,6 +1304,9 @@ def build_crossmatch(
     export_fits: Path | str | None = None,
     tiles_per_worker: int = 1,
     restrict_npix: Iterable[int] | None = None,
+    b_cache: bool = True,
+    b_cache_max_tiles: int = 48,
+    b_cache_max_mib: int = 512,
 ) -> CrossmatchResult:
     """
     Build a precomputed cross-match between two surveys.
@@ -1253,7 +1315,8 @@ def build_crossmatch(
     those overlapping the survey-B populated footprint (see
     :func:`filter_survey_a_tiles_overlapping_survey_b`).  Survey-B candidates
     per tile are read from the matching survey-B HEALPix tile Parquet files only,
-    with an RA/Dec bounding-box filter around survey-A sources.
+    with an RA/Dec bounding-box filter around survey-A sources.  Neighbouring A
+    tiles reuse a bounded LRU of full B tiles when ``b_cache`` is True.
 
     Parameters
     ----------
@@ -1386,6 +1449,9 @@ def build_crossmatch(
     pending, n_match_rows, n_tiles_written = _pending_crossmatch_tiles(
         tile_npixels, out_root, norder_a, overwrite,
     )
+    # Spatial locality improves B-tile LRU hit rate inside each worker.
+    pending = sorted(pending)
+    b_cache_max_bytes = max(1, int(b_cache_max_mib)) * 1024 * 1024
     if n_workers > 1:
         log.info(
             "Cross-match %s × %s: %d tile(s) to compute with %d workers (%d skipped)",
@@ -1400,6 +1466,11 @@ def build_crossmatch(
     failures: list[str] = []
 
     if n_workers == 1:
+        from data_lake.io.crossmatch_b_cache import (
+            CrossmatchBTileCache,
+            CrossmatchBTileCacheConfig,
+        )
+
         radius_deg = radius_arcsec / 3600.0
         iterator: Iterable[int] = pending
         if show_progress:
@@ -1410,6 +1481,13 @@ def build_crossmatch(
             except ImportError:
                 pass
 
+        b_tile_cache = CrossmatchBTileCache(
+            CrossmatchBTileCacheConfig(
+                enabled=b_cache,
+                max_tiles=b_cache_max_tiles,
+                max_bytes=b_cache_max_bytes,
+            )
+        )
         with CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a, \
              CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b:
             log.info(
@@ -1435,10 +1513,17 @@ def build_crossmatch(
                     acc_b=acc_b,
                     match_backend=match_backend,
                     gpu_id=gpu_id,
+                    b_cache=b_tile_cache,
                 )
                 if n_rows > 0:
                     n_tiles_written += 1
                     n_match_rows += n_rows
+        if b_cache and (b_tile_cache.hits or b_tile_cache.misses):
+            log.info(
+                "Survey-B tile cache: %d hit(s), %d miss(es)",
+                b_tile_cache.hits,
+                b_tile_cache.misses,
+            )
     else:
         from data_lake.cli_utils import init_parallel_ingest_subprocess
 
@@ -1468,6 +1553,9 @@ def build_crossmatch(
                 out_root=str(out_root),
                 match_backend=match_backend,
                 gpu_id=gpu_id,
+                b_cache_enabled=b_cache,
+                b_cache_max_tiles=b_cache_max_tiles,
+                b_cache_max_bytes=b_cache_max_bytes,
             )
             for tiles in worker_tiles
         ]
@@ -1714,7 +1802,7 @@ def _prepare_b_join_frame(
             "source_id_b": pl.Series([], dtype=pl.Int64),
             "healpix_npix_b": pl.Series([], dtype=pl.Int64),
         })
-    ids_b = _catalog_ids_to_int64(df_b[id_col_b].to_list())
+    ids_b = _catalog_ids_to_int64(df_b[id_col_b])
     return df_b.select([
         pl.col(match_col_b).cast(pl.Utf8).alias("__match_key_b"),
         pl.Series("source_id_b", ids_b),
@@ -1809,7 +1897,7 @@ def _column_crossmatch_one_tile(
     if df_a.is_empty():
         return 0
 
-    ids_a = _catalog_ids_to_int64(df_a[id_col_a].to_list())
+    ids_a = _catalog_ids_to_int64(df_a[id_col_a])
     df_a = df_a.select([
         pl.Series("source_id_a", ids_a),
         pl.col(match_col_a).cast(pl.Utf8).alias("__match_key_a"),
@@ -2271,6 +2359,9 @@ def execute_crossmatch_plan(
     match_backend: MatchBackend = "astropy",
     gpu_id: int = 0,
     show_progress: bool = False,
+    b_cache: bool = True,
+    b_cache_max_tiles: int = 48,
+    b_cache_max_mib: int = 512,
 ) -> list[CrossmatchResult]:
     """Execute a crossmatch plan (base catalog x N partners), optionally region-bounded.
 
@@ -2359,6 +2450,9 @@ def execute_crossmatch_plan(
                 gpu_id=gpu_id,
                 show_progress=show_progress,
                 restrict_npix=restrict_npix,
+                b_cache=b_cache,
+                b_cache_max_tiles=b_cache_max_tiles,
+                b_cache_max_mib=b_cache_max_mib,
             )
         results.append(result)
     return results
@@ -2596,6 +2690,26 @@ try:
         default=None,
         help="[column mode] Column in survey B to join on. Required with --match-mode=column.",
     )
+    @click.option(
+        "--b-cache/--no-b-cache",
+        default=True,
+        show_default=True,
+        help="LRU-cache full survey-B HEALPix tiles across neighbouring A tiles (sky mode).",
+    )
+    @click.option(
+        "--b-cache-tiles",
+        default=48,
+        show_default=True,
+        type=int,
+        help="Max survey-B tiles retained in the per-worker LRU.",
+    )
+    @click.option(
+        "--b-cache-mib",
+        default=512,
+        show_default=True,
+        type=int,
+        help="Max survey-B tile cache size in MiB (per worker).",
+    )
     @logging_options
     def cli(
         survey_a: str | None,
@@ -2623,6 +2737,9 @@ try:
         match_mode: str,
         match_col_a: str | None,
         match_col_b: str | None,
+        b_cache: bool,
+        b_cache_tiles: int,
+        b_cache_mib: int,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -2739,6 +2856,9 @@ try:
                     match_backend=match_backend,  # type: ignore[arg-type]
                     gpu_id=gpu_id,
                     show_progress=effective_progress,
+                    b_cache=b_cache,
+                    b_cache_max_tiles=b_cache_tiles,
+                    b_cache_max_mib=b_cache_mib,
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
@@ -2778,6 +2898,10 @@ try:
             if not cat_root.is_dir():
                 raise click.ClickException(f"{label} catalog not found: {cat_root}")
 
+        if b_cache_tiles < 1:
+            raise click.ClickException("--b-cache-tiles must be >= 1")
+        if b_cache_mib < 1:
+            raise click.ClickException("--b-cache-mib must be >= 1")
         result = build_crossmatch(
             lake,
             survey_a,
@@ -2798,6 +2922,9 @@ try:
             gpu_id=gpu_id,
             export_parquet=export_parquet,
             export_fits=export_fits,
+            b_cache=b_cache,
+            b_cache_max_tiles=b_cache_tiles,
+            b_cache_max_mib=b_cache_mib,
         )
         backend_note = result.match_backend
         if result.match_backend == "rapids":

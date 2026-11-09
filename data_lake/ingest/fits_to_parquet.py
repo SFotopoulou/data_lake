@@ -165,6 +165,23 @@ def storage_int64_from_integer(value: int) -> int:
     raise ValueError(f"object ID {value} is outside uint64 range")
 
 
+def storage_int64_from_uint64_array(values: np.ndarray) -> np.ndarray:
+    """Vectorized :func:`storage_int64_from_integer` for non-negative integer arrays.
+
+    Reinterprets uint64 bit patterns as signed int64 (NumPy ``uint64.view(int64)``).
+    """
+    arr = np.asarray(values)
+    if arr.size == 0:
+        return np.array([], dtype=np.int64)
+    if np.issubdtype(arr.dtype, np.unsignedinteger):
+        return np.asarray(arr, dtype=np.uint64).view(np.int64)
+    if np.issubdtype(arr.dtype, np.signedinteger):
+        # Already signed; values outside int64 must not appear (caller validated).
+        return np.asarray(arr, dtype=np.int64)
+    u = np.asarray(arr, dtype=np.uint64)
+    return u.view(np.int64)
+
+
 def normalize_object_id(value: object) -> int:
     """Coerce one catalog/Zarr object ID to int64 **storage** (signed int64 column).
 

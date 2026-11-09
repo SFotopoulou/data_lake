@@ -81,7 +81,7 @@ def _match_sky_astropy(
     dec_b: np.ndarray,
     ids_b: np.ndarray,
     radius_deg: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from astropy.coordinates import SkyCoord
     import astropy.units as u
 
@@ -92,7 +92,8 @@ def _match_sky_astropy(
     sep_deg = sep2d.deg
 
     mask = sep_deg <= radius_deg
-    return ids_a[mask], ids_b[idx_b[mask]], sep_deg[mask]
+    idx_keep = idx_b[mask].astype(np.int64, copy=False)
+    return ids_a[mask], ids_b[idx_keep], sep_deg[mask], idx_keep
 
 
 def _match_sky_rapids(
@@ -105,7 +106,7 @@ def _match_sky_rapids(
     radius_deg: float,
     *,
     gpu_id: int = 0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     import cupy as cp
     from cuml.neighbors import NearestNeighbors
 
@@ -121,7 +122,8 @@ def _match_sky_rapids(
     sep_deg = _angular_sep_deg_from_unit_xyz(xyz_a, xyz_b, idx_b)
 
     mask = sep_deg <= radius_deg
-    return ids_a[mask], ids_b[idx_b[mask]], sep_deg[mask]
+    idx_keep = idx_b[mask]
+    return ids_a[mask], ids_b[idx_keep], sep_deg[mask], idx_keep
 
 
 def match_sky_nn_within_radius(
@@ -135,17 +137,18 @@ def match_sky_nn_within_radius(
     *,
     backend: MatchBackend = "astropy",
     gpu_id: int = 0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Nearest-neighbour sky match: each A source → closest B, keep if within radius.
 
-    Returns ``(ids_a_matched, ids_b_matched, separations_deg)``.
+    Returns ``(ids_a_matched, ids_b_matched, separations_deg, idx_b_matched)``
+    where ``idx_b_matched`` indexes into the input B arrays.
     """
     validate_match_backend(backend)
     if ra_a.size == 0 or ra_b.size == 0:
         empty_i = np.array([], dtype=np.int64)
         empty_f = np.array([], dtype=np.float64)
-        return empty_i, empty_i, empty_f
+        return empty_i, empty_i, empty_f, empty_i
 
     if backend == "astropy":
         return _match_sky_astropy(
