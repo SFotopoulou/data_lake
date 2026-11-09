@@ -131,6 +131,7 @@ class CrossmatchTileConfig:
     b_cache_enabled: bool = True
     b_cache_max_tiles: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_TILES
     b_cache_max_bytes: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_BYTES
+    heartbeat_tiles: int = 1  # log every N tiles inside the mega-strip
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,138 @@ class CrossmatchTileResult:
     n_match_rows: int
     n_tiles_written: int
     error: str | None = None
+    t_a_read_s: float = 0.0
+    t_b_load_s: float = 0.0
+    t_match_s: float = 0.0
+    t_write_s: float = 0.0
+    b_cache_hits: int = 0
+    b_cache_misses: int = 0
+
+
+@dataclass
+class CrossmatchPhaseStats:
+    """Mutable accumulators for I/O vs matcher timing (one run or one worker)."""
+
+    t_a_read_s: float = 0.0
+    t_b_load_s: float = 0.0
+    t_match_s: float = 0.0
+    t_write_s: float = 0.0
+    b_cache_hits: int = 0
+    b_cache_misses: int = 0
+
+    def add_tile(
+        self,
+        *,
+        t_a_read_s: float = 0.0,
+        t_b_load_s: float = 0.0,
+        t_match_s: float = 0.0,
+        t_write_s: float = 0.0,
+    ) -> None:
+        self.t_a_read_s += t_a_read_s
+        self.t_b_load_s += t_b_load_s
+        self.t_match_s += t_match_s
+        self.t_write_s += t_write_s
+
+    def absorb_result(self, res: CrossmatchTileResult) -> None:
+        self.t_a_read_s += res.t_a_read_s
+        self.t_b_load_s += res.t_b_load_s
+        self.t_match_s += res.t_match_s
+        self.t_write_s += res.t_write_s
+        self.b_cache_hits += res.b_cache_hits
+        self.b_cache_misses += res.b_cache_misses
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "t_a_read_s": round(self.t_a_read_s, 3),
+            "t_b_load_s": round(self.t_b_load_s, 3),
+            "t_match_s": round(self.t_match_s, 3),
+            "t_write_s": round(self.t_write_s, 3),
+            "b_cache_hits": int(self.b_cache_hits),
+            "b_cache_misses": int(self.b_cache_misses),
+        }
+
+
+def nested_parent_order(norder: int) -> int:
+    """Coarse nested order for clustering pending A tiles (typically ``norder - 2``)."""
+    norder = int(norder)
+    if norder <= 0:
+        return 0
+    return max(0, norder - 2)
+
+
+def sort_pending_by_nested_parent(
+    pending: Sequence[int],
+    *,
+    norder: int,
+    parent_order: int | None = None,
+) -> list[int]:
+    """Sort A tiles by coarse nested parent, then ``npix`` (stable spatial clusters).
+
+    Parent id is ``npix >> 2*(norder - parent_order)`` — no extra catalog column.
+    """
+    po = nested_parent_order(norder) if parent_order is None else int(parent_order)
+    po = max(0, min(int(norder), po))
+    delta = int(norder) - po
+    tiles = [int(p) for p in pending]
+    if delta <= 0:
+        return sorted(tiles)
+    shift = 2 * delta
+    return sorted(tiles, key=lambda p: (p >> shift, p))
+
+
+def partition_pending_among_workers(
+    pending: Sequence[int],
+    n_workers: int,
+) -> list[tuple[int, ...]]:
+    """Split pending into at most ``n_workers`` contiguous mega-strips (one job each).
+
+    Each strip is processed by one process with a single long-lived B-tile cache.
+    """
+    if n_workers < 1:
+        raise ValueError("n_workers must be >= 1")
+    tiles = [int(p) for p in pending]
+    if not tiles:
+        return []
+    n_jobs = min(int(n_workers), len(tiles))
+    base, rem = divmod(len(tiles), n_jobs)
+    strips: list[tuple[int, ...]] = []
+    i = 0
+    for j in range(n_jobs):
+        sz = base + (1 if j < rem else 0)
+        strips.append(tuple(tiles[i : i + sz]))
+        i += sz
+    return strips
+
+
+def _heartbeat_interval(tiles_per_worker: int) -> int:
+    """Log progress every N tiles inside a mega-strip (``1`` → every 50)."""
+    n = int(tiles_per_worker)
+    if n <= 1:
+        return 50
+    return n
+
+
+def _log_phase_stats(label: str, stats: CrossmatchPhaseStats) -> None:
+    total = (
+        stats.t_a_read_s
+        + stats.t_b_load_s
+        + stats.t_match_s
+        + stats.t_write_s
+    )
+    if total <= 0 and not (stats.b_cache_hits or stats.b_cache_misses):
+        return
+    log.info(
+        "%s phase timing: a_read=%.2fs b_load=%.2fs match=%.2fs write=%.2fs "
+        "(sum=%.2fs); B-cache hits=%d misses=%d",
+        label,
+        stats.t_a_read_s,
+        stats.t_b_load_s,
+        stats.t_match_s,
+        stats.t_write_s,
+        total,
+        stats.b_cache_hits,
+        stats.b_cache_misses,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -996,6 +1129,7 @@ def _crossmatch_one_tile(
     match_backend: MatchBackend = "astropy",
     gpu_id: int = 0,
     b_cache: "CrossmatchBTileCache | None" = None,
+    phase_stats: CrossmatchPhaseStats | None = None,
 ) -> int:
     """Match one survey-A tile; write Parquet. Returns number of match rows."""
     from data_lake.io.crossmatch_b_cache import filter_sky_bbox
@@ -1009,8 +1143,12 @@ def _crossmatch_one_tile(
     out_dir = out_root / healpix_dir(norder_a, npix_a)
     out_file = out_dir / f"Npix={npix_a}.parquet"
 
+    t0 = time.perf_counter()
     df_a = acc_a.sources_in_tile(npix_a, columns=cols_a, fmt="polars")
+    t_a_read = time.perf_counter() - t0
     if df_a.is_empty():
+        if phase_stats is not None:
+            phase_stats.add_tile(t_a_read_s=t_a_read)
         return 0
 
     ra_a = df_a[ra_col_a].to_numpy().astype(np.float64)
@@ -1038,6 +1176,7 @@ def _crossmatch_one_tile(
     cols_b = [id_col_b, ra_col_b, dec_col_b, hp_col_b]
     ra_min, ra_max, dec_min, dec_max = _source_bbox_deg(ra_a, dec_a, radius_deg)
 
+    t1 = time.perf_counter()
     if b_cache is not None and b_cache.enabled:
         df_b = b_cache.get_tiles(acc_b, b_pixels, cols_b, hp_col=hp_col_b)
         df_b = filter_sky_bbox(
@@ -1061,19 +1200,28 @@ def _crossmatch_one_tile(
             dec_min=dec_min,
             dec_max=dec_max,
         )
+    t_b_load = time.perf_counter() - t1
     if df_b.is_empty():
+        if phase_stats is not None:
+            phase_stats.add_tile(t_a_read_s=t_a_read, t_b_load_s=t_b_load)
         return 0
     ra_b = df_b[ra_col_b].to_numpy().astype(np.float64)
     dec_b = df_b[dec_col_b].to_numpy().astype(np.float64)
     ids_b = _catalog_ids_to_int64(df_b[id_col_b])
     hp_b = np.asarray(df_b[hp_col_b].to_numpy(), dtype=np.int64)
 
+    t2 = time.perf_counter()
     matched_a, matched_b, sep, idx_b = match_sky_nn_within_radius(
         ra_a, dec_a, ids_a, ra_b, dec_b, ids_b, radius_deg,
         backend=match_backend,
         gpu_id=gpu_id,
     )
+    t_match = time.perf_counter() - t2
     if matched_a.size == 0:
+        if phase_stats is not None:
+            phase_stats.add_tile(
+                t_a_read_s=t_a_read, t_b_load_s=t_b_load, t_match_s=t_match
+            )
         return 0
 
     npix_b_matched = hp_b[idx_b]
@@ -1086,6 +1234,7 @@ def _crossmatch_one_tile(
         CROSSMATCH_HEALPIX_NPIX_B: pa.array(npix_b_matched, type=pa.int64()),
     })
 
+    t3 = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         table,
@@ -1094,6 +1243,14 @@ def _crossmatch_one_tile(
         compression_level=_ZSTD_LEVEL,
         write_statistics=True,
     )
+    t_write = time.perf_counter() - t3
+    if phase_stats is not None:
+        phase_stats.add_tile(
+            t_a_read_s=t_a_read,
+            t_b_load_s=t_b_load,
+            t_match_s=t_match,
+            t_write_s=t_write,
+        )
     return table.num_rows
 
 
@@ -1112,6 +1269,8 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
         radius_rad = np.radians(radius_deg)
         n_match_rows = 0
         n_tiles_written = 0
+        phase = CrossmatchPhaseStats()
+        heartbeat = _heartbeat_interval(getattr(config, "heartbeat_tiles", 1) or 1)
         b_cache = CrossmatchBTileCache(
             CrossmatchBTileCacheConfig(
                 enabled=config.b_cache_enabled,
@@ -1122,7 +1281,8 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
 
         with CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a, \
              CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b:
-            for npix_a in config.npix_a_list:
+            n_list = len(config.npix_a_list)
+            for i, npix_a in enumerate(config.npix_a_list, start=1):
                 n_rows = _crossmatch_one_tile(
                     npix_a=npix_a,
                     norder_a=config.norder_a,
@@ -1139,13 +1299,29 @@ def _crossmatch_tile_worker(config: CrossmatchTileConfig) -> CrossmatchTileResul
                     match_backend=config.match_backend,
                     gpu_id=config.gpu_id,
                     b_cache=b_cache,
+                    phase_stats=phase,
                 )
                 n_match_rows += n_rows
                 if n_rows > 0:
                     n_tiles_written += 1
+                if i % heartbeat == 0 or i == n_list:
+                    log.info(
+                        "Worker strip: %d/%d A tile(s) done, %d match row(s) so far",
+                        i,
+                        n_list,
+                        n_match_rows,
+                    )
+        phase.b_cache_hits = int(b_cache.hits)
+        phase.b_cache_misses = int(b_cache.misses)
         return CrossmatchTileResult(
             n_match_rows,
             n_tiles_written,
+            t_a_read_s=phase.t_a_read_s,
+            t_b_load_s=phase.t_b_load_s,
+            t_match_s=phase.t_match_s,
+            t_write_s=phase.t_write_s,
+            b_cache_hits=phase.b_cache_hits,
+            b_cache_misses=phase.b_cache_misses,
         )
     except Exception as exc:
         log.exception(
@@ -1342,6 +1518,11 @@ def build_crossmatch(
         Show a tqdm progress bar over survey-A tiles when available.
     n_workers:
         Parallel worker processes for disjoint survey-A tiles (default 1).
+        Pending tiles are split into at most ``n_workers`` contiguous mega-strips
+        (one job / one B-tile cache per process).
+    tiles_per_worker:
+        Heartbeat / log interval inside each mega-strip (not a separate job size).
+        ``1`` means log about every 50 tiles.
     match_backend:
         Sky matcher: ``astropy`` (default) or ``rapids`` (cuML on GPU).
     gpu_id:
@@ -1450,8 +1631,9 @@ def build_crossmatch(
     pending, n_match_rows, n_tiles_written = _pending_crossmatch_tiles(
         tile_npixels, out_root, norder_a, overwrite,
     )
-    # Spatial locality improves B-tile LRU hit rate inside each worker.
-    pending = sorted(pending)
+    # Cluster by coarse nested parent so each mega-strip stays spatially local
+    # even when populated tiles have large Morton gaps (patchy surveys).
+    pending = sort_pending_by_nested_parent(pending, norder=norder_a)
     from data_lake.knobs import (
         PARTNER_TILE_CACHE_MAX_BYTES,
         PARTNER_TILE_CACHE_MAX_TILES,
@@ -1480,6 +1662,7 @@ def build_crossmatch(
 
     t0 = time.perf_counter()
     failures: list[str] = []
+    phase_stats = CrossmatchPhaseStats()
 
     if n_workers == 1:
         from data_lake.io.crossmatch_b_cache import (
@@ -1530,28 +1713,27 @@ def build_crossmatch(
                     match_backend=match_backend,
                     gpu_id=gpu_id,
                     b_cache=b_tile_cache,
+                    phase_stats=phase_stats,
                 )
                 if n_rows > 0:
                     n_tiles_written += 1
                     n_match_rows += n_rows
-        if b_cache and (b_tile_cache.hits or b_tile_cache.misses):
-            log.info(
-                "Survey-B tile cache: %d hit(s), %d miss(es)",
-                b_tile_cache.hits,
-                b_tile_cache.misses,
-            )
+        phase_stats.b_cache_hits = int(b_tile_cache.hits)
+        phase_stats.b_cache_misses = int(b_tile_cache.misses)
+        _log_phase_stats(f"Cross-match {survey_a} × {survey_b}", phase_stats)
     else:
         from data_lake.cli_utils import init_parallel_ingest_subprocess
 
-        worker_tiles: list[tuple[int, ...]] = []
-        batch: list[int] = []
-        for npix_a in pending:
-            batch.append(npix_a)
-            if len(batch) >= tiles_per_worker:
-                worker_tiles.append(tuple(batch))
-                batch = []
-        if batch:
-            worker_tiles.append(tuple(batch))
+        # One mega-strip job per process so the B-tile LRU lives for the whole strip.
+        worker_tiles = partition_pending_among_workers(pending, n_workers)
+        log.info(
+            "Parallel cross-match: %d mega-strip job(s) for %d pending tile(s) "
+            "(≤ %d workers; heartbeat every %d tile(s))",
+            len(worker_tiles),
+            len(pending),
+            n_workers,
+            _heartbeat_interval(tiles_per_worker),
+        )
 
         configs = [
             CrossmatchTileConfig(
@@ -1572,6 +1754,7 @@ def build_crossmatch(
                 b_cache_enabled=b_cache,
                 b_cache_max_tiles=tiles_cap,
                 b_cache_max_bytes=b_cache_max_bytes,
+                heartbeat_tiles=tiles_per_worker,
             )
             for tiles in worker_tiles
         ]
@@ -1604,9 +1787,11 @@ def build_crossmatch(
                     continue
                 n_match_rows += res.n_match_rows
                 n_tiles_written += res.n_tiles_written
+                phase_stats.absorb_result(res)
 
         if pbar is not None:
             pbar.close()
+        _log_phase_stats(f"Cross-match {survey_a} × {survey_b}", phase_stats)
 
     elapsed = time.perf_counter() - t0
     if failures:
@@ -1632,6 +1817,7 @@ def build_crossmatch(
         gpu_id=gpu_id,
         n_match_rows=n_match_rows,
         n_tiles=n_tiles_written,
+        perf=phase_stats.as_dict(),
     )
     if tree_rows != n_match_rows or tree_tiles != n_tiles_written:
         log.info(
@@ -1717,6 +1903,7 @@ def _write_xm_info(
     gpu_id: int = 0,
     n_match_rows: int = 0,
     n_tiles: int | None = None,
+    perf: dict[str, float | int] | None = None,
 ) -> tuple[int, int]:
     """Write ``crossmatch_info.json`` with **full-tree** row/tile counts from disk.
 
@@ -1724,11 +1911,13 @@ def _write_xm_info(
     compatibility); values always come from :func:`recount_crossmatch_tree` so a
     region-bounded re-run cannot shrink the sidecar below tiles already on disk.
 
+    Optional *perf* records last-run phase timing / B-cache stats (not tree totals).
+
     Returns ``(tree_total_rows, tree_n_tiles)``.
     """
     del n_match_rows, n_tiles  # scoped run stats must not overwrite full-tree totals
     tree_rows, tree_tiles = recount_crossmatch_tree(out_root)
-    info = {
+    info: dict[str, Any] = {
         "catalog_name": xm_name,
         "catalog_type": "association",
         "modality": "crossmatch",
@@ -1751,6 +1940,8 @@ def _write_xm_info(
         "schema_version": "1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if perf:
+        info["perf"] = perf
     out_root.mkdir(parents=True, exist_ok=True)
     with open(out_root / CROSSMATCH_INFO_FILENAME, "w") as fh:
         json.dump(info, fh, indent=2)
@@ -1787,6 +1978,8 @@ class _BTileJoinCache:
 
     max_tiles: int = 0
     max_bytes: int = 0
+    hits: int = 0
+    misses: int = 0
     _entries: OrderedDict[int, pl.DataFrame] = field(default_factory=OrderedDict)
     _bytes: int = 0
 
@@ -1813,7 +2006,10 @@ class _BTileJoinCache:
         cached = self._entries.get(key)
         if cached is not None:
             self._entries.move_to_end(key)
-        return cached
+            self.hits += 1
+            return cached
+        self.misses += 1
+        return None
 
     def put(self, npix_b: int, df: pl.DataFrame) -> None:
         key = int(npix_b)
@@ -1904,6 +2100,7 @@ class ColumnCrossmatchTileConfig:
     b_cache_enabled: bool = True
     b_cache_max_tiles: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_TILES
     b_cache_max_bytes: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_BYTES
+    heartbeat_tiles: int = 1
 
 
 def _column_crossmatch_one_tile(
@@ -2008,6 +2205,7 @@ def _column_crossmatch_tile_worker(
         b_populated = set(config.b_populated)
         n_match_rows = 0
         n_tiles_written = 0
+        heartbeat = _heartbeat_interval(config.heartbeat_tiles)
         b_cache = (
             _BTileJoinCache(
                 max_tiles=config.b_cache_max_tiles,
@@ -2021,7 +2219,8 @@ def _column_crossmatch_tile_worker(
             CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a,
             CatalogAccessor(lake_root, config.survey_b, norder=config.norder_b) as acc_b,
         ):
-            for npix_a in config.npix_a_list:
+            n_list = len(config.npix_a_list)
+            for i, npix_a in enumerate(config.npix_a_list, start=1):
                 n_rows = _column_crossmatch_one_tile(
                     npix_a=npix_a,
                     norder_a=config.norder_a,
@@ -2037,7 +2236,19 @@ def _column_crossmatch_tile_worker(
                 n_match_rows += n_rows
                 if n_rows > 0:
                     n_tiles_written += 1
-        return CrossmatchTileResult(n_match_rows, n_tiles_written)
+                if i % heartbeat == 0 or i == n_list:
+                    log.info(
+                        "Column worker strip: %d/%d A tile(s) done, %d row(s) so far",
+                        i,
+                        n_list,
+                        n_match_rows,
+                    )
+        return CrossmatchTileResult(
+            n_match_rows,
+            n_tiles_written,
+            b_cache_hits=int(b_cache.hits) if b_cache is not None else 0,
+            b_cache_misses=int(b_cache.misses) if b_cache is not None else 0,
+        )
     except Exception as exc:
         log.exception("Column crossmatch worker failed for tiles %s", config.npix_a_list[:8])
         return CrossmatchTileResult(0, 0, str(exc))
@@ -2253,6 +2464,7 @@ def build_column_crossmatch(
     pending, n_match_rows, n_tiles_written = _pending_crossmatch_tiles(
         tile_npixels, out_root, norder_a, overwrite
     )
+    pending = sort_pending_by_nested_parent(pending, norder=norder_a)
     n_pending = len(pending)
     log.info(
         "%d A tile(s) pending (overwrite=%s, n_workers=%d)",
@@ -2262,18 +2474,15 @@ def build_column_crossmatch(
     t0 = time.perf_counter()
     t_last_log = t0
     n_done = 0
+    phase_stats = CrossmatchPhaseStats()
 
     if n_workers > 1:
-        # -- parallel: distribute tile batches to worker processes --
-        worker_tiles: list[tuple[int, ...]] = []
-        batch_buf: list[int] = []
-        for npix_a in pending:
-            batch_buf.append(npix_a)
-            if len(batch_buf) >= tiles_per_worker:
-                worker_tiles.append(tuple(batch_buf))
-                batch_buf = []
-        if batch_buf:
-            worker_tiles.append(tuple(batch_buf))
+        worker_tiles = partition_pending_among_workers(pending, n_workers)
+        log.info(
+            "Column parallel: %d mega-strip job(s) for %d pending tile(s)",
+            len(worker_tiles),
+            n_pending,
+        )
 
         configs = [
             ColumnCrossmatchTileConfig(
@@ -2290,6 +2499,7 @@ def build_column_crossmatch(
                 b_cache_enabled=b_cache,
                 b_cache_max_tiles=tiles_cap,
                 b_cache_max_bytes=b_cache_max_bytes,
+                heartbeat_tiles=tiles_per_worker,
             )
             for tiles in worker_tiles
         ]
@@ -2313,6 +2523,7 @@ def build_column_crossmatch(
                 n_match_rows += res.n_match_rows
                 n_tiles_written += res.n_tiles_written
                 n_done += n_tiles_done
+                phase_stats.absorb_result(res)
                 if pbar is not None:
                     pbar.update(n_tiles_done)
                 now = time.perf_counter()
@@ -2325,6 +2536,9 @@ def build_column_crossmatch(
 
         if pbar is not None:
             pbar.close()
+        _log_phase_stats(
+            f"Column crossmatch {survey_a} × {survey_b}", phase_stats
+        )
     else:
         # -- sequential --
         iterator: Iterable[int] = pending
@@ -2370,6 +2584,12 @@ def build_column_crossmatch(
                         n_done, n_pending, n_match_rows, now - t0,
                     )
                     t_last_log = now
+            if col_b_cache is not None:
+                phase_stats.b_cache_hits = int(col_b_cache.hits)
+                phase_stats.b_cache_misses = int(col_b_cache.misses)
+                _log_phase_stats(
+                    f"Column crossmatch {survey_a} × {survey_b}", phase_stats
+                )
 
     elapsed = time.perf_counter() - t0
     log.info(
@@ -2738,7 +2958,11 @@ try:
         default=1,
         show_default=True,
         type=int,
-        help="Survey-A tiles matched per worker task (try 4–16 for large surveys).",
+        help=(
+            "Heartbeat interval inside each worker mega-strip (log every N tiles). "
+            "Pending tiles are split into at most --n-workers long strips so the "
+            "B-tile cache lives for the whole strip. 1 → log about every 50 tiles."
+        ),
     )
     @click.option(
         "--match-backend",
