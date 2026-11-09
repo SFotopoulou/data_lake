@@ -220,15 +220,31 @@ class CatalogAccessor:
 
     @property
     def schema(self) -> pa.Schema:
-        """PyArrow schema of the catalog (reads aggregate _metadata if present)."""
+        """PyArrow schema of the catalog (reads aggregate _metadata if present).
+
+        Cached per accessor and re-read only when ``_metadata`` changes on disk:
+        the aggregate footer holds every tile's row-group metadata, so for wide
+        catalogs with many tiles one read takes seconds.
+        """
         meta_path = self._catalog_root / "_metadata"
-        if meta_path.exists():
-            return pq.read_metadata(str(meta_path)).schema.to_arrow_schema()
-        # Fall back to reading one file
-        first_file = next(self._catalog_root.rglob("*.parquet"), None)
-        if first_file:
-            return pq.read_schema(str(first_file))
-        raise RuntimeError("No Parquet files found in catalog.")
+        try:
+            st = meta_path.stat()
+            key: tuple | None = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        cached = getattr(self, "_schema_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if key is not None:
+            schema = pq.read_metadata(str(meta_path)).schema.to_arrow_schema()
+        else:
+            # Fall back to reading one file
+            first_file = next(self._catalog_root.rglob("*.parquet"), None)
+            if first_file is None:
+                raise RuntimeError("No Parquet files found in catalog.")
+            schema = pq.read_schema(str(first_file))
+        self._schema_cache = (key, schema)
+        return schema
 
     @property
     def columns(self) -> list[str]:
