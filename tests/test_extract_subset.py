@@ -979,6 +979,40 @@ class TestOpenTileLRU:
         assert result["n_written"] == 5
         assert len(acc._tile_stores) == 0
 
+    def test_extract_releases_tiles_during_pass(self, synthetic_lake: Path):
+        """One-pass extract closes each tile after read (no LRU retention)."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        acc = SpectrumAccessor(synthetic_lake, SURVEY, max_open_tiles=8)
+        plan = acc._plan_subset_extraction(
+            [101, 102, 103, 201, 202], show_progress=False
+        )
+        assert len(plan.by_tile) >= 2
+        n_seen = 0
+        for _batch in acc._iter_subset_tile_batches(plan, show_progress=False):
+            n_seen += 1
+            # After each yielded tile the handle is released.
+            assert len(acc._tile_stores) == 0
+        assert n_seen == len(plan.by_tile)
+        acc.close()
+
+    def test_get_batch_releases_when_fanout_exceeds_lru(self, synthetic_lake: Path):
+        """get_batch closes tiles when unique npix > max_open_tiles."""
+        from data_lake.io.spectra import SpectrumAccessor
+
+        tiles = []
+        with SpectrumAccessor(synthetic_lake, SURVEY) as probe:
+            tiles = list(probe.available_tiles())
+        assert len(tiles) >= 2
+
+        # Cap at 1 so any multi-tile batch triggers release-after-read.
+        acc = SpectrumAccessor(synthetic_lake, SURVEY, max_open_tiles=1)
+        # Touch IDs from at least two tiles
+        flux, ivar, mask, wave = acc.get_batch([101, 201])
+        assert flux.shape[0] == 2
+        assert len(acc._tile_stores) == 0
+        acc.close()
+
     def test_shared_planning_uses_info_n_pix(self, synthetic_lake: Path):
         """Shared-mode planning reads n_pix from spectrum_info.json, not all tiles."""
         from data_lake.io.spectra import SpectrumAccessor

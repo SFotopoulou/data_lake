@@ -40,6 +40,7 @@ import zarr.codecs
 
 from data_lake.ingest.fits_to_parquet import healpix_dir
 from data_lake.ingest.fits_to_spectra_zarr import _META_DTYPE
+from data_lake.knobs import DEFAULT_FITS_CHUNK_ROWS, DEFAULT_CHUNKS_PER_SHARD
 
 log = logging.getLogger(__name__)
 
@@ -322,7 +323,7 @@ class SpectrumAccessor:
         survey_name: str,
         norder: int | None = None,
         catalog_accessor=None,
-        max_open_tiles: int = 8,
+        max_open_tiles: int | None = None,
     ) -> None:
         self.lake_root = Path(lake_root)
         self.survey_name = survey_name
@@ -336,9 +337,15 @@ class SpectrumAccessor:
             with open(info_path) as fh:
                 self._info = json.load(fh)
 
-        self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
+        from data_lake.knobs import DEFAULT_HATS_ORDER, READ_MAX_OPEN_TILES
+
+        self.norder: int = norder if norder is not None else int(
+            self._info.get("hats_order", DEFAULT_HATS_ORDER)
+        )
         self._catalog = catalog_accessor
-        self._max_open_tiles: int = max_open_tiles
+        self._max_open_tiles: int = (
+            READ_MAX_OPEN_TILES if max_open_tiles is None else max_open_tiles
+        )
 
         self._tile_stores: OrderedDict[int, SpectrumTileStore] = OrderedDict()
         self._tile_indices: dict[int, dict[int, int]] = {}
@@ -364,6 +371,12 @@ class SpectrumAccessor:
                 _, evicted = self._tile_stores.popitem(last=False)
                 evicted.close()
         return store
+
+    def _release_tile_store(self, npix: int) -> None:
+        """Drop one open tile from the LRU (one-pass batch/extract paths)."""
+        store = self._tile_stores.pop(npix, None)
+        if store is not None:
+            store.close()
 
     def close(self) -> None:
         """Close all cached tile stores and clear caches."""
@@ -484,6 +497,9 @@ class SpectrumAccessor:
         shared_wavelength: np.ndarray | None = sample_wave if sample_wave.ndim == 1 else None
         per_source_wavelength: list[np.ndarray | None] = [None] * n
 
+        # One-pass over tiles: when fan-out exceeds the LRU, close after each
+        # tile so we do not thrash open→evict→reopen of never-revisited tiles.
+        release = self._max_open_tiles > 0 and len(tile_groups) > self._max_open_tiles
         for npix, positions in tile_groups.items():
             store = self._get_tile_store(npix)
             orig_pos_arr = np.array([p[0] for p in positions])
@@ -496,6 +512,8 @@ class SpectrumAccessor:
                 shared_wavelength = None
                 for i, orig in enumerate(orig_pos_arr):
                     per_source_wavelength[orig] = wave[i]
+            if release:
+                self._release_tile_store(npix)
 
         if shared_wavelength is not None:
             return flux_out, ivar_out, mask_out, shared_wavelength
@@ -748,6 +766,11 @@ class SpectrumAccessor:
 
         per_source = plan.wavelength_mode == "per_source"
 
+        # Drop any stores pinned during planning — this pass never revisits tiles.
+        if self._max_open_tiles > 0 and self._tile_stores:
+            for _npix in list(self._tile_stores):
+                self._release_tile_store(_npix)
+
         for npix, items in tqdm(
             plan.by_tile.items(),
             desc="extract",
@@ -805,6 +828,10 @@ class SpectrumAccessor:
 
                 flux_batch, ivar_batch = apply_flux_scale(flux_batch, ivar_batch, flux_scale)
 
+            # Extract never revisits a tile in this pass — free the FD promptly.
+            if self._max_open_tiles > 0:
+                self._release_tile_store(npix)
+
             yield sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch
 
     def _collect_subset_stacks(
@@ -850,13 +877,13 @@ class SpectrumAccessor:
         *,
         fmt: SubsetFormat = "zarr",
         missing: str = "skip",
-        chunks_per_shard: int = 512,
+        chunks_per_shard: int = DEFAULT_CHUNKS_PER_SHARD,
         show_progress: bool = True,
         overwrite: bool = False,
         fits_filename_template: str = "spec_{source_id}.fits",
         fits_layout: FitsLayout = "per-file",
         flux_scale: float | None = None,
-        fits_chunk_rows: int = 50_000,
+        fits_chunk_rows: int = DEFAULT_FITS_CHUNK_ROWS,
         confirm: bool | None = None,
         keep_part_files: bool = False,
         force_many_fits_parts: bool = False,
@@ -913,7 +940,7 @@ class SpectrumAccessor:
         output_zarr: Path | str,
         *,
         missing: str = "skip",
-        chunks_per_shard: int = 512,
+        chunks_per_shard: int = DEFAULT_CHUNKS_PER_SHARD,
         show_progress: bool = True,
         overwrite: bool = False,
         flux_scale: float | None = None,
@@ -1357,7 +1384,7 @@ class SpectrumAccessor:
         filename_template: str = "spec_{source_id}.fits",
         layout: FitsLayout = "per-file",
         flux_scale: float | None = None,
-        fits_chunk_rows: int = 50_000,
+        fits_chunk_rows: int = DEFAULT_FITS_CHUNK_ROWS,
         confirm: bool | None = None,
         keep_part_files: bool = False,
         force_many_fits_parts: bool = False,
@@ -1395,7 +1422,7 @@ class SpectrumAccessor:
         show_progress: bool = True,
         overwrite: bool = False,
         flux_scale: float | None = None,
-        fits_chunk_rows: int = 50_000,
+        fits_chunk_rows: int = DEFAULT_FITS_CHUNK_ROWS,
         confirm: bool | None = None,
         keep_part_files: bool = False,
         force_many_fits_parts: bool = False,
@@ -1403,14 +1430,12 @@ class SpectrumAccessor:
         """Extract a subset into one multi-row FITS catalog (BINTABLE + WAVELENGTH HDU).
 
         Large extracts are written as temporary ``_partNNNNN.fits`` shards (default
-        ``fits_chunk_rows=50000``), then merged with fitsio into ``output_fits``.
+        from :data:`data_lake.knobs.DEFAULT_FITS_CHUNK_ROWS`), then merged with
+        fitsio into ``output_fits``.
         Requires ``wavelength_mode='shared'``; use ``--fits-layout per-file`` for
         per-source wavelength surveys.
         """
-        from data_lake.export.to_spectrum_fits import (
-            DEFAULT_FITS_CHUNK_ROWS,
-            stream_spectra_catalog_fits,
-        )
+        from data_lake.export.to_spectrum_fits import stream_spectra_catalog_fits
 
         if fits_chunk_rows <= 0:
             fits_chunk_rows = DEFAULT_FITS_CHUNK_ROWS

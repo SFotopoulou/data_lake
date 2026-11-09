@@ -118,6 +118,12 @@ try:
         resolve_log_level,
         validate_quiet_verbose,
     )
+    from data_lake.knobs import (
+        PARTNER_TILE_CACHE_MAX_BYTES,
+        PARTNER_TILE_CACHE_MAX_TILES,
+    )
+
+    _partner_cache_mib = PARTNER_TILE_CACHE_MAX_BYTES // (1024 * 1024)
 
     @click.command("dl-gather")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
@@ -141,14 +147,14 @@ try:
     )
     @click.option(
         "--partner-cache-mb",
-        default=512,
+        default=_partner_cache_mib,
         show_default=True,
         type=int,
         help="Max partner-tile cache size in MiB (0 disables cache).",
     )
     @click.option(
         "--partner-cache-tiles",
-        default=48,
+        default=PARTNER_TILE_CACHE_MAX_TILES,
         show_default=True,
         type=int,
         help="Max partner tiles cached per gather run.",

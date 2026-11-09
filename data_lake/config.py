@@ -58,6 +58,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from data_lake.knobs import DEFAULT_CHUNKS_PER_SHARD, DEFAULT_HATS_ORDER
+
 CONFIG_FILENAME = "lake_config.toml"
 ENV_VAR = "DATA_LAKE_CONFIG"
 SCHEMA_VERSION = "1"
@@ -81,8 +83,8 @@ class LakeConfigInvalid(LakeConfigError, ValueError):
 
 _DEFAULTS: dict[str, dict[str, Any]] = {
     "partitioning": {
-        "hats_order": 5,
-        "chunks_per_shard": 512,
+        "hats_order": DEFAULT_HATS_ORDER,
+        "chunks_per_shard": DEFAULT_CHUNKS_PER_SHARD,
     },
     "defaults": {
         "wavelength_mode": "shared",
@@ -120,8 +122,8 @@ class _Lake:
 
 @dataclass(slots=True)
 class _Partitioning:
-    hats_order: int = 5
-    chunks_per_shard: int = 512
+    hats_order: int = DEFAULT_HATS_ORDER
+    chunks_per_shard: int = DEFAULT_CHUNKS_PER_SHARD
 
 
 @dataclass(slots=True)

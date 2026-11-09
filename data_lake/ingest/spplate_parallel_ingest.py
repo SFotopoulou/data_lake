@@ -36,6 +36,8 @@ use ``dl-ingest-spectra-from-list`` with the existing slow path if needed.
 
 from __future__ import annotations
 
+from data_lake.knobs import WRITE_MAX_OPEN_TILES
+
 import logging
 import time
 import traceback
@@ -428,7 +430,7 @@ def ingest_spplate_files_parallel(
     show_progress: bool = True,
     on_duplicate_source_id: ZarrDuplicateMode = "skip",
     max_in_flight: int | None = None,
-    max_open_tiles: int = 64,
+    max_open_tiles: int = WRITE_MAX_OPEN_TILES,
     track_index_map: bool = False,
     executor_factory: Callable | None = None,
     on_length_mismatch: str = "pad",
@@ -545,6 +547,7 @@ try:
         validate_quiet_verbose,
     )
     from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file as _paths_from_file_list_file
+    from data_lake.knobs import WRITE_MAX_OPEN_TILES
 
     @click.command("dl-ingest-spectra-batch-spplate")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
@@ -590,7 +593,7 @@ try:
     @click.option(
         "--max-open-tiles",
         "max_open_tiles",
-        default=64,
+        default=WRITE_MAX_OPEN_TILES,
         show_default=True,
         type=int,
         help="Max HEALPix tile Zarr groups open in the writer; 0 = unlimited.",

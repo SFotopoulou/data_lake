@@ -44,6 +44,8 @@ Anti-patterns that do *not* work
 
 from __future__ import annotations
 
+from data_lake.knobs import WRITE_MAX_OPEN_TILES
+
 import json
 import logging
 import os
@@ -580,7 +582,7 @@ def ingest_spectra_parallel(
     on_duplicate_source_id: ZarrDuplicateMode = "skip",
     track_index_map: bool = False,
     max_in_flight: int | None = None,
-    max_open_tiles: int = 64,
+    max_open_tiles: int = WRITE_MAX_OPEN_TILES,
     length_policy: str = "error",
     wavelength_mode: str = "shared",
     heartbeat: "Any | None" = None,
@@ -1049,7 +1051,7 @@ try:
              "(default: n_workers + 2).  Lower to reduce peak RAM.",
     )
     @click.option(
-        "--max-open-tiles", "max_open_tiles", default=64, show_default=True,
+        "--max-open-tiles", "max_open_tiles", default=WRITE_MAX_OPEN_TILES, show_default=True,
         type=int,
         help="Max HEALPix tile Zarr groups open in the writer; "
              "0 = unlimited (not recommended for large runs).",

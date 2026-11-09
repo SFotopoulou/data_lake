@@ -605,6 +605,8 @@ try:
 
         sys.exit(code)
 
+    from data_lake.knobs import WRITE_MAX_OPEN_TILES as _WRITE_MAX_OPEN_TILES
+
     @click.command("dl-ingest-spectra-from-list")
     @click.argument("paths_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
@@ -707,7 +709,7 @@ try:
     )
     @click.option(
         "--max-open-tiles",
-        default=64,
+        default=_WRITE_MAX_OPEN_TILES,
         show_default=True,
         type=int,
         help="Max HEALPix tile Zarr groups open in the writer (parallel path).",

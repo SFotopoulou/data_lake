@@ -12,9 +12,20 @@ if TYPE_CHECKING:
 
 @dataclass
 class PartnerTileCacheConfig:
-    max_bytes: int = 512 * 1024 * 1024
-    max_tiles: int = 48
+    max_bytes: int = 0  # filled in __post_init__ from knobs when 0
+    max_tiles: int = 0
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        from data_lake.knobs import (
+            PARTNER_TILE_CACHE_MAX_BYTES,
+            PARTNER_TILE_CACHE_MAX_TILES,
+        )
+
+        if self.max_bytes <= 0:
+            self.max_bytes = PARTNER_TILE_CACHE_MAX_BYTES
+        if self.max_tiles <= 0:
+            self.max_tiles = PARTNER_TILE_CACHE_MAX_TILES
 
 
 def _estimate_df_bytes(df) -> int:

@@ -43,6 +43,7 @@ from ..config import (
     _Partitioning,
     _Paths,
 )
+from ..knobs import DEFAULT_CHUNKS_PER_SHARD, DEFAULT_HATS_ORDER
 
 # ---------------------------------------------------------------------------
 # Templates (kept tiny on purpose – users will customise)
@@ -122,8 +123,8 @@ def init_lake(
     *,
     root: Path | None = None,
     description: str = "",
-    norder: int = 5,
-    chunks_per_shard: int = 512,
+    norder: int = DEFAULT_HATS_ORDER,
+    chunks_per_shard: int = DEFAULT_CHUNKS_PER_SHARD,
     wavelength_mode: str = "shared",
     mask_dtype: str = "uint8",
     with_resolution: bool = False,
@@ -247,9 +248,9 @@ def init_lake(
     default="",
     help="Free-text description of this lake.",
 )
-@click.option("--norder", default=5, show_default=True, type=int,
+@click.option("--norder", default=DEFAULT_HATS_ORDER, show_default=True, type=int,
               help="Default HEALPix order for HATS partitioning.")
-@click.option("--chunks-per-shard", default=512, show_default=True, type=int,
+@click.option("--chunks-per-shard", default=DEFAULT_CHUNKS_PER_SHARD, show_default=True, type=int,
               help="Rows per Zarr shard.")
 @click.option("--wavelength-mode",
               type=click.Choice(["shared", "per_source"]),

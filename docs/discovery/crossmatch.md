@@ -159,6 +159,25 @@ astropy backend. Install with `uv sync --extra rapids` (Linux + NVIDIA CUDA 12).
 Prefer `--n-workers 1` on a single GPU; multiple processes can contend for one
 device. `crossmatch_info.json` records `match_backend` and `gpu_id` for provenance.
 
+**Survey-B tile cache** — neighbouring survey-A tiles often need the same
+survey-B HEALPix Parquet files. By default `dl-crossmatch` (sky **and** column
+modes) keeps a per-worker LRU of **full** B tiles (defaults from
+`data_lake.knobs.PARTNER_TILE_CACHE_*`: 48 tiles / 512 MiB — same policy as
+`dl-gather`’s partner cache). Sky mode applies the A-tile RA/Dec bbox in memory.
+Disable with `--no-b-cache`, or tune with `--b-cache-tiles` / `--b-cache-mib`.
+Process workers do **not** share a cache; raise `--tiles-per-worker` (e.g. 4–16)
+so each worker sees spatially local A tiles and hits the cache. Integer lake
+`_source_id` columns are coerced with a vectorized fast path (no per-row Python
+loop).
+
+```bash
+dl-crossmatch SURVEY_A SURVEY_B /data/lake \
+  --radius-arcsec 1.0 --n-workers 8 --tiles-per-worker 8
+
+# Compare without B-tile reuse (slower on HDD/NFS)
+dl-crossmatch SURVEY_A SURVEY_B /data/lake --no-b-cache --overwrite
+```
+
 ### Crossmatch is a top-level modality
 
 Crossmatch trees live under `<lake>/crossmatch/<A>_x_<B>__r<radius>/` (a
@@ -274,7 +293,7 @@ Example: `crossmatch/EUCLID_DR1_x_DESI_DR1__col_TARGETID__TARGETID/`
 
 **Same schema as sky trees:** `source_id_a`, `source_id_b`, `sep_arcsec`, `_healpix_norder{N}`, `healpix_npix_b` — readable by `CrossmatchAccessor` and exportable with `--export-parquet` / `--export-fits`.
 
-**Spatial-locality assumption:** For each survey-A tile, B tiles are loaded if their HEALPix footprint overlaps that tile **or** its neighbours.  Overlap uses the A-tile geometric extent plus a **half-pixel pad** of the coarser of the two surveys (`0.5 × max_pixrad`), so edge sources and `norder` mismatches still find partner tiles.  Rows whose sky positions lie in completely disjoint regions remain out of scope, even if their key values match.  Per-process LRU reuse of prepared B frames avoids reopening the same B Parquet for adjacent A tiles.
+**Spatial-locality assumption:** For each survey-A tile, B tiles are loaded if their HEALPix footprint overlaps that tile **or** its neighbours.  Overlap uses the A-tile geometric extent plus a **half-pixel pad** of the coarser of the two surveys (`0.5 × max_pixrad`), so edge sources and `norder` mismatches still find partner tiles.  Rows whose sky positions lie in completely disjoint regions remain out of scope, even if their key values match.  Per-process LRU reuse of prepared B frames (same `--b-cache*` knobs as sky mode) avoids reopening the same B Parquet for adjacent A tiles.
 
 If you know that matched IDs can span arbitrary sky positions, pre-partition both catalogs by the shared key outside the lake before ingesting.
 

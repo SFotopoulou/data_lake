@@ -22,7 +22,9 @@ from data_lake.schema_registry import MODALITY_CUTOUT, MODALITY_SPECTRA, PRODUCT
 
 log = logging.getLogger(__name__)
 
-_MAX_WORKERS = 64
+from data_lake.knobs import MAX_PARALLEL_WORKERS_CAP
+
+_MAX_WORKERS = MAX_PARALLEL_WORKERS_CAP
 
 
 @dataclass

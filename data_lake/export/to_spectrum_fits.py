@@ -39,10 +39,10 @@ import numpy as np
 from astropy.io import fits
 
 from data_lake.io.spectra import Spectrum, SpectrumAccessor
+from data_lake.knobs import DEFAULT_FITS_CHUNK_ROWS
 
 log = logging.getLogger(__name__)
 
-DEFAULT_FITS_CHUNK_ROWS = 50_000
 MAX_FITS_PARTS_SOFT = 100
 MAX_FITS_PARTS_HARD = 10_000
 # Leave headroom under 2**32 for FITS/CFITSIO 32-bit table size math.

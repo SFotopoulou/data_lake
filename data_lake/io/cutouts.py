@@ -190,7 +190,7 @@ class CutoutAccessor:
         survey_name: str,
         norder: int | None = None,
         catalog_accessor=None,
-        max_open_tiles: int = 8,
+        max_open_tiles: int | None = None,
     ) -> None:
         self.lake_root = Path(lake_root)
         self.survey_name = survey_name
@@ -205,9 +205,15 @@ class CutoutAccessor:
             with open(info_path) as fh:
                 self._info = json.load(fh)
 
-        self.norder: int = norder if norder is not None else int(self._info.get("hats_order", 5))
+        from data_lake.knobs import DEFAULT_HATS_ORDER, READ_MAX_OPEN_TILES
+
+        self.norder: int = norder if norder is not None else int(
+            self._info.get("hats_order", DEFAULT_HATS_ORDER)
+        )
         self._catalog = catalog_accessor
-        self._max_open_tiles: int = max_open_tiles
+        self._max_open_tiles: int = (
+            READ_MAX_OPEN_TILES if max_open_tiles is None else max_open_tiles
+        )
 
         self._tile_stores: OrderedDict[int, TileStore] = OrderedDict()
         self._tile_indices: dict[int, dict[int, int]] = {}  # npix → {source_id: local_idx}
@@ -233,6 +239,12 @@ class CutoutAccessor:
                 _, evicted = self._tile_stores.popitem(last=False)
                 evicted.close()
         return store
+
+    def _release_tile_store(self, npix: int) -> None:
+        """Drop one open tile from the LRU (one-pass batch/extract paths)."""
+        store = self._tile_stores.pop(npix, None)
+        if store is not None:
+            store.close()
 
     def close(self) -> None:
         """Close all cached tile stores and clear caches."""
@@ -375,6 +387,7 @@ class CutoutAccessor:
         out = np.empty((len(source_ids), *sample_img.shape), dtype=sample_img.dtype)
         wcs_list: list[CutoutWCS | None] = [None] * len(source_ids)
 
+        release = self._max_open_tiles > 0 and len(tile_groups) > self._max_open_tiles
         for npix, positions in tile_groups.items():
             store = self._get_tile_store(npix)
             orig_positions = np.array([p[0] for p in positions])
@@ -384,6 +397,8 @@ class CutoutAccessor:
             if return_wcs:
                 for i, (orig_pos, local_idx) in enumerate(positions):
                     wcs_list[orig_pos] = store.get_wcs(local_idx)
+            if release:
+                self._release_tile_store(npix)
 
         if return_wcs:
             return out, wcs_list  # type: ignore[return-value]
@@ -454,6 +469,10 @@ class CutoutAccessor:
             except ImportError:
                 pass
 
+        if self._max_open_tiles > 0 and self._tile_stores:
+            for _npix in list(self._tile_stores):
+                self._release_tile_store(_npix)
+
         for npix, pairs in items:
             sids = np.array([p[0] for p in pairs], dtype=np.int64)
             local_idxs = np.array([p[1] for p in pairs], dtype=np.int64)
@@ -467,6 +486,8 @@ class CutoutAccessor:
                 images = images[np.newaxis, np.newaxis, ...]
             root = store._open()
             wcs_raw = [root["wcs"][int(i)] for i in local_idxs]
+            if self._max_open_tiles > 0:
+                self._release_tile_store(npix)
             yield sids, images, wcs_raw
 
     def extract_subset_to_zarr(

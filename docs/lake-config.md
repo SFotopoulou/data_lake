@@ -13,7 +13,7 @@ created_utc = "2026-05-13T11:43:00Z"
 
 [partitioning]
 hats_order       = 5                # default HEALPix order; see README “Choosing HEALPix order” (~3.36 deg²/tile at 5)
-chunks_per_shard = 512              # rows per Zarr shard
+chunks_per_shard = 512              # rows per Zarr shard (matches data_lake.knobs.SPECTRA_CHUNKS_PER_SHARD; cutout ingest uses CUTOUT_CHUNKS_PER_SHARD=1024)
 
 [defaults]
 wavelength_mode  = "shared"         # "shared" | "per_source"
@@ -44,4 +44,9 @@ from data_lake.config import LakeConfig
 cfg = LakeConfig.discover()                # explicit > env > cwd walk-up
 print(cfg.lake.name, cfg.spectra_root)
 ```
+
+Operational defaults that are **not** yet in TOML (open-tile LRUs, partner /
+B-tile caches, ZSTD tiers, FITS chunk rows, worker caps) live in
+[`data_lake/knobs.py`](../data_lake/knobs.py). See
+[Performance → Operational knobs](performance.md#operational-knobs-data_lakeknobs).
 

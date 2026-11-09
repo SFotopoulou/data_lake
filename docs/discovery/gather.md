@@ -151,7 +151,7 @@ partner tile when adjacent base tiles overlap:
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--partner-cache-mb` | 512 | Max cache size (MiB); `0` disables. |
+| `--partner-cache-mb` | 512 | Max cache size (MiB); `0` disables. Defaults from `data_lake.knobs.PARTNER_TILE_CACHE_*` (shared with `dl-crossmatch` B-cache). |
 | `--partner-cache-tiles` | 48 | Max cached partner tiles. |
 | `--no-partner-cache` | off | Disable cache entirely. |
 

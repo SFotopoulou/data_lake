@@ -43,8 +43,10 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_CHUNKS_PER_SHARD = 1024   # target ~760 MB shards for medium cutouts
-_ZSTD_LEVEL = 3
+from data_lake.knobs import CUTOUT_CHUNKS_PER_SHARD, ZSTD_INGEST
+
+_CHUNKS_PER_SHARD = CUTOUT_CHUNKS_PER_SHARD
+_ZSTD_LEVEL = ZSTD_INGEST
 _DEFAULT_DTYPE = np.float32
 
 # WCS structured dtype stored per source

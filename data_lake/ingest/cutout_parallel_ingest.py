@@ -6,6 +6,8 @@ Workers decode FITS cutouts; a single main-thread writer appends to Zarr tiles.
 
 from __future__ import annotations
 
+from data_lake.knobs import WRITE_MAX_OPEN_TILES
+
 import json
 import logging
 import time
@@ -139,6 +141,12 @@ class _OpenCutoutTile:
 
 
 class _CutoutTileCache:
+    """LRU of open cutout Zarr groups for the parallel writer.
+
+    ``max_open <= 0`` means unlimited (same contract as spectrum writer caches).
+    Eviction always closes the underlying LocalStore so FDs are released.
+    """
+
     def __init__(
         self,
         *,
@@ -170,9 +178,7 @@ class _CutoutTileCache:
                 sid_arr = zarr_join_array(root)
                 existing = set(np.asarray(sid_arr[:]).tolist()) if sid_arr.shape[0] else set()
             self._tiles[npix] = _OpenCutoutTile(root=root, tile_path=tile_path, existing_ids=existing)
-            if len(self._tiles) > self._max_open:
-                old_npix, old = self._tiles.popitem(last=False)
-                log.debug("Closed cutout tile Npix=%d (LRU)", old_npix)
+            self._evict_if_needed()
         entry = self._tiles[npix]
         self._tiles.move_to_end(npix)
         root = entry.root
@@ -207,6 +213,21 @@ class _CutoutTileCache:
             entry.existing_ids.update(int(s) for s in sids.tolist())
         self.tiles_touched.add(npix)
 
+    def close_all(self) -> None:
+        from data_lake.io.zarr_close import close_zarr_group
+
+        for entry in self._tiles.values():
+            close_zarr_group(entry.root)
+        self._tiles.clear()
+
+    def _evict_if_needed(self) -> None:
+        from data_lake.io.zarr_close import close_zarr_group
+
+        while self._max_open > 0 and len(self._tiles) > self._max_open:
+            old_npix, oldest = self._tiles.popitem(last=False)
+            close_zarr_group(oldest.root)
+            log.debug("Closed cutout tile Npix=%d (LRU)", old_npix)
+
 
 def ingest_cutouts_parallel(
     file_paths: Sequence[Path | str],
@@ -228,7 +249,7 @@ def ingest_cutouts_parallel(
     show_progress: bool = True,
     skip_completed: bool = True,
     max_in_flight: int | None = None,
-    max_open_tiles: int = 64,
+    max_open_tiles: int = WRITE_MAX_OPEN_TILES,
     files_per_worker: int = 1,
     partition_by_dir: bool = False,
     fits_memmap: str = "auto",
@@ -288,44 +309,48 @@ def ingest_cutouts_parallel(
             batch.append(work_queue.popleft())
         return batch
 
-    with ProcessPoolExecutor(max_workers=n_workers, initializer=init_parallel_ingest_subprocess) as pool:
-        while work_queue or in_flight:
-            while len(in_flight) < max_in_flight and work_queue:
-                batch = _pop_batch()
-                if batch:
-                    in_flight[pool.submit(_decode_cutout_batch_safe, batch, decode_cfg)] = batch
-            if not in_flight:
-                break
-            done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
-            for fut in done:
-                batch_paths = in_flight.pop(fut)
-                try:
-                    results = fut.result()
-                except Exception as exc:
-                    for path_str in batch_paths:
-                        n_fail += 1
-                        failures.append({"path": path_str, "error": str(exc)})
-                    continue
-                if not isinstance(results, list):
-                    results = [results]
-                for res in results:
-                    if not res.ok:
-                        n_fail += 1
-                        failures.append({"path": res.path, "error": res.error})
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers, initializer=init_parallel_ingest_subprocess) as pool:
+            while work_queue or in_flight:
+                while len(in_flight) < max_in_flight and work_queue:
+                    batch = _pop_batch()
+                    if batch:
+                        in_flight[pool.submit(_decode_cutout_batch_safe, batch, decode_cfg)] = batch
+                if not in_flight:
+                    break
+                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    batch_paths = in_flight.pop(fut)
+                    try:
+                        results = fut.result()
+                    except Exception as exc:
+                        for path_str in batch_paths:
+                            n_fail += 1
+                            failures.append({"path": path_str, "error": str(exc)})
                         continue
-                    if tile_cache is None:
-                        tile_cache = _CutoutTileCache(
-                            survey_root=survey_root,
-                            norder=norder,
-                            dtype=np.dtype(dtype),
-                            on_duplicate=on_duplicate,
-                            max_open=max_open_tiles,
-                        )
-                    for batch in res.batches:
-                        tile_cache.append_batch(batch)
-                    n_ok += 1
-                    if checkpoint_path is not None:
-                        _append_checkpoint(checkpoint_path, res.path)
+                    if not isinstance(results, list):
+                        results = [results]
+                    for res in results:
+                        if not res.ok:
+                            n_fail += 1
+                            failures.append({"path": res.path, "error": res.error})
+                            continue
+                        if tile_cache is None:
+                            tile_cache = _CutoutTileCache(
+                                survey_root=survey_root,
+                                norder=norder,
+                                dtype=np.dtype(dtype),
+                                on_duplicate=on_duplicate,
+                                max_open=max_open_tiles,
+                            )
+                        for batch in res.batches:
+                            tile_cache.append_batch(batch)
+                        n_ok += 1
+                        if checkpoint_path is not None:
+                            _append_checkpoint(checkpoint_path, res.path)
+    finally:
+        if tile_cache is not None:
+            tile_cache.close_all()
 
     return {
         "n_files_succeeded": n_ok,

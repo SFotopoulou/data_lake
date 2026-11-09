@@ -38,8 +38,10 @@ from data_lake.schema_registry import (
 
 log = logging.getLogger(__name__)
 
-_MAX_WORKERS = 64
-_ZSTD_LEVEL = 3
+from data_lake.knobs import MAX_PARALLEL_WORKERS_CAP, ZSTD_INGEST
+
+_MAX_WORKERS = MAX_PARALLEL_WORKERS_CAP
+_ZSTD_LEVEL = ZSTD_INGEST
 
 
 def _storage_type(dtype: pa.DataType) -> pa.DataType:

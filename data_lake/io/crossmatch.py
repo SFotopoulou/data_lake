@@ -129,8 +129,8 @@ class CrossmatchTileConfig:
     match_backend: MatchBackend = "astropy"
     gpu_id: int = 0
     b_cache_enabled: bool = True
-    b_cache_max_tiles: int = 48
-    b_cache_max_bytes: int = 512 * 1024 * 1024
+    b_cache_max_tiles: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_TILES
+    b_cache_max_bytes: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_BYTES
 
 
 @dataclass(frozen=True)
@@ -976,7 +976,6 @@ def _catalog_ids_to_int64(values) -> np.ndarray:
     return np.asarray([normalize_object_id(v) for v in arr.tolist()], dtype=np.int64)
 
 
-_CROSSMATCH_DENSE_TILE_WARN = 50_000
 CROSSMATCH_HEALPIX_NPIX_B = "healpix_npix_b"
 
 
@@ -1016,7 +1015,9 @@ def _crossmatch_one_tile(
 
     ra_a = df_a[ra_col_a].to_numpy().astype(np.float64)
     dec_a = df_a[dec_col_a].to_numpy().astype(np.float64)
-    if ra_a.size > _CROSSMATCH_DENSE_TILE_WARN:
+    from data_lake.knobs import CROSSMATCH_DENSE_TILE_WARN
+
+    if ra_a.size > CROSSMATCH_DENSE_TILE_WARN:
         log.warning(
             "Survey-A tile Npix=%d has %d sources; matcher may be slow. "
             "Consider coarser --norder or pre-filtering.",
@@ -1305,8 +1306,8 @@ def build_crossmatch(
     tiles_per_worker: int = 1,
     restrict_npix: Iterable[int] | None = None,
     b_cache: bool = True,
-    b_cache_max_tiles: int = 48,
-    b_cache_max_mib: int = 512,
+    b_cache_max_tiles: int | None = None,
+    b_cache_max_mib: int | None = None,
 ) -> CrossmatchResult:
     """
     Build a precomputed cross-match between two surveys.
@@ -1451,7 +1452,22 @@ def build_crossmatch(
     )
     # Spatial locality improves B-tile LRU hit rate inside each worker.
     pending = sorted(pending)
-    b_cache_max_bytes = max(1, int(b_cache_max_mib)) * 1024 * 1024
+    from data_lake.knobs import (
+        PARTNER_TILE_CACHE_MAX_BYTES,
+        PARTNER_TILE_CACHE_MAX_TILES,
+    )
+
+    tiles_cap = (
+        PARTNER_TILE_CACHE_MAX_TILES
+        if b_cache_max_tiles is None
+        else int(b_cache_max_tiles)
+    )
+    mib_cap = (
+        PARTNER_TILE_CACHE_MAX_BYTES // (1024 * 1024)
+        if b_cache_max_mib is None
+        else int(b_cache_max_mib)
+    )
+    b_cache_max_bytes = max(1, mib_cap) * 1024 * 1024
     if n_workers > 1:
         log.info(
             "Cross-match %s × %s: %d tile(s) to compute with %d workers (%d skipped)",
@@ -1484,7 +1500,7 @@ def build_crossmatch(
         b_tile_cache = CrossmatchBTileCache(
             CrossmatchBTileCacheConfig(
                 enabled=b_cache,
-                max_tiles=b_cache_max_tiles,
+                max_tiles=tiles_cap,
                 max_bytes=b_cache_max_bytes,
             )
         )
@@ -1554,7 +1570,7 @@ def build_crossmatch(
                 match_backend=match_backend,
                 gpu_id=gpu_id,
                 b_cache_enabled=b_cache,
-                b_cache_max_tiles=b_cache_max_tiles,
+                b_cache_max_tiles=tiles_cap,
                 b_cache_max_bytes=b_cache_max_bytes,
             )
             for tiles in worker_tiles
@@ -1747,8 +1763,6 @@ def _write_xm_info(
 
 # Heartbeat cadence: emit a log.info every this many A tiles when not using tqdm.
 _COL_XM_HEARTBEAT_TILES = 50
-# Per-process LRU of prepared survey-B join frames (adjacent A tiles reuse neighbours).
-_COL_XM_B_CACHE_TILES = 64
 
 
 def _column_crossmatch_pad_rad(nside_a: int, nside_b: int) -> float:
@@ -1765,10 +1779,34 @@ def _column_crossmatch_pad_rad(nside_a: int, nside_b: int) -> float:
 
 @dataclass
 class _BTileJoinCache:
-    """Bounded LRU of prepared survey-B frames for column-equality joins."""
+    """Bounded LRU of prepared survey-B frames for column-equality joins.
 
-    max_tiles: int = _COL_XM_B_CACHE_TILES
+    Uses the same tile/byte budget as sky crossmatch and gather partner caches
+    (:mod:`data_lake.knobs`).
+    """
+
+    max_tiles: int = 0
+    max_bytes: int = 0
     _entries: OrderedDict[int, pl.DataFrame] = field(default_factory=OrderedDict)
+    _bytes: int = 0
+
+    def __post_init__(self) -> None:
+        from data_lake.knobs import (
+            PARTNER_TILE_CACHE_MAX_BYTES,
+            PARTNER_TILE_CACHE_MAX_TILES,
+        )
+
+        if self.max_tiles <= 0:
+            self.max_tiles = PARTNER_TILE_CACHE_MAX_TILES
+        if self.max_bytes <= 0:
+            self.max_bytes = PARTNER_TILE_CACHE_MAX_BYTES
+
+    @staticmethod
+    def _estimate_bytes(df: pl.DataFrame) -> int:
+        try:
+            return int(df.estimated_size())
+        except Exception:
+            return 0
 
     def get(self, npix_b: int) -> pl.DataFrame | None:
         key = int(npix_b)
@@ -1779,13 +1817,20 @@ class _BTileJoinCache:
 
     def put(self, npix_b: int, df: pl.DataFrame) -> None:
         key = int(npix_b)
+        new_bytes = self._estimate_bytes(df)
         if key in self._entries:
+            self._bytes -= self._estimate_bytes(self._entries[key])
             self._entries.move_to_end(key)
             self._entries[key] = df
+            self._bytes += new_bytes
             return
         self._entries[key] = df
-        while len(self._entries) > self.max_tiles:
-            self._entries.popitem(last=False)
+        self._bytes += new_bytes
+        while self._entries and (
+            len(self._entries) > self.max_tiles or self._bytes > self.max_bytes
+        ):
+            _, old = self._entries.popitem(last=False)
+            self._bytes -= self._estimate_bytes(old)
 
 
 def _prepare_b_join_frame(
@@ -1856,6 +1901,9 @@ class ColumnCrossmatchTileConfig:
     match_col_b: str
     b_populated: tuple[int, ...]
     out_root: str
+    b_cache_enabled: bool = True
+    b_cache_max_tiles: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_TILES
+    b_cache_max_bytes: int = 0  # 0 → PARTNER_TILE_CACHE_MAX_BYTES
 
 
 def _column_crossmatch_one_tile(
@@ -1960,7 +2008,14 @@ def _column_crossmatch_tile_worker(
         b_populated = set(config.b_populated)
         n_match_rows = 0
         n_tiles_written = 0
-        b_cache = _BTileJoinCache()
+        b_cache = (
+            _BTileJoinCache(
+                max_tiles=config.b_cache_max_tiles,
+                max_bytes=config.b_cache_max_bytes,
+            )
+            if config.b_cache_enabled
+            else None
+        )
 
         with (
             CatalogAccessor(lake_root, config.survey_a, norder=config.norder_a) as acc_a,
@@ -2078,6 +2133,9 @@ def build_column_crossmatch(
     export_parquet: Path | str | None = None,
     export_fits: Path | str | None = None,
     restrict_npix: Iterable[int] | None = None,
+    b_cache: bool = True,
+    b_cache_max_tiles: int | None = None,
+    b_cache_max_mib: int | None = None,
 ) -> CrossmatchResult:
     """Build a column-equality crossmatch between two surveys.
 
@@ -2119,7 +2177,26 @@ def build_column_crossmatch(
         Optionally consolidate all rows into a flat file after writing tiles.
     restrict_npix:
         Limit to a subset of survey-A HEALPix pixels (region restriction).
+    b_cache / b_cache_max_tiles / b_cache_max_mib:
+        Same partner-tile LRU policy as sky crossmatch
+        (:mod:`data_lake.knobs.PARTNER_TILE_CACHE_*`).
     """
+    from data_lake.knobs import (
+        PARTNER_TILE_CACHE_MAX_BYTES,
+        PARTNER_TILE_CACHE_MAX_TILES,
+    )
+
+    tiles_cap = (
+        PARTNER_TILE_CACHE_MAX_TILES
+        if b_cache_max_tiles is None
+        else int(b_cache_max_tiles)
+    )
+    mib_cap = (
+        PARTNER_TILE_CACHE_MAX_BYTES // (1024 * 1024)
+        if b_cache_max_mib is None
+        else int(b_cache_max_mib)
+    )
+    b_cache_max_bytes = max(1, mib_cap) * 1024 * 1024
     from data_lake.schema_registry import resolve_catalog_root
     validate_match_column(match_col_a, "--match-col-a")
     validate_match_column(match_col_b, "--match-col-b")
@@ -2210,6 +2287,9 @@ def build_column_crossmatch(
                 match_col_b=match_col_b,
                 b_populated=tuple(b_populated_list),
                 out_root=str(out_root),
+                b_cache_enabled=b_cache,
+                b_cache_max_tiles=tiles_cap,
+                b_cache_max_bytes=b_cache_max_bytes,
             )
             for tiles in worker_tiles
         ]
@@ -2259,7 +2339,11 @@ def build_column_crossmatch(
             CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a,
             CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b,
         ):
-            b_cache = _BTileJoinCache()
+            col_b_cache = (
+                _BTileJoinCache(max_tiles=tiles_cap, max_bytes=b_cache_max_bytes)
+                if b_cache
+                else None
+            )
             for npix_a in iterator:
                 n_rows = _column_crossmatch_one_tile(
                     npix_a=npix_a,
@@ -2271,7 +2355,7 @@ def build_column_crossmatch(
                     out_root=out_root,
                     acc_a=acc_a,
                     acc_b=acc_b,
-                    b_cache=b_cache,
+                    b_cache=col_b_cache,
                 )
                 if n_rows > 0:
                     n_tiles_written += 1
@@ -2360,8 +2444,8 @@ def execute_crossmatch_plan(
     gpu_id: int = 0,
     show_progress: bool = False,
     b_cache: bool = True,
-    b_cache_max_tiles: int = 48,
-    b_cache_max_mib: int = 512,
+    b_cache_max_tiles: int | None = None,
+    b_cache_max_mib: int | None = None,
 ) -> list[CrossmatchResult]:
     """Execute a crossmatch plan (base catalog x N partners), optionally region-bounded.
 
@@ -2431,6 +2515,9 @@ def execute_crossmatch_plan(
                 tiles_per_worker=tiles_per_worker,
                 show_progress=show_progress,
                 restrict_npix=restrict_npix,
+                b_cache=b_cache,
+                b_cache_max_tiles=b_cache_max_tiles,
+                b_cache_max_mib=b_cache_max_mib,
             )
         else:
             radius = partner.get("radius_arcsec")
@@ -2589,6 +2676,12 @@ try:
         resolve_log_level,
         validate_quiet_verbose,
     )
+    from data_lake.knobs import (
+        PARTNER_TILE_CACHE_MAX_BYTES,
+        PARTNER_TILE_CACHE_MAX_TILES,
+    )
+
+    _cli_b_cache_mib = PARTNER_TILE_CACHE_MAX_BYTES // (1024 * 1024)
 
     @click.command("dl-crossmatch")
     @click.argument("survey_a", required=False)
@@ -2694,21 +2787,24 @@ try:
         "--b-cache/--no-b-cache",
         default=True,
         show_default=True,
-        help="LRU-cache full survey-B HEALPix tiles across neighbouring A tiles (sky mode).",
+        help=(
+            "LRU-cache full survey-B HEALPix tiles across neighbouring A tiles "
+            "(sky and column modes; same defaults as dl-gather partner cache)."
+        ),
     )
     @click.option(
         "--b-cache-tiles",
-        default=48,
+        default=PARTNER_TILE_CACHE_MAX_TILES,
         show_default=True,
         type=int,
-        help="Max survey-B tiles retained in the per-worker LRU.",
+        help="Max survey-B tiles in the per-worker LRU.",
     )
     @click.option(
         "--b-cache-mib",
-        default=512,
+        default=_cli_b_cache_mib,
         show_default=True,
         type=int,
-        help="Max survey-B tile cache size in MiB (per worker).",
+        help="Max survey-B tile cache size in MiB per worker.",
     )
     @logging_options
     def cli(
@@ -2767,6 +2863,10 @@ try:
             raise click.ClickException("--gpu-id must be >= 0")
 
         effective_progress = show_progress and not quiet
+        if b_cache_tiles < 1:
+            raise click.ClickException("--b-cache-tiles must be >= 1")
+        if b_cache_mib < 1:
+            raise click.ClickException("--b-cache-mib must be >= 1")
 
         # ---- column mode: dl-crossmatch A B [LAKE] --match-mode column ... ----
         if match_mode == "column":
@@ -2809,6 +2909,9 @@ try:
                     tiles_per_worker=tiles_per_worker,
                     export_parquet=export_parquet,
                     export_fits=export_fits,
+                    b_cache=b_cache,
+                    b_cache_max_tiles=b_cache_tiles,
+                    b_cache_max_mib=b_cache_mib,
                 )
             except (ValueError, FileNotFoundError) as exc:
                 raise click.ClickException(str(exc))
@@ -2898,10 +3001,6 @@ try:
             if not cat_root.is_dir():
                 raise click.ClickException(f"{label} catalog not found: {cat_root}")
 
-        if b_cache_tiles < 1:
-            raise click.ClickException("--b-cache-tiles must be >= 1")
-        if b_cache_mib < 1:
-            raise click.ClickException("--b-cache-mib must be >= 1")
         result = build_crossmatch(
             lake,
             survey_a,

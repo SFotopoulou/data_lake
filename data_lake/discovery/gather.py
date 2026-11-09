@@ -45,8 +45,9 @@ from data_lake.schema_registry import CATALOG_KIND_PRODUCT, MODALITY_CATALOG
 
 log = logging.getLogger(__name__)
 
-_MAX_WORKERS = 64
-_ZSTD_LEVEL = 7
+from data_lake.knobs import ZSTD_GATHER
+
+_ZSTD_LEVEL = ZSTD_GATHER
 
 
 @dataclass

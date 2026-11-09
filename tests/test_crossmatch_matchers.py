@@ -48,17 +48,18 @@ class TestMatchSkyBackends:
         }
 
     def test_astropy_nearest_within_radius(self, sky_fixture: dict) -> None:
-        matched_a, matched_b, sep = match_sky_nn_within_radius(
+        matched_a, matched_b, sep, idx_b = match_sky_nn_within_radius(
             **sky_fixture,
             backend="astropy",
         )
         assert matched_a.tolist() == [1001]
         assert matched_b.tolist() == [2001]
+        assert idx_b.tolist() == [0]
         assert sep.size == 1
         assert sep[0] * 3600.0 < 4.0
 
     def test_empty_catalog_b(self, sky_fixture: dict) -> None:
-        matched_a, matched_b, sep = match_sky_nn_within_radius(
+        matched_a, matched_b, sep, idx_b = match_sky_nn_within_radius(
             sky_fixture["ra_a"],
             sky_fixture["dec_a"],
             sky_fixture["ids_a"],
@@ -71,6 +72,7 @@ class TestMatchSkyBackends:
         assert matched_a.size == 0
         assert matched_b.size == 0
         assert sep.size == 0
+        assert idx_b.size == 0
 
     @pytest.mark.gpu
     def test_rapids_matches_astropy(self, sky_fixture: dict) -> None:
@@ -83,7 +85,7 @@ class TestMatchSkyBackends:
             backend="rapids",
             gpu_id=0,
         )
-        for field_idx in range(3):
+        for field_idx in range(4):
             a = astropy_result[field_idx]
             r = rapids_result[field_idx]
             assert a.shape == r.shape

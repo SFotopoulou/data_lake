@@ -7,6 +7,8 @@ Workers decode one FITS file at a time; a single main-thread writer appends to
 
 from __future__ import annotations
 
+from data_lake.knobs import WRITE_MAX_OPEN_TILES
+
 import json
 import logging
 import time
@@ -187,7 +189,7 @@ def ingest_spectra_files_parallel(
     show_progress: bool = True,
     skip_completed: bool = True,
     max_in_flight: int | None = None,
-    max_open_tiles: int = 64,
+    max_open_tiles: int = WRITE_MAX_OPEN_TILES,
     on_duplicate_source_id: ZarrDuplicateMode = "skip",
     executor_factory: Callable[[int], Executor] | None = None,
     decoder: Callable[[str, SpectrumDecodeConfig], WorkerResult] | None = None,

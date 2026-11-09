@@ -175,6 +175,7 @@ try:
         load_optional_config,
         progress_option,
     )
+    from data_lake.knobs import DEFAULT_CHUNKS_PER_SHARD, DEFAULT_FITS_CHUNK_ROWS
 
     @click.command("dl-extract-spectra-subset")
     @click.option(
@@ -232,7 +233,7 @@ try:
     )
     @click.option(
         "--fits-chunk-rows",
-        default=50_000,
+        default=DEFAULT_FITS_CHUNK_ROWS,
         show_default=True,
         type=int,
         help="Rows per temporary catalog-FITS part when --fits-layout catalog "
@@ -272,7 +273,7 @@ try:
         help="Behaviour for source_ids not found in the lake.",
     )
     @click.option(
-        "--chunks-per-shard", default=512, show_default=True, type=int,
+        "--chunks-per-shard", default=DEFAULT_CHUNKS_PER_SHARD, show_default=True, type=int,
         help="Output Zarr shard rows (ignored for parquet/fits).",
     )
     @click.option(

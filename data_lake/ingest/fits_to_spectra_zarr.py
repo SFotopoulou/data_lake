@@ -137,8 +137,10 @@ def _import_desispec():
 # Constants / schema
 # ---------------------------------------------------------------------------
 
-_CHUNKS_PER_SHARD = 512    # ~512 MB shards for typical 5000-px spectra
-_ZSTD_LEVEL = 3
+from data_lake.knobs import SPECTRA_CHUNKS_PER_SHARD, ZSTD_INGEST
+
+_CHUNKS_PER_SHARD = SPECTRA_CHUNKS_PER_SHARD
+_ZSTD_LEVEL = ZSTD_INGEST
 _DEFAULT_FLUX_DTYPE = np.float32
 _DEFAULT_MASK_DTYPE = np.uint8
 

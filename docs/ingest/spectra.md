@@ -725,8 +725,9 @@ Mitigations built into the batch command:
 
 - Lower **`--n-workers`** (main lever for decoder process RAM).
 - Lower **`--max-in-flight`** (default `n_workers + 2`; caps queued decode results).
-- Keep default **`--max-open-tiles 64`** so the writer does not hold thousands of
-  Zarr tiles open; use `0` only for small tests.
+- Keep default **`--max-open-tiles 64`** (`data_lake.knobs.WRITE_MAX_OPEN_TILES`)
+  so the writer does not hold thousands of Zarr tiles open; use `0` only for
+  small tests. Extract/query accessors use a tighter read LRU (8).
 - Use **`--on-duplicate skip`** when resuming (writer caches IDs per open tile).
 
 Run long jobs under `tmux`/`nohup` so oomd killing the terminal does not stop

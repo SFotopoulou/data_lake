@@ -34,6 +34,8 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from astropy.table import Table
 
+from data_lake.knobs import ZSTD_COMPACT, ZSTD_INGEST
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -41,7 +43,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _HATS_DIR_STRIDE = 10_000  # tiles per Dir= folder (HATS convention)
-_ZSTD_LEVEL = 3             # default balance of speed vs ratio (catalog ingest)
+_ZSTD_LEVEL = ZSTD_INGEST   # catalog ingest / crossmatch tiles
 
 # Lake-internal int64 join key (Parquet catalogs and Zarr); not a survey column name.
 LAKE_JOIN_ID_COLUMN = "_source_id"
@@ -63,7 +65,7 @@ class CatalogParquetOptions:
     def compact(cls) -> CatalogParquetOptions:
         """Smaller on-disk footprint; slower ingest, still ZSTD-compressed."""
         return cls(
-            compression_level=9,
+            compression_level=ZSTD_COMPACT,
             write_statistics=False,
             use_dictionary=False,
             shrink_strings_for_tiles=True,
