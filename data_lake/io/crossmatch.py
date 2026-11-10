@@ -1511,9 +1511,9 @@ def _worker_resources(key: tuple, lake_root: Path, survey_a: str, norder_a: int,
         yield _worker_state[1:]
         return
     _close_worker_state()
-    acc_a = CatalogAccessor(lake_root, survey_a, norder=norder_a)
+    acc_a = CatalogAccessor(lake_root, survey_a, norder=norder_a, metadata_cache=False)
     try:
-        acc_b = CatalogAccessor(lake_root, survey_b, norder=norder_b)
+        acc_b = CatalogAccessor(lake_root, survey_b, norder=norder_b, metadata_cache=False)
     except Exception:
         acc_a.close()
         raise
@@ -1987,8 +1987,8 @@ def build_crossmatch(
             )
         )
         with process_limits(duckdb_limits), \
-             CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a, \
-             CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b:
+             CatalogAccessor(lake_root, survey_a, norder=norder_a, metadata_cache=False) as acc_a, \
+             CatalogAccessor(lake_root, survey_b, norder=norder_b, metadata_cache=False) as acc_b:
             log.info(
                 "ID columns: %s (%r) × %s (%r)",
                 survey_a,
@@ -2897,8 +2897,8 @@ def build_column_crossmatch(
 
         with (
             process_limits(duckdb_limits),
-            CatalogAccessor(lake_root, survey_a, norder=norder_a) as acc_a,
-            CatalogAccessor(lake_root, survey_b, norder=norder_b) as acc_b,
+            CatalogAccessor(lake_root, survey_a, norder=norder_a, metadata_cache=False) as acc_a,
+            CatalogAccessor(lake_root, survey_b, norder=norder_b, metadata_cache=False) as acc_b,
         ):
             col_b_cache = (
                 _BTileJoinCache(max_tiles=tiles_cap, max_bytes=b_cache_max_bytes)

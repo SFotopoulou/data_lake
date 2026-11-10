@@ -84,7 +84,24 @@ def export_cutout(
     finally:
         if _own_accessor:
             accessor.close()
+    return _write_cutout_fits(
+        image, wcs, source_id, survey, output_path,
+        band_index=band_index, overwrite=overwrite,
+    )
 
+
+def _write_cutout_fits(
+    image: np.ndarray,
+    wcs: CutoutWCS,
+    source_id: int,
+    survey: str,
+    output_path: Path,
+    *,
+    band_index: int | None,
+    overwrite: bool,
+) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     if band_index is not None:
         if band_index < 0 or band_index >= image.shape[0]:
             raise IndexError(
@@ -198,17 +215,16 @@ def export_cutouts_batch(
     paths: list[Path] = []
 
     with CutoutAccessor(lake_root, survey) as accessor:
-        for source_id in source_ids:
+        npix_arr, local_arr = accessor.locate(source_ids)
+        for source_id, npix, local_idx in zip(source_ids, npix_arr.tolist(), local_arr.tolist()):
             out = output_dir / filename_template.format(source_id=source_id)
             try:
-                p = export_cutout(
-                    lake_root=lake_root,
-                    survey=survey,
-                    source_id=source_id,
-                    output_path=out,
-                    band_index=band_index,
-                    overwrite=overwrite,
-                    accessor=accessor,
+                if npix < 0:
+                    raise KeyError(f"source_id={source_id} not found in any tile.")
+                image, wcs = accessor.get_cutout_at(npix, local_idx)
+                p = _write_cutout_fits(
+                    image, wcs, int(source_id), survey, out,
+                    band_index=band_index, overwrite=overwrite,
                 )
                 paths.append(p)
             except Exception as exc:

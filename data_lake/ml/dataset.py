@@ -33,7 +33,6 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import numpy as np
-import polars as pl
 
 try:
     import torch
@@ -105,8 +104,14 @@ class CutoutDataset(Dataset):
         If True, each item is a dict ``{"image": …, "wcs": …, "source_id": …}``.
         If False (default), returns only the image tensor (or transform output).
     catalog_accessor:
-        Optional ``CatalogAccessor`` for fast O(1) tile lookup; if None,
-        the accessor falls back to scanning tiles.
+        Optional ``CatalogAccessor`` used once, at construction, to resolve
+        every source ID to its tile position (one catalog scan per million
+        IDs).  Without it the tiles are scanned instead.  It is not kept, so
+        DataLoader workers never share its DuckDB connection.
+
+    All IDs are resolved when the dataset is built and kept as two int64
+    arrays (16 bytes per sample); ``__getitem__`` then reads the stored tile
+    position directly.  IDs not found raise ``KeyError`` when accessed.
     """
 
     def __init__(
@@ -128,41 +133,30 @@ class CutoutDataset(Dataset):
         self.transform = transform
         self.target_transform = target_transform
         self.return_wcs = return_wcs
-        self._catalog = catalog_accessor
 
-        # Build tile-sorted permutation
+        with CutoutAccessor(
+            self.lake_root, survey, norder=norder, catalog_accessor=catalog_accessor,
+        ) as acc:
+            self._npix, self._local = acc.locate(self.source_ids)
+        n_missing = int((self._npix < 0).sum())
+        if n_missing:
+            log.warning(
+                "CutoutDataset: %d of %d source ID(s) not found in %s cutouts",
+                n_missing, len(self.source_ids), survey,
+            )
+
         self._tile_sorted_perm: list[int] | None = None
         if tile_sort:
-            self._tile_sorted_perm = self._build_tile_sorted_perm()
+            self._tile_sorted_perm = np.argsort(self._npix, kind="stable").tolist()
 
         # Accessor is created lazily per worker (or immediately for single-process)
         self._accessor: CutoutAccessor | None = None
         self._worker_id: int | None = None
 
-    def _build_tile_sorted_perm(self) -> list[int]:
-        """Return permutation of 0..N that groups source_ids by HEALPix tile."""
-        try:
-            import healpy as hp
-            # We need RA/Dec to assign tiles, but we only have source_ids here.
-            # If a catalog accessor is available, use it; otherwise defer sort
-            # to runtime (sort by tile after first access).
-            if self._catalog is not None:
-                # Fetch healpix tile for all source_ids in one shot
-                hp_col = f"_healpix_norder{self.norder}"
-                id_list = ", ".join(str(s) for s in self.source_ids)
-                sql = f"SELECT source_id, {hp_col} FROM catalog WHERE source_id IN ({id_list})"
-                df = self._catalog.query(sql, fmt="polars")
-                id_to_tile = dict(
-                    zip(
-                        df["source_id"].cast(pl.Int64).to_list(),
-                        df[hp_col].cast(pl.Int64).to_list(),
-                    )
-                )
-                tiles = [id_to_tile.get(sid, 0) for sid in self.source_ids]
-                return list(np.argsort(tiles, kind="stable"))
-        except Exception as exc:
-            log.debug("Could not build tile-sorted perm: %s", exc)
-        return list(range(len(self.source_ids)))
+    @property
+    def tile_npix(self) -> np.ndarray:
+        """HEALPix tile of each dataset index (``-1`` when the ID was not found)."""
+        return self._npix
 
     @property
     def tile_sorted_indices(self) -> list[int]:
@@ -184,7 +178,6 @@ class CutoutDataset(Dataset):
         if self._accessor is None or worker_id != self._worker_id:
             self._accessor = CutoutAccessor(
                 self.lake_root, self.survey, norder=self.norder,
-                catalog_accessor=self._catalog,
             )
             self._worker_id = worker_id
         return self._accessor
@@ -194,12 +187,15 @@ class CutoutDataset(Dataset):
 
     def __getitem__(self, idx: int):
         source_id = self.source_ids[idx]
+        npix, local_idx = int(self._npix[idx]), int(self._local[idx])
+        if npix < 0:
+            raise KeyError(f"source_id={source_id} not found in any tile.")
         acc = self._get_accessor()
 
         if self.return_wcs:
-            image, wcs = acc.get_cutout(source_id)
+            image, wcs = acc.get_cutout_at(npix, local_idx)
         else:
-            image = acc.get_image(source_id)
+            image = acc.get_image_at(npix, local_idx)
             wcs = None
 
         if self.transform is not None:
@@ -257,18 +253,13 @@ class TileSequentialSampler:
         self._build()
 
     def _build(self) -> None:
-        perm = self._dataset.tile_sorted_indices
-        # Group consecutive positions (same tile) into runs
-        self._tile_runs: list[list[int]] = []
-        if not perm:
+        npix = self._dataset.tile_npix
+        order = np.argsort(npix, kind="stable")
+        if order.size == 0:
+            self._tile_runs: list[list[int]] = []
             return
-        run: list[int] = [perm[0]]
-        for p in perm[1:]:
-            run.append(p)
-            # Each element of tile_sorted_perm is a dataset index; we can't
-            # easily detect tile boundaries here without re-doing the lookup.
-            # Use a run of _TILE_RUN_SIZE as heuristic; override by subclassing.
-        self._tile_runs = [run]  # single group for now
+        boundaries = np.flatnonzero(np.diff(npix[order])) + 1
+        self._tile_runs = [run.tolist() for run in np.split(order, boundaries)]
 
     def __iter__(self):
         runs = list(self._tile_runs)

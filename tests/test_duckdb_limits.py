@@ -115,6 +115,34 @@ class TestConnections:
                 assert _settings(acc._con) == (2, "512.0 MiB")
 
 
+def _metadata_cache_on(con) -> bool:
+    value = con.execute("SELECT current_setting('parquet_metadata_cache')").fetchone()[0]
+    return str(value).lower() == "true"
+
+
+class TestParquetMetadataCache:
+    def test_connect_default_off(self) -> None:
+        assert not _metadata_cache_on(connect())
+        assert _metadata_cache_on(connect(parquet_metadata_cache=True))
+
+    @pytest.mark.parametrize(
+        ("env", "expected"), [(None, True), ("0", False), ("off", False), ("1", True)],
+    )
+    def test_accessor_default_and_env(self, tmp_path: Path, monkeypatch, env, expected) -> None:
+        from data_lake.io.catalog import CatalogAccessor
+
+        if env is None:
+            monkeypatch.delenv("DATA_LAKE_PARQUET_METADATA_CACHE", raising=False)
+        else:
+            monkeypatch.setenv("DATA_LAKE_PARQUET_METADATA_CACHE", env)
+        lake = tmp_path / "lake"
+        _write_catalog_tile(lake, "A", norder=5, npix=100, source_ids=[1], ra=[30.0], dec=[5.0])
+        with CatalogAccessor(lake, "A") as acc:
+            assert _metadata_cache_on(acc._con) is expected
+        with CatalogAccessor(lake, "A", metadata_cache=False) as acc:
+            assert not _metadata_cache_on(acc._con)
+
+
 class TestCrossmatchWorkers:
     def test_worker_installs_config_limits(self, tmp_path: Path) -> None:
         from data_lake.io.crossmatch import CrossmatchTileConfig, _crossmatch_tile_worker

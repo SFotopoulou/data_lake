@@ -187,16 +187,30 @@ def infer_column_groups(column_names: list[str]) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in buckets.items() if len(v) >= 2}
 
 
-def read_catalog_arrow_schema(catalog_root: Path) -> pa.Schema:
-    """Load aggregate or single-tile Parquet schema for a survey catalog."""
+def catalog_schema_source(catalog_root: Path | str) -> Path | None:
+    """Return the cheapest file that holds a catalog's schema, or ``None``.
+
+    Preference: ``_common_metadata`` (schema only), one ``Npix=*.parquet`` tile,
+    then the aggregate ``_metadata`` (holds every tile's row groups, so it can
+    be hundreds of MiB for wide catalogs with many tiles).
+    """
     catalog_root = Path(catalog_root)
-    meta_path = catalog_root / "_metadata"
-    if meta_path.exists():
-        return pq.read_metadata(str(meta_path)).schema.to_arrow_schema()
+    common = catalog_root / "_common_metadata"
+    if common.is_file():
+        return common
     first_tile = next(catalog_root.rglob("Npix=*.parquet"), None)
-    if first_tile is None:
+    if first_tile is not None:
+        return first_tile
+    meta_path = catalog_root / "_metadata"
+    return meta_path if meta_path.is_file() else None
+
+
+def read_catalog_arrow_schema(catalog_root: Path) -> pa.Schema:
+    """Load a survey catalog's Arrow schema from the cheapest available file."""
+    source = catalog_schema_source(catalog_root)
+    if source is None:
         raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
-    return pq.read_schema(str(first_tile))
+    return pq.read_schema(str(source))
 
 
 def build_catalog_schema_manifest(
@@ -277,6 +291,7 @@ def write_catalog_schema_manifest(
     dec_column: str,
     link_id_mode: str,
     total_rows: int | None = None,
+    schema: pa.Schema | None = None,
 ) -> Path:
     """Write ``schema_manifest.json`` under the survey catalog directory."""
     catalog_root = Path(catalog_root)
@@ -288,6 +303,7 @@ def write_catalog_schema_manifest(
         dec_column=dec_column,
         link_id_mode=link_id_mode,
         total_rows=total_rows,
+        schema=schema,
     )
     out_path = catalog_root / MANIFEST_FILENAME
     with open(out_path, "w", encoding="utf-8") as fh:

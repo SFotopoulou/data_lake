@@ -33,10 +33,10 @@ def bulk_tile_index_from_catalog(
     source_ids: Sequence[int] | np.ndarray,
     kind: ModalityKind,
     *,
-    batch_size: int = 10_000,
+    batch_size: int = 1_000_000,
     show_progress: bool = True,
 ) -> dict[int, tuple[int, int]]:
-    """Resolve IDs via batched SQL against the catalog view."""
+    """Resolve IDs via one catalog scan per *batch_size* IDs (semi-join, not literals)."""
     requested_int = np.unique(np.asarray(source_ids, dtype=np.int64).ravel())
     result: dict[int, tuple[int, int]] = {}
     if requested_int.size == 0:
@@ -63,23 +63,25 @@ def bulk_tile_index_from_catalog(
         def tqdm(x, **_kw):  # type: ignore[misc]
             return x
 
+    n_batches = -(-len(requested_int) // max(1, int(batch_size)))
     try:
-        for start in tqdm(
-            range(0, len(requested_int), batch_size),
+        for ids_table in tqdm(
+            catalog._id_tables(requested_int, batch_size),
+            total=n_batches,
             desc=f"catalog {kind} lookup",
             disable=not show_progress,
             unit="batch",
         ):
-            chunk = requested_int[start : start + batch_size]
-            ids_csv = ",".join(str(int(s)) for s in chunk)
             sql = (
-                f"SELECT {sid_col}, {tile_col}, {index_col} "
-                f"FROM catalog WHERE {sid_col} IN ({ids_csv}) "
-                f"AND {index_col} >= 0"
+                f'SELECT "{sid_col}", "{tile_col}", "{index_col}" '
+                f'FROM catalog WHERE "{sid_col}" IN (SELECT id FROM {ids_table}) '
+                f'AND "{index_col}" >= 0'
             )
-            rows = catalog._con.execute(sql).fetchall()
-            for sid, npix, lidx in rows:
-                result[int(sid)] = (int(npix), int(lidx))
+            sids, npixs, lidxs = (
+                np.asarray(col, dtype=np.int64)
+                for col in catalog._con.execute(sql).fetchnumpy().values()
+            )
+            result.update(zip(sids.tolist(), zip(npixs.tolist(), lidxs.tolist())))
     except Exception:  # pragma: no cover - defensive
         log.warning(
             "Catalog bulk %s lookup failed; tile scan may be needed.",
@@ -89,6 +91,20 @@ def bulk_tile_index_from_catalog(
         result.clear()
 
     return result
+
+
+def lookup_to_arrays(
+    source_ids: np.ndarray,
+    lookup: dict[int, tuple[int, int]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map *source_ids* through *lookup* to ``(npix, local_index)`` int64 arrays (-1 if absent)."""
+    npix = np.full(source_ids.shape, -1, dtype=np.int64)
+    local = np.full(source_ids.shape, -1, dtype=np.int64)
+    for i, sid in enumerate(source_ids.tolist()):
+        loc = lookup.get(sid)
+        if loc is not None:
+            npix[i], local[i] = loc
+    return npix, local
 
 
 def bulk_tile_index_with_scan(

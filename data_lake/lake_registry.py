@@ -160,18 +160,34 @@ def _count_parquet_tiles(survey_root: Path) -> int:
     return sum(1 for _ in survey_root.rglob("Npix=*.parquet"))
 
 
-def _sum_parquet_rows(survey_root: Path) -> int | None:
-    """Sum row counts from Parquet footers (no full column read)."""
+FOOTER_READ_THREADS = 16
+"""Concurrent footer reads when summing tile row counts (I/O-bound; latency on Lustre)."""
+
+
+def _parquet_tree_stats(survey_root: Path) -> tuple[int | None, int]:
+    """Return ``(total_rows, n_tiles)`` from one directory walk and the tile footers.
+
+    ``total_rows`` is ``None`` when any footer cannot be read.
+    """
     paths = list(survey_root.rglob("Npix=*.parquet"))
     if not paths:
-        return 0
-    total = 0
+        return 0, 0
+    from concurrent.futures import ThreadPoolExecutor
+
+    def rows(path: Path) -> int:
+        return int(pq.read_metadata(str(path)).num_rows)
+
     try:
-        for path in paths:
-            total += int(pq.read_metadata(str(path)).num_rows)
+        with ThreadPoolExecutor(max_workers=min(FOOTER_READ_THREADS, len(paths))) as pool:
+            total = sum(pool.map(rows, paths))
     except Exception:
-        return None
-    return total
+        return None, len(paths)
+    return total, len(paths)
+
+
+def _sum_parquet_rows(survey_root: Path) -> int | None:
+    """Sum row counts from Parquet footers (no full column read)."""
+    return _parquet_tree_stats(survey_root)[0]
 
 
 def _count_zarr_tiles(survey_root: Path) -> int:
@@ -666,8 +682,7 @@ def _crossmatch_registry_rows(lake_root: Path) -> list[dict[str, Any]]:
                 info = {}
         # Prefer on-disk Parquet footers so a region-bounded re-run that shrank
         # crossmatch_info.json cannot hide matches still present on disk.
-        total_rows = _sum_parquet_rows(root)
-        n_tiles = _count_parquet_tiles(root)
+        total_rows, n_tiles = _parquet_tree_stats(root)
         return {
             "survey": root.name,
             "modality": MODALITY_CROSSMATCH,

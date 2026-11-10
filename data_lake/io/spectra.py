@@ -40,6 +40,7 @@ import zarr.codecs
 
 from data_lake.ingest.fits_to_parquet import healpix_dir
 from data_lake.ingest.fits_to_spectra_zarr import _META_DTYPE
+from data_lake.io.id_lookup import lookup_to_arrays as _lookup_to_arrays
 from data_lake.knobs import DEFAULT_FITS_CHUNK_ROWS, DEFAULT_CHUNKS_PER_SHARD
 
 log = logging.getLogger(__name__)
@@ -441,8 +442,22 @@ class SpectrumAccessor:
         populated; call ``.resolution_operator()`` to get a scipy sparse matrix.
         """
         npix, local_idx = self._source_id_to_tile_and_local(source_id)
-        store = self._get_tile_store(npix)
-        flux, ivar, mask, wave, meta, res = store.get_spectrum(local_idx)
+        return self.get_spectrum_at(npix, local_idx, source_id=source_id)
+
+    def get_spectrum_at(
+        self,
+        npix: int,
+        local_idx: int,
+        *,
+        source_id: int | None = None,
+    ) -> Spectrum:
+        """Return the ``Spectrum`` stored at a known tile position (see :meth:`locate`)."""
+        store = self._get_tile_store(int(npix))
+        flux, ivar, mask, wave, meta, res = store.get_spectrum(int(local_idx))
+        if source_id is None:
+            from data_lake.ingest.zarr_ids import zarr_join_array
+
+            source_id = int(zarr_join_array(store._open())[int(local_idx)])
         return Spectrum(
             source_id=source_id,
             flux=flux, ivar=ivar, mask=mask,
@@ -450,6 +465,24 @@ class SpectrumAccessor:
             wcs_attrs=store.wcs_attrs,
             resolution=res,
             resolution_offsets=store.resolution_offsets if res is not None else None,
+        )
+
+    def locate(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        *,
+        show_progress: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resolve many source IDs to ``(npix, local_index)`` arrays in one pass.
+
+        Uses one catalog scan per million IDs (when a catalog accessor is
+        attached) plus a tile scan for the rest.  Missing IDs get ``-1`` in
+        both arrays.  Pair with :meth:`get_spectrum_at` instead of calling
+        :meth:`get_spectrum` per source.
+        """
+        ids = np.asarray(source_ids, dtype=np.int64).ravel()
+        return _lookup_to_arrays(
+            ids, self._build_source_id_lookup(ids, show_progress=show_progress),
         )
 
     def get_batch(

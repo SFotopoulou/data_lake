@@ -14,13 +14,14 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import zarr
 
 from data_lake.ingest.fits_to_parquet import healpix_dir
 from data_lake.ingest.fits_to_zarr import _WCS_DTYPE
+from data_lake.io.id_lookup import lookup_to_arrays as _lookup_to_arrays
 
 log = logging.getLogger(__name__)
 
@@ -350,6 +351,33 @@ class CutoutAccessor:
         """Return only the image array ``(B, H, W)`` for a source."""
         npix, local_idx = self._source_id_to_tile_and_local(source_id)
         return self._get_tile_store(npix).get_image(local_idx)
+
+    def locate(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        *,
+        show_progress: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resolve many source IDs to ``(npix, local_index)`` arrays in one pass.
+
+        Uses one catalog scan per million IDs (when a catalog accessor is
+        attached) plus a tile scan for the rest.  Missing IDs get ``-1`` in
+        both arrays.  Pair with :meth:`get_image_at` / :meth:`get_cutout_at`
+        instead of calling :meth:`get_cutout` per source.
+        """
+        ids = np.asarray(source_ids, dtype=np.int64).ravel()
+        return _lookup_to_arrays(
+            ids, self._build_source_id_lookup(ids, show_progress=show_progress),
+        )
+
+    def get_image_at(self, npix: int, local_idx: int) -> np.ndarray:
+        """Return the image ``(B, H, W)`` stored at a known tile position."""
+        return self._get_tile_store(int(npix)).get_image(int(local_idx))
+
+    def get_cutout_at(self, npix: int, local_idx: int) -> tuple[np.ndarray, CutoutWCS]:
+        """Return ``(image, wcs)`` stored at a known tile position."""
+        store = self._get_tile_store(int(npix))
+        return store.get_image(int(local_idx)), store.get_wcs(int(local_idx))
 
     def get_batch(
         self,

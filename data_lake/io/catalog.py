@@ -24,6 +24,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from data_lake.ingest.fits_to_parquet import (
+    _REDSHIFT_COLUMN_CANDIDATES,
     catalog_tile_schema_names,
     healpix_dir,
     match_schema_column,
@@ -33,11 +34,15 @@ from data_lake.ingest.fits_to_parquet import (
     resolve_link_id_column,
 )
 from data_lake.io.duckdb_limits import connect as connect_duckdb
-from data_lake.schema_registry import resolve_catalog_root
+from data_lake.io.duckdb_limits import parquet_metadata_cache_default
+from data_lake.schema_registry import catalog_schema_source, resolve_catalog_root
 
 log = logging.getLogger(__name__)
 
 ReturnFormat = Literal["polars", "astropy", "arrow"]
+
+ID_SCAN_CHUNK = 1_000_000
+"""Source IDs per catalog scan in batched ID lookups (8 bytes each in memory)."""
 
 
 def _quote_sql_ident(name: str) -> str:
@@ -90,6 +95,10 @@ class CatalogAccessor:
     norder:
         HEALPix order used for partitioning.  Read from ``catalog_info.json``
         if not supplied.
+    metadata_cache:
+        Keep parsed tile footers across queries (faster repeated queries,
+        memory grows with the tiles read).  Default:
+        :data:`~data_lake.knobs.CATALOG_PARQUET_METADATA_CACHE`.
     """
 
     def __init__(
@@ -97,6 +106,8 @@ class CatalogAccessor:
         lake_root: Path | str,
         survey_name: str,
         norder: int | None = None,
+        *,
+        metadata_cache: bool | None = None,
     ) -> None:
         self.lake_root = Path(lake_root)
         self.survey_name = survey_name
@@ -118,7 +129,9 @@ class CatalogAccessor:
         self._redshift_column: str | None = resolve_redshift_column(self.columns)
 
         # DuckDB in-process connection (no file, memory only)
-        self._con = connect_duckdb(":memory:")
+        if metadata_cache is None:
+            metadata_cache = parquet_metadata_cache_default()
+        self._con = connect_duckdb(":memory:", parquet_metadata_cache=metadata_cache)
         # Register the full Parquet glob as a view once so queries are cheap
         self._glob = str(self._catalog_root / f"Norder={self.norder}" / "**" / "*.parquet")
         self._con.execute(f"CREATE OR REPLACE VIEW catalog AS SELECT * FROM parquet_scan('{self._glob}')")
@@ -178,13 +191,14 @@ class CatalogAccessor:
         source_ids: Sequence[int] | np.ndarray,
         columns: Sequence[str],
         *,
-        batch_size: int = 10_000,
+        batch_size: int = ID_SCAN_CHUNK,
     ) -> dict[str, dict[int, object]]:
         """Return ``{column: {source_id: value}}`` for the requested columns.
 
         Used by spectrum/cutout subset extract to embed native link-id
         columns (e.g. ``TARGETID``, ``SURVEY``, ``PROGRAM``) alongside
         ``_source_id`` so exported Zarr/HDF5 files are self-contained.
+        *batch_size* is the number of IDs per catalog scan.
         """
         cols = [c for c in columns if c]
         if not cols:
@@ -196,21 +210,13 @@ class CatalogAccessor:
                 f"Available: {self.columns[:30]}"
             )
 
-        ids = np.unique(np.asarray(source_ids, dtype=np.int64))
-        if ids.size == 0:
-            return {c: {} for c in cols}
-
-        sid_col = self._link_id_column
-        sid_sql = _quote_sql_ident(sid_col)
-        col_sql = ", ".join(_quote_sql_ident(c) for c in cols)
         out: dict[str, dict[int, object]] = {c: {} for c in cols}
-
-        for start in range(0, int(ids.size), batch_size):
-            chunk = ids[start : start + batch_size]
-            ids_csv = ",".join(str(int(s)) for s in chunk)
+        sid_sql = _quote_sql_ident(self._link_id_column)
+        col_sql = ", ".join(_quote_sql_ident(c) for c in cols)
+        for ids_table in self._id_tables(source_ids, batch_size):
             sql = (
                 f"SELECT {sid_sql}, {col_sql} FROM catalog "
-                f"WHERE {sid_sql} IN ({ids_csv})"
+                f"WHERE {sid_sql} IN (SELECT id FROM {ids_table})"
             )
             for row in self._con.execute(sql).fetchall():
                 sid = int(row[0])
@@ -218,32 +224,49 @@ class CatalogAccessor:
                     out[col][sid] = row[i + 1]
         return out
 
+    def _id_tables(
+        self,
+        source_ids: Sequence[int] | np.ndarray,
+        chunk_size: int,
+    ):
+        """Yield the name of a registered one-column ``id`` table per chunk of unique IDs.
+
+        Queries semi-join against it (``IN (SELECT id FROM …)``), so each chunk
+        costs one scan instead of one scan per few thousand literal IDs.
+        """
+        ids = np.unique(np.asarray(source_ids, dtype=np.int64).ravel())
+        name = f"__ids_{id(self)}"
+        step = max(1, int(chunk_size))
+        for start in range(0, int(ids.size), step):
+            self._con.register(name, pa.table({"id": ids[start : start + step]}))
+            try:
+                yield name
+            finally:
+                self._con.unregister(name)
+
     @property
     def schema(self) -> pa.Schema:
-        """PyArrow schema of the catalog (reads aggregate _metadata if present).
+        """PyArrow schema of the catalog.
 
-        Cached per accessor and re-read only when ``_metadata`` changes on disk:
-        the aggregate footer holds every tile's row-group metadata, so for wide
-        catalogs with many tiles one read takes seconds.
+        Read from ``_common_metadata`` when present, else one tile, else the
+        aggregate ``_metadata`` (see :func:`catalog_schema_source`). Cached per
+        accessor and re-read only when that file changes on disk.
         """
-        meta_path = self._catalog_root / "_metadata"
-        try:
-            st = meta_path.stat()
-            key: tuple | None = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            key = None
         cached = getattr(self, "_schema_cache", None)
-        if cached is not None and cached[0] == key:
-            return cached[1]
-        if key is not None:
-            schema = pq.read_metadata(str(meta_path)).schema.to_arrow_schema()
-        else:
-            # Fall back to reading one file
-            first_file = next(self._catalog_root.rglob("*.parquet"), None)
-            if first_file is None:
-                raise RuntimeError("No Parquet files found in catalog.")
-            schema = pq.read_schema(str(first_file))
-        self._schema_cache = (key, schema)
+        if cached is not None:
+            path, key, schema = cached
+            try:
+                st = path.stat()
+                if (st.st_mtime_ns, st.st_size) == key:
+                    return schema
+            except OSError:
+                pass
+        source = catalog_schema_source(self._catalog_root)
+        if source is None:
+            raise RuntimeError("No Parquet files found in catalog.")
+        st = source.stat()
+        schema = pq.read_schema(str(source))
+        self._schema_cache = (source, (st.st_mtime_ns, st.st_size), schema)
         return schema
 
     @property
@@ -339,7 +362,7 @@ class CatalogAccessor:
         source_ids: Sequence[int],
         kind: str = "spectrum",
         *,
-        batch_size: int = 10_000,
+        batch_size: int = ID_SCAN_CHUNK,
         show_progress: bool = True,
     ) -> dict[int, tuple[int, int]]:
         """Resolve many source IDs to ``(npix, local_index)`` via batched catalog SQL."""
@@ -513,12 +536,13 @@ class CatalogAccessor:
         columns: list[str] | None = None,
         fmt: ReturnFormat = "polars",
         *,
-        batch_size: int = 10_000,
+        batch_size: int = ID_SCAN_CHUNK,
     ):
         """Fetch rows by ID, reading only the given HEALPix tile Parquet files.
 
         Unlike :meth:`get_sources_by_id`, this never scans the full survey
         ``catalog`` view — only existing ``Npix=*.parquet`` paths for *npixels*.
+        The files are scanned once per *batch_size* IDs.
         """
         ids = [int(s) for s in source_ids]
         if not ids:
@@ -547,10 +571,11 @@ class CatalogAccessor:
         from_clause = f"read_parquet([{escaped}])"
 
         chunks: list = []
-        for start in range(0, len(ids), batch_size):
-            chunk = ids[start : start + batch_size]
-            id_list = ", ".join(str(i) for i in chunk)
-            sql = f"SELECT {col_expr} FROM {from_clause} WHERE {sid_sql} IN ({id_list})"
+        for ids_table in self._id_tables(ids, batch_size):
+            sql = (
+                f"SELECT {col_expr} FROM {from_clause} "
+                f"WHERE {sid_sql} IN (SELECT id FROM {ids_table})"
+            )
             chunks.append(self.query(sql, fmt=fmt))
 
         if not chunks:
@@ -575,7 +600,7 @@ class CatalogAccessor:
         source_ids: Sequence[int] | np.ndarray,
         *,
         redshift_column: str | None = None,
-        batch_size: int = 10_000,
+        batch_size: int = ID_SCAN_CHUNK,
     ) -> dict[int, float]:
         """Return ``{source_id: redshift}`` from the survey catalog (not spectrum tiles).
 
@@ -586,7 +611,7 @@ class CatalogAccessor:
         redshift_column:
             Override auto-detected column (default: :attr:`redshift_column`).
         batch_size:
-            Chunk size for ``IN (...)`` SQL queries.
+            Source IDs per catalog scan.
 
         Raises
         ------
@@ -601,16 +626,14 @@ class CatalogAccessor:
                 f"Available columns include: {self.columns[:20]}"
             )
 
-        ids = np.unique(np.asarray(source_ids, dtype=np.int64))
-        if ids.size == 0:
-            return {}
-
-        sid_col = self._link_id_column
+        sid_sql = _quote_sql_ident(self._link_id_column)
+        z_sql = _quote_sql_ident(zcol)
         out: dict[int, float] = {}
-        for start in range(0, int(ids.size), batch_size):
-            chunk = ids[start : start + batch_size]
-            ids_csv = ",".join(str(int(s)) for s in chunk)
-            sql = f"SELECT {sid_col}, {zcol} FROM catalog WHERE {sid_col} IN ({ids_csv})"
+        for ids_table in self._id_tables(source_ids, batch_size):
+            sql = (
+                f"SELECT {sid_sql}, {z_sql} FROM catalog "
+                f"WHERE {sid_sql} IN (SELECT id FROM {ids_table})"
+            )
             for sid_raw, z_raw in self._con.execute(sql).fetchall():
                 out[int(sid_raw)] = float(z_raw)
         return out
@@ -731,7 +754,9 @@ class MultiCatalogAccessor:
     def __init__(self, lake_root: Path | str, surveys: list[str]) -> None:
         self.lake_root = Path(lake_root)
         self._accessors: dict[str, CatalogAccessor] = {}
-        self._con = connect_duckdb(":memory:")
+        self._con = connect_duckdb(
+            ":memory:", parquet_metadata_cache=parquet_metadata_cache_default(),
+        )
         for name in surveys:
             acc = CatalogAccessor(lake_root, name)
             glob = str(acc._catalog_root / f"Norder={acc.norder}" / "**" / "*.parquet")

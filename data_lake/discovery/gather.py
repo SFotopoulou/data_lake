@@ -196,7 +196,7 @@ def _gather_one_tile(
     base_order: int,
     multiplicity: str,
     include_sep: bool,
-    selection_ids: set[int] | None,
+    selection_ids: Any,
     keep_all: bool = True,
     partner_cache: PartnerTileCache | None = None,
 ):
@@ -209,7 +209,7 @@ def _gather_one_tile(
     if base_df.is_empty():
         return None
     if selection_ids is not None:
-        base_df = base_df.filter(pl.col(base_id).is_in(list(selection_ids)))
+        base_df = base_df.filter(pl.col(base_id).is_in(selection_ids))
         if base_df.is_empty():
             return None
 
@@ -384,13 +384,26 @@ def gather_product(
         except ImportError:
             pass
 
-    base_acc = CatalogAccessor(lake_root, base, norder=base_order)
-    partner_acc = {p.survey: CatalogAccessor(lake_root, p.survey) for p in partners}
+    base_acc = CatalogAccessor(lake_root, base, norder=base_order, metadata_cache=False)
+    partner_acc = {
+        p.survey: CatalogAccessor(lake_root, p.survey, metadata_cache=False)
+        for p in partners
+    }
     if partner_cache is None:
         partner_cache = PartnerTileCache()
+    where_con = None
     try:
         import polars as pl
 
+        selection_series = (
+            pl.Series(sorted(selection_ids), dtype=pl.Int64)
+            if selection_ids is not None
+            else None
+        )
+        if where_joined:
+            from data_lake.io.duckdb_limits import connect as connect_duckdb
+
+            where_con = connect_duckdb(":memory:")
         for npix in iterator:
             df = _gather_one_tile(
                 npix,
@@ -402,23 +415,22 @@ def gather_product(
                 base_order=base_order,
                 multiplicity=multiplicity,
                 include_sep=include_sep,
-                selection_ids=selection_ids,
+                selection_ids=selection_series,
                 keep_all=keep_all,
                 partner_cache=partner_cache,
             )
             if df is None or df.is_empty():
                 continue
-            if where_joined:
-                import duckdb
-
-                con = duckdb.connect(":memory:")
+            if where_con is not None:
+                where_con.register("t", df.to_arrow())
                 try:
-                    con.register("t", df.to_arrow())
-                    filtered = con.execute(
+                    filtered = where_con.execute(
                         f"SELECT * FROM t WHERE {where_joined}"
                     ).arrow()
+                    if isinstance(filtered, pa.RecordBatchReader):
+                        filtered = filtered.read_all()
                 finally:
-                    con.close()
+                    where_con.unregister("t")
                 df = pl.from_arrow(filtered)
                 if df.is_empty():
                     continue
@@ -436,9 +448,13 @@ def gather_product(
             if product_n_columns is None:
                 product_n_columns = table.num_columns
     finally:
+        if where_con is not None:
+            where_con.close()
         base_acc.close()
         for acc in partner_acc.values():
             acc.close()
+    if partner_cache.enabled:
+        log.debug("Gather partner cache: %s", partner_cache.summary())
 
     _write_product_info(
         out_root,
@@ -568,9 +584,12 @@ def _extract_cutouts_to_fits(
     written = 0
     missing_ids: list[int] = []
     with CutoutAccessor(lake_root, survey) as acc:
-        for sid in source_ids:
+        npix_arr, local_arr = acc.locate(source_ids)
+        for sid, npix, local_idx in zip(source_ids, npix_arr.tolist(), local_arr.tolist()):
             try:
-                image, wcs = acc.get_cutout(int(sid))
+                if npix < 0:
+                    raise KeyError(f"source_id={sid} not found in any tile.")
+                image, wcs = acc.get_cutout_at(npix, local_idx)
             except (KeyError, FileNotFoundError):
                 missing_ids.append(int(sid))
                 if missing == "error":

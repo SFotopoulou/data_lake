@@ -212,8 +212,32 @@ def apply_limits(con, limits: DuckDBLimits | None = None):
     return con
 
 
-def connect(database: str = ":memory:", limits: DuckDBLimits | None = None):
-    """``duckdb.connect`` with the process limits applied."""
+def parquet_metadata_cache_default() -> bool:
+    """``DATA_LAKE_PARQUET_METADATA_CACHE`` when set, else the knob default."""
+    raw = os.environ.get("DATA_LAKE_PARQUET_METADATA_CACHE", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    from data_lake.knobs import CATALOG_PARQUET_METADATA_CACHE
+
+    return CATALOG_PARQUET_METADATA_CACHE
+
+
+def connect(
+    database: str = ":memory:",
+    limits: DuckDBLimits | None = None,
+    *,
+    parquet_metadata_cache: bool = False,
+):
+    """``duckdb.connect`` with the process limits applied.
+
+    ``parquet_metadata_cache`` keeps parsed Parquet footers across queries on
+    this connection, so repeated queries over the same files skip re-parsing.
+    """
     import duckdb
 
-    return apply_limits(duckdb.connect(database=database), limits)
+    con = apply_limits(duckdb.connect(database=database), limits)
+    if parquet_metadata_cache:
+        con.execute("SET parquet_metadata_cache = true")
+    return con

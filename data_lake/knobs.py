@@ -48,6 +48,13 @@ DUCKDB_WORKER_MEMORY_FRACTION: float = 0.25
 """Share of each worker's memory budget given to DuckDB; the rest is left for
 Polars frames, partner caches, and the matcher."""
 
+CATALOG_PARQUET_METADATA_CACHE: bool = True
+"""Keep parsed tile footers in memory for repeated queries on a ``CatalogAccessor``
+(DuckDB ``parquet_metadata_cache``).  Costs about one footer per tile read
+(roughly the size of ``_metadata``) per accessor.  Pipelines that read each tile
+once, such as crossmatch workers, turn it off.  Environment override:
+``DATA_LAKE_PARQUET_METADATA_CACHE=0``."""
+
 # ---------------------------------------------------------------------------
 # Zarr shard sizing
 # ---------------------------------------------------------------------------

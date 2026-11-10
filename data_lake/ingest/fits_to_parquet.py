@@ -2221,18 +2221,47 @@ def _schema_needs_canonicalization(schema: pa.Schema) -> bool:
 def _reconcile_catalog_tile_dtypes(
     tile_path: Path,
     parquet_options: CatalogParquetOptions,
-) -> bool:
+    *,
+    schema: pa.Schema | None = None,
+) -> pq.FileMetaData | None:
     """Rewrite one tile when on-disk dtypes are not canonical (e.g. float32 ``flux``).
 
-    Returns True if the file was rewritten.
+    *schema* is the tile's Arrow schema when the caller already holds its footer.
+    Returns the rewritten tile's footer, or ``None`` when no rewrite was needed.
     """
-    schema = pq.read_schema(str(tile_path))
+    if schema is None:
+        schema = pq.read_schema(str(tile_path))
     if not _schema_needs_canonicalization(schema):
-        return False
+        return None
     table = _read_catalog_tile(tile_path)
     normalized = normalize_catalog_table_types(table)
-    _write_catalog_parquet_tile(normalized, tile_path, parquet_options)
-    return True
+    return _write_catalog_parquet_tile(normalized, tile_path, parquet_options)
+
+
+def _reconcile_scanned_tile_dtypes(
+    catalog_root: Path,
+    tiles: list[tuple[Path, pq.FileMetaData]],
+    parquet_options: CatalogParquetOptions | None = None,
+) -> list[tuple[Path, pq.FileMetaData]]:
+    """Canonicalize dtypes of already-scanned tiles; return the updated footers."""
+    pq_opts = parquet_options or CatalogParquetOptions()
+    out: list[tuple[Path, pq.FileMetaData]] = []
+    n_rewritten = 0
+    for path, meta in tiles:
+        rewritten = _reconcile_catalog_tile_dtypes(
+            path, pq_opts, schema=meta.schema.to_arrow_schema(),
+        )
+        if rewritten is not None:
+            n_rewritten += 1
+            meta = rewritten
+        out.append((path, meta))
+    if n_rewritten:
+        log.info(
+            "Reconciled dtypes on %d catalog tile(s) under %s",
+            n_rewritten,
+            catalog_root,
+        )
+    return out
 
 
 def reconcile_catalog_tile_dtypes(
@@ -2250,8 +2279,10 @@ def reconcile_catalog_tile_dtypes(
     catalog_root = Path(catalog_root)
     pq_opts = parquet_options or CatalogParquetOptions()
     n_rewritten = 0
-    for path in _iter_valid_parquet_tiles(catalog_root):
-        if _reconcile_catalog_tile_dtypes(path, pq_opts):
+    for path, meta in _scan_valid_parquet_tiles(catalog_root):
+        if _reconcile_catalog_tile_dtypes(
+            path, pq_opts, schema=meta.schema.to_arrow_schema(),
+        ) is not None:
             n_rewritten += 1
     if n_rewritten:
         log.info(
@@ -2541,42 +2572,74 @@ def _write_tile_for_mode(
     return _write_catalog_parquet_tile(merged, out_file, parquet_options)
 
 
-def _iter_valid_parquet_tiles(catalog_root: Path) -> list[Path]:
-    """Return ``Npix=*.parquet`` paths that pass a footer read (skip corrupt tiles)."""
-    valid: list[Path] = []
+def _scan_valid_parquet_tiles(catalog_root: Path) -> list[tuple[Path, pq.FileMetaData]]:
+    """Return ``(path, footer)`` for every readable ``Npix=*.parquet`` tile, sorted by path.
+
+    One footer read per tile; corrupt or truncated tiles are skipped with a warning.
+    """
+    valid: list[tuple[Path, pq.FileMetaData]] = []
     for path in sorted(catalog_root.rglob("Npix=*.parquet")):
-        if _is_valid_parquet_tile(path):
-            valid.append(path)
-        else:
+        meta: pq.FileMetaData | None = None
+        try:
+            if path.stat().st_size >= 8:
+                meta = pq.read_metadata(str(path))
+        except Exception:
+            meta = None
+        if meta is None:
             log.warning("Skipping corrupt/incomplete tile for metadata: %s", path)
+            continue
+        valid.append((path, meta))
     return valid
 
 
-def _regenerate_metadata_from_all_tiles(catalog_root: Path) -> None:
-    """Rebuild ``_metadata`` from every ``Npix=*.parquet`` under *catalog_root*."""
-    reconcile_catalog_tile_dtypes(catalog_root)
-    tile_paths = _iter_valid_parquet_tiles(catalog_root)
-    if not tile_paths:
-        return
-    file_metadata: list[pq.FileMetaData] = []
+def _iter_valid_parquet_tiles(catalog_root: Path) -> list[Path]:
+    """Return ``Npix=*.parquet`` paths that pass a footer read (skip corrupt tiles)."""
+    return [path for path, _ in _scan_valid_parquet_tiles(catalog_root)]
+
+
+def _unified_tiles_schema(tiles: list[tuple[Path, pq.FileMetaData]]) -> pa.Schema | None:
     schema: pa.Schema | None = None
-    for path in tile_paths:
-        meta = pq.read_metadata(str(path))
-        file_metadata.append(meta)
+    for _, meta in tiles:
         arrow_schema = meta.schema.to_arrow_schema()
-        if schema is None:
-            schema = arrow_schema
-        else:
-            schema = _unified_append_schema(schema, arrow_schema)
-    if schema is not None:
-        _write_aggregate_metadata(catalog_root, file_metadata, schema)
+        schema = arrow_schema if schema is None else _unified_append_schema(schema, arrow_schema)
+    return schema
 
 
-def _count_catalog_rows(catalog_root: Path) -> int:
-    return sum(
-        pq.read_metadata(str(p)).num_rows
-        for p in _iter_valid_parquet_tiles(catalog_root)
+def _write_catalog_metadata_files(
+    catalog_root: Path,
+    tiles: list[tuple[Path, pq.FileMetaData]],
+) -> pa.Schema | None:
+    """Write ``_metadata`` (all row groups) and ``_common_metadata`` (schema only).
+
+    Returns the unified Arrow schema, or ``None`` when there are no tiles.
+    """
+    schema = _unified_tiles_schema(tiles)
+    if schema is None:
+        return None
+    write_common_metadata(catalog_root, schema)
+    _write_aggregate_metadata(catalog_root, [meta for _, meta in tiles], schema)
+    return schema
+
+
+def write_common_metadata(catalog_root: Path | str, schema: pa.Schema) -> Path:
+    """Write the schema-only ``_common_metadata`` file (HATS convention).
+
+    Readers that need column names or types use this small file instead of the
+    aggregate ``_metadata``, whose size grows with tiles × columns.
+    """
+    out = Path(catalog_root) / "_common_metadata"
+    tmp = out.with_name(out.name + ".tmp")
+    pq.write_metadata(schema, str(tmp))
+    os.replace(tmp, out)
+    return out
+
+
+def _regenerate_metadata_from_all_tiles(catalog_root: Path) -> pa.Schema | None:
+    """Rebuild ``_metadata`` and ``_common_metadata`` from every tile under *catalog_root*."""
+    tiles = _reconcile_scanned_tile_dtypes(
+        catalog_root, _scan_valid_parquet_tiles(catalog_root),
     )
+    return _write_catalog_metadata_files(catalog_root, tiles)
 
 
 def finalize_catalog_survey(
@@ -2616,7 +2679,8 @@ def finalize_catalog_survey(
         if allow_incomplete is None:
             allow_incomplete = bool(info.get("allow_incomplete_link_id", False))
 
-    if not _iter_valid_parquet_tiles(catalog_root):
+    tiles = _scan_valid_parquet_tiles(catalog_root)
+    if not tiles:
         return False
 
     _finalize_catalog_writes(
@@ -2629,6 +2693,7 @@ def finalize_catalog_survey(
         streaming=stream,
         fallback_n_cols=fallback_n_cols,
         allow_incomplete_link_id=allow_incomplete,
+        scanned_tiles=tiles,
     )
     return True
 
@@ -2648,37 +2713,47 @@ def _finalize_catalog_writes(
     lifecycle: str | None = None,
     finalized: bool = True,
     set_columns: dict[str, pa.Scalar] | None = None,
+    scanned_tiles: list[tuple[Path, pq.FileMetaData]] | None = None,
 ) -> None:
-    """Refresh ``_metadata`` and ``catalog_info.json`` from all on-disk tiles.
+    """Refresh ``_metadata``, ``_common_metadata`` and ``catalog_info.json`` from tiles.
 
-    When ``regenerate_metadata`` is False the expensive ``_metadata`` rebuild
-    (reads every tile footer) is skipped — used for deferred-finalize live
-    ingest where finalization happens once at the end via
-    :func:`finalize_catalog_survey`. ``lifecycle`` (e.g. ``"live"``) and
-    ``finalized`` are recorded in ``catalog_info.json``.
+    Every tile footer is read once (or taken from *scanned_tiles*) and reused for
+    the dtype check, the aggregate metadata, the row count and the manifest.
+    When ``regenerate_metadata`` is False the ``_metadata`` rebuild is skipped —
+    used for deferred-finalize live ingest where finalization happens once at
+    the end via :func:`finalize_catalog_survey`. ``lifecycle`` (e.g. ``"live"``)
+    and ``finalized`` are recorded in ``catalog_info.json``.
     """
     if link_id_mode is None:
         link_id_mode = "sequential"
     catalog_root.mkdir(parents=True, exist_ok=True)
-    tile_paths = _iter_valid_parquet_tiles(catalog_root)
-    total_rows = _count_catalog_rows(catalog_root)
-    n_cols = (
-        len(pq.read_schema(str(tile_paths[0])))
-        if tile_paths
-        else fallback_n_cols
+    tiles = (
+        scanned_tiles
+        if scanned_tiles is not None
+        else _scan_valid_parquet_tiles(catalog_root)
     )
-    if regenerate_metadata:
+    unified_schema: pa.Schema | None = None
+    if regenerate_metadata and tiles:
         try:
-            _regenerate_metadata_from_all_tiles(catalog_root)
+            tiles = _reconcile_scanned_tile_dtypes(catalog_root, tiles)
+        except Exception:
+            log.exception("Could not reconcile tile dtypes under %s", catalog_root)
+    # Before the _metadata write, which appends row groups into the first footer.
+    total_rows = sum(int(meta.num_rows) for _, meta in tiles)
+    first_schema = tiles[0][1].schema.to_arrow_schema() if tiles else None
+    if regenerate_metadata and tiles:
+        try:
+            unified_schema = _write_catalog_metadata_files(catalog_root, tiles)
         except Exception:
             log.exception(
                 "Could not rebuild catalog _metadata under %s; "
                 "catalog_info and schema_manifest will still be updated",
                 catalog_root,
             )
+    n_cols = len(first_schema) if first_schema is not None else fallback_n_cols
     native_col: str | None = native_id_column_from_mode(link_id_mode)
-    if tile_paths:
-        tile_schema = pq.read_schema(str(tile_paths[0])).names
+    if first_schema is not None:
+        tile_schema = first_schema.names
         try:
             resolve_link_id_column(catalog_root, schema_names=tile_schema)
         except KeyError:
@@ -2747,7 +2822,7 @@ def _finalize_catalog_writes(
     except (OSError, json.JSONDecodeError):
         log.warning("Could not record lifecycle/finalized in %s", info_path)
 
-    if tile_paths and regenerate_metadata:
+    if tiles and regenerate_metadata:
         from data_lake.schema_registry import write_catalog_schema_manifest
 
         write_catalog_schema_manifest(
@@ -2758,6 +2833,7 @@ def _finalize_catalog_writes(
             dec_column=dec_col,
             link_id_mode=link_id_mode,
             total_rows=total_rows,
+            schema=unified_schema,
         )
 
 

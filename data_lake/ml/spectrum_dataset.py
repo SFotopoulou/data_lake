@@ -180,7 +180,14 @@ class SpectrumDataset(Dataset):
     return_full:
         If True, return the full ``Spectrum`` dataclass (not just flux).
     catalog_accessor:
-        Optional ``CatalogAccessor`` for O(1) tile lookup.
+        Optional ``CatalogAccessor`` used once, at construction, to resolve
+        every source ID to its tile position (one catalog scan per million
+        IDs).  Without it the tiles are scanned instead.  It is not kept, so
+        DataLoader workers never share its DuckDB connection.
+
+    All IDs are resolved when the dataset is built and kept as two int64
+    arrays (16 bytes per sample).  IDs not found raise ``KeyError`` when
+    accessed.
     """
 
     def __init__(
@@ -199,9 +206,23 @@ class SpectrumDataset(Dataset):
         self.source_ids: list[int] = list(source_ids)
         self.transform = transform
         self.return_full = return_full
-        self._catalog = catalog_accessor
+        with SpectrumAccessor(
+            self.lake_root, survey, norder=norder, catalog_accessor=catalog_accessor,
+        ) as acc:
+            self._npix, self._local = acc.locate(self.source_ids)
+        n_missing = int((self._npix < 0).sum())
+        if n_missing:
+            log.warning(
+                "SpectrumDataset: %d of %d source ID(s) not found in %s spectra",
+                n_missing, len(self.source_ids), survey,
+            )
         self._accessor: SpectrumAccessor | None = None
         self._worker_id: int | None = None
+
+    @property
+    def tile_npix(self) -> np.ndarray:
+        """HEALPix tile of each dataset index (``-1`` when the ID was not found)."""
+        return self._npix
 
     def _get_accessor(self) -> SpectrumAccessor:
         worker = get_worker_info()
@@ -210,7 +231,6 @@ class SpectrumDataset(Dataset):
             self._accessor = SpectrumAccessor(
                 self.lake_root, self.survey,
                 norder=self.norder,
-                catalog_accessor=self._catalog,
             )
             self._worker_id = worker_id
         return self._accessor
@@ -220,7 +240,10 @@ class SpectrumDataset(Dataset):
 
     def __getitem__(self, idx: int):
         source_id = self.source_ids[idx]
-        sp = self._get_accessor().get_spectrum(source_id)
+        npix, local_idx = int(self._npix[idx]), int(self._local[idx])
+        if npix < 0:
+            raise KeyError(f"source_id={source_id} not found in spectrum store.")
+        sp = self._get_accessor().get_spectrum_at(npix, local_idx, source_id=source_id)
 
         if self.transform is not None:
             return self.transform(sp)

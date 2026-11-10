@@ -176,6 +176,19 @@ def export_spectrum(
         accessor = SpectrumAccessor(lake_root, survey)
 
     sp = accessor.get_spectrum(source_id)
+    return _write_spectrum_fits(sp, survey, output_path, overwrite=overwrite)
+
+
+def _write_spectrum_fits(
+    sp: Spectrum,
+    survey: str,
+    output_path: Path,
+    *,
+    overwrite: bool,
+) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    source_id = sp.source_id
 
     # ---- HDU 0: flux as a 1-D image with spectral WCS ----
     primary_header = _build_primary_header(sp, survey)
@@ -795,17 +808,18 @@ def export_spectra_batch(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    accessor = SpectrumAccessor(lake_root, survey)
     paths: list[Path] = []
-
-    for source_id in source_ids:
-        out = output_dir / filename_template.format(source_id=source_id)
-        try:
-            p = export_spectrum(lake_root, survey, source_id, out,
-                                overwrite=overwrite, accessor=accessor)
-            paths.append(p)
-        except Exception as exc:
-            log.error("Failed to export source_id=%d: %s", source_id, exc)
+    with SpectrumAccessor(lake_root, survey) as accessor:
+        npix_arr, local_arr = accessor.locate(source_ids)
+        for source_id, npix, local_idx in zip(source_ids, npix_arr.tolist(), local_arr.tolist()):
+            out = output_dir / filename_template.format(source_id=source_id)
+            try:
+                if npix < 0:
+                    raise KeyError(f"source_id={source_id} not found in spectrum store.")
+                sp = accessor.get_spectrum_at(npix, local_idx, source_id=int(source_id))
+                paths.append(_write_spectrum_fits(sp, survey, out, overwrite=overwrite))
+            except Exception as exc:
+                log.error("Failed to export source_id=%d: %s", source_id, exc)
 
     return paths
 
