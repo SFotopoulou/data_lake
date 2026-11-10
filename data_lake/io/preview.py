@@ -89,11 +89,11 @@ def _peek_catalog(
 ) -> pl.DataFrame:
     from data_lake.io.catalog import CatalogAccessor
 
-    cat = CatalogAccessor(lake_root, survey_name)
-    cols = _catalog_peek_columns(cat.columns, columns)
-    select = ", ".join(_quote_sql_ident(c) for c in cols)
-    sql = f"SELECT {select} FROM catalog LIMIT {int(n)}"
-    return cat.query(sql, fmt="polars")
+    with CatalogAccessor(lake_root, survey_name) as cat:
+        cols = _catalog_peek_columns(cat.columns, columns)
+        select = ", ".join(_quote_sql_ident(c) for c in cols)
+        sql = f"SELECT {select} FROM catalog LIMIT {int(n)}"
+        return cat.query(sql, fmt="polars")
 
 
 def _peek_zarr_modality(
@@ -106,40 +106,40 @@ def _peek_zarr_modality(
     if modality == "spectra":
         from data_lake.io.spectra import SpectrumAccessor
 
-        acc = SpectrumAccessor(lake_root, survey_name)
-        tiles = acc.available_tiles()
-        get_store = acc._get_tile_store
+        acc_cm = SpectrumAccessor(lake_root, survey_name)
     else:
         from data_lake.io.cutouts import CutoutAccessor
 
-        acc = CutoutAccessor(lake_root, survey_name)
+        acc_cm = CutoutAccessor(lake_root, survey_name)
+
+    with acc_cm as acc:
         tiles = acc.available_tiles()
         get_store = acc._get_tile_store
 
-    source_ids: list[int] = []
-    npix_out: list[int] = []
-    for npix in tiles:
-        store = get_store(npix)
-        sids = np.asarray(store.get_source_ids(), dtype=np.int64).ravel()
-        for sid in sids.tolist():
-            source_ids.append(int(sid))
-            npix_out.append(int(npix))
-            if len(source_ids) >= n:
-                return pl.DataFrame(
-                    {
-                        "_source_id": source_ids,
-                        "npix": npix_out,
-                        "modality": [modality] * len(source_ids),
-                    }
-                )
+        source_ids: list[int] = []
+        npix_out: list[int] = []
+        for npix in tiles:
+            store = get_store(npix)
+            sids = np.asarray(store.get_source_ids(), dtype=np.int64).ravel()
+            for sid in sids.tolist():
+                source_ids.append(int(sid))
+                npix_out.append(int(npix))
+                if len(source_ids) >= n:
+                    return pl.DataFrame(
+                        {
+                            "_source_id": source_ids,
+                            "npix": npix_out,
+                            "modality": [modality] * len(source_ids),
+                        }
+                    )
 
-    return pl.DataFrame(
-        {
-            "_source_id": source_ids,
-            "npix": npix_out,
-            "modality": [modality] * len(source_ids),
-        }
-    )
+        return pl.DataFrame(
+            {
+                "_source_id": source_ids,
+                "npix": npix_out,
+                "modality": [modality] * len(source_ids),
+            }
+        )
 
 
 def preview_sources(

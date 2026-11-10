@@ -186,110 +186,114 @@ try:
             )
 
         catalog_accessor = None
-        if with_catalog:
-            try:
-                from data_lake.io.catalog import CatalogAccessor
-
-                catalog_accessor = CatalogAccessor(lake_root, survey_name)
-                log.info(
-                    "Using catalog at %s for lookup + link-id embedding.",
-                    catalog_accessor._catalog_root,
-                )
-            except FileNotFoundError:
-                if where_sql:
-                    raise click.ClickException(
-                        f"No catalog found for survey {survey_name!r}; "
-                        "--where requires an ingested catalog."
-                    ) from None
-                log.info(
-                    "No catalog for survey %r — tile-scan lookup; "
-                    "link-id columns will not be embedded.",
-                    survey_name,
-                )
-
-        from data_lake.io.cutouts import CutoutAccessor
-
-        acc = CutoutAccessor(
-            lake_root, survey_name, catalog_accessor=catalog_accessor,
-        )
-
         try:
-            source_ids_raw = load_extract_source_ids(
-                catalog_accessor=catalog_accessor,
-                target_list=target_list,
-                target_id_col=target_id_col,
-                where_sql=where_sql,
-                row_limit=row_limit,
-                index_column=CUTOUT_INDEX_COLUMN,
-                read_target_ids=_read_target_ids,
-            )
-        except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
-        source_ids = source_ids_raw.tolist()
-        if where_sql:
-            click.echo(f"Selected {len(source_ids):,} source IDs via --where")
-        else:
-            assert target_list is not None
-            click.echo(
-                f"Loaded {len(source_ids):,} source IDs from {target_list.name} "
-                f"(column: {target_id_col!r})"
-            )
+            if with_catalog:
+                try:
+                    from data_lake.io.catalog import CatalogAccessor
 
-        if output_path.exists() and not overwrite:
-            raise click.ClickException(
-                f"{output_path} already exists. Pass --overwrite to replace it."
-            )
-        if output_path.exists() and overwrite and not yes:
-            click.confirm(f"Delete existing {output_path}?", abort=True)
+                    catalog_accessor = CatalogAccessor(lake_root, survey_name)
+                    log.info(
+                        "Using catalog at %s for lookup + link-id embedding.",
+                        catalog_accessor._catalog_root,
+                    )
+                except FileNotFoundError:
+                    if where_sql:
+                        raise click.ClickException(
+                            f"No catalog found for survey {survey_name!r}; "
+                            "--where requires an ingested catalog."
+                        ) from None
+                    log.info(
+                        "No catalog for survey %r — tile-scan lookup; "
+                        "link-id columns will not be embedded.",
+                        survey_name,
+                    )
 
-        if output_format == "zarr":
-            result = acc.extract_subset_to_zarr(
-                source_ids,
-                output_path,
-                missing=missing,
-                show_progress=show_progress,
-                overwrite=overwrite,
-            )
-            click.echo(
-                f"Wrote {result['n_written']:,} cutout(s) → {output_path} "
-                f"(skipped {len(result['missing_ids'])} missing)."
-            )
+            from data_lake.io.cutouts import CutoutAccessor
 
-        elif output_format == "fits":
-            output_path.mkdir(parents=True, exist_ok=True)
-            result = acc.extract_subset_to_fits(
-                source_ids,
-                output_path,
-                missing=missing,
-                show_progress=show_progress,
-                overwrite=overwrite,
-                filename_template=fits_filename_template,
-                id_hdu_key=id_hdu_key,
-            )
-            click.echo(
-                f"Wrote {result['n_written']:,} FITS cutout(s) → {output_path}/ "
-                f"(skipped {len(result['missing_ids'])} missing)."
-            )
+            with CutoutAccessor(
+                lake_root, survey_name, catalog_accessor=catalog_accessor,
+            ) as acc:
+                try:
+                    source_ids_raw = load_extract_source_ids(
+                        catalog_accessor=catalog_accessor,
+                        target_list=target_list,
+                        target_id_col=target_id_col,
+                        where_sql=where_sql,
+                        row_limit=row_limit,
+                        index_column=CUTOUT_INDEX_COLUMN,
+                        read_target_ids=_read_target_ids,
+                    )
+                except ValueError as exc:
+                    raise click.UsageError(str(exc)) from exc
+                source_ids = source_ids_raw.tolist()
+                if where_sql:
+                    click.echo(f"Selected {len(source_ids):,} source IDs via --where")
+                else:
+                    assert target_list is not None
+                    click.echo(
+                        f"Loaded {len(source_ids):,} source IDs from {target_list.name} "
+                        f"(column: {target_id_col!r})"
+                    )
 
-        elif output_format == "hdf5":
-            result = acc.extract_subset_to_hdf5(
-                source_ids,
-                output_path,
-                missing=missing,
-                show_progress=show_progress,
-                overwrite=overwrite,
-            )
-            click.echo(
-                f"Wrote {result['n_written']:,} cutout(s) → {output_path} "
-                f"(skipped {len(result['missing_ids'])} missing)."
-            )
+                if output_path.exists() and not overwrite:
+                    raise click.ClickException(
+                        f"{output_path} already exists. Pass --overwrite to replace it."
+                    )
+                if output_path.exists() and overwrite and not yes:
+                    click.confirm(f"Delete existing {output_path}?", abort=True)
 
-        if result.get("missing_ids") and missing == "skip":
-            click.echo(
-                f"  Missing IDs ({len(result['missing_ids'])}): "
-                f"{result['missing_ids'][:5]}{'…' if len(result['missing_ids']) > 5 else ''}",
-                err=True,
-            )
+                if output_format == "zarr":
+                    result = acc.extract_subset_to_zarr(
+                        source_ids,
+                        output_path,
+                        missing=missing,
+                        show_progress=show_progress,
+                        overwrite=overwrite,
+                    )
+                    click.echo(
+                        f"Wrote {result['n_written']:,} cutout(s) → {output_path} "
+                        f"(skipped {len(result['missing_ids'])} missing)."
+                    )
+
+                elif output_format == "fits":
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    result = acc.extract_subset_to_fits(
+                        source_ids,
+                        output_path,
+                        missing=missing,
+                        show_progress=show_progress,
+                        overwrite=overwrite,
+                        filename_template=fits_filename_template,
+                        id_hdu_key=id_hdu_key,
+                    )
+                    click.echo(
+                        f"Wrote {result['n_written']:,} FITS cutout(s) → {output_path}/ "
+                        f"(skipped {len(result['missing_ids'])} missing)."
+                    )
+
+                elif output_format == "hdf5":
+                    result = acc.extract_subset_to_hdf5(
+                        source_ids,
+                        output_path,
+                        missing=missing,
+                        show_progress=show_progress,
+                        overwrite=overwrite,
+                    )
+                    click.echo(
+                        f"Wrote {result['n_written']:,} cutout(s) → {output_path} "
+                        f"(skipped {len(result['missing_ids'])} missing)."
+                    )
+
+                if result.get("missing_ids") and missing == "skip":
+                    click.echo(
+                        f"  Missing IDs ({len(result['missing_ids'])}): "
+                        f"{result['missing_ids'][:5]}"
+                        f"{'…' if len(result['missing_ids']) > 5 else ''}",
+                        err=True,
+                    )
+        finally:
+            if catalog_accessor is not None:
+                catalog_accessor.close()
 
 except ImportError:
     cli = None  # type: ignore[assignment,misc]

@@ -99,58 +99,65 @@ def cli(
         safe_survey = "".join(c if c.isalnum() or c in "-_" else "_" for c in survey)
         output_path = Path(f"spectrum_{safe_survey}_{source_id}.png")
 
-    log.info("Opening spectrum store %r under %s", survey, root)
-    try:
-        from data_lake.io.catalog import CatalogAccessor
-        from data_lake.io.spectra import SpectrumAccessor
+    from data_lake.io.catalog import CatalogAccessor
+    from data_lake.io.spectra import SpectrumAccessor
 
-        catalog_acc = None
+    catalog_acc = None
+    spec_acc = None
+    try:
+        log.info("Opening spectrum store %r under %s", survey, root)
         try:
             catalog_acc = CatalogAccessor(root, survey)
         except FileNotFoundError:
             log.debug("No catalog for %r; spectrum lookup will scan Zarr tiles", survey)
 
-        spec_acc = SpectrumAccessor(root, survey, catalog_accessor=catalog_acc)
-    except FileNotFoundError as exc:
-        raise click.ClickException(
-            f"Spectrum store {survey!r} not found under {root}/spectra/."
-        ) from exc
+        try:
+            spec_acc = SpectrumAccessor(root, survey, catalog_accessor=catalog_acc)
+        except FileNotFoundError as exc:
+            raise click.ClickException(
+                f"Spectrum store {survey!r} not found under {root}/spectra/."
+            ) from exc
 
-    log.info("Fetching spectrum source_id=%d", source_id)
-    try:
-        spectrum = spec_acc.get_spectrum(source_id)
-    except KeyError as exc:
-        raise click.ClickException(
-            f"Spectrum for source_id={source_id} not found in survey {survey!r}."
-        ) from exc
+        log.info("Fetching spectrum source_id=%d", source_id)
+        try:
+            spectrum = spec_acc.get_spectrum(source_id)
+        except KeyError as exc:
+            raise click.ClickException(
+                f"Spectrum for source_id={source_id} not found in survey {survey!r}."
+            ) from exc
 
-    try:
-        import matplotlib
+        try:
+            import matplotlib
 
-        matplotlib.use("Agg")
-    except ImportError as exc:
-        raise click.ClickException(
-            "matplotlib is required for plotting.\n"
-            'Install it with:  uv sync --extra viz'
-        ) from exc
+            matplotlib.use("Agg")
+        except ImportError as exc:
+            raise click.ClickException(
+                "matplotlib is required for plotting.\n"
+                'Install it with:  uv sync --extra viz'
+            ) from exc
 
-    from data_lake.plot.source_figure import plot_spectrum
+        from data_lake.plot.source_figure import plot_spectrum
 
-    log.info("Rendering figure → %s", output_path)
-    clip = None if clip_sigma <= 0 else clip_sigma
-    fig = plot_spectrum(
-        spectrum,
-        title=title,
-        survey_name=survey,
-        dpi=dpi,
-        rest_frame=rest_frame,
-        log_x=not linear_x,
-        clip_sigma=clip,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")
-    import matplotlib.pyplot as plt
+        log.info("Rendering figure → %s", output_path)
+        clip = None if clip_sigma <= 0 else clip_sigma
+        fig = plot_spectrum(
+            spectrum,
+            title=title,
+            survey_name=survey,
+            dpi=dpi,
+            rest_frame=rest_frame,
+            log_x=not linear_x,
+            clip_sigma=clip,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")
+        import matplotlib.pyplot as plt
 
-    plt.close(fig)
-    click.echo(str(output_path))
-    log.info("Saved figure to %s", output_path)
+        plt.close(fig)
+        click.echo(str(output_path))
+        log.info("Saved figure to %s", output_path)
+    finally:
+        if spec_acc is not None:
+            spec_acc.close()
+        if catalog_acc is not None:
+            catalog_acc.close()

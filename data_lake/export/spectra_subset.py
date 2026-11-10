@@ -390,95 +390,101 @@ try:
             )
 
         catalog_accessor = None
-        if with_catalog:
+        try:
+            if with_catalog:
+                try:
+                    from data_lake.io.catalog import CatalogAccessor
+                    catalog_accessor = CatalogAccessor(lake_root, survey_name)
+                    log.info(
+                        "Using catalog at %s for fast index lookup.",
+                        catalog_accessor._catalog_root,
+                    )
+                except FileNotFoundError:
+                    if where_sql:
+                        raise click.ClickException(
+                            f"No catalog found for survey {survey_name!r}; "
+                            "--where requires an ingested catalog."
+                        ) from None
+                    log.info(
+                        "No catalog found for survey %r — using tile-scan lookup.",
+                        survey_name,
+                    )
+
             try:
-                from data_lake.io.catalog import CatalogAccessor
-                catalog_accessor = CatalogAccessor(lake_root, survey_name)
-                log.info("Using catalog at %s for fast index lookup.",
-                         catalog_accessor._catalog_root)
-            except FileNotFoundError:
-                if where_sql:
-                    raise click.ClickException(
-                        f"No catalog found for survey {survey_name!r}; "
-                        "--where requires an ingested catalog."
-                    ) from None
+                source_ids = load_extract_source_ids(
+                    catalog_accessor=catalog_accessor,
+                    target_list=target_list,
+                    target_id_col=target_id_col,
+                    where_sql=where_sql,
+                    row_limit=row_limit,
+                    index_column=SPECTRUM_INDEX_COLUMN,
+                    read_target_ids=_read_target_ids,
+                )
+            except ValueError as exc:
+                raise click.UsageError(str(exc)) from exc
+            n_unique = int(np.unique(source_ids).size)
+            if where_sql:
                 log.info(
-                    "No catalog found for survey %r — using tile-scan lookup.",
-                    survey_name,
+                    "Selected %d source IDs (%d unique) via --where.",
+                    source_ids.size, n_unique,
+                )
+            else:
+                log.info(
+                    "Loaded %d source IDs (%d unique) from %s (column=%s).",
+                    source_ids.size, n_unique, target_list, target_id_col,
                 )
 
-        try:
-            source_ids = load_extract_source_ids(
-                catalog_accessor=catalog_accessor,
-                target_list=target_list,
-                target_id_col=target_id_col,
-                where_sql=where_sql,
-                row_limit=row_limit,
-                index_column=SPECTRUM_INDEX_COLUMN,
-                read_target_ids=_read_target_ids,
+            from data_lake.io.spectra import SpectrumAccessor
+
+            def _confirm_fits(plan_msg: str) -> bool:
+                click.echo(plan_msg)
+                if assume_yes:
+                    return True
+                return click.confirm("Proceed?", default=False)
+
+            confirm_arg: bool | None
+            if fmt == "fits" and layout == "catalog":
+                confirm_arg = True if assume_yes else _confirm_fits
+            else:
+                confirm_arg = None
+
+            try:
+                with SpectrumAccessor(
+                    lake_root=lake_root,
+                    survey_name=survey_name,
+                    catalog_accessor=catalog_accessor,
+                ) as acc:
+                    result = acc.extract_subset(
+                        source_ids=source_ids,
+                        output=output_path,
+                        fmt=fmt,
+                        missing=missing,
+                        chunks_per_shard=chunks_per_shard,
+                        show_progress=show_progress,
+                        overwrite=overwrite,
+                        fits_filename_template=fits_filename_template,
+                        fits_layout=layout,
+                        flux_scale=scale,
+                        fits_chunk_rows=fits_chunk_rows,
+                        confirm=confirm_arg,
+                        keep_part_files=keep_part_files,
+                        force_many_fits_parts=force_many_fits_parts,
+                    )
+            except (ValueError, RuntimeError, ImportError) as exc:
+                raise click.ClickException(str(exc)) from exc
+
+            out = result.get("output", result.get("output_zarr", output_path))
+            if calibration is not None and not no_calibration_sidecar:
+                sidecar = write_calibration_sidecar(out, calibration)
+                click.echo(f"  calibration → {sidecar}")
+            fmt_label = f"{fmt}" + (f", {layout}" if fmt == "fits" else "")
+            click.echo(
+                f"Wrote {result['n_written']}/{result['n_requested']} spectra "
+                f"({fmt_label}) → {out}  (missing: {len(result['missing_ids'])})"
             )
-        except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
-        n_unique = int(np.unique(source_ids).size)
-        if where_sql:
-            log.info(
-                "Selected %d source IDs (%d unique) via --where.",
-                source_ids.size, n_unique,
-            )
-        else:
-            log.info(
-                "Loaded %d source IDs (%d unique) from %s (column=%s).",
-                source_ids.size, n_unique, target_list, target_id_col,
-            )
-
-        from data_lake.io.spectra import SpectrumAccessor
-
-        def _confirm_fits(plan_msg: str) -> bool:
-            click.echo(plan_msg)
-            if assume_yes:
-                return True
-            return click.confirm("Proceed?", default=False)
-
-        confirm_arg: bool | None
-        if fmt == "fits" and layout == "catalog":
-            confirm_arg = True if assume_yes else _confirm_fits
-        else:
-            confirm_arg = None
-
-        try:
-            with SpectrumAccessor(
-                lake_root=lake_root,
-                survey_name=survey_name,
-                catalog_accessor=catalog_accessor,
-            ) as acc:
-                result = acc.extract_subset(
-                    source_ids=source_ids,
-                    output=output_path,
-                    fmt=fmt,
-                    missing=missing,
-                    chunks_per_shard=chunks_per_shard,
-                    show_progress=show_progress,
-                    overwrite=overwrite,
-                    fits_filename_template=fits_filename_template,
-                    fits_layout=layout,
-                    flux_scale=scale,
-                    fits_chunk_rows=fits_chunk_rows,
-                    confirm=confirm_arg,
-                    keep_part_files=keep_part_files,
-                    force_many_fits_parts=force_many_fits_parts,
-                )
-        except (ValueError, RuntimeError, ImportError) as exc:
-            raise click.ClickException(str(exc)) from exc
-
-        out = result.get("output", result.get("output_zarr", output_path))
-        if calibration is not None and not no_calibration_sidecar:
-            sidecar = write_calibration_sidecar(out, calibration)
-            click.echo(f"  calibration → {sidecar}")
-        fmt_label = f"{fmt}" + (f", {layout}" if fmt == "fits" else "")
-        click.echo(
-            f"Wrote {result['n_written']}/{result['n_requested']} spectra "
-            f"({fmt_label}) → {out}  (missing: {len(result['missing_ids'])})"
-        )
+        finally:
+            if catalog_accessor is not None:
+                catalog_accessor.close()
 
 except ImportError:
     cli = None  # type: ignore[assignment]

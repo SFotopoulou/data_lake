@@ -102,90 +102,99 @@ def cli(
         output_path = Path(f"source_{source_id}.png")
 
     # ------------------------------------------------------------------
-    # Open accessors
+    # Open accessors, assemble, render, then always close
     # ------------------------------------------------------------------
-    log.info("Opening product catalog %r on lake %s", product, lake_root)
+    from data_lake.io.catalog import CatalogAccessor
+    from data_lake.io.spectra import SpectrumAccessor
+
+    product_acc = None
+    spec_acc = None
     try:
-        from data_lake.io.catalog import CatalogAccessor
-        product_acc = CatalogAccessor(lake_root, product)
-    except FileNotFoundError as exc:
-        raise click.ClickException(
-            f"Product catalog {product!r} not found under {lake_root}/catalogs/.\n"
-            f"Run 'dl-describe-lake --kind product' to list available products."
-        ) from exc
+        log.info("Opening product catalog %r on lake %s", product, lake_root)
+        try:
+            product_acc = CatalogAccessor(lake_root, product)
+        except FileNotFoundError as exc:
+            raise click.ClickException(
+                f"Product catalog {product!r} not found under {lake_root}/catalogs/.\n"
+                f"Run 'dl-describe-lake --kind product' to list available products."
+            ) from exc
 
-    log.info("Opening spectrum store %r", spectra_survey)
-    try:
-        from data_lake.io.spectra import SpectrumAccessor
-        spec_acc = SpectrumAccessor(lake_root, spectra_survey, catalog_accessor=product_acc)
-    except FileNotFoundError as exc:
-        raise click.ClickException(
-            f"Spectrum store {spectra_survey!r} not found under {lake_root}/spectra/."
-        ) from exc
+        log.info("Opening spectrum store %r", spectra_survey)
+        try:
+            spec_acc = SpectrumAccessor(
+                lake_root, spectra_survey, catalog_accessor=product_acc,
+            )
+        except FileNotFoundError as exc:
+            raise click.ClickException(
+                f"Spectrum store {spectra_survey!r} not found under {lake_root}/spectra/."
+            ) from exc
 
-    # ------------------------------------------------------------------
-    # Assemble SED
-    # ------------------------------------------------------------------
-    from data_lake.homogenize.bandpass import BandpassRegistry
-    from data_lake.plot.sed import assemble_sed
+        from data_lake.homogenize.bandpass import BandpassRegistry
+        from data_lake.plot.sed import assemble_sed
 
-    bp = BandpassRegistry(lake_root=lake_root)
-    log.info("Assembling SED for source_id=%d from product %r", source_id, product)
-    try:
-        sed = assemble_sed(product_acc, source_id, bp)
-    except KeyError as exc:
-        raise click.ClickException(str(exc)) from exc
+        bp = BandpassRegistry(lake_root=lake_root)
+        log.info("Assembling SED for source_id=%d from product %r", source_id, product)
+        try:
+            sed = assemble_sed(product_acc, source_id, bp)
+        except KeyError as exc:
+            raise click.ClickException(str(exc)) from exc
 
-    if not sed.points:
-        click.echo(
-            f"Warning: no photometric bands with known wavelengths found for source {source_id}. "
-            "The SED panel will be empty.",
-            err=True,
+        if not sed.points:
+            click.echo(
+                f"Warning: no photometric bands with known wavelengths found for "
+                f"source {source_id}. The SED panel will be empty.",
+                err=True,
+            )
+        else:
+            log.info(
+                "SED: %d bands assembled (%s)",
+                len(sed.points),
+                ", ".join(p.band for p in sed.points),
+            )
+
+        log.info(
+            "Fetching spectrum for source_id=%d from survey %r",
+            source_id, spectra_survey,
         )
-    else:
-        log.info("SED: %d bands assembled (%s)", len(sed.points),
-                 ", ".join(p.band for p in sed.points))
+        try:
+            spectrum = spec_acc.get_spectrum(source_id)
+        except KeyError as exc:
+            raise click.ClickException(
+                f"Spectrum for source_id={source_id} not found in survey "
+                f"{spectra_survey!r}."
+            ) from exc
 
-    # ------------------------------------------------------------------
-    # Fetch spectrum
-    # ------------------------------------------------------------------
-    log.info("Fetching spectrum for source_id=%d from survey %r", source_id, spectra_survey)
-    try:
-        spectrum = spec_acc.get_spectrum(source_id)
-    except KeyError as exc:
-        raise click.ClickException(
-            f"Spectrum for source_id={source_id} not found in survey {spectra_survey!r}."
-        ) from exc
+        from data_lake.plot.source_figure import plot_source_sed_spectrum
 
-    # ------------------------------------------------------------------
-    # Render figure
-    # ------------------------------------------------------------------
-    from data_lake.plot.source_figure import plot_source_sed_spectrum
+        log.info("Rendering figure → %s", output_path)
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # non-interactive; before pyplot import
+        except ImportError as exc:
+            raise click.ClickException(
+                "matplotlib is required for plotting.\n"
+                "Install it with:  pip install \"data-lake[viz]\""
+            ) from exc
 
-    log.info("Rendering figure → %s", output_path)
-    try:
-        import matplotlib
-        matplotlib.use("Agg")  # non-interactive backend; must be set before pyplot import
-    except ImportError as exc:
-        raise click.ClickException(
-            "matplotlib is required for plotting.\n"
-            "Install it with:  pip install \"data-lake[viz]\""
-        ) from exc
+        fig = plot_source_sed_spectrum(
+            sed,
+            spectrum,
+            title=title,
+            bandpass_registry=(bp if not no_curves else None),
+            show_curves=not no_curves,
+            dpi=dpi,
+            spectrum_rest_frame=rest_frame,
+        )
 
-    fig = plot_source_sed_spectrum(
-        sed,
-        spectrum,
-        title=title,
-        bandpass_registry=(bp if not no_curves else None),
-        show_curves=not no_curves,
-        dpi=dpi,
-        spectrum_rest_frame=rest_frame,
-    )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")
+        import matplotlib.pyplot as plt
+        plt.close(fig)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")
-    import matplotlib.pyplot as plt
-    plt.close(fig)
-
-    click.echo(str(output_path))
-    log.info("Saved figure to %s", output_path)
+        click.echo(str(output_path))
+        log.info("Saved figure to %s", output_path)
+    finally:
+        if spec_acc is not None:
+            spec_acc.close()
+        if product_acc is not None:
+            product_acc.close()
