@@ -2,6 +2,11 @@
 
 This page explains the storage choices behind the lake, how catalog schemas are versioned, and which ingest command to use for a given input file. Read it when choosing an ingest path, or when you need to know why data is laid out the way it is.
 
+Publication figures (TikZ): layered architecture
+[`docs/figures/architecture_layers.tex`](figures/architecture_layers.tex) and
+end-to-end pipeline
+[`docs/figures/pipeline_flowchart.tex`](figures/pipeline_flowchart.tex).
+
 ## Which command for this file?
 
 Start with the single-file command for your data type. Switch to the list or batch variant once you have many files.

@@ -20,6 +20,13 @@ into your lake's `areas/` directory and edit the survey and column names.
 
 ## Pipeline overview
 
+Publication figure (TikZ, Okabe–Ito colours; companion to the layered
+architecture diagram):
+[`docs/figures/pipeline_flowchart.tex`](../figures/pipeline_flowchart.tex)
+→ [`pipeline_flowchart.pdf`](../figures/pipeline_flowchart.pdf). Compile with
+`pdftex -fmt=pdflatex pipeline_flowchart.tex`. The layered architecture view is
+[`architecture_layers.tex`](../figures/architecture_layers.tex).
+
 ```mermaid
 flowchart LR
   R[dl-region / area JSON] --> X[dl-crossmatch --from-area]
