@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
+import click
 from astropy.io import fits
 from tqdm import tqdm
 
@@ -21,38 +21,37 @@ def _has_2df_spectrum(path: Path) -> bool:
         return any(_is_2df_spectrum_hdu(hdu) for hdu in hdul)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("file_list", type=Path, help="Input paths, one per line")
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        required=True,
-        help="Output paths that pass the spectrum HDU check",
-    )
-    parser.add_argument(
-        "--rejects",
-        type=Path,
-        default=None,
-        help="Optional path listing rejected inputs",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable tqdm progress bar",
-    )
-    args = parser.parse_args()
-
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("file_list", type=click.Path(path_type=Path))
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output paths that pass the spectrum HDU check",
+)
+@click.option(
+    "--rejects",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional path listing rejected inputs",
+)
+@click.option("--no-progress", is_flag=True, help="Disable tqdm progress bar")
+def main(
+    file_list: Path,
+    output: Path,
+    rejects: Path | None,
+    no_progress: bool,
+) -> int:
     entries: list[str] = []
-    for line in args.file_list.read_text().splitlines():
+    for line in file_list.read_text().splitlines():
         path_str = line.strip()
         if path_str and not path_str.startswith("#"):
             entries.append(path_str)
 
     kept: list[str] = []
     rejected: list[str] = []
-    for path_str in tqdm(entries, desc="filter 2df", unit="file", disable=args.no_progress):
+    for path_str in tqdm(entries, desc="filter 2df", unit="file", disable=no_progress):
         p = Path(path_str)
         if not p.is_file():
             rejected.append(path_str)
@@ -67,9 +66,9 @@ def main() -> int:
         else:
             rejected.append(path_str)
 
-    args.output.write_text("\n".join(kept) + ("\n" if kept else ""))
-    if args.rejects is not None:
-        args.rejects.write_text("\n".join(rejected) + ("\n" if rejected else ""))
+    output.write_text("\n".join(kept) + ("\n" if kept else ""))
+    if rejects is not None:
+        rejects.write_text("\n".join(rejected) + ("\n" if rejected else ""))
 
     print(f"kept {len(kept)} / {len(kept) + len(rejected)}", file=sys.stderr)
     if rejected:

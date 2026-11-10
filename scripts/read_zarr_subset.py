@@ -28,10 +28,11 @@ Requirements:  zarr, numpy, pyarrow
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
+
+import click
 from typing import Any
 
 import numpy as np
@@ -603,47 +604,62 @@ def show_cutout(root: zarr.Group, row: int) -> None:
     plt.show()
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("zarr_path", help="Path to the .zarr directory")
-    ap.add_argument(
-        "--catalog", metavar="OUT.parquet",
-        help=(
-            "Export a per-row scalar catalog for TOPCAT. "
-            "Prefer .parquet (memory-safe; TOPCAT opens Parquet natively). "
-            "Use .fits only for small subsets. "
-            "Spectra: flux stats + redshift; cutouts: WCS centre + flux stats."
-        ),
-    )
-    ap.add_argument("--plot-row", metavar="N", type=int,
-                    help="[spectra] Plot spectrum at row N (0-based).")
-    ap.add_argument("--show-cutout", metavar="N", type=int,
-                    help="[cutouts] Display cutout stamp at row N (0-based).")
-    args = ap.parse_args()
-
-    root = open_zarr(args.zarr_path)
+@click.command(context_settings={"help_option_names": ["-h", "--help"]}, help=__doc__)
+@click.argument("zarr_path", metavar="ZARR_PATH", type=click.Path(path_type=Path))
+@click.option(
+    "--catalog",
+    metavar="OUT.parquet",
+    default=None,
+    help=(
+        "Export a per-row scalar catalog for TOPCAT. "
+        "Prefer .parquet (memory-safe; TOPCAT opens Parquet natively). "
+        "Use .fits only for small subsets. "
+        "Spectra: flux stats + redshift; cutouts: WCS centre + flux stats."
+    ),
+)
+@click.option(
+    "--plot-row",
+    metavar="N",
+    type=int,
+    default=None,
+    help="[spectra] Plot spectrum at row N (0-based).",
+)
+@click.option(
+    "--show-cutout",
+    "show_cutout_row",
+    metavar="N",
+    type=int,
+    default=None,
+    help="[cutouts] Display cutout stamp at row N (0-based).",
+)
+def main(
+    zarr_path: Path,
+    catalog: str | None,
+    plot_row: int | None,
+    show_cutout_row: int | None,
+) -> None:
+    root = open_zarr(zarr_path)
     modality = _detect_modality(root)
     print_summary(root)
 
-    if args.catalog:
+    if catalog:
         if modality == "spectra":
-            export_catalog(root, Path(args.catalog))
+            export_catalog(root, Path(catalog))
         else:
-            export_cutout_catalog(root, Path(args.catalog))
+            export_cutout_catalog(root, Path(catalog))
 
-    if args.plot_row is not None:
+    if plot_row is not None:
         if modality != "spectra":
             sys.exit("ERROR: --plot-row is for spectra Zarr. Use --show-cutout for cutouts.")
         n = root["flux"].shape[0]
-        if args.plot_row >= n:
-            sys.exit(f"ERROR: --plot-row {args.plot_row} out of range (0–{n-1})")
-        plot_spectrum(root, args.plot_row)
+        if plot_row >= n:
+            sys.exit(f"ERROR: --plot-row {plot_row} out of range (0–{n-1})")
+        plot_spectrum(root, plot_row)
 
-    if args.show_cutout is not None:
+    if show_cutout_row is not None:
         if modality != "cutout":
             sys.exit("ERROR: --show-cutout is for cutout Zarr. Use --plot-row for spectra.")
-        show_cutout(root, args.show_cutout)
+        show_cutout(root, show_cutout_row)
 
 
 if __name__ == "__main__":

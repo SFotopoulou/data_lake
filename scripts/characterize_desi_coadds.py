@@ -19,11 +19,12 @@ Recursive directory::
 
 from __future__ import annotations
 
-import argparse
 import json
 import random
 import sys
 from pathlib import Path
+
+import click
 
 # Allow running without install
 _REPO = Path(__file__).resolve().parents[1]
@@ -36,25 +37,34 @@ from data_lake.ingest.desi_coadd_characterize import (  # noqa: E402
 )
 
 
-def _collect_paths(args: argparse.Namespace) -> list[Path]:
-    if args.file_list is not None:
-        root = args.file_list.parent
+def _collect_paths(
+    *,
+    paths_arg: tuple[Path, ...],
+    file_list: Path | None,
+    coadd_root: Path | None,
+    coadd_glob: str,
+    sample: int | None,
+    seed: int,
+    max_files: int | None,
+) -> list[Path]:
+    if file_list is not None:
+        root = file_list.parent
         lines = [
             ln.strip()
-            for ln in args.file_list.read_text().splitlines()
+            for ln in file_list.read_text().splitlines()
             if ln.strip() and not ln.strip().startswith("#")
         ]
         paths = [(root / ln if not Path(ln).is_absolute() else Path(ln)) for ln in lines]
-    elif args.coadd_root is not None:
-        paths = sorted(args.coadd_root.rglob(args.coadd_glob))
+    elif coadd_root is not None:
+        paths = sorted(coadd_root.rglob(coadd_glob))
     else:
-        paths = [Path(p) for p in args.paths]
+        paths = [Path(p) for p in paths_arg]
     paths = [p.expanduser().resolve() for p in paths if p.expanduser().exists()]
-    if args.sample is not None and len(paths) > args.sample:
-        rng = random.Random(args.seed)
-        paths = sorted(rng.sample(paths, args.sample))
-    if args.max_files is not None:
-        paths = paths[: args.max_files]
+    if sample is not None and len(paths) > sample:
+        rng = random.Random(seed)
+        paths = sorted(rng.sample(paths, sample))
+    if max_files is not None:
+        paths = paths[:max_files]
     return paths
 
 
@@ -71,41 +81,55 @@ def _report_line(r: CoaddExposureReport) -> str:
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("paths", nargs="*", help="Coadd FITS paths")
-    parser.add_argument("--file-list", type=Path, help="One path per line")
-    parser.add_argument("--coadd-root", type=Path, help="Search root for coadd files")
-    parser.add_argument("--coadd-glob", default="coadd-*.fits")
-    parser.add_argument(
-        "--mode",
-        choices=("quick", "desispec"),
-        default="quick",
-        help="quick=FIBERMAP only; desispec=read_spectra like ingest",
+@click.command(context_settings={"help_option_names": ["-h", "--help"]}, help=__doc__)
+@click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
+@click.option("--file-list", type=click.Path(path_type=Path), help="One path per line")
+@click.option("--coadd-root", type=click.Path(path_type=Path), help="Search root for coadd files")
+@click.option("--coadd-glob", default="coadd-*.fits", show_default=True)
+@click.option(
+    "--mode",
+    type=click.Choice(("quick", "desispec")),
+    default="quick",
+    show_default=True,
+    help="quick=FIBERMAP only; desispec=read_spectra like ingest",
+)
+@click.option("--sample", type=int, help="Random subsample of paths")
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--max-files", type=int, help="Cap number of files processed")
+@click.option("--json-out", type=click.Path(path_type=Path), help="Write per-file reports + summary as JSON")
+@click.option(
+    "--only-needs-coadd",
+    is_flag=True,
+    help="Print only files where max rows per TARGETID > 1",
+)
+def main(
+    paths: tuple[Path, ...],
+    file_list: Path | None,
+    coadd_root: Path | None,
+    coadd_glob: str,
+    mode: str,
+    sample: int | None,
+    seed: int,
+    max_files: int | None,
+    json_out: Path | None,
+    only_needs_coadd: bool,
+) -> int:
+    collected = _collect_paths(
+        paths_arg=paths,
+        file_list=file_list,
+        coadd_root=coadd_root,
+        coadd_glob=coadd_glob,
+        sample=sample,
+        seed=seed,
+        max_files=max_files,
     )
-    parser.add_argument("--sample", type=int, help="Random subsample of paths")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-files", type=int, help="Cap number of files processed")
-    parser.add_argument(
-        "--json-out",
-        type=Path,
-        help="Write per-file reports + summary as JSON",
-    )
-    parser.add_argument(
-        "--only-needs-coadd",
-        action="store_true",
-        help="Print only files where max rows per TARGETID > 1",
-    )
-    args = parser.parse_args()
-
-    paths = _collect_paths(args)
-    if not paths:
+    if not collected:
         print("No input files found.", file=sys.stderr)
         return 1
 
-    reports, summary = characterize_coadd_paths(paths, mode=args.mode)
+    reports, summary = characterize_coadd_paths(collected, mode=mode)
 
-    print(f"Mode: {args.mode}  Files: {summary.n_files}")
+    print(f"Mode: {mode}  Files: {summary.n_files}")
     print(
         f"  single row/target: {summary.n_files_single_row_per_target}  "
         f"needs exposure coadd: {summary.n_files_needing_exposure_coadd}  "
@@ -114,7 +138,7 @@ def main() -> int:
     print(f"  pooled histogram (rows per TARGETID -> #targets): {summary.pooled_histogram}")
 
     for r in reports:
-        if args.only_needs_coadd and not r.needs_exposure_coadd:
+        if only_needs_coadd and not r.needs_exposure_coadd:
             continue
         print(_report_line(r))
 
@@ -123,9 +147,9 @@ def main() -> int:
         for p in summary.files_needing_coadd:
             print(f"  {p}")
 
-    if args.json_out:
+    if json_out is not None:
         payload = {
-            "mode": args.mode,
+            "mode": mode,
             "summary": {
                 "n_files": summary.n_files,
                 "n_files_needing_exposure_coadd": summary.n_files_needing_exposure_coadd,
@@ -147,8 +171,8 @@ def main() -> int:
                 for r in reports
             ],
         }
-        args.json_out.write_text(json.dumps(payload, indent=2))
-        print(f"\nWrote {args.json_out}")
+        json_out.write_text(json.dumps(payload, indent=2))
+        print(f"\nWrote {json_out}")
 
     # Exit 2 if any file needs exposure coadd (useful in shell scripts).
     return 2 if summary.n_files_needing_exposure_coadd else 0

@@ -52,6 +52,8 @@ data_lake/
 
 notebooks/                  Guided walk-throughs; see docs/notebooks.md
 examples/                   Self-contained demos (synthetic cross-survey lake, area JSON, survey scripts)
+scripts/                    Dev/ops helpers (Click CLIs; not installed as ``dl-*`` entry points)
 tests/                      pytest suite; needs no external data
 docs/                       This documentation
 ```
+

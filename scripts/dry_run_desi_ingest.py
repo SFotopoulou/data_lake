@@ -17,7 +17,6 @@ Or with the defaults:
 
 from __future__ import annotations
 
-import argparse
 import logging
 import shutil
 import sys
@@ -25,6 +24,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import click
 import numpy as np
 
 DEFAULT_FILES = [
@@ -163,22 +163,25 @@ def verify_readback(output_root: Path, survey: str, index_map: dict, with_resolu
     log.info("VERIFY: all invariants OK for %d sampled sources", len(sample_ids))
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("files", nargs="*", help="DESI coadd FITS files")
-    parser.add_argument("--survey", default="desi_dryrun")
-    parser.add_argument(
-        "--keep-output",
-        type=Path,
-        default=None,
-        help="If given, write to this directory instead of a temp dir (and keep it)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+@click.command(context_settings={"help_option_names": ["-h", "--help"]}, help=__doc__)
+@click.argument("files", nargs=-1, type=click.Path(path_type=Path))
+@click.option("--survey", default="desi_dryrun", show_default=True)
+@click.option(
+    "--keep-output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="If given, write to this directory instead of a temp dir (and keep it)",
+)
+@click.option("-v", "--verbose", is_flag=True)
+def main(
+    files: tuple[Path, ...],
+    survey: str,
+    keep_output: Path | None,
+    verbose: bool,
+) -> int:
+    _setup_logging(verbose)
 
-    _setup_logging(args.verbose)
-
-    file_paths = [Path(p) for p in (args.files or DEFAULT_FILES)]
+    file_paths = [Path(p) for p in (list(files) if files else DEFAULT_FILES)]
     missing = [p for p in file_paths if not p.exists()]
     if missing:
         log.error("Missing input files: %s", missing)
@@ -189,9 +192,9 @@ def main() -> int:
     desispec = _import_desispec()
     log.info("desispec %s available", desispec.__version__)
 
-    if args.keep_output:
-        args.keep_output.mkdir(parents=True, exist_ok=True)
-        tmp_root = args.keep_output
+    if keep_output:
+        keep_output.mkdir(parents=True, exist_ok=True)
+        tmp_root = keep_output
         cleanup = False
     else:
         tmp_root = Path(tempfile.mkdtemp(prefix="data_lake_dryrun_"))
@@ -202,13 +205,13 @@ def main() -> int:
     try:
         # ------ Pass 1: no resolution matrix ------
         no_res_root = tmp_root / "no_resolution"
-        pass1 = run_one_pass(file_paths, no_res_root, with_resolution=False, survey=args.survey)
-        verify_readback(no_res_root, args.survey, pass1["index_map"], with_resolution=False)
+        pass1 = run_one_pass(file_paths, no_res_root, with_resolution=False, survey=survey)
+        verify_readback(no_res_root, survey, pass1["index_map"], with_resolution=False)
 
         # ------ Pass 2: with resolution matrix ------
         res_root = tmp_root / "with_resolution"
-        pass2 = run_one_pass(file_paths, res_root, with_resolution=True, survey=args.survey)
-        verify_readback(res_root, args.survey, pass2["index_map"], with_resolution=True)
+        pass2 = run_one_pass(file_paths, res_root, with_resolution=True, survey=survey)
+        verify_readback(res_root, survey, pass2["index_map"], with_resolution=True)
 
         # ------ Summary ------
         log.info("=" * 70)

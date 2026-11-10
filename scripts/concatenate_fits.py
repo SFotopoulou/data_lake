@@ -10,11 +10,11 @@ are rejected — convert those to row-normal FITS or Parquet first.
 
 from __future__ import annotations
 
-import argparse
 import sys
 import warnings
 from pathlib import Path
 
+import click
 from astropy.io import fits
 from astropy.table import Table, vstack
 from astropy.utils.exceptions import AstropyWarning
@@ -106,114 +106,103 @@ def concatenate_fits_tables(
     return vstack(tables, join_type=join_type)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "input_dir",
-        type=Path,
-        help="Directory containing FITS table shards to concatenate.",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        required=True,
-        help="Output FITS path.",
-    )
-    parser.add_argument(
-        "--pattern",
-        default="*.fits",
-        help="Glob pattern for input files relative to input_dir (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Search subdirectories recursively.",
-    )
-    parser.add_argument(
-        "--hdu",
-        default=None,
-        help="Table HDU index or name (default: first BINTABLE in each file).",
-    )
-    parser.add_argument(
-        "--join",
-        dest="join_type",
-        choices=("exact", "outer"),
-        default="exact",
-        help="How to align columns when stacking tables (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--fits-memmap",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="FITS read policy, same semantics as dl-ingest-catalog (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace output file if it already exists.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="List input files and exit without writing output.",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable tqdm progress bar.",
-    )
-    args = parser.parse_args()
-
-    hdu: int | str | None
-    if args.hdu is None:
-        hdu = None
+@click.command(context_settings={"help_option_names": ["-h", "--help"]}, help=__doc__)
+@click.argument("input_dir", type=click.Path(path_type=Path))
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output FITS path.",
+)
+@click.option(
+    "--pattern",
+    default="*.fits",
+    show_default=True,
+    help="Glob pattern for input files relative to input_dir.",
+)
+@click.option("--recursive", is_flag=True, help="Search subdirectories recursively.")
+@click.option(
+    "--hdu",
+    default=None,
+    help="Table HDU index or name (default: first BINTABLE in each file).",
+)
+@click.option(
+    "--join",
+    "join_type",
+    type=click.Choice(("exact", "outer")),
+    default="exact",
+    show_default=True,
+    help="How to align columns when stacking tables.",
+)
+@click.option(
+    "--fits-memmap",
+    type=click.Choice(("auto", "on", "off")),
+    default="auto",
+    show_default=True,
+    help="FITS read policy, same semantics as dl-ingest-catalog.",
+)
+@click.option("--overwrite", is_flag=True, help="Replace output file if it already exists.")
+@click.option("--dry-run", is_flag=True, help="List input files and exit without writing output.")
+@click.option("--no-progress", is_flag=True, help="Disable tqdm progress bar.")
+def main(
+    input_dir: Path,
+    output: Path,
+    pattern: str,
+    recursive: bool,
+    hdu: str | None,
+    join_type: str,
+    fits_memmap: str,
+    overwrite: bool,
+    dry_run: bool,
+    no_progress: bool,
+) -> int:
+    hdu_resolved: int | str | None
+    if hdu is None:
+        hdu_resolved = None
     else:
         try:
-            hdu = int(args.hdu)
+            hdu_resolved = int(hdu)
         except ValueError:
-            hdu = args.hdu
+            hdu_resolved = hdu
 
     try:
         paths = _collect_fits_paths(
-            args.input_dir,
-            pattern=args.pattern,
-            recursive=args.recursive,
+            input_dir,
+            pattern=pattern,
+            recursive=recursive,
         )
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr)
         return 1
 
-    print(f"Found {len(paths)} FITS file(s) under {args.input_dir}", file=sys.stderr)
-    if args.dry_run:
+    print(f"Found {len(paths)} FITS file(s) under {input_dir}", file=sys.stderr)
+    if dry_run:
         for path in paths:
             print(path)
         return 0
 
-    if args.output.exists() and not args.overwrite:
-        print(f"Refusing to overwrite existing file: {args.output}", file=sys.stderr)
+    if output.exists() and not overwrite:
+        print(f"Refusing to overwrite existing file: {output}", file=sys.stderr)
         print("Pass --overwrite to replace it.", file=sys.stderr)
         return 1
 
     try:
         merged = concatenate_fits_tables(
             paths,
-            hdu=hdu,
-            join_type=args.join_type,
-            memmap=args.fits_memmap,
-            show_progress=not args.no_progress,
+            hdu=hdu_resolved,
+            join_type=join_type,
+            memmap=fits_memmap,
+            show_progress=not no_progress,
         )
     except (OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    merged.write(str(args.output), format="fits", overwrite=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    merged.write(str(output), format="fits", overwrite=True)
     print(
-        f"Wrote {len(merged)} row(s) from {len(paths)} file(s) to {args.output}",
+        f"Wrote {len(merged)} row(s) from {len(paths)} file(s) to {output}",
         file=sys.stderr,
     )
     return 0

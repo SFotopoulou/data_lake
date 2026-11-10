@@ -21,10 +21,10 @@ Examples
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
+import click
 import pyarrow.parquet as pq
 
 from data_lake.ingest.checkpoint_sidecars import paths_from_file_list_file
@@ -92,111 +92,101 @@ def _collect_sources(paths: list[Path], file_list: Path | None) -> list[Path]:
     return sources
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "sources",
-        nargs="*",
-        type=Path,
-        help="Input MEF FITS file(s).",
-    )
-    parser.add_argument(
-        "--file-list",
-        type=Path,
-        default=None,
-        help="Text file, one FITS path per line (instead of positional paths).",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        default=None,
-        help="Output Parquet path (single input only). Default: <stem>.parquet "
-             "next to the FITS file.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Directory for one Parquet per input (required for more than one file "
-             "unless you want each <stem>.parquet next to its FITS).",
-    )
-    parser.add_argument(
-        "--hdu",
-        action="append",
-        dest="hdu_names",
-        metavar="NAME",
-        help="Table extension to join (index, EXTNAME, or EXTNAME,EXTVER). "
-             "Repeatable; omit to join every non-empty table HDU.",
-    )
-    parser.add_argument(
-        "--key-cols",
-        default=None,
-        help="Comma-separated shared columns that must match row by row "
-             "(default: every column name present on all selected HDUs).",
-    )
-    parser.add_argument(
-        "--fits-memmap",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="FITS read policy, same semantics as dl-ingest-catalog (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace output file(s) if they already exist.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print planned input → output paths and exit.",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable tqdm progress bar on multi-file runs.",
-    )
-    args = parser.parse_args(argv)
-
+@click.command(context_settings={"help_option_names": ["-h", "--help"]}, help=__doc__)
+@click.argument("sources", nargs=-1, type=click.Path(path_type=Path))
+@click.option(
+    "--file-list",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Text file, one FITS path per line (instead of positional paths).",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output Parquet path (single input only). Default: <stem>.parquet "
+         "next to the FITS file.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory for one Parquet per input (required for more than one file "
+         "unless you want each <stem>.parquet next to its FITS).",
+)
+@click.option(
+    "--hdu",
+    "hdu_names",
+    multiple=True,
+    metavar="NAME",
+    help="Table extension to join (index, EXTNAME, or EXTNAME,EXTVER). "
+         "Repeatable; omit to join every non-empty table HDU.",
+)
+@click.option(
+    "--key-cols",
+    default=None,
+    help="Comma-separated shared columns that must match row by row "
+         "(default: every column name present on all selected HDUs).",
+)
+@click.option(
+    "--fits-memmap",
+    type=click.Choice(("auto", "on", "off")),
+    default="auto",
+    show_default=True,
+    help="FITS read policy, same semantics as dl-ingest-catalog.",
+)
+@click.option("--overwrite", is_flag=True, help="Replace output file(s) if they already exist.")
+@click.option("--dry-run", is_flag=True, help="Print planned input → output paths and exit.")
+@click.option("--no-progress", is_flag=True, help="Disable tqdm progress bar on multi-file runs.")
+def cli(
+    sources: tuple[Path, ...],
+    file_list: Path | None,
+    output: Path | None,
+    output_dir: Path | None,
+    hdu_names: tuple[str, ...],
+    key_cols: str | None,
+    fits_memmap: str,
+    overwrite: bool,
+    dry_run: bool,
+    no_progress: bool,
+) -> int:
     try:
-        sources = _collect_sources(args.sources, args.file_list)
+        resolved_sources = _collect_sources(list(sources), file_list)
     except (ValueError, FileNotFoundError) as exc:
         print(exc, file=sys.stderr)
         return 1
 
-    if args.output is not None and args.output_dir is not None:
+    if output is not None and output_dir is not None:
         print("Pass -o or --output-dir, not both.", file=sys.stderr)
         return 1
-    if args.output is not None and len(sources) > 1:
+    if output is not None and len(resolved_sources) > 1:
         print(
             " -o is a single Parquet file; use --output-dir for more than one input.",
             file=sys.stderr,
         )
         return 1
-    if args.hdu_names is not None and len(args.hdu_names) < 2:
+    if len(hdu_names) == 1:
         print("Pass --hdu at least twice, or omit it to join every table HDU.", file=sys.stderr)
         return 1
 
     keys = (
-        [c.strip() for c in args.key_cols.split(",") if c.strip()]
-        if args.key_cols else None
+        [c.strip() for c in key_cols.split(",") if c.strip()]
+        if key_cols else None
     )
-    extensions = list(args.hdu_names) if args.hdu_names else None
+    extensions = list(hdu_names) if hdu_names else None
 
     planned = [
-        (src, parquet_path_for(src, output=args.output, output_dir=args.output_dir))
-        for src in sources
+        (src, parquet_path_for(src, output=output, output_dir=output_dir))
+        for src in resolved_sources
     ]
-    if args.dry_run:
+    if dry_run:
         for src, dest in planned:
             print(f"{src} → {dest}")
         return 0
 
     iterator = planned
-    if len(planned) > 1 and not args.no_progress:
+    if len(planned) > 1 and not no_progress:
         try:
             from tqdm import tqdm
 
@@ -212,8 +202,8 @@ def main(argv: list[str] | None = None) -> int:
                 dest,
                 extensions=extensions,
                 key_cols=keys,
-                fits_memmap=args.fits_memmap,
-                overwrite=args.overwrite,
+                fits_memmap=fits_memmap,
+                overwrite=overwrite,
             )
         except (OSError, ValueError, FileExistsError) as exc:
             print(f"ERROR: {src}: {exc}", file=sys.stderr)
@@ -229,6 +219,10 @@ def main(argv: list[str] | None = None) -> int:
     if len(planned) > 1:
         print(f"Wrote {n_ok} Parquet file(s).", file=sys.stderr)
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return cli.main(args=argv, prog_name="flatten_fits_mef", standalone_mode=False)  # type: ignore[return-value]
 
 
 if __name__ == "__main__":

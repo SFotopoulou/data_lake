@@ -13,13 +13,13 @@ committed outputs do not leak local paths.
 
 from __future__ import annotations
 
-import argparse
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
 
+import click
 import nbformat
 from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError
@@ -77,20 +77,37 @@ def _run_one(path: Path, *, kernel: str, timeout: int, write: bool) -> tuple[boo
     return ok, elapsed, len(text.encode()) // 1024
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("notebooks", nargs="*", type=Path, help=f"Notebooks to run (default: {DEFAULT_GLOB}).")
-    ap.add_argument("--demo-dir", type=Path, default=REPO_ROOT / "notebooks" / "_demo_lake",
-                    help="Demo deployment used by the notebooks (default: notebooks/_demo_lake).")
-    ap.add_argument("--fresh", action="store_true", help="Delete --demo-dir first so it is rebuilt.")
-    ap.add_argument("--kernel", default="python3", help="Jupyter kernel name (default: python3).")
-    ap.add_argument("--timeout", type=int, default=900, help="Per-cell timeout in seconds.")
-    ap.add_argument("--no-write", action="store_true", help="Execute only; leave notebook files unchanged.")
-    args = ap.parse_args(argv)
-
-    paths = [p.resolve() for p in args.notebooks] or sorted(REPO_ROOT.glob(DEFAULT_GLOB))
-    demo_dir = args.demo_dir.resolve()
-    if args.fresh and demo_dir.exists():
+@click.command(
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help=__doc__,
+)
+@click.argument(
+    "notebooks",
+    nargs=-1,
+    type=click.Path(path_type=Path),
+)
+@click.option(
+    "--demo-dir",
+    type=click.Path(path_type=Path),
+    default=str(REPO_ROOT / "notebooks" / "_demo_lake"),
+    show_default=True,
+    help="Demo deployment used by the notebooks.",
+)
+@click.option("--fresh", is_flag=True, help="Delete --demo-dir first so it is rebuilt.")
+@click.option("--kernel", default="python3", show_default=True, help="Jupyter kernel name.")
+@click.option("--timeout", type=int, default=900, show_default=True, help="Per-cell timeout in seconds.")
+@click.option("--no-write", is_flag=True, help="Execute only; leave notebook files unchanged.")
+def cli(
+    notebooks: tuple[Path, ...],
+    demo_dir: Path,
+    fresh: bool,
+    kernel: str,
+    timeout: int,
+    no_write: bool,
+) -> int:
+    paths = [p.resolve() for p in notebooks] or sorted(REPO_ROOT.glob(DEFAULT_GLOB))
+    demo_dir = demo_dir.resolve()
+    if fresh and demo_dir.exists():
         shutil.rmtree(demo_dir)
 
     os.environ.pop("DATA_LAKE_CONFIG", None)
@@ -101,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = []
     for path in paths:
         print(f"{path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path} …", flush=True)
-        ok, elapsed, kib = _run_one(path, kernel=args.kernel, timeout=args.timeout, write=not args.no_write)
+        ok, elapsed, kib = _run_one(path, kernel=kernel, timeout=timeout, write=not no_write)
         flag = "" if kib <= MAX_OUTPUT_KIB else f"  (over {MAX_OUTPUT_KIB} KiB)"
         print(f"  {'ok' if ok else 'FAILED'} in {elapsed:.1f} s, {kib} KiB{flag}", flush=True)
         if not ok:
@@ -110,6 +127,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(failed)} notebook(s) failed: {', '.join(failed)}", file=sys.stderr)
         return 1
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return cli.main(args=argv, prog_name="execute_notebooks", standalone_mode=False)  # type: ignore[return-value]
 
 
 if __name__ == "__main__":

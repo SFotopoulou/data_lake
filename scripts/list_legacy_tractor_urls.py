@@ -25,7 +25,6 @@ Examples::
 
 from __future__ import annotations
 
-import argparse
 import fnmatch
 import re
 import sys
@@ -35,6 +34,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+
+import click
 
 try:
     from tqdm import tqdm
@@ -124,123 +125,113 @@ def list_matching_urls(
     return sorted(urls)
 
 
-def _parse_folder_list(spec: str) -> list[str]:
+def _parse_folder_list(ctx: click.Context, param: click.Parameter, value: str | None) -> list[str] | None:
+    if value is None:
+        return None
     folders: list[str] = []
-    for part in spec.split(","):
+    for part in value.split(","):
         part = part.strip()
         if not part:
             continue
         if not part.isdigit():
-            raise argparse.ArgumentTypeError(
-                f"folder id must be numeric, got {part!r}"
-            )
+            raise click.BadParameter(f"folder id must be numeric, got {part!r}", ctx=ctx, param=param)
         folders.append(f"{int(part):03d}")
     return folders
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--base-url",
-        default=DEFAULT_BASE_URL,
-        help=f"Tractor root URL (default: {DEFAULT_BASE_URL})",
-    )
-    parser.add_argument(
-        "--folders",
-        type=_parse_folder_list,
-        default=None,
-        help="Comma-separated folder ids (e.g. 0,1,10 → 000,001,010).",
-    )
-    parser.add_argument(
-        "--folder-min",
-        type=int,
-        default=None,
-        help="Inclusive minimum folder id when scanning a numeric range.",
-    )
-    parser.add_argument(
-        "--folder-max",
-        type=int,
-        default=None,
-        help="Inclusive maximum folder id when scanning a numeric range.",
-    )
-    parser.add_argument(
-        "--pattern",
-        default=DEFAULT_PATTERN,
-        help=f"fnmatch pattern for files inside each folder (default: {DEFAULT_PATTERN}).",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        default=None,
-        help="Write URLs one per line (default: stdout).",
-    )
-    parser.add_argument(
-        "--list-folders",
-        action="store_true",
-        help="Only print discovered/selected folder names, then exit.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Parallel HTTP workers for folder listings (default: 8).",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=60.0,
-        help="HTTP timeout in seconds (default: 60).",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable tqdm progress bar.",
-    )
-    args = parser.parse_args()
-
-    base_url = _normalize_base(args.base_url)
-    if (args.folder_min is None) ^ (args.folder_max is None):
+@click.command(context_settings={"help_option_names": ["-h", "--help"]}, help=__doc__)
+@click.option(
+    "--base-url",
+    default=DEFAULT_BASE_URL,
+    show_default=True,
+    help="Tractor root URL.",
+)
+@click.option(
+    "--folders",
+    callback=_parse_folder_list,
+    default=None,
+    help="Comma-separated folder ids (e.g. 0,1,10 → 000,001,010).",
+)
+@click.option(
+    "--folder-min",
+    type=int,
+    default=None,
+    help="Inclusive minimum folder id when scanning a numeric range.",
+)
+@click.option(
+    "--folder-max",
+    type=int,
+    default=None,
+    help="Inclusive maximum folder id when scanning a numeric range.",
+)
+@click.option(
+    "--pattern",
+    default=DEFAULT_PATTERN,
+    show_default=True,
+    help="fnmatch pattern for files inside each folder.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write URLs one per line (default: stdout).",
+)
+@click.option("--list-folders", is_flag=True, help="Only print discovered/selected folder names, then exit.")
+@click.option("--workers", type=int, default=8, show_default=True, help="Parallel HTTP workers for folder listings.")
+@click.option("--timeout", type=float, default=60.0, show_default=True, help="HTTP timeout in seconds.")
+@click.option("--no-progress", is_flag=True, help="Disable tqdm progress bar.")
+def main(
+    base_url: str,
+    folders: list[str] | None,
+    folder_min: int | None,
+    folder_max: int | None,
+    pattern: str,
+    output: Path | None,
+    list_folders: bool,
+    workers: int,
+    timeout: float,
+    no_progress: bool,
+) -> int:
+    base_url = _normalize_base(base_url)
+    if (folder_min is None) ^ (folder_max is None):
         print("ERROR: --folder-min and --folder-max must be used together.", file=sys.stderr)
         return 1
-    if args.folders is not None and args.folder_min is not None:
+    if folders is not None and folder_min is not None:
         print("ERROR: pass either --folders or --folder-min/--folder-max, not both.", file=sys.stderr)
         return 1
-    if args.workers < 1:
+    if workers < 1:
         print("ERROR: --workers must be >= 1.", file=sys.stderr)
         return 1
 
     try:
-        if args.folders is not None:
-            folders = args.folders
-        elif args.folder_min is not None:
-            if args.folder_min < 0 or args.folder_max < args.folder_min:
+        if folders is not None:
+            folder_list = folders
+        elif folder_min is not None:
+            if folder_min < 0 or folder_max < folder_min:
                 print("ERROR: invalid folder range.", file=sys.stderr)
                 return 1
-            folders = [f"{i:03d}" for i in range(args.folder_min, args.folder_max + 1)]
+            folder_list = [f"{i:03d}" for i in range(folder_min, folder_max + 1)]
         else:
             print(f"Discovering folders under {base_url} …", file=sys.stderr)
-            folders = list_subfolders(base_url, timeout=args.timeout)
+            folder_list = list_subfolders(base_url, timeout=timeout)
     except urllib.error.URLError as exc:
         print(f"ERROR: failed to fetch {base_url}: {exc}", file=sys.stderr)
         return 1
 
-    if not folders:
+    if not folder_list:
         print("ERROR: no folders selected or discovered.", file=sys.stderr)
         return 1
 
-    print(f"folders={len(folders)} pattern={args.pattern!r}", file=sys.stderr)
+    print(f"folders={len(folder_list)} pattern={pattern!r}", file=sys.stderr)
 
-    if args.list_folders:
-        out = sys.stdout if args.output is None else args.output.open("w", encoding="utf-8")
+    if list_folders:
+        out = sys.stdout if output is None else output.open("w", encoding="utf-8")
         try:
-            for name in folders:
+            for name in folder_list:
                 print(name, file=out)
         finally:
-            if args.output is not None:
+            if output is not None:
                 out.close()
         return 0
 
@@ -251,7 +242,7 @@ def main() -> int:
         folder_url = urljoin(base_url, folder + "/")
         try:
             return folder, list_matching_urls(
-                folder_url, pattern=args.pattern, timeout=args.timeout
+                folder_url, pattern=pattern, timeout=timeout
             ), None
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -260,10 +251,10 @@ def main() -> int:
         except urllib.error.URLError as exc:
             return folder, None, str(exc)
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(_one, folder) for folder in folders]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, folder) for folder in folder_list]
         iterator = as_completed(futures)
-        if not args.no_progress:
+        if not no_progress:
             iterator = tqdm(iterator, total=len(futures), desc="folders", unit="dir")
         for fut in iterator:
             folder, found, err = fut.result()
@@ -274,13 +265,13 @@ def main() -> int:
             urls.extend(found)
 
     urls = sorted(set(urls))
-    if args.output is None:
+    if output is None:
         for url in urls:
             print(url)
     else:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
-        print(f"Wrote {len(urls)} URL(s) to {args.output}", file=sys.stderr)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+        print(f"Wrote {len(urls)} URL(s) to {output}", file=sys.stderr)
 
     print(f"total_urls={len(urls)} failed_folders={len(failed)}", file=sys.stderr)
     for folder, err in failed:

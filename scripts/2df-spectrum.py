@@ -8,51 +8,16 @@ into ASCII text files.
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
+import click
 import numpy as np
 from astropy.io import fits
 
 
 SPEC_SIZE = 1024
 DEFAULT_DATABASE_PREFIX = Path("/2dFGRS_Database")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "List object spectrum, variance array, and sky spectrum from 2dFGRS "
-            "FITS files into ASCII text files."
-        )
-    )
-    parser.add_argument(
-        "name",
-        help=(
-            "Either a FITS filename or a file containing a list of FITS filenames "
-            "(with optional extension numbers when xtn > 0)."
-        ),
-    )
-    parser.add_argument(
-        "xtn",
-        type=int,
-        help="0 for all extensions, >0 for one extension (or list-provided extensions).",
-    )
-    parser.add_argument(
-        "--plot",
-        action="store_true",
-        help="Generate PNG plots for each extracted spectrum.",
-    )
-    parser.add_argument(
-        "--base-dir",
-        default=str(DEFAULT_DATABASE_PREFIX),
-        help=(
-            "Base directory to prepend when FITS paths are not found directly "
-            "(default: /2dFGRS_Database)."
-        ),
-    )
-    return parser.parse_args()
 
 
 def is_fits_name(path_like: str) -> bool:
@@ -319,16 +284,31 @@ def process_one_file(ff: str, requested_xtn: int, base_dir: Path, plot: bool = F
                 )
 
 
-def main() -> int:
-    args = parse_args()
+@click.command(
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help=(
+        "List object spectrum, variance array, and sky spectrum from 2dFGRS "
+        "FITS files into ASCII text files."
+    ),
+)
+@click.argument("name")
+@click.argument("xtn", type=int)
+@click.option("--plot", is_flag=True, help="Generate PNG plots for each extracted spectrum.")
+@click.option(
+    "--base-dir",
+    default=str(DEFAULT_DATABASE_PREFIX),
+    show_default=True,
+    help="Base directory to prepend when FITS paths are not found directly.",
+)
+def main(name: str, xtn: int, plot: bool, base_dir: str) -> int:
     try:
-        inputs = build_inputs(args.name, args.xtn)
+        inputs = build_inputs(name, xtn)
     except Exception as exc:
         print(f"ERROR: {exc}")
         return 1
 
-    for ff, xtn in inputs:
-        process_one_file(ff, xtn, base_dir=Path(args.base_dir), plot=args.plot)
+    for ff, ext_xtn in inputs:
+        process_one_file(ff, ext_xtn, base_dir=Path(base_dir), plot=plot)
     return 0
 
 
