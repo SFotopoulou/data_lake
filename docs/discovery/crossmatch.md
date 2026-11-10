@@ -253,10 +253,13 @@ oversubscribing the node and getting workers killed (`BrokenProcessPool`).
 Override with `$DATA_LAKE_DUCKDB_THREADS` and
 `$DATA_LAKE_DUCKDB_MEMORY_LIMIT_MIB`; the chosen values are logged at start.
 
-At the end of a run, phase timings and B-cache hit/miss counts are logged
-(`a_read=… b_load=… match=… write=…`) and stored under `perf` in
+At the end of a run, phase timings and B-cache hit/miss counts are logged at
+INFO (`a_read=… b_load=… match=… write=…`), stored under `perf` in
 `crossmatch_info.json` as `t_a_read_s`, `t_b_load_s`, `t_match_s`, `t_write_s`,
-`b_cache_hits` and `b_cache_misses`.
+`b_cache_hits` and `b_cache_misses`, and appended to the final CLI summary line
+(`click.echo`) so they still print under `-q`/`--quiet` (which raises the
+terminal log level to WARNING). With `--log-file` and `-q`, the file still
+receives the INFO phase line as well.
 
 ### GPU backend
 

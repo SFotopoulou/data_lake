@@ -99,6 +99,8 @@ class CrossmatchResult:
     # Full on-disk tree totals after info rewrite (may exceed this-run stats).
     tree_total_rows: int | None = None
     tree_n_tiles: int | None = None
+    # Last-run phase timing / B-cache (also in crossmatch_info.json ``perf``).
+    perf: dict[str, float | int] | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +199,16 @@ class CrossmatchPhaseStats:
             "b_cache_hits": int(self.b_cache_hits),
             "b_cache_misses": int(self.b_cache_misses),
         }
+
+    def has_data(self) -> bool:
+        return bool(
+            self.t_a_read_s
+            or self.t_b_load_s
+            or self.t_match_s
+            or self.t_write_s
+            or self.b_cache_hits
+            or self.b_cache_misses
+        )
 
 
 def nested_parent_order(norder: int) -> int:
@@ -412,27 +424,39 @@ def _heartbeat_interval(tiles_per_worker: int) -> int:
     return n
 
 
+def format_crossmatch_perf_summary(
+    perf: dict[str, float | int] | None,
+) -> str | None:
+    """One-line phase timing / B-cache summary for CLI end-of-run printing.
+
+    Returns ``None`` when *perf* is empty so quiet ``-q`` summaries stay short.
+    Survives ``-q`` when appended to :func:`click.echo` (terminal log level is
+    WARNING under quiet, which would hide the matching ``log.info`` lines).
+    """
+    if not perf:
+        return None
+    a = float(perf.get("t_a_read_s", 0.0) or 0.0)
+    b = float(perf.get("t_b_load_s", 0.0) or 0.0)
+    m = float(perf.get("t_match_s", 0.0) or 0.0)
+    w = float(perf.get("t_write_s", 0.0) or 0.0)
+    hits = int(perf.get("b_cache_hits", 0) or 0)
+    misses = int(perf.get("b_cache_misses", 0) or 0)
+    if not (a or b or m or w or hits or misses):
+        return None
+    total = a + b + m + w
+    return (
+        f"phase timing: a_read={a:.2f}s b_load={b:.2f}s match={m:.2f}s "
+        f"write={w:.2f}s (sum={total:.2f}s); B-cache hits={hits} misses={misses}"
+    )
+
+
 def _log_phase_stats(label: str, stats: CrossmatchPhaseStats) -> None:
-    total = (
-        stats.t_a_read_s
-        + stats.t_b_load_s
-        + stats.t_match_s
-        + stats.t_write_s
-    )
-    if total <= 0 and not (stats.b_cache_hits or stats.b_cache_misses):
+    if not stats.has_data():
         return
-    log.info(
-        "%s phase timing: a_read=%.2fs b_load=%.2fs match=%.2fs write=%.2fs "
-        "(sum=%.2fs); B-cache hits=%d misses=%d",
-        label,
-        stats.t_a_read_s,
-        stats.t_b_load_s,
-        stats.t_match_s,
-        stats.t_write_s,
-        total,
-        stats.b_cache_hits,
-        stats.b_cache_misses,
-    )
+    line = format_crossmatch_perf_summary(stats.as_dict())
+    if line is None:
+        return
+    log.info("%s %s", label, line)
 
 
 # ---------------------------------------------------------------------------
@@ -2157,6 +2181,7 @@ def build_crossmatch(
         export_fits=fits_path,
         tree_total_rows=tree_rows,
         tree_n_tiles=tree_tiles,
+        perf=phase_stats.as_dict() if phase_stats.has_data() else None,
     )
 
 
@@ -2992,6 +3017,7 @@ def build_column_crossmatch(
         match_col_b=match_col_b,
         tree_total_rows=tree_rows,
         tree_n_tiles=tree_tiles,
+        perf=phase_stats.as_dict() if phase_stats.has_data() else None,
     )
 
 

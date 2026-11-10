@@ -22,11 +22,13 @@ from data_lake.knobs import (
     PARTNER_TILE_CACHE_MAX_TILES,
 )
 from data_lake.io.crossmatch import (
+    CrossmatchResult,
     build_column_crossmatch,
     build_crossmatch,
     describe_crossmatch_tree,
     execute_crossmatch_plan,
     format_crossmatch_list,
+    format_crossmatch_perf_summary,
     format_crossmatch_report,
     list_crossmatch_descriptions,
     load_crossmatch_plan,
@@ -35,6 +37,14 @@ from data_lake.io.crossmatch import (
     resolve_crossmatch_describe_target,
     validate_match_column,
 )
+
+
+def _echo_crossmatch_result_line(msg: str, result: CrossmatchResult) -> None:
+    """Print the end-of-run summary (always; survives ``-q``)."""
+    perf_line = format_crossmatch_perf_summary(result.perf)
+    if perf_line:
+        msg = f"{msg}; {perf_line}"
+    click.echo(msg)
 
 _cli_b_cache_mib = PARTNER_TILE_CACHE_MAX_BYTES // (1024 * 1024)
 
@@ -320,7 +330,7 @@ def cli(
             msg += f"; parquet → {result.export_parquet}"
         if result.export_fits is not None:
             msg += f"; fits → {result.export_fits}"
-        click.echo(msg)
+        _echo_crossmatch_result_line(msg, result)
         return
 
     # ---- plan mode: dl-crossmatch [LAKE] --from-area AREA | --plan FILE ----
@@ -380,10 +390,11 @@ def cli(
                     f" (tree on disk: {r.tree_total_rows:,} row(s) "
                     f"in {r.tree_n_tiles:,} tile(s))"
                 )
-            click.echo(
+            _echo_crossmatch_result_line(
                 f"  {r.crossmatch_name}: {r.n_match_rows:,} row(s) in "
                 f"{r.n_tiles_written:,} tile(s) this run → {r.output_root}"
-                f"{tree_note}"
+                f"{tree_note}",
+                r,
             )
         return
 
@@ -449,7 +460,7 @@ def cli(
     if result.n_workers == 1:
         msg += "; DuckDB may use additional CPU threads for parquet I/O"
     msg += ")"
-    click.echo(msg)
+    _echo_crossmatch_result_line(msg, result)
 
 @click.command("dl-describe-crossmatch")
 @click.argument("survey_a", required=False)
