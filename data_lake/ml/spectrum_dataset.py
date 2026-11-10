@@ -4,8 +4,11 @@ spectrum_dataset – PyTorch Dataset / IterableDataset for 1-D spectra.
 Two modes
 ---------
 SpectrumDataset (map-style)
-    Loads a fixed list of source_ids.  Supports random access, shuffling,
-    and DataLoader with ``num_workers > 0``.
+    Loads a fixed list of source_ids.  Supports random access and
+    DataLoader with ``num_workers > 0``.  Prefer
+    ``TileSequentialSampler`` (from ``data_lake.ml.dataset``) over
+    ``shuffle=True`` so consecutive batches stay inside the same HEALPix
+    tile.
 
 TileSpectrumDataset (iterable-style)
     Streams complete HEALPix tiles sequentially.  Optimal for full-epoch
@@ -20,6 +23,7 @@ Built-in transforms (composable)
 
 Usage
 -----
+>>> from data_lake.ml.dataset import TileSequentialSampler
 >>> from data_lake.ml.spectrum_dataset import SpectrumDataset, mask_to_nan
 >>> ds = SpectrumDataset(
 ...     lake_root="/data/lake",
@@ -27,7 +31,8 @@ Usage
 ...     source_ids=my_ids,
 ...     transform=mask_to_nan,
 ... )
->>> loader = DataLoader(ds, batch_size=128, shuffle=True, num_workers=4)
+>>> sampler = TileSequentialSampler(ds, shuffle_tiles=True, shuffle_within_tile=False)
+>>> loader = DataLoader(ds, batch_size=128, sampler=sampler, num_workers=4)
 """
 
 from __future__ import annotations

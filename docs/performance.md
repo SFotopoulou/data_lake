@@ -118,9 +118,10 @@ such a sample raises `KeyError`, so drop them first (`ds.tile_npix < 0` marks
 them). Both datasets default to `norder=5`; pass `norder=` if the survey uses a
 different `hats_order`.
 
-`TileSequentialSampler` (for `CutoutDataset`) yields samples grouped by tile,
-shuffling the tile order by default, so consecutive reads hit the same Zarr
-shard. For a full pass over whole tiles, use the iterable `TileCutoutDataset` /
+`TileSequentialSampler` (for `CutoutDataset` or `SpectrumDataset`) yields
+samples grouped by tile, shuffling the tile order by default, so consecutive
+reads hit the same Zarr shard. Prefer it over `DataLoader(..., shuffle=True)`.
+For a full pass over whole tiles, use the iterable `TileCutoutDataset` /
 `TileSpectrumDataset` instead.
 
 ```python

@@ -4,10 +4,10 @@ dataset – PyTorch Dataset / IterableDataset for galaxy cutout stacks.
 Two modes
 ---------
 CutoutDataset (map-style)
-    Loads a pre-built list of source_ids.  Supports random access, shuffling,
-    and torch DataLoader with ``num_workers > 0``.  Indices within each
-    HEALPix tile are accessed in sequential order within a worker to maximise
-    Zarr shard reuse.
+    Loads a pre-built list of source_ids.  Supports random access and
+    torch DataLoader with ``num_workers > 0``.  Prefer
+    ``TileSequentialSampler`` over ``shuffle=True`` so consecutive batches
+    stay inside the same HEALPix tile and reuse Zarr shards.
 
 TileCutoutDataset (iterable-style)
     Streams complete tiles one by one.  Optimal for training when the full
@@ -15,14 +15,15 @@ TileCutoutDataset (iterable-style)
 
 Usage
 -----
->>> from data_lake.ml.dataset import CutoutDataset
+>>> from data_lake.ml.dataset import CutoutDataset, TileSequentialSampler
 >>> ds = CutoutDataset(
 ...     lake_root="/data/lake",
 ...     survey="des_dr2",
 ...     source_ids=my_ids,      # list[int]
 ...     transform=my_transforms,
 ... )
->>> loader = DataLoader(ds, batch_size=64, shuffle=True, num_workers=4)
+>>> sampler = TileSequentialSampler(ds, shuffle_tiles=True, shuffle_within_tile=False)
+>>> loader = DataLoader(ds, batch_size=64, sampler=sampler, num_workers=4)
 """
 
 from __future__ import annotations
@@ -228,13 +229,15 @@ class TileSequentialSampler:
     Sampler that yields dataset indices grouped by HEALPix tile, optionally
     shuffling the order of tiles and the order within each tile.
 
-    Designed to work with ``CutoutDataset`` to maximise Zarr shard locality
-    while still providing intra-tile and inter-tile variety.
+    Works with any map-style lake dataset that exposes ``tile_npix``
+    (``CutoutDataset``, ``SpectrumDataset``, …) to maximise Zarr shard
+    locality while still providing inter-tile variety.
 
     Parameters
     ----------
     dataset:
-        A ``CutoutDataset`` instance.
+        A map-style dataset with a ``tile_npix`` array (one HEALPix npix per
+        sample; ``-1`` for missing IDs).
     shuffle_tiles:
         Shuffle the ordering of tiles (default True).
     shuffle_within_tile:
@@ -243,7 +246,7 @@ class TileSequentialSampler:
 
     def __init__(
         self,
-        dataset: CutoutDataset,
+        dataset: Any,
         shuffle_tiles: bool = True,
         shuffle_within_tile: bool = False,
     ) -> None:
