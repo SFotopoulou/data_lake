@@ -164,32 +164,40 @@ def read_ids_file(path: str | Path, id_col: str | None = None) -> list[int]:
     The column is ``id_col`` when given; otherwise the first column for CSV, or a
     column named like an id (``*_id`` / ``source_id`` / ``targetid``) for Parquet,
     falling back to the first column.
-    """
-    import pyarrow as pa
 
+    Parquet reads only the id column (schema is used to guess the column when
+    ``id_col`` is omitted).
+    """
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix in (".parquet", ".pq"):
         import pyarrow.parquet as pq
 
-        table = pq.read_table(str(path))
+        names = list(pq.read_schema(str(path)).names)
+        if id_col is not None:
+            if id_col not in names:
+                raise KeyError(f"column {id_col!r} not in {path} (have {names})")
+            col = id_col
+        else:
+            col = _guess_id_column(names)
+        table = pq.read_table(str(path), columns=[col])
     elif suffix in (".csv", ".txt", ".tsv"):
         from pyarrow import csv as pacsv
 
         delimiter = "\t" if suffix == ".tsv" else ","
-        table = pacsv.read_csv(
-            str(path), parse_options=pacsv.ParseOptions(delimiter=delimiter)
-        )
+        parse_options = pacsv.ParseOptions(delimiter=delimiter)
+        # ID CSVs are typically small; read once then select the column.
+        table = pacsv.read_csv(str(path), parse_options=parse_options)
+        names = table.column_names
+        if id_col is not None:
+            if id_col not in names:
+                raise KeyError(f"column {id_col!r} not in {path} (have {names})")
+            col = id_col
+        else:
+            col = _guess_id_column(names)
     else:
         raise ValueError(f"unsupported id file type {suffix!r}; use .parquet or .csv")
 
-    names = table.column_names
-    if id_col is not None:
-        if id_col not in names:
-            raise KeyError(f"column {id_col!r} not in {path} (have {names})")
-        col = id_col
-    else:
-        col = _guess_id_column(names)
     arr = table.column(col)
     return [int(v) for v in arr.to_pylist() if v is not None]
 

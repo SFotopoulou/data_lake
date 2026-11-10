@@ -14,7 +14,7 @@ from data_lake.discovery.areas import make_area, save_area
 from data_lake.discovery.region import Region
 from data_lake.discovery import tile_index as ti
 from data_lake.discovery.selection import selection_from_region
-from data_lake.homogenize.engine import homogenize_catalog
+from data_lake.homogenize.engine import _homogenize_source_columns, homogenize_catalog
 from data_lake.homogenize.registry import load_transform, validate_transform_schema
 from data_lake.homogenize.transforms import (
     TransformRule,
@@ -307,6 +307,34 @@ class TestTransforms:
         sql = build_homogenized_view_sql("ALLWISE", t, lake_root=None)
         assert "phot_ab_w1" in sql
         assert "2.699" in sql
+
+
+class TestHomogenizeSourceColumns:
+    def test_projects_join_coords_and_rule_inputs(self) -> None:
+        rule = TransformRule(
+            survey="ALLWISE",
+            source_column="w1mpro",
+            target_column="phot_ab_w1",
+            transform_steps=({"type": "mag_offset", "delta": 2.699},),
+            uncertainty_column="w1sigmpro",
+            target_uncertainty_column="phot_ab_w1_err",
+        )
+        cols = _homogenize_source_columns(
+            norder=5,
+            ra_col="ra",
+            dec_col="dec",
+            rules=[rule],
+            passthrough=["class"],
+        )
+        assert cols == [
+            LAKE_JOIN_ID_COLUMN,
+            "ra",
+            "dec",
+            "_healpix_norder5",
+            "class",
+            "w1mpro",
+            "w1sigmpro",
+        ]
 
 
 class TestHomogenizeCatalog:

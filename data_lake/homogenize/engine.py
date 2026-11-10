@@ -229,6 +229,35 @@ def _read_source_info(lake_root: Path, survey: str) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def _homogenize_source_columns(
+    *,
+    norder: int,
+    ra_col: str,
+    dec_col: str,
+    rules: Sequence[TransformRule],
+    passthrough: Sequence[str],
+) -> list[str]:
+    """Columns required from a native tile when ``keep_native`` is false."""
+    cols: list[str] = [
+        LAKE_JOIN_ID_COLUMN,
+        ra_col,
+        dec_col,
+        f"_healpix_norder{norder}",
+    ]
+    cols.extend(passthrough)
+    for rule in rules:
+        cols.append(rule.source_column)
+        if rule.uncertainty_column:
+            cols.append(rule.uncertainty_column)
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in cols:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
 def _homogenize_tile(
     npix: int,
     *,
@@ -250,7 +279,20 @@ def _homogenize_tile(
     if not tile_path.is_file():
         return 0, None, []
 
-    table = pq.read_table(tile_path)
+    if keep_native:
+        # Product re-homogenize keeps every native column.
+        table = pq.read_table(tile_path)
+    else:
+        available = set(pq.read_schema(tile_path).names)
+        want = _homogenize_source_columns(
+            norder=norder,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            rules=rules,
+            passthrough=passthrough,
+        )
+        columns = [c for c in want if c in available]
+        table = pq.read_table(tile_path, columns=columns)
     df = pl.from_arrow(table)
     if selection_ids is not None:
         if LAKE_JOIN_ID_COLUMN in df.columns:

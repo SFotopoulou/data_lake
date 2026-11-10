@@ -101,6 +101,29 @@ class TestReadIdsFile:
         pq.write_table(pa.table({"source_id": pa.array([10, 20, 30], type=pa.int64())}), p)
         assert read_ids_file(p) == [10, 20, 30]
 
+    def test_parquet_projects_id_column_only(self, tmp_path: Path, monkeypatch) -> None:
+        p = tmp_path / "wide.parquet"
+        pq.write_table(
+            pa.table({
+                "noise": pa.array(["a", "b"], type=pa.string()),
+                "_source_id": pa.array([7, 8], type=pa.int64()),
+                "mag": pa.array([1.0, 2.0]),
+            }),
+            p,
+        )
+        import pyarrow.parquet as pq_mod
+
+        real_read = pq_mod.read_table
+        seen: list[list[str] | None] = []
+
+        def _spy(path, *args, **kwargs):
+            seen.append(kwargs.get("columns"))
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(pq_mod, "read_table", _spy)
+        assert read_ids_file(p) == [7, 8]
+        assert seen and seen[-1] == ["_source_id"]
+
     def test_csv_explicit_col(self, tmp_path: Path) -> None:
         p = tmp_path / "ids.csv"
         p.write_text("name,sid\na,1\nb,2\n")
