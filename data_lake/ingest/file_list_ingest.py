@@ -31,7 +31,11 @@ def _load_completed(checkpoint: Path) -> set[str]:
         return set()
     try:
         data = json.loads(checkpoint.read_text())
-    except Exception:
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        log.warning(
+            "Ignoring unreadable checkpoint %s (%s); resume will reprocess files.",
+            checkpoint, exc,
+        )
         return set()
     out: set[str] = set()
     for item in data.get("completed", []):
@@ -49,8 +53,12 @@ def _append_checkpoint(checkpoint: Path, path_done: str) -> None:
     if checkpoint.exists():
         try:
             data = json.loads(checkpoint.read_text())
-        except Exception:
-            pass
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            log.warning(
+                "Checkpoint %s is unreadable (%s); rewriting from this path onward.",
+                checkpoint, exc,
+            )
+            data = {"completed": []}
     comp = [str(x) for x in data.get("completed", []) if x]
     if path_done not in comp:
         comp.append(path_done)

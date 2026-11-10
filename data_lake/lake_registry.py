@@ -124,8 +124,10 @@ def _zarr_tile_n_sources(tile_path: Path) -> int | None:
             shape = meta.get("shape")
             if shape:
                 return int(shape[0])
-        except Exception:
-            pass
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+            log.debug(
+                "Could not read Zarr array metadata at %s: %s", meta_path, exc,
+            )
     try:
         import zarr
 
@@ -181,6 +183,9 @@ def _parquet_tree_stats(survey_root: Path) -> tuple[int | None, int]:
         with ThreadPoolExecutor(max_workers=min(FOOTER_READ_THREADS, len(paths))) as pool:
             total = sum(pool.map(rows, paths))
     except Exception:
+        log.debug(
+            "Could not sum Parquet footers under %s", survey_root, exc_info=True,
+        )
         return None, len(paths)
     return total, len(paths)
 

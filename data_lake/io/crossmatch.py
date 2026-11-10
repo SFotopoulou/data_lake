@@ -707,7 +707,8 @@ def _sample_crossmatch_columns(xm_root: Path) -> list[str] | None:
     for path in sorted(xm_root.rglob("Npix=*.parquet")):
         try:
             return list(pq.read_schema(str(path)).names)
-        except Exception:
+        except Exception as exc:
+            log.debug("Skipping unreadable crossmatch tile schema %s: %s", path, exc)
             continue
     return None
 
@@ -1255,7 +1256,8 @@ def _catalog_ids_to_int64(values) -> np.ndarray:
                 casted = values.cast("Int64", strict=True)
                 return np.asarray(casted.to_numpy(), dtype=np.int64)
             except Exception:
-                pass  # fall through to slow path
+                # Non-decimal labels (or cast rejection) → per-element normalize.
+                pass
 
     arr = np.asarray(values)
     if arr.dtype == object or arr.dtype.kind in ("U", "S"):
@@ -1494,7 +1496,7 @@ def _close_worker_state() -> None:
             try:
                 acc.close()
             except Exception:
-                pass
+                log.debug("Ignoring error while closing crossmatch worker accessor", exc_info=True)
     _worker_state = None
 
 
@@ -1629,8 +1631,13 @@ def _pending_crossmatch_tiles(
             try:
                 n_match_rows += pq.read_metadata(str(out_file)).num_rows
                 n_tiles_written += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning(
+                    "Existing crossmatch tile %s is unreadable (%s); "
+                    "counting it as written but omitting its row count.",
+                    out_file, exc,
+                )
+                n_tiles_written += 1
             continue
         pending.append(npix_a)
     return pending, n_match_rows, n_tiles_written
@@ -2302,7 +2309,7 @@ class _BTileJoinCache:
     def _estimate_bytes(df: pl.DataFrame) -> int:
         try:
             return int(df.estimated_size())
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             return 0
 
     def get(self, npix_b: int) -> pl.DataFrame | None:
@@ -2385,6 +2392,11 @@ def _load_b_join_frames(
         try:
             df_raw = acc_b.sources_in_tile(npix_b, columns=cols_b, fmt="polars")
         except Exception:
+            log.debug(
+                "Survey-B tile npix=%s unavailable during column crossmatch; treating as empty",
+                npix_b,
+                exc_info=True,
+            )
             df_raw = pl.DataFrame()
         prepared = _prepare_b_join_frame(
             df_raw, id_col_b=id_col_b, match_col_b=match_col_b, hp_col_b=hp_col_b,
@@ -2452,6 +2464,11 @@ def _column_crossmatch_one_tile(
     try:
         df_a = acc_a.sources_in_tile(npix_a, columns=cols_a, fmt="polars")
     except Exception:
+        log.debug(
+            "Survey-A tile npix=%s unavailable during column crossmatch; skipping",
+            npix_a,
+            exc_info=True,
+        )
         return 0
     if df_a.is_empty():
         return 0
