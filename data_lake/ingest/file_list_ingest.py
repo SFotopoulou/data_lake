@@ -238,13 +238,6 @@ try:
     @fits_memmap_option
     @hdu_option
     @click.option(
-        "--log-file",
-        "log_file",
-        type=click.Path(path_type=Path),
-        default=None,
-        help="File for INFO+ logs (useful with --quiet for an audit trail).",
-    )
-    @click.option(
         "--heartbeat-interval",
         default=None,
         type=int,
@@ -444,13 +437,6 @@ try:
         help="Order file queue by parent directory when --n-workers > 1.",
     )
     @fits_memmap_option
-    @click.option(
-        "--log-file",
-        "log_file",
-        type=click.Path(path_type=Path),
-        default=None,
-        help="File for INFO+ logs (useful with --quiet for an audit trail).",
-    )
     @click.option(
         "--heartbeat-interval",
         default=None,
@@ -732,13 +718,6 @@ try:
         show_default=True,
         type=int,
         help="FITS files decoded per worker task (try 8–32 for many small spectra).",
-    )
-    @click.option(
-        "--log-file",
-        "log_file",
-        type=click.Path(path_type=Path),
-        default=None,
-        help="File for INFO+ logs (useful with --quiet for an audit trail).",
     )
     @click.option(
         "--heartbeat-interval",

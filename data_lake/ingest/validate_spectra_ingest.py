@@ -232,7 +232,10 @@ try:
         config_option,
         configure_cli_logging,
         load_optional_config,
+        logging_options,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
     from .validate_cli import (
         discover_spectra_ingest_surveys,
@@ -276,8 +279,7 @@ try:
         is_flag=True,
         help="Treat warnings (e.g. stale inflight, missing checkpoint files) as errors.",
     )
-    @click.option("-q", "--quiet", is_flag=True, default=False,
-                  help="Suppress INFO log messages.")
+    @logging_options
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -288,11 +290,17 @@ try:
         inflight: Path | None,
         max_tiles: int | None,
         strict: bool,
+        log_file: Path | None,
         quiet: bool,
+        verbose: bool,
     ) -> None:
         """Validate spectrum Zarr layout and ingest sidecars."""
-        import logging as _logging
-        configure_cli_logging(level=_logging.WARNING if quiet else _logging.INFO, quiet=quiet)
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="spectra")
 

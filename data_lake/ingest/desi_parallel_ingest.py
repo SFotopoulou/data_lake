@@ -1078,13 +1078,6 @@ try:
              "Default: <output>/spectra/<survey>/.ingest_failures.jsonl",
     )
     @click.option(
-        "--log-file", "log_file_path",
-        type=click.Path(path_type=Path), default=None,
-        help="File to receive INFO/DEBUG logs (terminal stays clean for the "
-             "progress bar).  "
-             "Default: <output>/spectra/<survey>/.ingest.log",
-    )
-    @click.option(
         "--link-id-col",
         default="TARGETID,SURVEY,PROGRAM",
         show_default=True,
@@ -1108,7 +1101,7 @@ try:
              "(skipped silently if no catalog exists for this survey).",
     )
     @progress_option
-    @logging_options
+    @logging_options(log_file_help='File to receive INFO/DEBUG logs (terminal stays clean for the progress bar).  Default: <output>/spectra/<survey>/.ingest.log')
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -1124,7 +1117,7 @@ try:
         norder: int | None,
         checkpoint_path: Path | None,
         failures_log: Path | None,
-        log_file_path: Path | None,
+        log_file: Path | None,
         link_id_col: str,
         on_duplicate: str,
         update_catalog: bool,
@@ -1181,15 +1174,15 @@ try:
             checkpoint_path = survey_root / ".ingest_checkpoint.json"
         if failures_log is None:
             failures_log = survey_root / ".ingest_failures.jsonl"
-        if log_file_path is None:
-            log_file_path = survey_root / ".ingest.log"
+        if log_file is None:
+            log_file = survey_root / ".ingest.log"
 
         validate_quiet_verbose(quiet, verbose)
-        configure_file_only_logging(log_file_path, verbose=verbose)
+        configure_file_only_logging(log_file, verbose=verbose)
 
         click.echo(
             f"Ingesting {len(paths)} coadd files into survey={survey_name!r} "
-            f"with {n_workers} workers.  Logs → {log_file_path}"
+            f"with {n_workers} workers.  Logs → {log_file}"
         )
         log.info("Ingesting %d coadd files into survey=%r with %d workers.",
                  len(paths), survey_name, n_workers)
@@ -1202,7 +1195,7 @@ try:
             norder=resolved_norder,
             checkpoint_path=checkpoint_path,
             failures_log=failures_log,
-            worker_log_file=log_file_path,
+            worker_log_file=log_file,
             worker_verbose=verbose,
             on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
             max_in_flight=max_in_flight,

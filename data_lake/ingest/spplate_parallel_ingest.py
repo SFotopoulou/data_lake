@@ -683,24 +683,13 @@ try:
         ),
     )
     @click.option(
-        "--log-file",
-        "log_file_path",
-        type=click.Path(path_type=Path),
-        default=None,
-        help=(
-            "File to receive INFO/DEBUG logs (terminal stays clean for the "
-            "progress bar).  "
-            "Default: <output>/spectra/<survey>/.ingest.log"
-        ),
-    )
-    @click.option(
         "--update-catalog/--no-update-catalog",
         default=True,
         show_default=True,
         help="Patch _spectrum_index in the Parquet catalog after ingest.",
     )
     @progress_option
-    @logging_options
+    @logging_options(log_file_help='File to receive INFO/DEBUG logs (terminal stays clean for the progress bar).  Default: <output>/spectra/<survey>/.ingest.log')
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -723,7 +712,7 @@ try:
         on_duplicate: str,
         checkpoint_path: Path | None,
         failures_log: Path | None,
-        log_file_path: Path | None,
+        log_file: Path | None,
         update_catalog: bool,
         show_progress: bool,
         quiet: bool,
@@ -780,11 +769,11 @@ try:
             checkpoint_path = survey_root / ".ingest_checkpoint.json"
         if failures_log is None:
             failures_log = survey_root / ".ingest_failures.jsonl"
-        if log_file_path is None:
-            log_file_path = survey_root / ".ingest.log"
+        if log_file is None:
+            log_file = survey_root / ".ingest.log"
 
         validate_quiet_verbose(quiet, verbose)
-        configure_file_only_logging(log_file_path, verbose=verbose)
+        configure_file_only_logging(log_file, verbose=verbose)
 
         id_mode = (
             "triplet hash PLATE|MJD|FIBERID"
@@ -794,7 +783,7 @@ try:
         click.echo(
             f"Ingesting {len(paths)} spPlate file(s) into survey={survey_name!r} "
             f"with {n_workers} workers.  ID mode: {id_mode}.  "
-            f"Logs → {log_file_path}"
+            f"Logs → {log_file}"
         )
 
         result = ingest_spplate_files_parallel(
@@ -812,7 +801,7 @@ try:
             specobj_id_layout=specobj_id_layout,
             checkpoint_path=checkpoint_path,
             failures_log=failures_log,
-            worker_log_file=log_file_path,
+            worker_log_file=log_file,
             worker_verbose=verbose,
             on_duplicate_source_id=on_duplicate,  # type: ignore[arg-type]
             on_length_mismatch=on_length_mismatch,

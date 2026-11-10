@@ -40,8 +40,12 @@ try:
 
     from ..cli_utils import (
         config_option,
+        configure_cli_logging,
         load_optional_config,
+        logging_options,
         progress_option,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
 
     @click.command("dl-extract-cutout-subset")
@@ -122,7 +126,7 @@ try:
     @click.option("--lake-root", default=None, type=click.Path(path_type=Path))
     @config_option
     @progress_option
-    @click.option("-v", "--verbose", is_flag=True)
+    @logging_options
     def cli(
         survey_name: str,
         target_list: Path | None,
@@ -140,6 +144,8 @@ try:
         lake_root: Path | None,
         config_path: Path | None,
         show_progress: bool,
+        log_file: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Export a curated cutout subset from the lake.
@@ -149,7 +155,12 @@ try:
         as TARGETID,SURVEY,PROGRAM (matched using the same hash as ingest),
         or a catalog --where predicate (mutually exclusive with --target-list).
         """
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
 
         cfg = load_optional_config(config_path)
         if lake_root is None:

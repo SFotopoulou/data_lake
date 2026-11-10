@@ -116,9 +116,35 @@ def create_mcp_app() -> Any:
 
 
 def main() -> None:
-    """Entry point for dl-mcp-docs."""
-    mcp = create_mcp_app()
-    mcp.run(transport="stdio")
+    """Entry point for dl-mcp-docs (Click wrapper with --log-file)."""
+    try:
+        import click
+    except ImportError as exc:  # pragma: no cover
+        raise SystemExit("dl-mcp-docs requires click") from exc
+
+    from pathlib import Path
+
+    from data_lake.cli_utils import (
+        configure_cli_logging,
+        logging_options,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
+
+    @click.command("dl-mcp-docs")
+    @logging_options
+    def _cli(log_file: Path | None, quiet: bool, verbose: bool) -> None:
+        """Start the documentation MCP server on stdio."""
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
+        mcp = create_mcp_app()
+        mcp.run(transport="stdio")
+
+    _cli()
 
 
 if __name__ == "__main__":

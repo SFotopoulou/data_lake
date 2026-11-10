@@ -739,7 +739,14 @@ def format_manifest_table(
 try:
     import click
 
-    from data_lake.cli_utils import config_option, load_optional_config
+    from data_lake.cli_utils import (
+        config_option,
+        configure_cli_logging,
+        load_optional_config,
+        logging_options,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
     from data_lake.config import LakeConfig
 
     @click.command("dl-describe-survey")
@@ -766,6 +773,7 @@ try:
         help="Regenerate schema_manifest.json from on-disk data before printing.",
     )
     @click.option("--json", "as_json", is_flag=True, help="Emit full manifest as JSON.")
+    @logging_options
     def cli(
         survey: str,
         output_root: Path | None,
@@ -775,8 +783,17 @@ try:
         modality: str,
         rebuild: bool,
         as_json: bool,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """List columns, types, and join keys for a survey layer."""
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         cfg = load_optional_config(config_path)
         if cfg is None and output_root is None:
             raise click.UsageError(

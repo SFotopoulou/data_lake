@@ -478,11 +478,13 @@ try:
     @logging_options
     def cli(
         path: Path | None, overwrite: bool, seed: int, n_sources: int,
-        quiet: bool, verbose: bool,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Build a small synthetic lake for tutorials (default PATH: ./_demo_lake)."""
         validate_quiet_verbose(quiet, verbose)
-        configure_cli_logging(level=resolve_log_level(quiet=quiet, verbose=verbose))
+        configure_cli_logging(level=resolve_log_level(quiet=quiet, verbose=verbose), log_file=log_file)
         scale = n_sources / DemoSizes.n_phot
         try:
             sizes = DemoSizes(

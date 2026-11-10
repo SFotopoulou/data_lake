@@ -1580,7 +1580,7 @@ def extract_catalog(
 
 import click
 
-from data_lake.cli_utils import config_option, load_optional_config, progress_option
+from data_lake.cli_utils import config_option, load_optional_config, progress_option, configure_cli_logging, logging_options, resolve_log_level, validate_quiet_verbose
 
 
 @click.command("dl-extract-catalog")
@@ -1716,7 +1716,7 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     help="Row batch size for --streaming FITS export.",
 )
 @progress_option
-@click.option("-v", "--verbose", is_flag=True)
+@logging_options
 def cli(
     paths: tuple[Path, ...],
     file_list: Path | None,
@@ -1743,6 +1743,8 @@ def cli(
     streaming: bool,
     batch_rows: int,
     show_progress: bool,
+    log_file: Path | None,
+    quiet: bool,
     verbose: bool,
     config_path: Path | None,
 ) -> None:
@@ -1751,7 +1753,12 @@ def cli(
     Pass --target-list to keep rows whose _source_id matches an external ID file
     (same resolution as dl-extract-spectra-subset). Mutually exclusive with --where.
     """
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+    validate_quiet_verbose(quiet, verbose)
+    configure_cli_logging(
+        level=resolve_log_level(quiet=quiet, verbose=verbose),
+        quiet=quiet,
+        log_file=log_file,
+    )
 
     all_paths: list[Path] = list(paths)
     if file_list is not None:

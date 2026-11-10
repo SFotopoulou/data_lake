@@ -371,6 +371,8 @@ def verify_manifest(
 try:
     import click
 
+    from data_lake.cli_utils import logging_options
+
     @click.command("dl-pack-tile")
     @click.argument("lake_root", type=click.Path(exists=True, path_type=Path))
     @click.argument("output_dir", type=click.Path(path_type=Path))
@@ -384,9 +386,7 @@ try:
     @click.option("--manifest", "write_manifest", is_flag=True, default=False,
                   help="(Re)generate MANIFEST.json after packing.")
     @click.option("--overwrite", is_flag=True)
-    @click.option("-v", "--verbose", is_flag=True)
-    @click.option("-q", "--quiet", is_flag=True, default=False,
-                  help="Suppress INFO messages on the terminal.")
+    @logging_options
     def cli(
         lake_root: Path,
         output_dir: Path,
@@ -397,16 +397,21 @@ try:
         include_spectra: bool,
         write_manifest: bool,
         overwrite: bool,
-        verbose: bool,
+        log_file: Path | None,
         quiet: bool,
+        verbose: bool,
     ) -> None:
         """Pack one or all tiles of LAKE_ROOT into OUTPUT_DIR as .tar archives."""
-        import logging as _logging
-        from data_lake.cli_utils import configure_cli_logging, validate_quiet_verbose
+        from data_lake.cli_utils import (
+            configure_cli_logging,
+            resolve_log_level,
+            validate_quiet_verbose,
+        )
         validate_quiet_verbose(quiet, verbose)
         configure_cli_logging(
-            level=_logging.DEBUG if verbose else (_logging.WARNING if quiet else _logging.INFO),
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
             quiet=quiet,
+            log_file=log_file,
         )
         if npix is not None:
             pack_tile(lake_root, norder, npix, list(surveys), output_dir,

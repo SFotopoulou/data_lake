@@ -343,7 +343,7 @@ def format_recommendation_report(rec: NorderRecommendation) -> str:
 try:
     import click
 
-    from data_lake.cli_utils import hdu_option
+    from data_lake.cli_utils import hdu_option, logging_options
 
     @click.command("dl-recommend-catalog-norder")
     @click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
@@ -375,9 +375,7 @@ try:
     )
     @click.option("--seed", default=0, show_default=True)
     @hdu_option
-    @click.option("-v", "--verbose", is_flag=True)
-    @click.option("-q", "--quiet", is_flag=True, default=False,
-                  help="Suppress INFO output (default is already WARNING for this tool).")
+    @logging_options
     def cli(
         paths: tuple[Path, ...],
         file_list: Path | None,
@@ -391,16 +389,19 @@ try:
         target_rows_per_tile: int,
         seed: int,
         fits_hdu: str | None,
-        verbose: bool,
+        log_file: Path | None,
         quiet: bool,
+        verbose: bool,
     ) -> None:
         """Quick FITS scan: suggest ``--norder`` before ``dl-ingest-catalog*``."""
         import logging as _logging
         from data_lake.cli_utils import configure_cli_logging, validate_quiet_verbose
         validate_quiet_verbose(quiet, verbose)
+        # Default terminal level is WARNING for this advisory tool; -v → DEBUG.
         configure_cli_logging(
             level=_logging.DEBUG if verbose else _logging.WARNING,
             quiet=False,
+            log_file=log_file,
         )
         rec = recommend_catalog_norder(
             paths,

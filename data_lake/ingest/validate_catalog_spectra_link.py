@@ -1069,8 +1069,11 @@ try:
         config_option,
         configure_cli_logging,
         load_optional_config,
+        logging_options,
         progress_option,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
     from .validate_cli import (
         discover_catalog_spectra_link_surveys,
@@ -1109,14 +1112,6 @@ try:
         help="Treat warnings (orphan Zarr, unpatched catalog) as errors.",
     )
     @click.option(
-        "-q",
-        "--quiet",
-        is_flag=True,
-        default=False,
-        help="Summary only: do not print per-row WARNING lines (use for surveys "
-             "with many orphan spectra). Counts still appear in the stats line.",
-    )
-    @click.option(
         "--n-workers",
         default=1,
         show_default=True,
@@ -1125,6 +1120,7 @@ try:
              "Default 1 (serial). Use cpu_count()-1 for large surveys.",
     )
     @progress_option
+    @logging_options
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -1136,16 +1132,22 @@ try:
         sample: int | None,
         seed: int,
         strict: bool,
-        quiet: bool,
         n_workers: int,
         show_progress: bool,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
-        """Verify catalog _spectrum_index matches spectrum Zarr _source_id tiles."""
-        import logging as _logging
+        """Verify catalog _spectrum_index matches spectrum Zarr _source_id tiles.
 
+        Use ``-q`` for summary-only output (suppresses per-row WARNING lines when
+        there are many orphan spectra). Counts still appear in the stats line.
+        """
+        validate_quiet_verbose(quiet, verbose)
         configure_cli_logging(
-            level=_logging.WARNING if quiet else _logging.INFO,
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
             quiet=quiet,
+            log_file=log_file,
         )
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="spectra")

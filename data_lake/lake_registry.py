@@ -1190,7 +1190,16 @@ try:
     import click
 
     from data_lake import __version__ as _package_version
-    from data_lake.cli_utils import config_option, load_optional_config
+    from data_lake.cli_utils import (
+        config_option,
+        configure_cli_logging,
+        load_optional_config,
+        log_file_option,
+        logging_options,
+        quiet_option,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
 
     def _resolve_lake_root(output_root: Path | None, config_path: Path | None) -> Path:
         cfg = load_optional_config(config_path)
@@ -1203,8 +1212,21 @@ try:
     @click.command("dl-refresh-lake-registry")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
-    def cli_refresh(output_root: Path | None, config_path: Path | None) -> None:
+    @logging_options
+    def cli_refresh(
+        output_root: Path | None,
+        config_path: Path | None,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
+    ) -> None:
         """Scan catalogs/spectra/cutouts and write shared/registry/surveys.parquet."""
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         lake_root = _resolve_lake_root(output_root, config_path)
         out = refresh_lake_registry(lake_root)
         click.echo(f"Wrote {out} ({pq.read_metadata(str(out)).num_rows} surveys/modalities)")
@@ -1257,6 +1279,8 @@ try:
         is_flag=True,
         help="Footer: catalog vs spectra hats_order per survey name.",
     )
+    @log_file_option
+    @quiet_option
     def cli_describe_lake(
         output_root: Path | None,
         config_path: Path | None,
@@ -1268,8 +1292,16 @@ try:
         as_json: bool,
         verbose: bool,
         pair_surveys: bool,
+        log_file: Path | None,
+        quiet: bool,
     ) -> None:
         """List surveys and modalities on disk (registry index)."""
+        # --verbose here means wide table output, not DEBUG logging.
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=False),
+            quiet=quiet,
+            log_file=log_file,
+        )
         lake_root = _resolve_lake_root(output_root, config_path)
         if refresh or not registry_path(lake_root).is_file():
             refresh_lake_registry(lake_root)
@@ -1317,6 +1349,7 @@ try:
         help="Primary survey name when guessing metadata.",
     )
     @click.option("--json", "as_json", is_flag=True, help="Emit master metadata as JSON.")
+    @logging_options
     def cli_describe_master(
         master_parquet: Path,
         output_root: Path | None,
@@ -1324,8 +1357,17 @@ try:
         write_meta: bool,
         primary_survey: str | None,
         as_json: bool,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Show master association columns mapped to per-survey catalog schemas."""
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         lake_root = _resolve_lake_root(output_root, config_path)
         meta = load_master_meta(master_parquet, lake_root, allow_guess=True)
         if primary_survey:

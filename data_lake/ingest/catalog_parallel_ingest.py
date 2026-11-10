@@ -678,13 +678,6 @@ try:
     )
     @fits_memmap_option
     @hdu_option
-    @click.option(
-        "--log-file",
-        "log_file",
-        type=click.Path(path_type=Path),
-        default=None,
-        help="File for INFO+ logs (useful with --quiet for an audit trail).",
-    )
     @logging_options
     def cli(
         paths_file: Path,

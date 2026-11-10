@@ -225,6 +225,36 @@ class TestValidateQuietVerbose:
         validate_quiet_verbose(quiet=False, verbose=False)
 
 
+class TestLoggingOptions:
+    def test_adds_log_file_quiet_verbose(self):
+        import click
+
+        from data_lake.cli_utils import logging_options
+
+        @click.command()
+        @logging_options
+        def cmd(log_file, quiet, verbose):
+            return log_file, quiet, verbose
+
+        opts = {o for p in cmd.params for o in (p.opts or [])}
+        assert "--log-file" in opts
+        assert "--quiet" in opts or "-q" in opts
+        assert "--verbose" in opts or "-v" in opts
+
+    def test_custom_log_file_help(self):
+        import click
+
+        from data_lake.cli_utils import logging_options
+
+        @click.command()
+        @logging_options(log_file_help="Custom help text for batch logs.")
+        def cmd(log_file, quiet, verbose):
+            return log_file
+
+        log_opt = next(p for p in cmd.params if "--log-file" in (p.opts or []))
+        assert "Custom help text" in (log_opt.help or "")
+
+
 class TestConfigureCliLogging:
     def test_quiet_suppresses_info_on_stderr(self, tmp_path):
         """In quiet mode, INFO records must not reach stderr."""

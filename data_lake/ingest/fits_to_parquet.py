@@ -4088,13 +4088,6 @@ try:
              "The column must not already exist in the source file.  All ingest "
              "runs for a given survey must use the same set of injected columns.",
     )
-    @click.option(
-        "--log-file",
-        "log_file",
-        type=click.Path(path_type=Path),
-        default=None,
-        help="File for INFO+ logs (useful with --quiet for an audit trail).",
-    )
     @logging_options
     def cli(
         source_path: Path,
@@ -4213,6 +4206,7 @@ try:
         ra_col: str,
         dec_col: str,
         norder: int | None,
+        log_file: Path | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -4223,6 +4217,7 @@ try:
             level=resolve_log_level(quiet=quiet, verbose=verbose,
                                     config_level=cfg.ingest.log_level if cfg else None),
             quiet=quiet,
+            log_file=log_file,
         )
         lake = require_output_root(output_root, cfg, kind="catalogs")
         n = pick(norder, cfg.partitioning.hats_order if cfg else None, 5)

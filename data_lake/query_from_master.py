@@ -315,7 +315,14 @@ def build_select_from_master(
 try:
     import click
 
-    from data_lake.cli_utils import config_option, load_optional_config
+    from data_lake.cli_utils import (
+        config_option,
+        configure_cli_logging,
+        load_optional_config,
+        logging_options,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
 
     @click.command("dl-build-query-from-master")
     @click.argument("master_parquet", type=click.Path(exists=True, path_type=Path))
@@ -343,6 +350,7 @@ try:
     )
     @click.option("--no-views", is_flag=True, help="Emit SELECT only (no CREATE VIEW DDL).")
     @click.option("--json", "as_json", is_flag=True, help="Emit plan as JSON.")
+    @logging_options
     def cli(
         master_parquet: Path,
         primary_survey: str,
@@ -354,8 +362,17 @@ try:
         master_columns: tuple[str, ...],
         no_views: bool,
         as_json: bool,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Print DuckDB SQL: want → master → catalogs from master.meta.json."""
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         cfg = load_optional_config(config_path)
         if cfg is None and output_root is None:
             raise click.UsageError(

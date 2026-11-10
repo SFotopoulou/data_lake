@@ -4047,13 +4047,6 @@ try:
              "(skipped silently if no catalog exists for this survey).",
     )
     @fits_memmap_option
-    @click.option(
-        "--log-file",
-        "log_file",
-        type=click.Path(path_type=Path),
-        default=None,
-        help="File for INFO+ logs (useful with --quiet for an audit trail).",
-    )
     @logging_options
     def cli(
         source_path: Path,

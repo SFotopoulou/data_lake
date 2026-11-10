@@ -3437,6 +3437,7 @@ try:
         b_cache_tiles: int,
         b_cache_mib: int,
         memory_budget_gb: float | None,
+        log_file: Path | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -3455,6 +3456,7 @@ try:
             level=resolve_log_level(quiet=quiet, verbose=verbose,
                                     config_level=cfg.ingest.log_level if cfg else None),
             quiet=quiet,
+            log_file=log_file,
         )
         if n_workers < 1:
             raise click.ClickException("--n-workers must be >= 1")
@@ -3696,6 +3698,7 @@ try:
         help="Recount total_rows / n_tiles from Parquet footers (slower, authoritative).",
     )
     @click.option("--json", "as_json", is_flag=True, help="Emit description as JSON.")
+    @logging_options
     def cli_describe_crossmatch(
         survey_a: str | None,
         survey_b: str | None,
@@ -3708,12 +3711,21 @@ try:
         match_col_b: str | None,
         recount: bool,
         as_json: bool,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """List or describe crossmatch trees (sky and column).
 
         With no survey args: list every tree under ``crossmatch/``.
         With SURVEY_A SURVEY_B (or ``--name`` / a tree dirname): show one tree.
         """
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         cfg = load_optional_config(config_path)
 
         def _is_tree_dirname(token: str) -> bool:

@@ -293,6 +293,13 @@ def extract_spplate_catalog(
 
 import click
 
+from data_lake.cli_utils import (
+    configure_cli_logging,
+    logging_options,
+    resolve_log_level,
+    validate_quiet_verbose,
+)
+
 
 @click.command("dl-extract-spplate-catalog")
 @click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
@@ -340,7 +347,7 @@ import click
     default=None,
     help="Maximum rows to write after --where (file order, no ORDER BY).",
 )
-@click.option("-v", "--verbose", is_flag=True)
+@logging_options
 def cli(
     paths: tuple[Path, ...],
     file_list: Path | None,
@@ -352,10 +359,17 @@ def cli(
     subtract_survey: str | None,
     where_sql: str | None,
     row_limit: int | None,
+    log_file: Path | None,
+    quiet: bool,
     verbose: bool,
 ) -> None:
     """Export ra/dec/plate/mjd/fiberid from spPlate PLUGMAP (HDU 5)."""
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+    validate_quiet_verbose(quiet, verbose)
+    configure_cli_logging(
+        level=resolve_log_level(quiet=quiet, verbose=verbose),
+        quiet=quiet,
+        log_file=log_file,
+    )
 
     all_paths: list[Path] = list(paths)
     if file_list is not None:

@@ -296,7 +296,13 @@ def format_summary_text(reports: Sequence[FitsTableFormatReport]) -> str:
 try:
     import click
 
-    from data_lake.cli_utils import hdu_option
+    from data_lake.cli_utils import (
+        configure_cli_logging,
+        hdu_option,
+        logging_options,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
 
     @click.command("dl-check-fits-table-format")
     @click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
@@ -314,14 +320,24 @@ try:
         help="Print aggregate counts when inspecting multiple files.",
     )
     @hdu_option
+    @logging_options
     def cli(
         paths: tuple[Path, ...],
         file_list: Path | None,
         as_json: bool,
         summary: bool,
         fits_hdu: str | None,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Report FITS BINTABLE layout (standard vs vector)."""
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         resolved = resolve_inspect_paths(paths, file_list=file_list)
         if not resolved:
             raise click.UsageError("Provide FITS path(s) and/or --file-list.")

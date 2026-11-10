@@ -70,6 +70,7 @@ def cli(
     rest_frame: bool,
     no_curves: bool,
     config_path: Path | None,
+    log_file: Path | None,
     quiet: bool,
     verbose: bool,
 ) -> None:
@@ -77,7 +78,7 @@ def cli(
     validate_quiet_verbose(quiet, verbose)
     import logging
     log_level = resolve_log_level(quiet=quiet, verbose=verbose)
-    configure_cli_logging(level=log_level, quiet=quiet)
+    configure_cli_logging(level=log_level, quiet=quiet, log_file=log_file)
     log = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------

@@ -80,6 +80,7 @@ def cli(
     linear_x: bool,
     clip_sigma: float,
     config_path: Path | None,
+    log_file: Path | None,
     quiet: bool,
     verbose: bool,
 ) -> None:
@@ -88,7 +89,7 @@ def cli(
     import logging
 
     log_level = resolve_log_level(quiet=quiet, verbose=verbose)
-    configure_cli_logging(level=log_level, quiet=quiet)
+    configure_cli_logging(level=log_level, quiet=quiet, log_file=log_file)
     log = logging.getLogger(__name__)
 
     cfg = load_optional_config(config_path)

@@ -754,6 +754,7 @@ try:
         lake_root: Path | None,
         config_path: Path | None,
         ingest_token: str | None,
+        log_file: Path | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -771,6 +772,7 @@ try:
             level=resolve_log_level(quiet=quiet, verbose=verbose,
                                     config_level=cfg.ingest.log_level if cfg else None),
             quiet=quiet,
+            log_file=log_file,
         )
         require_ingest_permission(cfg, ingest_token)
         resolved_root = require_output_root(lake_root, cfg)

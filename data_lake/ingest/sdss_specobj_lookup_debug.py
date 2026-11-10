@@ -17,7 +17,15 @@ from typing import Any, Literal
 import click
 from astropy.io import fits
 
-from data_lake.cli_utils import config_option, load_optional_config, require_output_root
+from data_lake.cli_utils import (
+    config_option,
+    configure_cli_logging,
+    load_optional_config,
+    logging_options,
+    require_output_root,
+    resolve_log_level,
+    validate_quiet_verbose,
+)
 from data_lake.ingest.sdss_specobj_lookup import (
     SpecObjIdLayout,
     build_fiber_to_source_id_from_triplet,
@@ -516,7 +524,7 @@ def format_debug_report(
 )
 @click.option("--sample", default=5, show_default=True, help="Sample mappings per mode.")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
-@click.option("-v", "--verbose", is_flag=True)
+@logging_options
 def cli(
     spplate: Path,
     survey_name: str,
@@ -531,10 +539,21 @@ def cli(
     link_id_col: str | None,
     sample: int,
     as_json: bool,
+    log_file: Path | None,
+    quiet: bool,
     verbose: bool,
 ) -> None:
     """Diagnose spPlate SPECOBJID lookup before ingest."""
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING)
+    validate_quiet_verbose(quiet, verbose)
+    configure_cli_logging(
+        level=resolve_log_level(
+            quiet=quiet,
+            verbose=verbose,
+            config_level=None if verbose or quiet else "WARNING",
+        ),
+        quiet=quiet,
+        log_file=log_file,
+    )
 
     catalog_root: Path | None = None
     if not no_catalog and output_root is not None:

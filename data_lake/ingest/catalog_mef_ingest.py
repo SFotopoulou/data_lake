@@ -118,13 +118,6 @@ try:
         help="Ignore checkpoint when deciding which files to run.",
     )
     @click.option(
-        "--log-file",
-        "log_file",
-        type=click.Path(path_type=Path),
-        default=None,
-        help="File for INFO+ logs (useful with --quiet for an audit trail).",
-    )
-    @click.option(
         "--heartbeat-interval",
         default=None,
         type=int,

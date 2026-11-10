@@ -160,6 +160,7 @@ try:
         export_moc: Path | None,
         moc_order: int | None,
         moc_format: str,
+        log_file: Path | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -183,6 +184,7 @@ try:
             level=resolve_log_level(quiet=quiet, verbose=verbose,
                                     config_level=cfg.ingest.log_level if cfg else None),
             quiet=quiet,
+            log_file=log_file,
         )
         lake = require_output_root(output_root, cfg)
 

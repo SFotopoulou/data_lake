@@ -295,7 +295,13 @@ def generate_cutout_fits(
 try:
     import click
 
-    from data_lake.cli_utils import progress_option
+    from data_lake.cli_utils import (
+        configure_cli_logging,
+        logging_options,
+        progress_option,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
 
     @click.command("dl-generate-cutout-fits")
     @click.argument("catalog_path", type=click.Path(exists=True, path_type=Path))
@@ -322,7 +328,7 @@ try:
     @click.option("--max-sources", default=None, type=int)
     @click.option("--skip-existing", is_flag=True)
     @progress_option
-    @click.option("-v", "--verbose", is_flag=True)
+    @logging_options
     def cli(
         catalog_path: Path,
         output_dir: Path,
@@ -341,10 +347,17 @@ try:
         max_sources: int | None,
         skip_existing: bool,
         show_progress: bool,
+        log_file: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Cut stamps from band images into per-source FITS for lake ingest."""
-        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         image_list = _parse_image_paths([images] if images else None, images_file)
         bn = [x.strip() for x in band_names.split(",") if x.strip()] if band_names else None
         if bn is not None and len(bn) != len(image_list):

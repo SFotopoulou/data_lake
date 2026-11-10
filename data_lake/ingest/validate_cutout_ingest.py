@@ -164,8 +164,12 @@ try:
 
     from ..cli_utils import (
         config_option,
+        configure_cli_logging,
         load_optional_config,
+        logging_options,
         require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
     from .validate_cli import (
         discover_cutout_ingest_surveys,
@@ -189,6 +193,7 @@ try:
     @click.option("--inflight", type=click.Path(path_type=Path), default=None)
     @click.option("--max-tiles", type=int, default=None)
     @click.option("--strict", is_flag=True)
+    @logging_options
     def cli(
         output_root: Path | None,
         config_path: Path | None,
@@ -199,8 +204,17 @@ try:
         inflight: Path | None,
         max_tiles: int | None,
         strict: bool,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Validate cutout Zarr layout and ingest sidecars."""
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         cfg = load_optional_config(config_path)
         lake = require_output_root(output_root, cfg, kind="cutouts")
 

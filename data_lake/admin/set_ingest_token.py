@@ -10,7 +10,15 @@ from pathlib import Path
 
 import click
 
-from ..cli_utils import INGEST_TOKEN_ENV, config_option, write_ingest_token_hash
+from ..cli_utils import (
+    INGEST_TOKEN_ENV,
+    config_option,
+    configure_cli_logging,
+    logging_options,
+    resolve_log_level,
+    validate_quiet_verbose,
+    write_ingest_token_hash,
+)
 from ..config import CONFIG_FILENAME, LakeConfig, LakeConfigNotFound
 
 _INGEST_HASH_GITIGNORE_LINE = ".ingest_token_hash"
@@ -73,8 +81,21 @@ def set_ingest_token(
     help="Ingest guard token (hashed to .ingest_token_hash; also reads "
          f"${INGEST_TOKEN_ENV}).",
 )
-def dl_set_ingest_token(config_path: Path | None, ingest_token: str) -> None:
+@logging_options
+def dl_set_ingest_token(
+    config_path: Path | None,
+    ingest_token: str,
+    log_file: Path | None,
+    quiet: bool,
+    verbose: bool,
+) -> None:
     """Set or rotate the ingest operator token on an existing deployment."""
+    validate_quiet_verbose(quiet, verbose)
+    configure_cli_logging(
+        level=resolve_log_level(quiet=quiet, verbose=verbose),
+        quiet=quiet,
+        log_file=log_file,
+    )
     try:
         deployment = set_ingest_token(ingest_token, config_path=config_path)
     except LakeConfigNotFound as exc:

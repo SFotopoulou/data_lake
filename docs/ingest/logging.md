@@ -15,10 +15,13 @@ dl-ingest-spectra-from-list gama.txt /data/lake \
 
 ## Verbosity levels
 
-Most `dl-*` commands log at INFO to stderr by default. Two exceptions: the DESI and spPlate
+Every `dl-*` command accepts `--log-file` (plus `-q`/`--quiet` and, where it does not
+clash with a product flag, `-v`/`--verbose`) via the shared `logging_options` helper.
+Most commands log at INFO to stderr by default. Two exceptions: the DESI and spPlate
 batch commands write logs only to a file (see
 [Parallel worker logs](#parallel-worker-logs)), and `dl-recommend-catalog-norder` defaults
-to WARNING.
+to WARNING. `dl-describe-lake` keeps `--verbose` for the wide table layout and uses
+`-q`/`--log-file` for logging only.
 
 | Mode | Flags | Terminal (stderr) | Optional `--log-file` |
 |------|-------|-------------------|------------------------|

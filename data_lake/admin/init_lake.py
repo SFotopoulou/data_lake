@@ -32,7 +32,14 @@ from pathlib import Path
 
 import click
 
-from ..cli_utils import INGEST_TOKEN_ENV, write_ingest_token_hash
+from ..cli_utils import (
+    INGEST_TOKEN_ENV,
+    configure_cli_logging,
+    logging_options,
+    resolve_log_level,
+    validate_quiet_verbose,
+    write_ingest_token_hash,
+)
 from ..config import (
     SCHEMA_VERSION,
     LakeConfig,
@@ -272,6 +279,7 @@ def init_lake(
     envvar=INGEST_TOKEN_ENV,
     help="Ingest operator token (written as .ingest_token_hash; hash only on disk).",
 )
+@logging_options
 def dl_init(
     name: str,
     parent: Path,
@@ -286,8 +294,17 @@ def dl_init(
     log_level: str,
     force: bool,
     ingest_token: str,
+    log_file: Path | None,
+    quiet: bool,
+    verbose: bool,
 ) -> None:
     """Bootstrap a new data lake deployment at PARENT/NAME."""
+    validate_quiet_verbose(quiet, verbose)
+    configure_cli_logging(
+        level=resolve_log_level(quiet=quiet, verbose=verbose, config_level=log_level),
+        quiet=quiet,
+        log_file=log_file,
+    )
     # 'num_workers' is a string from the CLI; coerce to int when possible.
     nw: int | str
     if num_workers.lower() == "auto":

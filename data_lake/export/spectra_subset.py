@@ -172,8 +172,12 @@ try:
 
     from ..cli_utils import (
         config_option,
+        configure_cli_logging,
         load_optional_config,
+        logging_options,
         progress_option,
+        resolve_log_level,
+        validate_quiet_verbose,
     )
     from data_lake.knobs import DEFAULT_CHUNKS_PER_SHARD, DEFAULT_FITS_CHUNK_ROWS
 
@@ -294,7 +298,7 @@ try:
         help="Do not write *.calibration.json beside the output.",
     )
     @progress_option
-    @click.option("-v", "--verbose", is_flag=True)
+    @logging_options
     def cli(
         survey_name: str,
         target_list: Path | None,
@@ -319,16 +323,19 @@ try:
         apply_survey_calibration: bool,
         no_calibration_sidecar: bool,
         show_progress: bool,
+        log_file: Path | None,
+        quiet: bool,
         verbose: bool,
     ) -> None:
         """Extract a curated subset of spectra (Zarr, Parquet, HDF5, or FITS).
 
         Pass --target-list or --where (catalog predicate), not both.
         """
-        logging.basicConfig(
-            level=logging.DEBUG if verbose else logging.INFO,
-            format="[%(asctime)s] %(name)-22s %(levelname)-7s %(message)s",
-            datefmt="%H:%M:%S",
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
         )
 
         fmt: SubsetFormat = output_format.lower()  # type: ignore[assignment]

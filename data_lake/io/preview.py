@@ -198,7 +198,15 @@ def preview_sources(
 try:
     import click
 
-    from data_lake.cli_utils import config_option, load_optional_config, require_output_root
+    from data_lake.cli_utils import (
+        config_option,
+        configure_cli_logging,
+        load_optional_config,
+        logging_options,
+        require_output_root,
+        resolve_log_level,
+        validate_quiet_verbose,
+    )
 
     @click.command("dl-preview-sources")
     @click.argument("survey", type=str)
@@ -245,6 +253,7 @@ try:
         show_default=True,
         help="Stdout format when -o is omitted (table = aligned text).",
     )
+    @logging_options
     def cli(
         survey: str,
         lake_root: Path | None,
@@ -254,6 +263,9 @@ try:
         columns: tuple[str, ...],
         output: Path | None,
         out_format: str,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Peek at the first N sources from a survey modality.
 
@@ -262,6 +274,12 @@ try:
           dl-preview-sources DESI_DR1 --modality spectra -n 10
           dl-preview-sources DESI_DR1 -c _source_id -c TARGETID -c SURVEY -n 5
         """
+        validate_quiet_verbose(quiet, verbose)
+        configure_cli_logging(
+            level=resolve_log_level(quiet=quiet, verbose=verbose),
+            quiet=quiet,
+            log_file=log_file,
+        )
         cfg = load_optional_config(config_path)
         root = require_output_root(lake_root, cfg)
         col_list = list(columns) if columns else None

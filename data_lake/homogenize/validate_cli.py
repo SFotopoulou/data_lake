@@ -61,6 +61,7 @@ try:
         products: tuple[str, ...],
         strict: bool,
         ab_coverage: bool,
+        log_file: Path | None,
         quiet: bool,
         verbose: bool,
     ) -> None:
@@ -74,6 +75,7 @@ try:
                 config_level=cfg.ingest.log_level if cfg else None,
             ),
             quiet=quiet,
+            log_file=log_file,
         )
         lake = require_output_root(output_root, cfg) if (output_root or cfg) else None
         if products and lake is None:

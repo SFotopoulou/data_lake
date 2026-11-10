@@ -68,8 +68,16 @@ try:
     @click.group("dl-area")
     @click.argument("output_root", type=click.Path(path_type=Path), required=False)
     @config_option
+    @logging_options
     @click.pass_context
-    def cli(ctx: click.Context, output_root: Path | None, config_path: Path | None) -> None:
+    def cli(
+        ctx: click.Context,
+        output_root: Path | None,
+        config_path: Path | None,
+        log_file: Path | None,
+        quiet: bool,
+        verbose: bool,
+    ) -> None:
         """Manage ``areas/<id>.json`` definitions (crossmatch, gather, homogenize).
 
         Examples:
@@ -84,7 +92,17 @@ try:
                 --materialize-as euclid_north_native_v1
             dl-area import MyCone --from-file examples/areas/multi_survey_cone.example.json
         """
+        validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
+        configure_cli_logging(
+            level=resolve_log_level(
+                quiet=quiet,
+                verbose=verbose,
+                config_level=cfg.ingest.log_level if cfg else None,
+            ),
+            quiet=quiet,
+            log_file=log_file,
+        )
         ctx.ensure_object(dict)
         ctx.obj["lake"] = require_output_root(output_root, cfg)
         ctx.obj["cfg"] = cfg

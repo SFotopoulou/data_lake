@@ -493,22 +493,68 @@ def configure_file_only_logging(log_file: Path, *, verbose: bool) -> None:
     logging.basicConfig(level=level, handlers=[fh], force=True)
 
 
-def logging_options(f: F) -> F:
-    """Add ``-q`` / ``--quiet`` and ``-v`` / ``--verbose`` to a click command."""
-    f = click.option(
+_LOG_FILE_HELP = (
+    "Append log messages to this file. "
+    "With -q/--quiet the file still receives INFO (audit trail)."
+)
+
+
+def log_file_option(f: F | None = None, *, help: str | None = None) -> F | Callable[[F], F]:
+    """Add ``--log-file`` alone (for CLIs that already claim ``-v``/``--verbose``)."""
+
+    def decorator(fn: F) -> F:
+        return click.option(
+            "--log-file",
+            type=click.Path(path_type=Path, dir_okay=False),
+            default=None,
+            help=help or _LOG_FILE_HELP,
+        )(fn)
+
+    if f is not None:
+        return decorator(f)
+    return decorator
+
+
+def quiet_option(f: F) -> F:
+    """Add ``-q``/``--quiet`` alone."""
+    return click.option(
         "-q", "--quiet",
         is_flag=True,
         default=False,
         help="Only print warnings and errors on the terminal.  "
              "Use with --log-file to keep a full INFO audit trail.",
     )(f)
-    f = click.option(
-        "-v", "--verbose",
-        is_flag=True,
-        default=False,
-        help="Print DEBUG-level output (overrides -q).",
-    )(f)
-    return f
+
+
+def logging_options(
+    f: F | None = None,
+    *,
+    log_file_help: str | None = None,
+) -> F | Callable[[F], F]:
+    """Add ``--log-file``, ``-q``/``--quiet``, and ``-v``/``--verbose``.
+
+    Use as ``@logging_options`` or ``@logging_options(log_file_help="...")`` when a
+    command needs custom ``--log-file`` help (e.g. batch workers that default the
+    path under the survey root).
+
+    If the command already uses ``-v``/``--verbose`` for a non-logging meaning,
+    compose :func:`log_file_option` and :func:`quiet_option` instead.
+    """
+
+    def decorator(fn: F) -> F:
+        fn = log_file_option(help=log_file_help)(fn)
+        fn = quiet_option(fn)
+        fn = click.option(
+            "-v", "--verbose",
+            is_flag=True,
+            default=False,
+            help="Print DEBUG-level output (overrides -q).",
+        )(fn)
+        return fn
+
+    if f is not None:
+        return decorator(f)
+    return decorator
 
 
 def validate_quiet_verbose(quiet: bool, verbose: bool) -> None:
