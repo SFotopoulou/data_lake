@@ -111,6 +111,10 @@ Give exactly one selector:
 | `--ids FILE` | Explicit base source IDs from a Parquet or CSV file. |
 | `--where SQL` | A predicate over base columns, applied before the join. |
 
+`--where` / `--where-joined` are trusted-operator DuckDB predicates (see
+[security.md](../security.md)). Prefer `--ids` when the selection comes from an
+untrusted upstream.
+
 The selected tiles always bound which crossmatch and partner tiles are read, so
 ID and predicate selections stay tile-scoped rather than scanning whole trees.
 

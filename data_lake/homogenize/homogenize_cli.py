@@ -136,7 +136,10 @@ try:
         help="Use area region, or drive transform/output from homogenize block.",
     )
     @click.option("--ids", "ids_file", type=click.Path(path_type=Path), default=None)
-    @click.option("--where", default=None, help="Base-catalog SQL predicate.")
+    @click.option(
+        "--where", default=None,
+        help="Trusted-operator DuckDB predicate on the base catalog (see docs/security.md).",
+    )
     @click.option("--cone", nargs=2, type=float, default=None)
     @click.option("--radius-arcsec", type=float, default=None)
     @click.option("--bbox", nargs=4, type=float, default=None)

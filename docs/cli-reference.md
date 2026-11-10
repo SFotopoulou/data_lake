@@ -2,7 +2,7 @@
 
 Every `dl-*` command in one table. Pass `--help` to any command for full flag docs.
 
-All commands that read from or write to a lake honour `--config PATH` (or `$DATA_LAKE_CONFIG`) to supply the lake root and defaults without repeating flags.
+All commands that read from or write to a lake honour `--config PATH` (or `$DATA_LAKE_CONFIG`) to supply the lake root and defaults without repeating flags. Free-form DuckDB predicates (`--where`, `--where-joined`) are trusted-operator input; see [security.md](security.md).
 
 **Deploy**
 

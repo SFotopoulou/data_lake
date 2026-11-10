@@ -164,12 +164,23 @@ try:
         is_flag=True,
         help="Disable partner catalog tile cache.",
     )
-    @click.option("--where-joined", "where_joined", default=None,
-                  help="Predicate over partner columns, applied after the join.")
+    @click.option(
+        "--where-joined", "where_joined", default=None,
+        help=(
+            "Trusted-operator DuckDB predicate over partner columns, "
+            "applied after the join (see docs/security.md)."
+        ),
+    )
     # selection selectors
     @click.option("--ids", "ids_file", type=click.Path(path_type=Path), default=None,
                   help="Base source-ids from a Parquet/CSV file.")
-    @click.option("--where", default=None, help="Base-catalog predicate (base columns only).")
+    @click.option(
+        "--where", default=None,
+        help=(
+            "Trusted-operator DuckDB predicate on base columns only "
+            "(see docs/security.md)."
+        ),
+    )
     @click.option("--cone", nargs=2, type=float, default=None, help="Cone centre RA DEC (deg).")
     @click.option("--radius-arcsec", type=float, default=None, help="Cone radius (arcsec).")
     @click.option("--bbox", nargs=4, type=float, default=None,

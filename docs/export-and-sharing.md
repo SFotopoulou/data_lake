@@ -100,8 +100,10 @@ catalog were ingested. DESI coadds ingested with the default composite key need
 `TARGETID,SURVEY,PROGRAM`, not `TARGETID` alone.
 
 Instead of an ID list, you can filter the ingested catalog with `--where` and
-`--limit`. Rows without a stored spectrum (`_spectrum_index < 0`) are dropped
-automatically, so `--limit` counts spectra that can actually be read:
+`--limit`. `--where` is a DuckDB predicate for **trusted operators** (do not
+pass untrusted input; see [security.md](security.md)). Rows without a stored
+spectrum (`_spectrum_index < 0`) are dropped automatically, so `--limit` counts
+spectra that can actually be read:
 
 ```bash
 dl-extract-spectra-subset \

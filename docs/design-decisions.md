@@ -69,3 +69,9 @@ Parquet handles adding and dropping columns natively. Schema changes follow thes
 | Breaking structural change | Bump `schema_version` in `catalog_info.json`; write a new directory `<survey>_v2/` |
 
 `schema_version` in `catalog_info.json` is stored as a string holding an integer, starting at `"1"`.
+
+## Trust boundaries
+
+Free-form DuckDB predicates (`--where`, `--where-joined`) and path-built view
+DDL are trusted-operator inputs for HPC/lab deployments, not a multi-tenant SQL
+API. Details: [security.md](security.md).

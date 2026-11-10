@@ -89,7 +89,9 @@ Neither server ingests, modifies or deletes survey data. They never:
 - Execute SQL (`build_query` returns the SQL as text)
 - Run shell commands
 
-Use the `dl-*` CLIs for all writes.
+Use the `dl-*` CLIs for all writes. Free-form DuckDB predicates on those CLIs
+(`--where`, `--where-joined`) are trusted-operator input; see
+[security.md](security.md).
 
 A few calls do write lake metadata files when they are missing or when the agent asks for a rebuild:
 

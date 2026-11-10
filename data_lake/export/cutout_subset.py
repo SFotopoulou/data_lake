@@ -64,6 +64,7 @@ try:
         help=(
             "DuckDB boolean expression over the survey catalog "
             "(e.g. \"upper(trim(SPECTYPE)) = 'STAR'\"). "
+            "Trusted-operator input only (see docs/security.md). "
             "Mutually exclusive with --target-list."
         ),
     )

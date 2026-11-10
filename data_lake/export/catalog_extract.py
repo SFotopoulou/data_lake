@@ -1688,6 +1688,7 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     help=(
         "DuckDB boolean expression over catalog columns "
         "(lake or raw files). "
+        "Trusted-operator input only (see docs/security.md). "
         "Example: \"upper(trim(SPECTYPE)) = 'STAR'\"."
     ),
 )
