@@ -1272,7 +1272,11 @@ try:
     @click.option(
         "--verbose",
         is_flag=True,
-        help="Wide table: path, tiles, ingest sidecars, link_id_mode, WCS summary, …",
+        help=(
+            "Wide table columns (path, tiles, ingest sidecars, link_id_mode, "
+            "WCS summary, …). This is not DEBUG logging — this command has no "
+            "-v log flag; use -q/--log-file for logging only."
+        ),
     )
     @click.option(
         "--pair-surveys",

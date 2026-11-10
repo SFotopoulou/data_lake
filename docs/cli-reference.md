@@ -69,7 +69,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--kind ingested\|product\|crossmatch`, `--areas`, `--refresh`, `--verbose`, `--pair-surveys` |
+| `dl-describe-lake` | Print survey × modality summary from registry; `--count-total`, `--modality`, `--kind ingested\|product\|crossmatch`, `--areas`, `--refresh`, `--verbose` (wide table, not DEBUG), `--pair-surveys`; logging via `-q`/`--log-file` only |
 | `dl-describe-survey` | Column manifest for one survey layer; `--modality`, `--role`, `--rebuild` |
 | `dl-describe-crossmatch` | List or describe crossmatch trees (sky + column); `--name`, `--radius-arcsec`, `--match-mode column --match-col-a/b`, `--recount`, `--json` ([docs](discovery/crossmatch.md)) |
 | `dl-preview-sources` | Peek first N sources from a modality (`catalog` / `spectra` / `cutouts`); `-n`, `-c COL`, `-o`, `--format` |

@@ -20,8 +20,7 @@ clash with a product flag, `-v`/`--verbose`) via the shared `logging_options` he
 Most commands log at INFO to stderr by default. Two exceptions: the DESI and spPlate
 batch commands write logs only to a file (see
 [Parallel worker logs](#parallel-worker-logs)), and `dl-recommend-catalog-norder` defaults
-to WARNING. `dl-describe-lake` keeps `--verbose` for the wide table layout and uses
-`-q`/`--log-file` for logging only.
+to WARNING.
 
 | Mode | Flags | Terminal (stderr) | Optional `--log-file` |
 |------|-------|-------------------|------------------------|
@@ -32,6 +31,13 @@ to WARNING. `dl-describe-lake` keeps `--verbose` for the wide table layout and u
 `-q` and `-v` are mutually exclusive; passing both is an error. The heartbeat appears only
 on the commands listed under [Heartbeat summaries](#heartbeat-summaries). The tqdm progress
 bar is separate from logging; turn it off with `--no-progress` where the command offers it.
+
+### `dl-describe-lake --verbose` is not DEBUG logging
+
+On most CLIs, `-v` / `--verbose` means DEBUG log level. **`dl-describe-lake` is different:**
+`--verbose` only widens the printed registry table (extra columns such as path, tile
+counts, ingest sidecars). That command does **not** expose a logging `-v`; use `-q` /
+`--log-file` for logging control. See [Lake registry](../discovery/registry.md).
 
 The terminal level is resolved in this order: the `-q` / `-v` flag, then `log_level` in the
 `[ingest]` section of `lake_config.toml`, then INFO.

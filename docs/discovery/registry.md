@@ -27,12 +27,17 @@ dl-describe-lake --count-total            # footer with per-modality totals and 
 dl-describe-lake --modality catalog --count-total
 dl-describe-lake --pair-surveys           # footer: catalog vs spectra hats_order per survey
 dl-describe-lake --areas                  # append the list of saved areas
-dl-describe-lake --verbose                # wide table: path, tiles, ingest sidecars, meta fields, …
+dl-describe-lake --verbose                # wide table columns (not DEBUG logging)
 dl-describe-lake --refresh                # rebuild the registry from disk first, then print
 dl-describe-lake --json                   # {"entries": [...]}, one per survey × modality
 dl-describe-lake --json --count-total     # adds a "summary" object
 dl-describe-lake --json --pair-surveys    # adds a "pairing" object
+dl-describe-lake -q --log-file describe.log   # quiet stderr; file gets INFO (no -v log flag)
 ```
+
+`--verbose` on this command means **extra table columns** (path, tiles, ingest sidecars,
+meta fields, …). It does **not** turn on DEBUG logging. Unlike most `dl-*` tools, there is
+no `-v` log switch here; use `-q` / `--log-file` only (see [Logging](../ingest/logging.md)).
 
 For crossmatch trees specifically:
 
