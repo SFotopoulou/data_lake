@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-10
+
 ### Added
 
+- **`--log-file` on all `dl-*` helpers** — unified logging setup via `cli_utils`; pair with `-v`/`-q` for file-backed operator runs.
+- **`docs/security.md`** — trusted-operator boundary for DuckDB `--where` / SQL and related CLI surfaces.
+- **`data_lake.mp_context.safe_mp_context`** — shared `forkserver`/`spawn` context for `ProcessPoolExecutor` sites outside crossmatch (ingest pools and similar).
+- **Lake-wide `knobs`** — central defaults for caches, DuckDB limits, and related tunables (`knobs.CATALOG_PARQUET_METADATA_CACHE` and peers).
 - **`--where` / `--limit` on all `dl-extract-*` commands** — `dl-extract-catalog` (lake or raw files), `dl-extract-spectra-subset`, `dl-extract-cutout-subset`, and `dl-extract-spplate-catalog` accept a DuckDB boolean expression over catalog/plugmap columns and an optional row cap (input/tile order, no `ORDER BY`). Spectra/cutouts take `--target-list` or `--where`, not both; `--limit` also truncates a target list. Rows with `_spectrum_index` / `_cutout_index` `< 0` are dropped so the limit counts objects that can be read.
 - **`dl-ingest-catalog-mef`** — horizontal join of row-aligned FITS table extensions that share columns (FastSpec-style `METADATA` + `SPECPHOT` + `FASTSPEC`, and any similar MEF). Shared keys are kept from the first HDU; remaining columns are appended. One file or `--file-list` (sequential, default `--tile-mode append`). Provenance is `fits_hdu: "join:EXT+EXT+…"`. `--hdu all` remains the vertical stack for identical schemas.
 - **`scripts/flatten_fits_mef.py`** — same join, written to Parquet (one file, several paths, or `--file-list`). Use when you want a flat table without ingesting.
@@ -48,12 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`dl-ingest-cutouts-from-list --n-workers > 1` failed after ingest** — the catalog patch step called `update_index_column` with arguments it does not accept (`TypeError`). It now rebuilds `_cutout_index` from the written Zarr tiles, like the parallel spectrum path.
 - **`CatalogAccessor.get_sources_by_id` built one literal `IN (...)` list** — large ID lists are now semi-joined in chunks of `batch_size` (default 1,000,000), like the other ID lookups; an empty list returns an empty result instead of a SQL error.
 - **Help-text fixes** — `lake_health` (MCP) now suggests `dl-refresh-lake-registry` (there is no `dl-refresh-tile-index`); `dl-area set-gather --materialize-as` says products go under `products/`.
+- **Parquet ID / homogenize loads projected columns** — homogenize engine and discovery selection no longer read full tile schemas when only a few columns are needed.
+- **Preview, plot, and subset CLIs close accessors** — `CatalogAccessor` (and peers) use `with` / `close` so DuckDB connections do not leak across CLI invocations.
+- **Silent exception swallows logged at DEBUG** — hot-path `except Exception: pass` sites in crossmatch, file-list, and lake-registry paths now record the failure.
 
 ### Changed
 
 - **Documentation aligned with the code** — every page in `docs/` was checked against the current commands, flags and defaults and reorganised so that it opens with what the page is for and a working example. Corrected examples that failed (`--overwrite` → `--tile-mode overwrite`, missing `--link-id-col`, `--link-id-mode` → `--link-id-col`, generated-cutout ingest IDs) and wrong defaults (`dl-ingest-catalog --tile-mode` is `skip`). Removed the stale "mega-strip" crossmatch description and fixed broken anchors and the dead sprint link. New material covers `_common_metadata`, the catalog footer cache, `locate()` / `get_*_at()`, cost-balanced crossmatch strips, ML construction-time ID resolve, and the `dl-gather` partner tile cache. README / quickstart / troubleshooting / notebooks index / validate-and-repair point newcomers at these paths; prefer `uv run --extra dev python -m pytest`.
 - **Catalog-then-modalities examples** — docs and notebooks (`02`, `03`, `14`) show `dl-extract-catalog --survey` then spectra/cutouts via `_source_id` or a positional partner match (`source_id_b`).
 - **Streaming catalog ingest reads the same table HDU as the in-memory path** — previously `--streaming` took the first `BINTABLE` while the in-memory reader took the first table HDU of any kind (including ASCII tables); both now use the shared selector.
+- **Thin Click CLI modules** — catalog ingest, spectra ingest, and crossmatch entry points live in `*_cli.py` with lazy re-exports from the library modules.
+- **`scripts/` helpers use Click** — argparse CLIs under `scripts/` migrated to Click for consistent `--help` / logging flags.
+- **`dl-describe-lake --verbose` vs logging `-v`** — docs and help distinguish lake-content verbosity from log level.
+- **ML sampler guidance** — docs and notebook `02` prefer `TileSequentialSampler`; notebook `11` no longer hardcodes `/data/lake`.
 
 ## [0.7.0] - 2026-10-23
 
@@ -286,7 +299,8 @@ Upgrade notes (breaking changes, details under **Changed**):
 - Multi-survey catalog (Parquet/HATS), cutout, and 1-D spectrum (Zarr v3) ingest.
 - Lake registry, crossmatch, validation, and export tooling.
 
-[Unreleased]: https://github.com/SFotopoulou/data_lake/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/SFotopoulou/data_lake/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/SFotopoulou/data_lake/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/SFotopoulou/data_lake/compare/v0.6.0...v0.7.0
 [0.4.1]: https://github.com/SFotopoulou/data_lake/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/SFotopoulou/data_lake/compare/v0.3.0...v0.4.0
