@@ -260,7 +260,13 @@ def ingest_spectra_files_parallel(
         from data_lake.cli_utils import init_parallel_ingest_subprocess as _init
 
         def _default_executor(nw: int) -> Executor:
-            return ProcessPoolExecutor(max_workers=nw, initializer=_init)
+            from data_lake.mp_context import safe_mp_context
+
+            return ProcessPoolExecutor(
+                max_workers=nw,
+                mp_context=safe_mp_context(),
+                initializer=_init,
+            )
 
         executor_factory = _default_executor
 

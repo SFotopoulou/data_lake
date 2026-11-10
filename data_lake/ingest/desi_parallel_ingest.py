@@ -723,7 +723,13 @@ def ingest_spectra_parallel(
         def _default_executor(nw: int) -> Executor:
             # initializer runs once in each worker process — filter state
             # does not propagate from the parent, so set it up there too.
-            return ProcessPoolExecutor(max_workers=nw, initializer=_init)
+            from data_lake.mp_context import safe_mp_context
+
+            return ProcessPoolExecutor(
+                max_workers=nw,
+                mp_context=safe_mp_context(),
+                initializer=_init,
+            )
 
         executor_factory = _default_executor
 

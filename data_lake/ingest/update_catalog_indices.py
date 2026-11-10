@@ -352,8 +352,11 @@ def _patch_all_catalog_tiles(
                 pass
 
         n_modified = 0
+        from data_lake.mp_context import safe_mp_context
+
         with ProcessPoolExecutor(
             max_workers=n_workers,
+            mp_context=safe_mp_context(),
             initializer=_init_catalog_patch_worker,
             initargs=(index_map, sid_col, index_col, npix_col),
         ) as pool:

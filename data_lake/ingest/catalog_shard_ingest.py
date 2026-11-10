@@ -365,6 +365,18 @@ _WORKER_KILLED = (
 )
 
 
+def _new_task_pool(n_workers: int) -> ProcessPoolExecutor:
+    """Process pool that never forks the current (possibly multi-threaded) parent."""
+    from data_lake.cli_utils import configure_warning_filters
+    from data_lake.mp_context import safe_mp_context
+
+    return ProcessPoolExecutor(
+        max_workers=n_workers,
+        mp_context=safe_mp_context(),
+        initializer=configure_warning_filters,
+    )
+
+
 def _run_tasks(
     fn: Callable[..., Any],
     items: Iterable[tuple[Any, tuple]],
@@ -394,7 +406,7 @@ def _run_tasks(
     todo: deque[tuple[Any, tuple]] = deque(items)
     # Tasks that were in flight when a worker died. Run one at a time.
     isolate: deque[tuple[Any, tuple]] = deque()
-    pool = ProcessPoolExecutor(max_workers=n_workers)
+    pool = _new_task_pool(n_workers)
     in_flight: dict[Future, tuple[Any, tuple]] = {}
 
     def _shutdown(executor: ProcessPoolExecutor) -> None:
@@ -423,7 +435,7 @@ def _run_tasks(
                         "Process pool broke on every submit. " + _WORKER_KILLED
                     ) from None
                 _shutdown(pool)
-                pool = ProcessPoolExecutor(max_workers=n_workers)
+                pool = _new_task_pool(n_workers)
                 continue
             submit_breaks = 0
             in_flight[fut] = (key, args)
@@ -433,7 +445,7 @@ def _run_tasks(
         lost = list(in_flight.values())
         in_flight.clear()
         _shutdown(pool)
-        pool = ProcessPoolExecutor(max_workers=n_workers)
+        pool = _new_task_pool(n_workers)
         if len(lost) == 1:
             key, _args = lost[0]
             log.error("Worker died on %s. %s", key, _WORKER_KILLED)

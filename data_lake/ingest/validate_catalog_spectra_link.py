@@ -975,8 +975,11 @@ def _run_parallel(
         except ImportError:
             pass
 
+    from data_lake.mp_context import safe_mp_context
+
     with ProcessPoolExecutor(
         max_workers=n_workers,
+        mp_context=safe_mp_context(),
         initializer=init_fn,
         initargs=init_args,
     ) as pool:

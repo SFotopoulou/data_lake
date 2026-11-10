@@ -1449,13 +1449,9 @@ def _crossmatch_mp_context():
     crossmatch, cost estimation, a library caller); forking a multi-threaded
     process can deadlock the child on locks held by those threads.
     """
-    import multiprocessing as mp
+    from data_lake.mp_context import safe_mp_context
 
-    if "forkserver" in mp.get_all_start_methods():
-        ctx = mp.get_context("forkserver")
-        ctx.set_forkserver_preload(["data_lake.io.crossmatch"])
-        return ctx
-    return mp.get_context("spawn")
+    return safe_mp_context(preload=["data_lake.io.crossmatch"])
 
 
 def _init_crossmatch_worker(log_level: int) -> None:

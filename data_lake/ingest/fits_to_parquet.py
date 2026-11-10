@@ -3748,8 +3748,11 @@ def _ingest_catalog_streaming_parallel(
         log.info("No rows in %s; nothing to ingest.", source_path.name)
         return
 
+    from data_lake.mp_context import safe_mp_context
+
     pool = ProcessPoolExecutor(
         max_workers=min(streaming_parallel, len(configs)),
+        mp_context=safe_mp_context(),
         initializer=init_parallel_ingest_subprocess,
     )
     try:

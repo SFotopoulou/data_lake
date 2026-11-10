@@ -310,7 +310,13 @@ def ingest_cutouts_parallel(
         return batch
 
     try:
-        with ProcessPoolExecutor(max_workers=n_workers, initializer=init_parallel_ingest_subprocess) as pool:
+        from data_lake.mp_context import safe_mp_context
+
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=safe_mp_context(),
+            initializer=init_parallel_ingest_subprocess,
+        ) as pool:
             while work_queue or in_flight:
                 while len(in_flight) < max_in_flight and work_queue:
                     batch = _pop_batch()
