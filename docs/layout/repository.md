@@ -12,11 +12,13 @@ data_lake/
 
   ingest/                   Raw files → lake
     fits_to_parquet.py        Catalog → HATS Parquet tiles; finalize writes _common_metadata + _metadata
+    catalog_ingest_cli.py     dl-ingest-catalog / dl-finalize-catalog
     catalog_parallel_ingest.py  dl-ingest-catalog-batch (parallel decode, single writer)
     catalog_shard_ingest.py   dl-ingest-from-shard (map → per-tile parts, reduce → tiles)
     catalog_mef_ingest.py     dl-ingest-catalog-mef (row-aligned FITS extensions joined)
     fits_to_zarr.py           Cutout FITS → sharded Zarr v3
     fits_to_spectra_zarr.py   1-D spectrum FITS → sharded Zarr v3
+    spectra_ingest_cli.py     dl-ingest-spectra
     desi_parallel_ingest.py, spplate_parallel_ingest.py, spectra_parallel_ingest.py
                               Multi-process spectrum batch ingest
     update_catalog_indices.py Write _spectrum_index / _cutout_index back into catalog tiles
@@ -27,7 +29,8 @@ data_lake/
     catalog.py                CatalogAccessor: DuckDB over Parquet tiles (SQL, cone, ID lookups)
     cutouts.py, spectra.py    Zarr accessors; locate() resolves many IDs at once, get_*_at() reads by position
     id_lookup.py              _source_id → (tile, row) resolution shared by the accessors
-    crossmatch.py             dl-crossmatch: tiled sky / column matching
+    crossmatch.py             Tiled sky / column matching library
+    crossmatch_cli.py         dl-crossmatch / dl-describe-crossmatch
     crossmatch_matchers.py    Matcher backends (astropy on CPU, RAPIDS cuML on GPU)
     crossmatch_b_cache.py     Per-worker LRU of partner (B) tiles
     duckdb_limits.py          Per-connection DuckDB memory/thread caps and footer cache
