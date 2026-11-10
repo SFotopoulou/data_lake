@@ -1,12 +1,21 @@
 # Export and sharing
 
-### Catalog by survey name, then spectra / cutouts
+This page shows how to get data out of the lake: catalog rows, spectra and
+cutouts for a chosen set of sources, in Zarr, Parquet, HDF5 or FITS. It also
+covers backfilling the catalog index columns that make those extracts fast, and
+packing one sky tile to hand to a collaborator.
 
-`dl-extract-catalog --survey NAME` reads the ingested lake catalog (not a raw
-file). Keep `_source_id` in the extract: that is the join key for the same
-survey’s spectra and cutouts. For a **partner** survey, positional-match first
-(`dl-crossmatch` or STILTS) and extract with the partner’s `_source_id`
-(`source_id_b` in a match tree).
+## Catalog by survey name, then spectra / cutouts
+
+The usual workflow has two steps. First, pull the rows you want from the
+ingested catalog with `dl-extract-catalog --survey NAME` (this reads the lake,
+not a raw file). Second, pass that file to the spectrum or cutout extractor.
+
+Keep `_source_id` in the catalog extract: it is the join key between a survey's
+catalog, spectra and cutouts. To fetch spectra or cutouts from a *different*
+(partner) survey, positionally match the two catalogs first (`dl-crossmatch` or
+STILTS) and use the partner's `_source_id`, which is `source_id_b` in a
+crossmatch tree.
 
 ```bash
 # $DATA_LAKE_CONFIG supplies --lake-root when set
@@ -27,7 +36,7 @@ dl-extract-cutout-subset --survey DESI_DR1 \
   --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
   --output /scratch/desi_stars_cutouts.zarr
 
-# 2b. Partner survey — positional match, then that survey’s modalities
+# 2b. Partner survey — positional match, then that survey's modalities
 dl-extract-catalog --survey EUCLID_DR1 \
   -c _source_id -c ra -c dec -o /scratch/euclid_sky.parquet
 
@@ -53,23 +62,124 @@ dl-extract-spectra-subset --survey EUCLID_DR1 \
   --output /scratch/euclid_matched_spectra.zarr
 ```
 
-STILTS on the two catalog extracts (`tskymatch2` on `TARGET_RA`/`TARGET_DEC`
-vs `ra`/`dec`) is the same idea when you do not want an in-lake match tree —
-see [Crossmatch](discovery/crossmatch.md#associations-with-stilts).
+If you do not want an in-lake crossmatch tree, run STILTS `tskymatch2` on the two
+catalog extracts (`TARGET_RA`/`TARGET_DEC` against `ra`/`dec`) instead; see
+[Crossmatch](discovery/crossmatch.md#associations-with-stilts).
+
+Note the different `--target-id-col` defaults: `dl-extract-spectra-subset`
+defaults to `TARGETID` (a survey-native ID list), while
+`dl-extract-cutout-subset` defaults to `_source_id`. Pass the flag explicitly
+when in doubt.
 
 Worked notebooks: [`02_spectrum_workflow.ipynb`](../notebooks/02_spectrum_workflow.ipynb)
 §6, [`03_cutout_ingest.ipynb`](../notebooks/03_cutout_ingest.ipynb) §6b,
 [`14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb) §8.
 
-### Extract a curated subset into one flat Zarr
+## Extract a curated subset into one flat Zarr
 
-Once spectra are ingested, you can materialise a self-contained Zarr
-group containing only a user-specified subset of sources (e.g. 100k
-DESI targets out of a fully-ingested release). Reads are batched per
-HEALPix tile via Zarr orthogonal indexing so each source shard is
+Once spectra are ingested, `dl-extract-spectra-subset` writes a self-contained
+file containing only the sources you ask for (for example 100k DESI quasars
+out of a full release). Reads are grouped by HEALPix sky tile, and each tile is
+read with one Zarr orthogonal-indexing call, so every source shard is
 decompressed at most once.
 
-Python API:
+### Command line
+
+```bash
+# Default output: one flat Zarr group
+dl-extract-spectra-subset \
+    --survey DESI_DR1 \
+    --target-list zall-pix-iron-qso.fits \
+    --target-id-col TARGETID,SURVEY,PROGRAM \
+    --format zarr \
+    --output /scratch/qso_subset.zarr
+```
+
+`--target-id-col` must match the `--link-id-col` used when the spectra and
+catalog were ingested. DESI coadds ingested with the default composite key need
+`TARGETID,SURVEY,PROGRAM`, not `TARGETID` alone.
+
+Instead of an ID list, you can filter the ingested catalog with `--where` and
+`--limit`. Rows without a stored spectrum (`_spectrum_index < 0`) are dropped
+automatically, so `--limit` counts spectra that can actually be read:
+
+```bash
+dl-extract-spectra-subset \
+    --survey DESI_DR1 \
+    --where "upper(trim(SPECTYPE)) = 'STAR'" \
+    --limit 1000 \
+    --format zarr \
+    --output /scratch/desi_stars_1000.zarr \
+    --apply-survey-calibration
+```
+
+Other output formats:
+
+```bash
+# One Parquet file (one row per spectrum; wavelength in file metadata)
+dl-extract-spectra-subset ... --format parquet --output /scratch/qso_subset.parquet
+
+# One HDF5 file (stacked flux/ivar/mask + shared wavelength; gzip-compressed)
+dl-extract-spectra-subset ... --format hdf5 --output /scratch/qso_subset.h5
+
+# One FITS file per spectrum (written into a directory)
+dl-extract-spectra-subset ... --format fits --fits-layout per-file \
+    --output /scratch/qso_fits/
+
+# One multi-row FITS catalog (BINTABLE: TARGETID, Z, FLUX, IVAR, MASK + WAVELENGTH HDU)
+dl-extract-spectra-subset ... --format fits --fits-layout catalog \
+    --fits-chunk-rows 50000 --yes \
+    --output /scratch/qso_spectra.fits
+```
+
+| Flag | Values / default | Notes |
+|------|------------------|-------|
+| `--format` | `zarr` (default), `parquet`, `hdf5`, `fits` | |
+| `--fits-layout` | `per-file` (default), `catalog` | FITS only |
+| `--fits-chunk-rows` | 50000 | Rows per temporary part file for the FITS catalog layout |
+| `--yes` / `-y` | off | Skip the part-count confirmation prompt |
+| `--keep-part-files` | off | Keep the temporary FITS part files after merging |
+| `--force-many-fits-parts` | off | Allow more than 100 FITS parts (hard maximum 10,000) |
+| `--with-catalog/--no-with-catalog` | on | Use the survey catalog for ID lookup and redshift |
+| `--missing` | `skip` (default), `error` | What to do with IDs not in the lake |
+| `--overwrite/--no-overwrite` | off | Replace an existing output |
+
+**FITS catalog layout.** Astropy and CFITSIO can crash on vector BINTABLEs
+larger than about 4 GiB, so the catalog layout is written as temporary
+`*_partNNNNN.fits` shards of `--fits-chunk-rows` rows and then merged into
+`--output` with `fitsio`. The command prints the expected number of parts and
+asks for confirmation unless you pass `--yes`. It refuses more than 100 parts
+unless you add `--force-many-fits-parts`. If a run crashes, re-run the same
+command: completed parts are reused. The catalog layout needs a shared
+wavelength grid; for per-source-wavelength surveys such as 2dF and 6dF use
+`--fits-layout per-file`. All other formats support both shared and per-source
+wavelengths.
+
+### Flux calibration
+
+Extracted flux can be multiplied by a constant (ivar is divided by its square).
+Use `--apply-survey-calibration` to apply the `spectra.flux_calibration` entry
+from `data_lake/homogenize/surveys/<SURVEY>.json` (bundled for `DESI_DR1` and
+`SDSS_DR17`: native \(10^{-17}\) erg/s/cm²/Å to cgs), or `--flux-scale FACTOR`
+for an explicit value. An explicit `--flux-scale` wins over the survey file.
+
+```bash
+dl-extract-spectra-subset ... --survey SDSS_DR17 --apply-survey-calibration \
+    --output /scratch/qso_ab.zarr
+
+dl-extract-spectra-subset ... --flux-scale 1e-17 --output /scratch/qso_ab.zarr
+```
+
+A sidecar `*.calibration.json` records where the factor came from unless you
+pass `--no-calibration-sidecar`. Zarr, HDF5 and Parquet outputs also store
+`flux_scale` in their metadata when scaling is applied.
+
+### Python API
+
+For many IDs, call `extract_subset_to_zarr` once with the whole list; it
+resolves all IDs in a single batched lookup. Attaching a `CatalogAccessor`
+lets that lookup use the catalog's `_spectrum_index` column and take redshift
+from the catalog.
 
 ```python
 import numpy as np
@@ -81,7 +191,7 @@ target_ids = np.asarray(Table.read("zall-pix-iron-qso.fits")["TARGETID"])
 
 lake = "/data/lake"
 survey = "DESI_DR1"
-cat = CatalogAccessor(lake, survey)   # fast _spectrum_index lookup + catalog Z
+cat = CatalogAccessor(lake, survey)   # batched _spectrum_index lookup + catalog redshift
 acc = SpectrumAccessor(lake, survey, catalog_accessor=cat)
 result = acc.extract_subset_to_zarr(
     source_ids=target_ids,
@@ -94,77 +204,52 @@ print(result["n_written"], "rows written;",
 # Redshift in the output uses cat.redshift_column (e.g. Z), not spectrum-tile meta.
 ```
 
-Or the CLI:
+The result dictionary also contains `n_requested`, `id_to_row` and
+`output_zarr`.
 
-```bash
-# Default: single flat Zarr group (--with-catalog: fast index + catalog Z for redshift)
-dl-extract-spectra-subset \
-    --survey DESI_DR1 \
-    --target-list zall-pix-iron-qso.fits \
-    --target-id-col TARGETID,SURVEY,PROGRAM \
-    --format zarr \
-    --output /scratch/qso_subset.zarr
+### Reading many spectra or cutouts in Python
 
-# ``--target-id-col`` must match the spectra (and catalog) ``--link-id-col``.
-# For DESI coadds ingested with the default composite key, pass
-# TARGETID,SURVEY,PROGRAM (not TARGETID alone).
+To read spectra or cutouts yourself, resolve all IDs first with `locate()`,
+then read each one by position. `locate()` returns two arrays, `npix` (tile)
+and `local` (row in the tile), with `-1` for IDs that are not in the lake. This
+replaces one catalog query per ID with one query per million IDs.
 
-# Filter the ingested catalog instead of building an ID list.
-# ``_spectrum_index >= 0`` is applied automatically so --limit counts readable spectra.
-dl-extract-spectra-subset \
-    --survey DESI_DR1 \
-    --where "upper(trim(SPECTYPE)) = 'STAR'" \
-    --limit 1000 \
-    --format zarr \
-    --output /scratch/desi_stars_1000.zarr \
-    --apply-survey-calibration
+```python
+from data_lake.io.catalog import CatalogAccessor
+from data_lake.io.cutouts import CutoutAccessor
+from data_lake.io.spectra import SpectrumAccessor
 
-# One Parquet file (one row per spectrum; wavelength in file metadata)
-dl-extract-spectra-subset ... --format parquet --output /scratch/qso_subset.parquet
+cat = CatalogAccessor(lake, survey)
 
-# One HDF5 file (stacked flux/ivar/mask + shared wavelength; gzip-compressed)
-dl-extract-spectra-subset ... --format hdf5 --output /scratch/qso_subset.h5
+with SpectrumAccessor(lake, survey, catalog_accessor=cat) as spec:
+    npix, local = spec.locate(target_ids)
+    for sid, p, i in zip(target_ids, npix.tolist(), local.tolist()):
+        if p < 0:
+            continue                      # not in the lake
+        sp = spec.get_spectrum_at(p, i, source_id=int(sid))
 
-# One FITS per spectrum (directory)
-dl-extract-spectra-subset ... --format fits --fits-layout per-file \
-    --output /scratch/qso_fits/
-
-# One multi-row FITS catalog (BINTABLE: TARGETID, Z, FLUX, IVAR, MASK + WAVELENGTH HDU).
-# Large extracts write temporary *_partNNNNN.fits shards (default 50k rows), then merge
-# into --output with fitsio and delete intermediates. You are prompted with the expected
-# part count unless --yes. Resume reuses completed parts.
-dl-extract-spectra-subset ... --format fits --fits-layout catalog \
-    --fits-chunk-rows 50000 --yes \
-    --output /scratch/qso_spectra.fits
-
-# Apply bundled SDSS/DESI flux calibration (native 10^-17 → cgs erg/s/cm²/Å)
-dl-extract-spectra-subset ... --survey SDSS_DR17 --apply-survey-calibration \
-    --output /scratch/qso_ab.zarr
-
-# Explicit scale (overrides registry); writes subset.calibration.json by default
-dl-extract-spectra-subset ... --flux-scale 1e-17 --output /scratch/qso_ab.zarr
+with CutoutAccessor(lake, survey, catalog_accessor=cat) as cut:
+    npix, local = cut.locate(target_ids)
+    for p, i in zip(npix.tolist(), local.tolist()):
+        if p >= 0:
+            image, wcs = cut.get_cutout_at(p, i)   # or get_image_at(p, i) for pixels only
 ```
 
-**Flux calibration** (optional): multiply extracted flux by a constant factor
-and divide ivar by factor².  Use `--apply-survey-calibration` to load
-`spectra.flux_calibration` from `data_lake/homogenize/surveys/<SURVEY>.json`
-(bundled for `SDSS_DR17`), or `--flux-scale FACTOR` for an explicit value
-(explicit wins).  A sidecar `*.calibration.json` records provenance unless
-`--no-calibration-sidecar` is set.  Zarr/HDF5/Parquet exports also store
-`flux_scale` in group/file metadata when scaling is applied.
+`get_spectrum(source_id)` and `get_cutout(source_id)` still exist, but they look
+up one ID at a time; use them only for a handful of sources. `get_batch(ids)`
+also resolves IDs in one pass and returns stacked arrays, but raises `KeyError`
+if any ID is missing.
 
-`--format` choices: `zarr` (default), `parquet`, `hdf5`, `fits`.  For FITS,
-`--fits-layout` is `per-file` (default) or `catalog`.  Catalog FITS streams in
-`--fits-chunk-rows` shards (default 50000) to avoid Astropy/CFITSIO ~4 GiB
-vector-BINTABLE crashes, then merges with `fitsio` into one file.  The CLI
-prints the expected temporary part count and asks for confirmation (`--yes` to
-skip).  Re-run the same command to resume after a crash.  Cap: refuse more than
-100 parts unless `--force-many-fits-parts` (hard max 10000).  All formats support
-both `wavelength_mode="shared"` and `wavelength_mode="per_source"` surveys,
-except FITS catalog layout, which requires a shared wavelength grid (use
-`--fits-layout per-file` for per-source surveys such as 2dF/6dF).
+To write one FITS file per source from Python, use
+`data_lake.export.to_spectrum_fits.export_spectra_batch` or
+`data_lake.export.to_fits.export_cutouts_batch`; both use `locate()` internally
+and log, rather than raise, for IDs they cannot find. The single-source helpers
+`export_spectrum` and `export_cutout` accept an existing `accessor=` to avoid
+reopening stores when called in a loop.
 
-Output layout for **zarr** (shared wavelength):
+### Output layout
+
+Zarr output with a shared wavelength grid:
 
 ```
 qso_subset.zarr/
@@ -176,7 +261,7 @@ qso_subset.zarr/
   redshift/    (N_written,)       float32  (from catalog ``Z`` when catalog is used)
 ```
 
-Output layout for **zarr** (per-source wavelength, e.g. 2dF/6dF):
+Zarr output with per-source wavelengths (for example 2dF and 6dF):
 
 ```
 2df_subset.zarr/
@@ -188,37 +273,42 @@ Output layout for **zarr** (per-source wavelength, e.g. 2dF/6dF):
   redshift/    (N_written,)       float32
 ```
 
-`N_pix` is the maximum pixel count across all tiles in the subset; shorter
-rows are right-padded with `nan` (flux), `0` (ivar/mask/wavelength).  The
-group attr `wavelength_mode` is `"per_source"`.  Parquet exports add a
-`wavelength` list column with the same per-row content.
+For per-source wavelengths, `N_pix` is the longest spectrum in the subset;
+shorter rows are right-padded with `nan` (flux) and `0` (ivar, mask,
+wavelength), and the group attribute `wavelength_mode` is `"per_source"`.
+Parquet output adds a `wavelength` list column with the same per-row content.
 
-Rows are written in HEALPix-tile-traversal order for fast contiguous
-writes; the returned `id_to_row` mapping lets you reorder if needed.
-Lookup uses the catalog's `_spectrum_index` column when available
-(O(catalog SQL) batched), otherwise falls back to a vectorised tile
-scan (one `_source_id` array read per tile + `np.isin`).
+Rows are written in HEALPix tile order, not in the order of your ID list, so
+writes stay contiguous. Use the returned `id_to_row` mapping (or the
+`_source_id` array) to reorder.
 
-**Redshift provenance** (Zarr `redshift/`, Parquet `redshift`, FITS `Z`):
-when a Parquet catalog is attached (`catalog_accessor` / CLI
-`--with-catalog`, default on), values come from the survey catalog column
-(auto-detected: `Z`, `ZCOSMO`, `Z_HP`, `Z_PHOT`, `REDSHIFT`, …), **not**
-from spectrum-tile `meta.z` (which is only a copy from ingest-time FITS).
-Pass `--no-with-catalog` to skip the catalog entirely (tile scan for IDs,
-`meta.z` for redshift).  If the catalog exists but has no redshift column,
-the code warns and falls back to `meta.z`.
+### Details: ID lookup and redshift source
 
-### Update catalog with spectrum / cutout index
+With a catalog attached (`catalog_accessor=` in Python, `--with-catalog` on the
+command line, the default), IDs are resolved through the catalog's
+`_spectrum_index` column in batched DuckDB queries; any IDs the catalog cannot
+resolve fall back to a vectorised scan of the spectrum tiles (one `_source_id`
+array read per tile). With `--no-with-catalog`, only the tile scan is used.
 
-The `dl-ingest-spectra`, `dl-ingest-cutouts`, and `dl-ingest-cutouts-from-list`
-CLIs patch the catalog automatically after each ingest run (`--no-update-catalog`
-to skip).  The ID column is resolved from `catalog_info.json`, so surveys
-ingested with `--link-id-col TARGETID` or a composite spec such as
-`TARGETID,SURVEY,PROGRAM` work without extra configuration — the hash
-rule is consistent across all `dl-*` commands.
+The redshift written to the output (Zarr `redshift/`, Parquet `redshift`, FITS
+`Z`) comes from the survey catalog when one is attached. The column is
+auto-detected; the first match among `Z`, `ZCOSMO`, `Z_HP`, `Z_PHOT`,
+`REDSHIFT`, `Z_QSO` and `Z_RED` is used. It does **not** come from the
+spectrum tile's `meta.z`, which is only a copy taken from the FITS files at
+ingest. With `--no-with-catalog`, or when the catalog has no redshift column
+(a warning is logged), `meta.z` is used instead.
 
-To backfill an existing lake where spectra or cutouts were ingested without
-catalog patching (no FITS re-ingestion needed):
+## Update catalog with spectrum / cutout index
+
+`dl-ingest-spectra`, `dl-ingest-cutouts` and `dl-ingest-cutouts-from-list`
+write the `_spectrum_index` / `_cutout_index` columns into the catalog
+automatically after each run (pass `--no-update-catalog` to skip). The ID
+column is read from `catalog_info.json`, so surveys ingested with
+`--link-id-col TARGETID` or a composite key such as `TARGETID,SURVEY,PROGRAM`
+need no extra configuration.
+
+If spectra or cutouts were ingested without this step, backfill the index from
+the Zarr tiles already on disk (no FITS re-ingestion needed):
 
 ```bash
 # Register console scripts after pulling (once per env):
@@ -227,14 +317,16 @@ uv sync --extra desi --extra dev
 dl-rebuild-catalog-indices --survey DESI_DR1 --kind spectrum
 dl-rebuild-catalog-indices --survey DESI_DR1 --kind cutout   # if cutouts exist
 
-``--norder`` defaults to ``hats_order`` in ``catalogs/<survey>/catalog_info.json``.
-Pass ``--norder`` only to override that metadata value.
-
 # Without reinstalling, use the module directly:
 uv run python -m data_lake.ingest.update_catalog_indices --survey DESI_DR1 --kind spectrum
 ```
 
-For manual / Python-API use:
+`--norder` defaults to `hats_order` in `catalogs/<survey>/catalog_info.json`;
+pass it only to override that value. See
+[Validate and repair](validate-and-repair.md) for checking the result.
+
+From Python, if you already have a `source_id → index` mapping (as returned by
+the ingest functions):
 
 ```python
 from data_lake.ingest.update_catalog_indices import update_index_column
@@ -242,7 +334,14 @@ update_index_column(lake_root="/data/lake", survey_name="SDSS_DR17",
                     source_id_to_index=index_map, kind="spectrum")
 ```
 
-### Pack a tile for sharing
+`update_index_column` also takes `norder` (default 5) and `link_id_col`; pass
+`norder` explicitly if the catalog uses a different `hats_order`.
+
+## Pack a tile for sharing
+
+`dl-pack-tile` bundles one HEALPix tile of one or more surveys (catalog
+Parquet plus, by default, spectrum and cutout Zarr stores and their info JSON
+files) into a `.tar` archive in the output directory.
 
 ```bash
 dl-pack-tile /data/lake /data/share --norder 5 --npix 1234 --survey des_dr2 --manifest
@@ -250,3 +349,7 @@ dl-pack-tile /data/lake /data/share --norder 5 --npix 1234 --survey des_dr2 --ma
 dl-pack-tile /data/lake /data/share --norder 5 --npix 1234 --survey des_dr2 --no-spectra
 ```
 
+`--survey` can be repeated. Without `--npix`, every tile is packed into its own
+archive. `--no-cutouts` excludes cutouts, `--manifest` (re)generates
+`MANIFEST.json` (tile, surveys, sizes and SHA-256 checksums for each archive),
+and `--norder` defaults to 5.

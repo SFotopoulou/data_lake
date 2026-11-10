@@ -469,13 +469,15 @@ def configure_cli_logging(
     # Let root level be low enough so FileHandler always gets INFO
     logging.getLogger().setLevel(min(level, logging.INFO))
 
+    # Imports astropy, which must install its logger class before
+    # logging.getLogger("astropy") below creates a plain one.
+    configure_warning_filters()
+
     # Silence noisy library loggers on the terminal when quiet
     if quiet or level >= logging.WARNING:
         for prefix in ("desispec", "desi", "astropy", "fitsio"):
             lg = logging.getLogger(prefix)
             lg.setLevel(logging.WARNING)
-
-    configure_warning_filters()
 
 
 def configure_file_only_logging(log_file: Path, *, verbose: bool) -> None:

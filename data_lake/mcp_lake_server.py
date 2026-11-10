@@ -402,7 +402,7 @@ def tool_lake_health(lake_root: str | None = None) -> dict[str, Any]:
         )
     if missing_index:
         notes.append(
-            f"{len(missing_index)} survey(s) missing tile index — run dl-refresh-tile-index."
+            f"{len(missing_index)} survey(s) missing tile index — run dl-refresh-lake-registry."
         )
 
     n_ingested = counts_by_kind.get(CATALOG_KIND_INGESTED, 0)

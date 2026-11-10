@@ -73,6 +73,10 @@ lake/
 *.fits
 !tests/**/*.fits
 TODO.md
+# Demo lakes built by dl-demo-lake / the notebooks, and notebook outputs
+_demo_lake/
+notebooks/_output/
+.scratch_*/
 
 # uv lockfile is fine to commit, but keep its cache out
 .uv-cache/

@@ -10,6 +10,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 |---------|---------|
 | `dl-init` | Scaffold a new deployment (`lake_config.toml`, dirs, `.gitignore`) |
 | `dl-set-ingest-token` | Rotate the ingest token hash on an existing deployment |
+| `dl-demo-lake` | Build a small synthetic lake for local smoke tests (no external data) |
 
 **Catalog ingest**
 
@@ -20,7 +21,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-ingest-catalog-from-list` | Sequential (default) or parallel catalog file-list ingest |
 | `dl-ingest-catalog-mef` | Join row-aligned FITS table extensions (shared keys, same `NAXIS2`) into one catalog; one file or `--file-list`; default `--tile-mode append`; see [Joined-extension catalogs](ingest/catalog.md#joined-extension-catalogs-dl-ingest-catalog-mef) |
 | `dl-ingest-from-shard` | Map-reduce catalog ingest for many files that share lake tiles (bricks, RA/Dec patches, unsorted run folders); choose via [Choosing a catalog ingest command](ingest/catalog.md#choosing-a-catalog-ingest-command). `--phase map` decodes FITS → immutable per-HEALPix Parquet parts; `--phase reduce` concatenates parts → lake tiles; see [batch-and-checkpoints.md](ingest/batch-and-checkpoints.md#two-phase-map-reduce-ingest-dl-ingest-from-shard) |
-| `dl-finalize-catalog` | Rebuild `catalog_info.json` + `_metadata` from tiles (no re-ingest) |
+| `dl-finalize-catalog` | Rebuild `catalog_info.json`, `_common_metadata` and `_metadata` from the tiles (no re-ingest); also adds `_common_metadata` to older catalogs |
 | `dl-repair-catalog-metadata` | Repair/rebuild link IDs, `--check-only`, `--rebuild-link-id` |
 | `dl-recommend-catalog-norder` | Sample a catalog to suggest a good `--norder` |
 | `dl-check-fits-table-format` | Header-only FITS layout probe (standard vs packed-vector; est. source count) |
@@ -78,11 +79,11 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-export-moc` | Write survey tile footprint (or region-clipped) as IVOA MOC FITS/JSON/ASCII; `--moc-order` ([docs](discovery/regions-and-areas.md#export-as-moc)) |
 
 
-**Accosiations**
+**Associations**
 
 | Command | Purpose |
 |---------|---------|
-| `dl-crossmatch` | Catalog↔catalog match at lake scale; sky mode (default, `--radius-arcsec`) or column equality (`--match-mode column --match-col-a COL --match-col-b COL`); `--from-area`/`--plan` for region-bounded sky plans; progress on by default (`--no-progress`) |
+| `dl-crossmatch` | Catalog↔catalog match at lake scale; sky mode (default, `--radius-arcsec`) or column equality (`--match-mode column --match-col-a COL --match-col-b COL`); `--from-area`/`--plan` for region-bounded sky plans; `--n-workers`, `--strips-per-worker` and `--memory-budget-gb` for large runs ([tuning](discovery/crossmatch.md)); progress on by default (`--no-progress`) |
 | `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--matches-only` (default: keep all base rows), partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities`; progress on by default (`--no-progress`) ([docs](discovery/gather.md)) |
 | `dl-homogenize` | Apply transform registry to a survey+region → homogenized product catalog; progress on by default (`--no-progress`) ([docs](homogenization.md)) |
 | `dl-validate-homogenization` | Lint transform registry, golden spot checks, homogenized product validation |

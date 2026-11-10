@@ -1,53 +1,60 @@
 # Glossary
 
-Short definitions of terms used throughout the data lake documentation. Links point to the canonical description in each topic guide.
+Short definitions of terms used throughout the data lake documentation. Each entry links to the guide that covers it in full.
 
 ---
 
 **area**
-A named logical region defined in `areas/<id>.json`. An area stores a sky region selector (cone, bbox, MOC, or npix list) plus optional plans for crossmatch, gather, and homogenization. Areas span surveys and modalities and contain no tile data.
+A named region saved in `areas/<id>.json`. An area stores a sky region selector (cone, bounding box, MOC or HEALPix pixel list), plus optional plans for crossmatch, gather and homogenization. Areas can span surveys and modalities, and they hold no tile data themselves.
 See [Regions and areas](discovery/regions-and-areas.md).
 
+**`_common_metadata`**
+A small Parquet file (a few KiB) in each catalog directory that holds only the schema: column names and types. Readers use it to learn a catalog's columns without opening a tile. It is written by `dl-finalize-catalog`, which runs at the end of every non-deferred ingest, alongside `_metadata` (the aggregate footer of all tiles). Older catalogs without it still work, because readers fall back to one tile's schema. Run `dl-finalize-catalog` once to add it. Joined products from `dl-gather` contain only tiles and `catalog_info.json`.
+See [Data layout on disk](layout/data-on-disk.md).
+
 **crossmatch tree**
-A precomputed catalog-to-catalog positional match stored under `crossmatch/<surveyA>_x_<surveyB>__r<radius>/`. Created by `dl-crossmatch`. Used as input to `dl-gather`.
+A precomputed positional match between two catalogs, stored under `crossmatch/<surveyA>_x_<surveyB>__r<radius>/`. It is created by `dl-crossmatch` and used as input to `dl-gather`.
 See [Crossmatch and associations](discovery/crossmatch.md).
 
 **deployment / lake root**
-A directory that contains a `lake_config.toml` and the `catalogs/`, `spectra/`, `cutouts/`, `shared/` tree. One person or team runs one deployment; multiple deployments can co-exist on the same machine.
+A directory that contains a `lake_config.toml` and the `catalogs/`, `spectra/`, `cutouts/` and `shared/` trees. One person or team runs one deployment, and several deployments can exist on the same machine.
 See [Step 3 in the quickstart](quickstart.md#step-3--initialise-your-lake-dl-init).
 
 **gather**
-The process of materialising a joined "wide" product catalog from one base survey and one or more partner surveys connected via crossmatch tiles. Run with `dl-gather`; output has `kind: product`, `product_subtype: joined`.
+Building a joined "wide" product catalog from one base survey and one or more partner surveys, linked through crossmatch tiles. Run it with `dl-gather`. The output has `kind: product` and `product_subtype: joined`.
 See [Gather](discovery/gather.md).
 
 **HATS (HEALPix Adaptive Tiling Scheme)**
-The partitioning scheme used for catalog Parquet tiles. Each tile is a HEALPix pixel at a chosen `norder` that contains all sources whose sky position falls within that pixel. HATS enables fast spatial queries and incremental ingest.
+The partitioning scheme for catalog Parquet tiles. Each tile is one HEALPix pixel at a chosen `norder` and holds every source whose position falls inside that pixel. This makes spatial queries fast and allows incremental ingest.
 See [hats.readthedocs.io](https://hats.readthedocs.io/en/stable/).
 
 **HEALPix / norder**
-HEALPix (*Hierarchical Equal Area isoLatitude Pixelisation*) divides the sphere into equal-area pixels. `norder` (or `hats_order`) determines the resolution: `norder=5` → 12 288 pixels, `norder=7` → 196 608 pixels. Higher norder means smaller pixels and more tiles.
+HEALPix (Hierarchical Equal Area isoLatitude Pixelisation) divides the sphere into equal-area pixels. `norder` (also `hats_order`) sets the resolution: the sky has \(12 \times 4^{\text{norder}}\) pixels, so `norder=5` gives 12,288 pixels and `norder=7` gives 196,608. A higher norder means smaller pixels and more tiles. The default catalog norder is 5.
 
 **homogenize / product catalog (homogenized)**
-The process of converting native survey columns (Vega mags, Jy fluxes, …) to a standardised system (AB magnitudes, uniform flux units) using versioned transform recipes. Run with `dl-homogenize`; output has `kind: product`, `product_subtype: homogenized`.
+Converting native survey columns (Vega magnitudes, Jy fluxes and so on) to a common system, such as AB magnitudes or uniform flux units, using versioned per-survey recipes. Run it with `dl-homogenize`. The output has `kind: product` and `product_subtype: homogenized`.
 See [Homogenization](homogenization.md).
 
 **ingest token**
-A plaintext secret passed via `$LAKE_INGEST_TOKEN` that every `dl-ingest-*` command checks before writing. The lake stores only the SHA-256 hash. Provides a lightweight "I am the operator" gate; real security is filesystem ACLs.
+A plaintext secret, passed in `$LAKE_INGEST_TOKEN` (or `--ingest-token`), that `dl-ingest-*` and other write commands check before writing. The lake stores only its SHA-256 hash. It is a lightweight "I am the operator" check. Real protection comes from filesystem permissions.
+
+**`locate()`**
+A method on `CutoutAccessor` and `SpectrumAccessor` that resolves many `_source_id` values in one pass. It returns two arrays, `npix` (the tile) and `local` (the row within the tile), with `-1` for IDs that were not found. Pass those positions to `get_image_at` / `get_cutout_at` / `get_spectrum_at(npix, local)` to read data. For bulk work this is much faster than calling `get_cutout(id)` or `get_spectrum(id)` once per source, which you can still use for one-off reads.
 
 **modality**
-One of the three data types stored by the lake: **catalog** (Parquet, `catalogs/`), **spectra** (Zarr, `spectra/`), or **cutout** (Zarr, `cutouts/`). A survey may have data in one or more modalities; ingest commands target a single modality at a time.
+One of the three data types stored in the lake: catalog (Parquet, `catalogs/`), spectra (Zarr, `spectra/`) and cutout (Zarr, `cutouts/`). A survey can have data in one or more modalities, and each ingest command targets one modality.
 
 **MOC (Multi-Order Coverage map)**
-An IVOA standard for representing arbitrary sky regions as a hierarchical set of HEALPix cells. Used by `dl-region --export-moc` and `dl-export-moc`. Formats: FITS, JSON, ASCII.
+An International Virtual Observatory Alliance (IVOA) standard that describes any sky region as a hierarchical set of HEALPix cells. It is used by `dl-region --export-moc` and `dl-export-moc`, which can write FITS, JSON or ASCII.
 See [Regions and areas](discovery/regions-and-areas.md#export-as-moc).
 
 **`_source_id`**
-A stable int64 join key assigned to every object at catalog ingest time. It links a catalog row to its spectrum tile row (`_spectrum_index`) and cutout tile row (`_cutout_index`). It can be a copy of a native integer ID column (`--link-id-col TARGETID`) or a hash of a string label. Once written, `_source_id` values never change for a given source.
+A stable int64 join key assigned to every object at catalog ingest. It links a catalog row to its spectrum (`_spectrum_index`) and cutout (`_cutout_index`) tile positions. Catalog ingest requires `--link-id-col`. If that column is a native integer ID, `_source_id` is a copy of it. If it is a string label or a comma-separated composite of columns, `_source_id` is a stable hash of the label. Once written, a source's `_source_id` does not change.
 See [data-on-disk.md](layout/data-on-disk.md) for the full column set.
 
 **native ID vs `_source_id`**
-The *native ID* is the survey's own identifier (e.g. DESI `TARGETID`, SDSS `SPECOBJID`). The `_source_id` is the lake's internal join key. When `--link-id-col` names the native integer column, the two are the same value; otherwise `_source_id` is a sequential counter or a hash.
+The native ID is the survey's own identifier, for example DESI `TARGETID` or SDSS `SPECOBJID`. The `_source_id` is the lake's internal join key. When `--link-id-col` names a native integer column, the two have the same value. Otherwise `_source_id` is a hash of the native label. Catalogs ingested by older versions may use a sequential counter instead, and `catalog_info.json` records which mode was used in `link_id_mode`.
 
 **region**
-A sky geometry used to select data: cone (`--cone RA DEC RADIUS`), bounding box (`--bbox`), HEALPix pixel(s) (`--npix`), or a MOC file (`--moc`). Used by `dl-region`, `dl-gather`, `dl-crossmatch`, and `dl-homogenize`.
+A sky geometry used to select data: a cone (`--cone RA DEC --radius-arcsec R`), a bounding box (`--bbox RA_MIN RA_MAX DEC_MIN DEC_MAX`), HEALPix pixels (`--npix … --norder N`) or a MOC file (`--moc`, `dl-region` only; needs the `moc` extra). `dl-region`, `dl-gather` and `dl-homogenize` accept these selectors directly. `dl-crossmatch` takes a region through `--from-area`.
 See [Regions and areas](discovery/regions-and-areas.md).

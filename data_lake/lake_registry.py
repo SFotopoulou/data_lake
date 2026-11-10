@@ -583,7 +583,7 @@ def _info_registry_row(
         n_columns = info.get("total_columns") or info.get("n_columns")
 
     total_rows: int | None = None
-    if modality == MODALITY_SPECTRA:
+    if modality in (MODALITY_SPECTRA, MODALITY_CUTOUT):
         counted = _count_zarr_sources(survey_root)
         if counted is not None:
             total_rows = counted

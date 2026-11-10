@@ -1,6 +1,6 @@
 # MCP server for agents
 
-The `dl-mcp-docs` command exposes read-only documentation and lake discovery tools over the [Model Context Protocol](https://modelcontextprotocol.io/) (stdio transport). Use it from Cursor or other MCP clients so agents can search guides and inspect your deployment without shell access.
+The `dl-mcp-docs` command runs a Model Context Protocol (MCP) server that lets an AI agent in Cursor, or any other MCP client, search this project's documentation and look up what is in your lake without shell access. It talks to the client over stdio (standard input/output). Use it when you want agents to answer "how do I…" questions from `docs/`. For lake exploration alone, the [MCP lake explorer](mcp-lake.md) (`dl-mcp-lake`) is enough.
 
 ## Install
 
@@ -10,18 +10,13 @@ uv sync --extra mcp
 
 ## Configure Cursor
 
-Copy the example config and set your lake path:
+Copy the example config, which defines both MCP servers:
 
 ```bash
 cp .cursor/mcp.json.example .cursor/mcp.json
 ```
 
-Edit `.cursor/mcp.json`:
-
-- Set `DATA_LAKE_CONFIG` to your `lake_config.toml` (same as CLI).
-- Run from the repo root so `docs/` resolves correctly.
-
-Example:
+In `.cursor/mcp.json`, set `DATA_LAKE_CONFIG` to the path of your `lake_config.toml` (the same file the `dl-*` commands use). To run only the docs server:
 
 ```json
 {
@@ -37,31 +32,28 @@ Example:
 }
 ```
 
-Restart Cursor (or reload MCP servers) after changing the config.
+Open the repository as your Cursor workspace so `uv run` finds the project. The server reads the `docs/` folder that sits next to the `data_lake` package, so it needs a source checkout of the repository. Restart Cursor (or reload MCP servers) after changing the config.
 
 ## Tools
 
 | Tool | Purpose |
 |------|---------|
-| `search_docs` | Keyword search across `docs/` (heading-weighted) |
-| `get_doc_section` | Fetch a file or section by path (`ingest/spectra.md`) or `docs://` URI |
-| `list_dl_commands` | All `dl-*` entry points from `pyproject.toml` |
-| `describe_lake` | Registry summary (`dl-describe-lake --json`); optional `kind` (`ingested`/`product`/`crossmatch`), `refresh`, `modality` |
-| `describe_survey` | Column manifest (`dl-describe-survey --json`); `survey`, `modality`, `rebuild` |
+| `search_docs` | Keyword search across `docs/`; matches in headings and file paths rank higher. Arguments: `query`, `limit` (default 5). |
+| `get_doc_section` | Fetch a whole file by path (`ingest/spectra.md`) or `docs://` URI, or one section by its heading or section ID. |
+| `list_dl_commands` | List every `dl-*` entry point in `pyproject.toml`. |
+| `describe_lake` | Lake registry summary, same output as `dl-describe-lake --json`. Optional `kind` (`ingested`, `product`, `crossmatch`), `modality`, `refresh`, `count_total` (default true). |
+| `describe_survey` | Column manifest for one survey, same output as `dl-describe-survey --json`. Arguments: `survey`, `modality` (default `catalog`), `rebuild`. |
 
-Pass `lake_root` on `describe_*` tools when `DATA_LAKE_CONFIG` is not set.
+`describe_lake` and `describe_survey` find the lake through `DATA_LAKE_CONFIG`. Pass `lake_root` to them when that variable is not set; see [lake configuration](mcp-deploy.md#lake-configuration) for the full lookup order.
 
 ## Resources
 
-Documentation files are available as MCP resources:
+Every documentation file is also available as an MCP resource. The URI is the path under `docs/` without the `.md` suffix, for example:
 
 - `docs://cli-reference`
 - `docs://ingest/spectra`
 - `docs://troubleshooting`
-- … (mirrors the `docs/` tree)
-
-See also [MCP lake explorer](mcp-lake.md) for region discovery, provenance, ingest recommendations, and inventory tools (`describe_lake`, `list_products`). The explorer alone is sufficient for lake operations.
 
 ## Out of scope
 
-The MCP server is **read-only**: no ingest, no token handling, no shell execution. Use the `dl-*` CLIs for writes.
+The server does not ingest data, handle ingest tokens, or run shell commands. Use the `dl-*` CLIs for anything that changes the lake. Two calls can write lake metadata: `describe_lake` rebuilds the lake registry when `refresh=True` or when no registry exists yet, and `describe_survey` rebuilds the survey's `schema_manifest.json` when `rebuild=True` or when it is missing. See [read-only boundary](mcp-deploy.md#read-only-boundary).

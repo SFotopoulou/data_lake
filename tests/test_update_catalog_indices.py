@@ -678,3 +678,47 @@ class TestBuildIndexMapFromZarr:
         merged = pa.concat_tables([pq.ParquetFile(str(t)).read() for t in tiles])
         spec_idx = merged.column("_spectrum_index").to_pylist()
         assert all(v >= 0 for v in spec_idx), f"Some _spectrum_index still -1: {spec_idx}"
+
+
+class TestCutoutFileListParallelPatch:
+    """``dl-ingest-cutouts-from-list --n-workers > 1`` patches the catalog after ingest."""
+
+    def test_parallel_ingest_patches_cutout_index(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.ingest.file_list_ingest import cli_cutout_list
+
+        ids = [7_000_001, 7_000_002, 7_000_003]
+        ra = [45.0, 90.0, 120.0]
+        dec = [10.0, -10.0, 30.0]
+        _write_mini_catalog(tmp_path, "cut_par", "TARGETID", ids, ra, dec)
+
+        paths = []
+        for sid, r, d in zip(ids, ra, dec):
+            hdu = fits.PrimaryHDU(np.full((4, 4), float(sid % 10), dtype=np.float32))
+            hdu.header["RA"] = r
+            hdu.header["DEC"] = d
+            hdu.header["TARGETID"] = sid
+            p = tmp_path / f"stamp_{sid}.fits"
+            hdu.writeto(p)
+            paths.append(str(p))
+        file_list = tmp_path / "stamps.txt"
+        file_list.write_text("\n".join(paths) + "\n")
+
+        result = CliRunner().invoke(
+            cli_cutout_list,
+            [
+                str(file_list), str(tmp_path),
+                "--survey", "cut_par",
+                "--link-id-col", "TARGETID",
+                "--norder", "5",
+                "--n-workers", "2",
+                "--no-progress",
+            ],
+        )
+        assert result.exit_code == 0, result.output + repr(result.exception)
+        assert "Patched _cutout_index" in result.output
+
+        tiles = list((tmp_path / "catalogs" / "cut_par").rglob("Npix=*.parquet"))
+        merged = pa.concat_tables([pq.read_table(t) for t in tiles])
+        assert all(v >= 0 for v in merged.column("_cutout_index").to_pylist())

@@ -37,11 +37,15 @@ To add or bump dependencies, edit `pyproject.toml` and run `uv lock && uv sync`.
 Verify the installation without any external files:
 
 ```bash
-# Unit tests (no external data required)
-pytest
+# Unit tests (no external data required). Prefer uv so the project env is used:
+uv run --extra dev python -m pytest -q
+# or, with the venv already activated:  python -m pytest -q
 
 # Self-contained cross-survey demo (synthetic lake, runs in seconds)
 python examples/cross_survey_lsst_desi_euclid/demo.py
+
+# Or scaffold a tiny lake you can query with dl-* commands:
+# dl-demo-lake ./_demo_lake && export DATA_LAKE_CONFIG=./_demo_lake/lake_config.toml
 ```
 
 Both should finish without errors. If they pass you are ready to create a real lake.
@@ -49,10 +53,10 @@ Both should finish without errors. If they pass you are ready to create a real l
 **Jupyter / notebooks:** register the project kernel once:
 
 ```bash
-python -m ipykernel install --user --name=data-lake --display-name "Python (data-lake)"
+uv run python -m ipykernel install --user --name=data-lake --display-name "Python (data-lake)"
 ```
 
-Then open `notebooks/01_catalog_ingest.ipynb` for a guided walk-through of catalog ingest with synthetic data.
+Then open `notebooks/01_catalog_ingest.ipynb` for a guided walk-through of catalog ingest with synthetic data. See [notebooks.md](notebooks.md) for which notebooks need a real lake.
 
 ---
 
@@ -157,10 +161,13 @@ preview_sources("/data/lake", "MY_SURVEY", modality="cutouts", n=5)
 |-------------|--------|
 | Ingest spectra (DESI, SDSS, generic FITS) | [ingest/spectra.md](ingest/spectra.md) |
 | Ingest image cutouts | [ingest/cutouts.md](ingest/cutouts.md) |
+| Join row-aligned FITS table extensions (MEF) | [ingest/catalog.md](ingest/catalog.md#joined-extension-catalogs-dl-ingest-catalog-mef) |
 | Add a second survey and crossmatch | [discovery/crossmatch.md](discovery/crossmatch.md) |
 | Build a joined product catalog (≥2 surveys) | [discovery/workflow.md](discovery/workflow.md) · [notebook 14](../notebooks/14_discovery_workflow.ipynb) |
 | Homogenize photometry to AB magnitudes | [homogenization.md](homogenization.md) |
 | Export a source subset (spectra → Zarr/FITS) | [export-and-sharing.md](export-and-sharing.md) |
+| Train on cutouts or spectra with PyTorch | [performance.md](performance.md#machine-learning-datasets) · [notebook 13](../notebooks/13_pytorch_training_loop.ipynb) |
+| Speed up workers, caches or ID lookups | [performance.md](performance.md) |
 | Plot SED + spectrum for one source | [plotting.md](plotting.md) |
 | All `dl-*` commands | [cli-reference.md](cli-reference.md) |
 | Troubleshoot | [troubleshooting.md](troubleshooting.md) |
@@ -171,7 +178,7 @@ preview_sources("/data/lake", "MY_SURVEY", modality="cutouts", n=5)
 
 | Role | Install | `DATA_LAKE_CONFIG` | `LAKE_INGEST_TOKEN` | Data path |
 |------|---------|-------------------|---------------------|-----------|
-| **Analyst** | `uv sync --extra dev` (or `pip install data-lake`) | Shared deployment config | **Not used** | Read-only mount |
+| **Analyst** | `uv sync --extra dev` | Shared deployment config | **Not used** | Read-only mount |
 | **Ingest operator** | Same package | Same or writable deployment | **Required** for `dl-ingest-*` | Read-write |
 
 Installing the package grants no ingest rights. Production lakes should rely on **filesystem permissions** (analysts cannot write Zarr tiles) as the primary control.

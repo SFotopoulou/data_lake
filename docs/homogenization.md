@@ -1,26 +1,20 @@
 # Homogenization
 
-Native ingest preserves survey column names and photometric systems. Homogenization is a **downstream, opt-in** step that materialises **product catalogs** with comparable columns (e.g. AB magnitudes) using a versioned transform registry.
+Ingest keeps each survey's native column names and photometric systems (Vega magnitudes, Jy fluxes, and so on). Homogenization is a separate, opt-in step that writes a new **product catalog** whose columns are comparable across surveys, for example AB magnitudes in `phot_ab_*` columns. Use this page when you need consistent photometry for SED fitting, photometric redshifts or ML training.
 
 ## When homogenization runs
 
-| Stage | Homogenize? |
-|-------|-------------|
-| Ingest (`dl-ingest-catalog*`) | No — archival native truth |
-| Crossmatch (`dl-crossmatch`) | No — geometry only |
-| **Homogenize (`dl-homogenize`)** | **Yes** — pick `transform_id` + survey + region |
+Only `dl-homogenize` changes units. Ingest and crossmatch never do.
 
-Recipes live in **`shared/registry/homogenize/<SURVEY>.json`** (lake overrides) or bundled **`data_lake/homogenize/surveys/<SURVEY>.json`**. Transform packs (`phot_ab_v1`, etc.) define profile semantics only — **executable rules live only in per-survey files**.
-
-Check coverage with `dl-validate-homogenization --ab-coverage` (requires lake root / `$DATA_LAKE_CONFIG`).
-
-Column matching uses **`dl-describe-survey`** manifests at apply time — no manual survey inventory required.
+| Stage | Homogenizes? |
+|-------|--------------|
+| Ingest (`dl-ingest-catalog*`) | No. Native values are kept as archived. |
+| Crossmatch (`dl-crossmatch`) | No. It matches positions only. |
+| Homogenize (`dl-homogenize`) | Yes. You choose a transform pack, a survey (or product) and a region. |
 
 ## Primary workflow: single survey + region
 
-``dl-homogenize`` honours ``--config`` and ``$DATA_LAKE_CONFIG`` like other lake
-CLIs: when a deployment config is set, omit the ``OUTPUT_ROOT`` positional (it
-defaults to ``lake.root``).
+Set your deployment config, inspect the survey's columns, then homogenize a region into a named product. When `--config` or `$DATA_LAKE_CONFIG` is set you can omit the `OUTPUT_ROOT` positional argument, which defaults to `lake.root`.
 
 ```bash
 export DATA_LAKE_CONFIG=/path/to/lake_config.toml
@@ -34,58 +28,166 @@ dl-homogenize \
   --transform phot_ab_v1 \
   --materialize-as ALLWISE_euclid_north_ab_v1
 
-# Dry run: rule resolution only (--survey must be set here or in the area's homogenize block)
+# Dry run: resolve rules and the selection, write nothing
+# (--survey must be given here or in the area's homogenize block)
 dl-homogenize --from-area Euclid_North --check-only
 
-# Or ad-hoc flags with area region:
+# Same dry run with a cone instead of an area
 dl-homogenize --survey ALLWISE --cone 150.1 2.2 --radius-arcsec 600 \
   --transform phot_ab_v1 --materialize-as tmp --check-only
 ```
 
-Region selectors (at most one required): `--from-area`, `--cone`, `--bbox`, `--npix` + `--norder`, `--ids`, `--where`. When `--from-product` is used (catalog modality only), no region selector is needed — all tiles in the product are processed automatically.
+`--check-only` prints a JSON summary of which rules would be applied and which were skipped because the source column is missing. Run it before a large job.
 
-Output directory depends on modality: `products/<materialize-as>/` (catalog), `spectra/<materialize-as>/` (spectra), `cutouts/<materialize-as>/` (cutout). All outputs carry `kind: product`, `product_subtype: homogenized`, and provenance (`transform_id`, column lineage).
+Before you start, check which ingested catalogs have a usable `phot_ab_v1` recipe:
+
+```bash
+dl-validate-homogenization --ab-coverage
+```
+
+This needs a lake root, from `OUTPUT_ROOT` or `$DATA_LAKE_CONFIG`.
+
+### Options
+
+You must give exactly one region selector. The exception is `--from-product` in catalog modality, where you can omit the selector to process every tile of the product.
+
+| Option | Meaning |
+|--------|---------|
+| `--survey NAME` | Native survey to homogenize. Cannot be combined with `--from-product` for catalogs. |
+| `--from-product NAME` | Homogenize a gathered product (catalog modality). For spectra or cutouts it limits the tiles to those covered by the product. |
+| `--from-area ID` | Use the area's region, and its `homogenize` block if present. |
+| `--cone RA DEC` + `--radius-arcsec R` | Cone selection (degrees, arcsec). |
+| `--bbox RA_MIN RA_MAX DEC_MIN DEC_MAX` | Box selection (four values). |
+| `--npix LIST` + `--norder N` | Explicit HEALPix pixels (comma-separated values and `a-b` ranges). |
+| `--ids FILE` | Select sources from an ID file. |
+| `--where SQL` | SQL predicate on the base catalog. |
+| `--transform ID` | Transform pack. The default is `phot_ab_v1` (catalog), `spec_observed_v1` (spectra) or `cutout_njy_v1` (cutout). |
+| `--materialize-as NAME` | Output product name. Required unless `--check-only` is set or the area provides it. |
+| `--modality` | `catalog` (default), `spectra` or `cutout`. |
+| `--columns A,B,…` | Restrict to rules for these native columns. By default, rules are applied to columns whose manifest role is photometry. |
+| `--overwrite` | Replace an existing product. Without it, an existing output is an error. |
+| `--n-workers N` | Parallel workers (default 8). |
+| `--check-only` | Validate rules and the selection without writing. |
+
+The output location depends on the modality: `products/<name>/` for catalogs, `spectra/<name>/` for spectra and `cutouts/<name>/` for cutouts. A catalog product name must not match an ingested survey under `catalogs/`. Every output records `kind: product`, `product_subtype: homogenized` and provenance (`transform_id` and column lineage).
+
+Column matching uses the survey manifest (what `dl-describe-survey` shows) at run time, so you do not need to list the survey's columns yourself.
+
+## Areas
+
+An area file (`areas/<id>.json`) can hold a top-level `homogenize` block so that `dl-homogenize --from-area <id>` needs no other flags:
+
+```json
+"homogenize": {
+  "survey": "ALLWISE",
+  "region": { "from_area": "Euclid_North" },
+  "transform": "phot_ab_v1",
+  "materialize_as": "ALLWISE_euclid_north_ab_v1"
+}
+```
+
+Set the block with [`dl-area set-homogenize`](discovery/areas-cli.md), then run:
+
+```bash
+dl-homogenize --from-area Euclid_North
+```
+
+Command-line flags override values from the block.
+
+For several surveys at once, run `dl-gather` first to build a wide native product, then homogenize that product:
+
+```bash
+dl-homogenize \
+  --from-product EUCLID_wise_native \
+  --transform phot_ab_v1 \
+  --materialize-as EUCLID_wise_ab_v1
+```
+
+## Spectra and cutouts
+
+Spectra and cutout homogenization need a `spec_observed_v1` or `cutout_njy_v1` block in the survey recipe. The bundled `SDSS_DR17.json` and `DESI_DR1.json` recipes do not include these blocks yet. Add a lake-level override in `shared/registry/homogenize/<SURVEY>.json` (the schema is described in that directory's `README.md`). The bundled `synthetic` recipe is a working example of both blocks.
+
+```bash
+# After adding a spec_observed_v1 block to the survey recipe:
+dl-homogenize --modality spectra --survey SDSS_DR17 \
+  --from-area Euclid_North --transform spec_observed_v1 \
+  --materialize-as SDSS_DR17_spec_obs_v1
+
+# After adding a cutout_njy_v1 block to the survey recipe:
+dl-homogenize --modality cutout --survey DESI_DR1 \
+  --cone 150.1 2.2 --radius-arcsec 600 --transform cutout_njy_v1 \
+  --materialize-as DESI_DR1_cutout_njy_v1
+```
+
+## Validation
+
+```bash
+# Golden input/output spot checks for a transform pack
+dl-validate-homogenization --golden --transform phot_ab_v1
+
+# Check a materialized product (needs a lake root)
+dl-validate-homogenization --product ALLWISE_ab_test --transform phot_ab_v1
+```
+
+Add `--strict` to treat warnings as errors.
+
+## ML export from homogenized products
+
+```bash
+dl-extract-catalog --lake-root /data/lake \
+  --from-product ALLWISE_euclid_north_ab_v1 \
+  -c _source_id -c ra -c dec -c phot_ab_w1 \
+  -o /scratch/allwise_ab.parquet
+```
+
+`--from-product` checks that the catalog is a homogenized product and writes provenance (`transform_id` and lineage) for your training config. Single-file exports write it to `<output>.homogenize_provenance.json`, and `--output-dir` exports write `extract_provenance.json`. Pass `--no-homogenize-provenance` to skip it.
+
+For the full end-to-end workflow (region, crossmatch, gather, homogenize, export), see [discovery/workflow.md](discovery/workflow.md) and [`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb).
+
+## Recipe files
+
+Each survey has a recipe file. `dl-homogenize` first looks for a lake override in `shared/registry/homogenize/<SURVEY>.json`, then falls back to the bundled `data_lake/homogenize/surveys/<SURVEY>.json`. Transform packs (`phot_ab_v1` and others) only define what the output means. The executable rules are always in the per-survey recipe files.
 
 ## Transform packs
 
 | Pack | Modality | Purpose |
 |------|----------|---------|
-| `phot_ab_v1` | catalog | Photometric unit conversion to AB magnitudes (`mag_offset`, `scale`, `identity`, `null_if_sentinel`, `flux_to_ab`) |
-| `spec_observed_v1` | spectra | Observed-frame flux unit normalisation (`flux_scale`) |
-| `cutout_njy_v1` | cutout | nJy/pixel calibration via `flux_scale` on image stamps |
+| `phot_ab_v1` | catalog | Convert photometry to AB magnitudes (rule types `mag_offset`, `scale`, `identity`, `null_if_sentinel`, `flux_to_ab`, `inverse`) |
+| `spec_observed_v1` | spectra | Normalise observed-frame flux units (`flux_scale`) |
+| `cutout_njy_v1` | cutout | Calibrate image stamps to nJy/pixel (`flux_scale`) |
 
-Bandpass metadata for SED conditioning: `data_lake/homogenize/bandpass.json`.
+Band metadata used for SED plots (effective wavelength, width) is in `data_lake/homogenize/bandpass.json`. See [plotting.md](plotting.md).
 
 ## Rule types reference
 
 ### Catalog rules (`phot_ab_v1`)
 
-Each rule operates on one source column and writes one target column. All catalog rules apply **built-in sentinel cleaning** automatically before the formula: values equal to `-9999`, `9999`, `-999`, or `999`, and IEEE NaN, are replaced with `null` before any arithmetic.
+Each rule reads one native column and writes one target column. Before the formula is applied, values equal to `-9999`, `9999`, `-999` or `999`, and NaN, are set to null. Rules whose source column is not numeric are skipped with a warning.
 
-| Type | Required params | Behaviour | Uncertainty propagation |
+| Type | Required params | Behaviour | Default uncertainty propagation |
 |------|-----------------|-----------|------------------------|
-| `mag_offset` | `delta` | `target = source + delta` | copied (nulled when source is null) |
+| `mag_offset` | `delta` | `target = source + delta` | copied (null when the target is null) |
 | `scale` | `factor` | `target = source × factor` | `err × factor` |
-| `identity` | — | copy after built-in sentinel clean | copied (nulled when source is null) |
-| `null_if_sentinel` | `values` (optional list) | copy; additionally null values in `values` and NaN | copied (nulled when source or uncertainty is null) |
-| `flux_to_ab` | `zp` | `target = −2.5 log₁₀(source) + zp`; source ≤ 0 → null | `2.5 / ln(10) × dflux / flux` |
-| `inverse` | — | `target = 1 / source`; source = 0 → null | no auto (copy err; use `uncertainty_transform: inverse` for `1/err`) |
+| `identity` | none | copy after sentinel cleaning | copied (null when the target is null) |
+| `null_if_sentinel` | `values` (optional list) | copy, also nulling the listed values | copied (null when the target is null) |
+| `flux_to_ab` | `zp` | `target = −2.5 log₁₀(source) + zp`; source ≤ 0 becomes null | `2.5 / ln(10) × dflux / flux` |
+| `inverse` | none | `target = 1 / source`; source = 0 becomes null | copied; set `uncertainty_transform: inverse` to get `1/err` |
 
-**JSON fields used on every rule:**
+Fields used on every rule:
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `source_column` | yes | Native column name in the survey tile |
 | `target_column` | yes | Output column name in the homogenized product |
+| `transform` | yes | An object with `type` and its parameters, or a non-empty list of such objects applied left to right (a chain) |
 | `uncertainty_column` | no | Native uncertainty column paired with `source_column` |
-| `target_uncertainty_column` | no | Output uncertainty column; must accompany `uncertainty_column` |
-| `uncertainty_transform` | no | Explicit transform for the uncertainty column (same `type` vocabulary as `transform`). When omitted, the engine auto-propagates from the value `transform` type (see uncertainty table above) |
-| `native_system` | no | Metadata only (e.g. `"Vega"`, `"uJy"`); does not affect computation |
-| `transform` | yes | Object with `type` and type-specific parameters, **or** a non-empty list of such objects applied left-to-right (chain) |
+| `target_uncertainty_column` | no | Output uncertainty column; needed together with `uncertainty_column` |
+| `uncertainty_transform` | no | Explicit transform for the uncertainty (same `type` vocabulary). When omitted, the uncertainty is propagated from the value transform as in the table above |
+| `native_system` | no | Metadata only (for example `"Vega"` or `"uJy"`); it does not affect the computation |
 
 #### Chained transforms
 
-A single rule may apply several value steps in order by giving `transform` as a list:
+A rule can apply several steps in order if `transform` is a list:
 
 ```json
 {
@@ -100,11 +202,11 @@ A single rule may apply several value steps in order by giving `transform` as a 
 }
 ```
 
-Steps run left-to-right on the intermediate value. Built-in sentinel cleaning applies on the first step (from the native column). `uncertainty_transform` may also be a list; when omitted, auto-propagation composes across the value chain (`scale` multiplies the error; `flux_to_ab` uses the flux after preceding scales).
+Each step works on the result of the previous one. Built-in sentinel cleaning happens only on the first step, which reads the native column. `uncertainty_transform` can also be a list. When it is omitted, propagation follows the chain: `scale` multiplies the error, and `flux_to_ab` uses the flux after any preceding scales.
 
 #### Explicit `uncertainty_transform`
 
-By default, uncertainty is derived from the value `transform` type (see table above). To override that — for example when native errors are in millimag while magnitudes are already in mag — set `uncertainty_transform` on the same rule:
+Set `uncertainty_transform` when the default propagation is wrong for your data. For example, use it when native errors are in millimag but the magnitudes are already in mag:
 
 ```json
 {
@@ -117,32 +219,25 @@ By default, uncertainty is derived from the value `transform` type (see table ab
 }
 ```
 
-Supported `uncertainty_transform` types are the same as value transforms:
+It requires both `uncertainty_column` and `target_uncertainty_column`. Supported types:
 
-| Type | Behaviour on uncertainty |
+| Type | Effect on the uncertainty |
 |------|--------------------------|
 | `scale` | `err × factor` |
-| `mag_offset` | `err + delta` |
-| `identity` / `null_if_sentinel` | copy, nulled when the value target is null |
-| `flux_to_ab` | `2.5 / ln(10) × dflux / flux` using `source_column` as flux (`zp` unused for the error) |
-| `inverse` | `1 / err` (reciprocal of the uncertainty column; zero → null) |
-
-Requires both `uncertainty_column` and `target_uncertainty_column`.
+| `mag_offset` | `err + delta` (only when set explicitly; a value `mag_offset` never changes the error) |
+| `identity` / `null_if_sentinel` | copy, null when the value target is null |
+| `flux_to_ab` | `2.5 / ln(10) × dflux / flux`, using `source_column` as the flux (`zp` is not used) |
+| `inverse` | `1 / err`; zero becomes null |
 
 #### `flux_to_ab` — flux units and zero points
 
-The formula `m_AB = −2.5 log₁₀(f) + zp` expects `f` in whatever units the zero point was derived for:
+The formula `m_AB = −2.5 log₁₀(f) + zp` only gives AB magnitudes if `zp` matches the unit of `f`. For a flux density in Jy, the AB zero point is 8.90 (8.906 is used in recipes). For µJy it is 23.9, as in EUCLID-style columns such as `flux_vis_2fwhm_aper`. Do not mix units and zero points.
 
-| Flux unit | Zero point (`zp`) | Example survey |
-|-----------|-------------------|----------------|
-| Jy | 8.906 (W1), 16.415 (W2) | `UNWISE_W1` |
-| µJy | 23.9 | EUCLID-style columns |
-
-Use `zp=8.906` for Jy flux; use `zp=23.9` for µJy flux (e.g. EUCLID `flux_vis_2fwhm_aper`). Do **not** mix units and zero points.
+The bundled `UNWISE_W1` recipe uses `zp = 8.906` and `UNWISE_W2` uses `zp = 16.415`. Both recipes describe the native system as "Vega Jy". Check the native flux unit before you reuse these values for another survey.
 
 #### `null_if_sentinel` — custom sentinel values
 
-Surveys sometimes encode missing data with survey-specific values (e.g. `99.0` for saturated detections) not covered by the built-in set. Use `null_if_sentinel` with an explicit `values` list:
+Some surveys mark missing data with their own values (for example `99.0` for saturated detections). List them in `values`:
 
 ```json
 {
@@ -151,94 +246,34 @@ Surveys sometimes encode missing data with survey-specific values (e.g. `99.0` f
 }
 ```
 
-An empty or omitted `values` list behaves identically to `identity` (built-in sentinels only).
-
-#### Query-time SQL
-
-`build_homogenized_view_sql` supports all catalog rule types and generates `CASE WHEN` expressions for sentinel nulling. It does **not** propagate uncertainty columns in SQL — for production use, always materialise with `dl-homogenize` instead.
+With an empty or missing `values` list it behaves like `identity` (built-in sentinels only).
 
 ### Spectra and cutout rules
 
 | Rule type | Used in pack | Parameters | Effect |
 |-----------|-------------|------------|--------|
-| `flux_scale` | `spec_observed_v1`, `cutout_njy_v1` | `factor` | Scales flux by `factor`; ivar by `1/factor²` |
-| `flux_calibration` | survey recipe only | `flux_scale` | Applied at ingest/export time (SDSS/DESI); **not** run by `dl-homogenize` |
+| `flux_scale` | `spec_observed_v1`, `cutout_njy_v1` | `factor` | Multiplies flux by `factor` (and ivar by `1/factor²`) |
+| `flux_calibration` | survey recipe only | `flux_scale` | Not run by `dl-homogenize`. It is applied at export time by `dl-extract-spectra-subset --apply-survey-calibration` |
 
-For `spec_observed_v1`: the transform block in the survey recipe sets `transform.type = "flux_scale"` and `transform.factor`. For `cutout_njy_v1`: per-band overrides via `bands.<name>.flux_scale` are also supported.
+In a `spec_observed_v1` block, set `transform.type = "flux_scale"` and `transform.factor`. A `cutout_njy_v1` block also accepts per-band factors in `bands.<name>.flux_scale`, which override the default factor for that band.
 
-Cross-reference: [Per-survey recipe schema](../shared/registry/homogenize/README.md).
+Recipe schema: [Per-survey recipe schema](../shared/registry/homogenize/README.md).
 
 ## Query-time (exploration)
 
-For ad-hoc SQL without materialising a product, use registry-driven view SQL from `build_homogenized_view_sql` (see notebook §8 migration path in `notebooks/11_duckdb_catalog_query.ipynb`).
+To try a conversion in SQL without writing a product, generate the view SQL with `build_homogenized_view_sql` (`data_lake.homogenize.transforms`). Section 8 of [`notebooks/11_duckdb_catalog_query.ipynb`](../notebooks/11_duckdb_catalog_query.ipynb) shows an example. This SQL is for exploration only, because it does not reproduce the materialized results exactly:
 
-## Areas
+- It does not compute uncertainty columns.
+- Built-in sentinel values are nulled only in `null_if_sentinel` rules (and `flux_to_ab` nulls values ≤ 0).
 
-Top-level `homogenize` block in `areas/<id>.json`:
+For science or training data, materialize with `dl-homogenize`.
 
-```json
-"homogenize": {
-  "survey": "ALLWISE",
-  "region": { "from_area": "Euclid_North" },
-  "transform": "phot_ab_v1",
-  "materialize_as": "ALLWISE_euclid_north_ab_v1"
-}
-```
+## Troubleshooting
 
-Multi-survey: use `gather` first, then homogenize the native wide product:
+**`AppendRowGroups requires equal schemas` during finalize.** This comes from older products built from sparse gather tiles, where a partner band was missing on some HEALPix tiles. Current versions write the missing targets as null columns so every tile shares one Parquet schema. Re-run `dl-homogenize … --overwrite`.
 
-```bash
-dl-homogenize \
-  --from-product EUCLID_wise_native \
-  --transform phot_ab_v1 \
-  --materialize-as EUCLID_wise_ab_v1
-```
+**`Provide exactly one selection selector`.** Give exactly one of `--from-area`, `--ids`, `--where`, `--cone`, `--bbox` or `--npix`. Omit them only with `--from-product` in catalog modality.
 
-Run from an area file (uses the top-level `homogenize` block — set it with
-[`dl-area set-homogenize`](discovery/areas-cli.md)):
-
-```bash
-dl-homogenize --from-area Euclid_North
-```
-
-## Spectra and cutouts (Phase F)
-
-Spectra and cutout homogenization requires a `spec_observed_v1` or `cutout_njy_v1` block in the survey recipe. The bundled `SDSS_DR17.json` and `DESI_DR1.json` do **not** yet include these blocks — add a lake-level override in `shared/registry/homogenize/<SURVEY>.json` (see the schema in that directory's `README.md`). The `synthetic` recipe is a working reference.
-
-```bash
-# After adding spec_observed_v1 block to the survey recipe:
-dl-homogenize --modality spectra --survey SDSS_DR17 \
-  --from-area Euclid_North --transform spec_observed_v1 \
-  --materialize-as SDSS_DR17_spec_obs_v1
-
-# After adding cutout_njy_v1 block to the survey recipe:
-dl-homogenize --modality cutout --survey DESI_DR1 \
-  --cone 150.1 2.2 --radius-arcsec 600 --transform cutout_njy_v1 \
-  --materialize-as DESI_DR1_cutout_njy_v1
-```
-
-## Validation
-
-```bash
-dl-validate-homogenization --golden --transform phot_ab_v1
-dl-validate-homogenization --product ALLWISE_ab_test --transform phot_ab_v1
-```
-
-## ML export from homogenized products
-
-```bash
-dl-extract-catalog --lake-root /data/lake \
-  --from-product ALLWISE_euclid_north_ab_v1 \
-  -c _source_id -c ra -c dec -c phot_ab_w1 \
-  -o /scratch/allwise_ab.parquet
-```
-
-`--from-product` implies `product_subtype: homogenized` and writes `extract_provenance.json` (or `*.homogenize_provenance.json` for single-file exports) with `transform_id` and lineage for ML training configs.
-
-**Sparse gather tiles:** when a partner band is missing on some HEALPix tiles, homogenized targets are still written (as null) so every tile shares one Parquet schema. Re-run with `--overwrite` if an older product failed finalize with `AppendRowGroups requires equal schemas`.
-
-**End-to-end workflow** (region → crossmatch → gather → homogenize → export):
-[discovery/workflow.md](discovery/workflow.md) and
-[`notebooks/14_discovery_workflow.ipynb`](../notebooks/14_discovery_workflow.ipynb).
+**`product catalog already exists`.** Add `--overwrite`, or choose a new `--materialize-as` name.
 
 See also: [Area plans (`dl-area`)](discovery/areas-cli.md), [Regions and areas](discovery/regions-and-areas.md), [Gather](discovery/gather.md), [Column overlays](../shared/registry/overlays/README.md), [SED + spectrum plot](plotting.md).

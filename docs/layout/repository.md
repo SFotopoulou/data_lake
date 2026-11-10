@@ -1,66 +1,54 @@
 # Repository layout
 
+Where to look in the source tree. Each `dl-*` command is a thin CLI over one of these modules; see [cli-reference.md](../cli-reference.md) for the command list.
+
 ```
 data_lake/
-  ingest/
-    fits_to_parquet.py        FITS/VOTable → HATS-partitioned Parquet (dl-ingest-catalog)
-    catalog_parallel_ingest.py  Parallel decode, single-thread writer (dl-ingest-catalog-batch)
-    fits_to_zarr.py           FITS cutouts → Zarr v3 sharded stacks
-    fits_to_spectra_zarr.py   FITS 1-D spectra → Zarr v3 sharded stacks
-    desi_parallel_ingest.py   Multi-process DESI coadd batch ingest
-    spectra_parallel_ingest.py  Parallel file-list spectrum ingest (non-DESI)
-    update_catalog_indices.py Patch _cutout_index / _spectrum_index in Parquet tiles; dl-rebuild-catalog-indices backfill CLI
-  io/
-    catalog.py           DuckDB-backed Parquet accessor
-    cutouts.py           Zarr cutout accessor (O(1) source_id lookup)
-    spectra.py           Zarr spectrum accessor (O(1) source_id lookup)
-    crossmatch.py        Build & query precomputed cross-match catalogs
-  ml/
-    dataset.py           PyTorch Dataset / IterableDataset (cutouts)
-    spectrum_dataset.py  PyTorch Dataset / IterableDataset (spectra) + transforms
-  homogenize/
-    bandpass.json        Per-band effective wavelength + FWHM registry (all phot_ab_* bands)
-    bandpass.py          BandpassRegistry: lake-override resolution + ECSV curve loading
-    bandpasses/          Bundled transmission-curve ECSV files (one per band; illustrative)
-    surveys/             Per-survey homogenization recipes (<SURVEY>.json)
-    transforms/          Transform-pack contracts (phot_ab_v1.json, etc.)
-    registry.py          load_homogenize_transforms / load_bandpass_metadata helpers
-  plot/
-    sed.py               Assemble SEDPoints from a homogenized product catalog row
-    source_figure.py     Two-panel SED + 1D spectrum matplotlib figure (lazy import)
-    plot_cli.py          dl-plot-source CLI entry point
-  discovery/
-    gather.py / gather_cli.py     Product catalog materialisation (dl-gather)
-    areas.py / area_cli.py        Area JSON management (dl-area)
-    engine.py                     Region query engine (dl-region)
-    moc_export.py / moc_export_cli.py  MOC export (dl-export-moc)
-  admin/
-    init_lake.py         dl-init: scaffold a new lake deployment
-    set_ingest_token.py  dl-set-ingest-token
-  bench/
-    __main__.py          Benchmarking entry point
-  cutouts/
-    generate_fits.py     dl-generate-cutout-fits: generate per-object stamps from band images
-  share/
-    pack_tile.py         Per-tile .tar packaging + MANIFEST.json
-  export/
-    catalog_extract.py   dl-extract-catalog: project columns → Parquet / CSV / FITS / VOTable
-    spectra_calibration.py  Flux calibration helpers for spectrum export
-    spectra_subset.py    Curated source-id subset → single flat Zarr group (dl-extract-spectra-subset)
-    spplate_catalog.py   dl-extract-spplate-catalog: specObj-style catalog from spPlate files
-    to_fits.py           Zarr cutout → standards-compliant FITS export
-    to_spectrum_fits.py  Zarr spectrum → 1-D FITS + BINTABLE export
-notebooks/
-  01_catalog_ingest.ipynb        02_spectrum_workflow.ipynb
-  03_cutout_ingest.ipynb         04_ingestion_report.ipynb
-  11_duckdb_catalog_query.ipynb  12_visualization.ipynb
-  13_pytorch_training_loop.ipynb 14_discovery_workflow.ipynb
-examples/
-  cross_survey_lsst_desi_euclid/   # synthetic lake + DuckDB join (master + modalities)
-  areas/                            # example area JSON files
-  imaging/ spectroscopy/ photometry/  # survey-specific example scripts
-data/                               # gitignored; populated locally with FITS fixtures for tests
-                                    # (lake data lives under catalogs/, products/, spectra/, cutouts/)
-                                    # (see tests/ for the actual committed test assets)
-```
+  config.py, knobs.py       Lake config resolution (lake_config.toml) and tunable defaults
+  lake_registry.py          Survey × modality registry (dl-describe-lake, dl-refresh-lake-registry, dl-describe-master)
+  schema_registry.py        Column manifests (dl-describe-survey); schema read from _common_metadata
+  query_from_master.py      SQL from a master association file (dl-build-query-from-master)
+  mcp_server.py, mcp_lake_server.py   MCP servers for agents (dl-mcp-docs, dl-mcp-lake)
 
+  ingest/                   Raw files → lake
+    fits_to_parquet.py        Catalog → HATS Parquet tiles; finalize writes _common_metadata + _metadata
+    catalog_parallel_ingest.py  dl-ingest-catalog-batch (parallel decode, single writer)
+    catalog_shard_ingest.py   dl-ingest-from-shard (map → per-tile parts, reduce → tiles)
+    catalog_mef_ingest.py     dl-ingest-catalog-mef (row-aligned FITS extensions joined)
+    fits_to_zarr.py           Cutout FITS → sharded Zarr v3
+    fits_to_spectra_zarr.py   1-D spectrum FITS → sharded Zarr v3
+    desi_parallel_ingest.py, spplate_parallel_ingest.py, spectra_parallel_ingest.py
+                              Multi-process spectrum batch ingest
+    update_catalog_indices.py Write _spectrum_index / _cutout_index back into catalog tiles
+    validate_*.py, repair_catalog_metadata.py, widen_spectrum_tiles.py
+                              Validation and repair commands
+
+  io/                       Reading the lake
+    catalog.py                CatalogAccessor: DuckDB over Parquet tiles (SQL, cone, ID lookups)
+    cutouts.py, spectra.py    Zarr accessors; locate() resolves many IDs at once, get_*_at() reads by position
+    id_lookup.py              _source_id → (tile, row) resolution shared by the accessors
+    crossmatch.py             dl-crossmatch: tiled sky / column matching
+    crossmatch_matchers.py    Matcher backends (astropy on CPU, RAPIDS cuML on GPU)
+    crossmatch_b_cache.py     Per-worker LRU of partner (B) tiles
+    duckdb_limits.py          Per-connection DuckDB memory/thread caps and footer cache
+
+  discovery/                Regions, areas and derived products
+    region.py, engine.py, region_cli.py   Region selection and dl-region
+    areas.py, area_cli.py     Area JSON (dl-area)
+    gather.py, gather_cli.py  dl-gather: base × partners → joined product catalog
+    partner_tile_cache.py     Whole-tile LRU used by dl-gather for partner lookups
+    moc_export.py             dl-export-moc
+
+  homogenize/               dl-homogenize: transform packs, bandpasses, per-survey recipes
+  export/                   dl-extract-catalog, spectra/cutout subsets, FITS writers
+  ml/                       PyTorch datasets (cutouts, spectra) with tile-ordered sampling
+  plot/                     dl-plot-source, dl-plot-spectrum
+  share/                    dl-pack-tile
+  admin/                    dl-init, dl-set-ingest-token
+  cutouts/                  dl-generate-cutout-fits
+
+notebooks/                  Guided walk-throughs; see docs/notebooks.md
+examples/                   Self-contained demos (synthetic cross-survey lake, area JSON, survey scripts)
+tests/                      pytest suite; needs no external data
+docs/                       This documentation
+```

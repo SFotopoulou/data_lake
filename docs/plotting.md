@@ -1,20 +1,15 @@
 # Source visualisation: SED + 1D spectrum
 
-`dl-plot-source` renders a two-panel figure for a single astronomical source:
+Two commands draw quick-look figures for one source:
 
-- **Top panel** — spectral energy distribution (SED): AB magnitudes from a homogenized product catalog, plotted at each band's effective wavelength with error bars.  Optional semi-transparent transmission-curve shading when ECSV curve files are registered.
-- **Bottom panel** — 1D spectrum: observed-frame flux from the Zarr spectrum store, with 1σ uncertainty shaded.
+- `dl-plot-spectrum` plots a single 1D spectrum from a survey's spectrum store. It needs only the survey name and the source's lake `_source_id`.
+- `dl-plot-source` draws a two-panel figure. The top panel is the spectral energy distribution (SED), built from the AB magnitudes in a homogenized product catalog. The bottom panel is the 1D spectrum.
 
-`dl-plot-spectrum` is the spectrum-only helper: given a survey and lake
-``_source_id``, it writes a single-panel flux vs wavelength figure (no product
-catalog required).
-
-Both panels / figures use wavelength in micron (log axis by default for
-``dl-plot-spectrum``).
+Use `dl-plot-spectrum` to check a spectrum. Use `dl-plot-source` once you have a homogenized product and want to compare photometry with spectroscopy.
 
 ## Install the viz extra
 
-Plotting requires matplotlib, which is an optional dependency:
+Plotting needs matplotlib, which is an optional dependency:
 
 ```bash
 pip install "data-lake[viz]"
@@ -38,13 +33,13 @@ dl-plot-source \
     -o source_1234567890.png
 ```
 
-This saves the figure (or prints the path to stdout).
+Both commands save the figure and print its path to stdout. Without `-o`, `dl-plot-spectrum` writes `spectrum_<survey>_<id>.png` and `dl-plot-source` writes `source_<id>.png` in the current directory. Wavelengths are shown in micron. The SED panel shows each band at its effective wavelength with error bars. The spectrum panel shows observed-frame flux with the 1σ uncertainty shaded.
 
 ## Source ID semantics
 
-`--id` must be the **lake `_source_id`** integer — the stable int64 join key shared between the catalog Parquet tiles and the Zarr spectrum stacks for a given survey.  This is *not* a native survey identifier like `TARGETID` or `SOURCE_ID` unless the survey was ingested with `--link-id-mode column:TARGETID`.
+`--id` must be the lake `_source_id`, the int64 key that links a survey's catalog Parquet tiles to its Zarr spectrum stacks. It is not the survey's native identifier (such as `TARGETID` or `SOURCE_ID`), unless the catalog was ingested with that integer column as `--link-id-col` (for example `--link-id-col TARGETID`). In that case the two values are the same.
 
-To look up the `_source_id` for a native identifier, query the catalog:
+To find the `_source_id` for a native identifier, query the catalog:
 
 ```python
 from data_lake.io.catalog import CatalogAccessor
@@ -52,7 +47,7 @@ cat = CatalogAccessor("/shared/como", "SDSS_DR17")
 df = cat.query("SELECT _source_id, SPECOBJID FROM catalog WHERE SPECOBJID = 123")
 ```
 
-Or from the CLI:
+Or from the command line:
 
 ```bash
 dl-extract-catalog --survey SDSS_DR17 -c _source_id -c SPECOBJID \
@@ -64,22 +59,29 @@ dl-preview-sources DESI_DR1 --modality spectra -n 5
 
 ## Spectrum-only options (`dl-plot-spectrum`)
 
+The lake root is an optional positional argument. You can leave it out when `--config` or `$DATA_LAKE_CONFIG` is set.
+
 ```
 dl-plot-spectrum SURVEY [LAKE_ROOT] --id INTEGER [OPTIONS]
 
 Options:
   --id INTEGER             Lake _source_id (required)
-  -o, --output PATH        Output file: .png (default), .pdf, .svg
+  -o, --output PATH        Output file: .png, .pdf, .svg
+                           [default: spectrum_<survey>_<id>.png]
   --dpi INTEGER            DPI for raster output [default: 150]
   --title TEXT             Figure title override
-  --rest-frame             Convert spectrum to rest-frame wavelength
+  --rest-frame             Convert to rest-frame wavelength using the stored redshift
   --linear-x               Linear wavelength axis (default: log)
   --clip-sigma FLOAT       Y-axis median ± N×MAD-σ clip [default: 10]; 0 disables
   --config PATH            Path to lake_config.toml (or $DATA_LAKE_CONFIG)
   -q / -v                  Quiet / verbose logging
 ```
 
+If the survey has a catalog, it is used to find the spectrum's tile. Otherwise the command scans the Zarr tiles, which is slower but works.
+
 ## SED + spectrum options (`dl-plot-source`)
+
+The lake root is passed as `--lake-root`, not as a positional argument.
 
 ```
 dl-plot-source [OPTIONS]
@@ -89,10 +91,10 @@ Options:
   --product TEXT           Homogenized product catalog name (required)
   --spectra-survey TEXT    Spectra survey name (required)
   --lake-root PATH         Lake root directory (or set $DATA_LAKE_CONFIG)
-  -o, --output PATH        Output file: .png (default), .pdf, .svg
+  -o, --output PATH        Output file: .png, .pdf, .svg [default: source_<id>.png]
   --dpi INTEGER            DPI for raster output [default: 150]
-  --title TEXT             Figure suptitle
-  --rest-frame             Convert spectrum to rest-frame wavelength
+  --title TEXT             Figure suptitle [default: "Source <id>"]
+  --rest-frame             Convert spectrum to rest-frame wavelength using the stored redshift
   --no-curves              Suppress bandpass transmission-curve shading
   --config PATH            Path to lake_config.toml (or $DATA_LAKE_CONFIG)
   -q, --quiet              Suppress INFO output
@@ -100,36 +102,40 @@ Options:
   --help                   Show this message and exit.
 ```
 
+If no bands with a known wavelength are found for the source, the command prints a warning and draws an empty SED panel. If the source is missing from the product or the spectrum store, it exits with an error.
+
 ## Photometry source: homogenized product catalog
 
-The SED panel reads all `phot_ab_*` columns (and matching `phot_ab_*_err` columns) present in the product catalog.  Bands without a known effective wavelength in the `BandpassRegistry` are silently skipped.
+The SED panel reads every `phot_ab_*` column in the product, together with its matching `phot_ab_*_err` column. Bands with a null value are skipped, and so are bands without an effective wavelength in the `BandpassRegistry`. Neither case produces a warning.
 
-The product catalog must have been produced by `dl-homogenize` (or `dl-gather` followed by `dl-homogenize`) and contain `phot_ab_*` columns from the `phot_ab_v1` transform.  Use `dl-describe-lake --kind product` to list available products.
+Make the product with `dl-homogenize`, or with `dl-gather` followed by `dl-homogenize`, using the `phot_ab_v1` transform (see [homogenization.md](homogenization.md)). Run `dl-describe-lake --kind product` to list the available products.
 
 ## Bandpass registry
 
-The `BandpassRegistry` provides:
+`BandpassRegistry` (`data_lake.homogenize.bandpass`) provides two things:
 
-- `lambda_eff_um` and `fwhm_um` for each `phot_ab_*` band (from `data_lake/homogenize/bandpass.json`)
-- Optional transmission-curve ECSV files (from `data_lake/homogenize/bandpasses/`)
+- The effective wavelength (`lambda_eff_um`) and width (`fwhm_um`) of each `phot_ab_*` band, from `data_lake/homogenize/bandpass.json`.
+- Optional transmission curves stored as ECSV files, which are drawn as semi-transparent shading behind the SED.
 
 ### Resolution rules
 
-1. `<lake_root>/shared/registry/bandpasses/<file>.ecsv` — lake-local override
-2. `data_lake/homogenize/bandpasses/<file>.ecsv` — bundled default
+Curve files are looked up in this order, and the first match wins:
 
-Lake overrides win, enabling deployment-specific curves without modifying the package.
+1. `<lake_root>/shared/registry/bandpasses/<file>.ecsv` (lake-local override)
+2. `data_lake/homogenize/bandpasses/<file>.ecsv` (bundled default)
+
+Use the lake directory for deployment-specific curves, so you don't have to modify the package. If a curve file is missing, the band is plotted without shading.
 
 ### Adding transmission curves
 
-See `data_lake/homogenize/bandpasses/README.md` for the ECSV format and instructions for downloading authoritative curves from the [SVO Filter Profile Service](http://svo2.cab.inta-csic.es/theory/fps/).
+`data_lake/homogenize/bandpasses/README.md` describes the ECSV format and how to download authoritative curves from the [SVO Filter Profile Service](http://svo2.cab.inta-csic.es/theory/fps/).
 
-To add a curve for a band already in `bandpass.json`:
+To add a curve for a band that is already in `bandpass.json`:
 
-1. Save the curve as `<Survey>_<Band>.ecsv` in `data_lake/homogenize/bandpasses/` (or a lake override directory).
-2. Add `"curve": "<Survey>_<Band>.ecsv"` to the band entry in `data_lake/homogenize/bandpass.json`.
+1. Save the curve as `<Survey>_<Band>.ecsv` in `data_lake/homogenize/bandpasses/` or in the lake override directory.
+2. Add `"curve": "<Survey>_<Band>.ecsv"` to the band's entry in `data_lake/homogenize/bandpass.json`.
 
-Currently bundled (illustrative, not authoritative): `WISE_W1.ecsv`, `Gaia_G.ecsv`.
+Only `WISE_W1.ecsv` and `Gaia_G.ecsv` are bundled, and they are illustrative rather than authoritative. `bandpass.json` also points `phot_ab_w2` to `WISE_W2.ecsv`, which is not bundled. That band is drawn without shading unless you add the file.
 
 ### All currently registered bands
 
@@ -150,6 +156,8 @@ Currently bundled (illustrative, not authoritative): `WISE_W1.ecsv`, `Gaia_G.ecs
 | `phot_ab_w4` | 22.194 | 4.098 | WISE W4 |
 
 ## Python API
+
+The same figure can be built in Python. This is what `dl-plot-source` does internally:
 
 ```python
 import matplotlib
@@ -174,10 +182,14 @@ fig = plot_source_sed_spectrum(sed, spectrum, bandpass_registry=bp)
 fig.savefig("source.png", dpi=150, bbox_inches="tight")
 ```
 
-## Follow-ups (not in v0.5.0)
+The optional `catalog_accessor` argument of `SpectrumAccessor` is used to find a spectrum's tile from the catalog's `_spectrum_index` column. If that lookup fails, `get_spectrum` falls back to scanning the spectrum tiles. A joined product may not carry `_spectrum_index` for the spectra survey, so pass `CatalogAccessor(lake, "SDSS_DR17")` instead when you need faster lookups. For many sources, call `spec_acc.locate(ids)` once and then `spec_acc.get_spectrum_at(npix, local)` for each source, instead of calling `get_spectrum` per ID. `plot_spectrum` in `data_lake.plot.source_figure` draws the spectrum-only figure.
 
-- `--y-unit fnu|flam` overlay: convert SED points to flux density units for direct overlay with the spectrum on a single axis.
-- Authoritative SVO transmission curves for all registered bands.
-- EUCLID/DESI/SDSS catalog mag → `phot_ab_*` recipes (needed to populate the SED for those surveys; see [homogenization.md](homogenization.md)).
+## Known limitations
+
+These features are not implemented yet:
+
+- There is no `--y-unit fnu|flam` option to convert SED points to flux density and overlay them on the spectrum in a single panel.
+- Authoritative SVO transmission curves are not bundled for every registered band.
+- EUCLID, DESI and SDSS have no bundled `phot_ab_*` catalog recipes, so their bands do not appear in the SED until you add a recipe (see [homogenization.md](homogenization.md)).
 
 See also: [homogenization.md](homogenization.md), [`dl-homogenize`](cli-reference.md).

@@ -539,11 +539,22 @@ try:
                 fits_memmap=fits_memmap.lower(),
             )
             if update_catalog and result["n_files_succeeded"] > 0:
-                from data_lake.ingest.update_catalog_indices import update_index_column
-
-                update_index_column(
-                    lake, survey_name, modality="cutout", norder=n,
-                )
+                try:
+                    from data_lake.ingest.update_catalog_indices import (
+                        update_index_column_from_zarr_tiles,
+                    )
+                    n_modified = update_index_column_from_zarr_tiles(
+                        lake_root=lake,
+                        survey_name=survey_name,
+                        kind="cutout",
+                        norder=n,
+                    )
+                    click.echo(f"Patched _cutout_index in {n_modified} catalog tile(s).")
+                except FileNotFoundError:
+                    log.info(
+                        "No catalog found for survey %r — skipping _cutout_index patch.",
+                        survey_name,
+                    )
             sys.exit(0 if result["n_files_failed"] == 0 else 1)
 
         # Accumulate index_map across all files so we patch the catalog once.

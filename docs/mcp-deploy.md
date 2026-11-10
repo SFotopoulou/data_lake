@@ -1,18 +1,15 @@
 # MCP server deployment guide
 
-This guide covers installing, configuring, and operating the two read-only MCP
-servers (`dl-mcp-docs` and `dl-mcp-lake`) for team deployments of the data lake.
+This guide covers installing, configuring and running the two Model Context Protocol (MCP) servers, `dl-mcp-docs` and `dl-mcp-lake`, for yourself or for a team sharing one lake. Read it when you set up agents against a shared lake or when a server does not behave as expected.
 
 ## Overview
 
-| Server | CLI | Exposes |
-|--------|-----|---------|
-| `data-lake-docs` | `dl-mcp-docs` | Documentation search, `docs://` resources, lake/survey inventory |
-| `data-lake-explorer` | `dl-mcp-lake` | Lake inventory (self-sufficient), region discovery, provenance, QA, ingest advice |
+| Server name | Command | Exposes |
+|-------------|---------|---------|
+| `data-lake-explorer` | `dl-mcp-lake` | Lake inventory, region discovery, provenance, QA and ingest advice |
+| `data-lake-docs` | `dl-mcp-docs` | Documentation search, `docs://` resources, and lake/survey inventory |
 
-The explorer is **self-sufficient** for lake operations: it includes `describe_lake`,
-`describe_survey`, `list_products`, and `list_homogenize_recipes`. Add the docs
-server only when you also need documentation search or `docs://` resources.
+Use the explorer alone unless you also want documentation search. It already includes the inventory tools (`describe_lake`, `describe_survey`, `list_products`, `list_homogenize_recipes`). Tool details are in [MCP lake explorer](mcp-lake.md) and [MCP docs server](mcp.md).
 
 ## Install
 
@@ -20,19 +17,17 @@ server only when you also need documentation search or `docs://` resources.
 uv sync --extra mcp
 ```
 
-Both servers are included in the same extra. No additional packages are needed.
+Both servers come with the same `mcp` extra; nothing else is needed.
 
 ## Lake configuration
 
-Both servers discover the lake via `DATA_LAKE_CONFIG` (path to `lake_config.toml`).
+Each tool call finds the lake in this order:
 
-Priority:
-1. `DATA_LAKE_CONFIG` environment variable
-2. `lake_config.toml` in the current working directory
-3. `lake_root` argument on individual tool calls
+1. The `lake_root` argument, if the agent passes one.
+2. The `DATA_LAKE_CONFIG` environment variable (path to `lake_config.toml`).
+3. A `lake_config.toml` in the server's working directory or any parent directory.
 
-Set `DATA_LAKE_CONFIG` in the MCP server env block so agents never need to pass
-`lake_root` explicitly:
+Set `DATA_LAKE_CONFIG` in the server's `env` block so agents never need to pass `lake_root`:
 
 ```json
 {
@@ -50,10 +45,9 @@ Copy the example and fill in your lake path:
 cp .cursor/mcp.json.example .cursor/mcp.json
 ```
 
-Edit `DATA_LAKE_CONFIG` in both server blocks, then restart Cursor (or reload MCP
-servers from the Cursor settings panel).
+Edit `DATA_LAKE_CONFIG` in both server blocks, then restart Cursor (or reload MCP servers from the Cursor settings panel).
 
-**Explorer only** (minimal — covers all lake operations):
+Explorer only (covers all lake operations):
 
 ```json
 {
@@ -67,7 +61,7 @@ servers from the Cursor settings panel).
 }
 ```
 
-**Both servers** (adds documentation search + `docs://` URI resources):
+Both servers (adds documentation search and `docs://` resources):
 
 ```json
 {
@@ -88,54 +82,56 @@ servers from the Cursor settings panel).
 
 ## Read-only boundary
 
-Both MCP servers are **strictly read-only**. They never:
+Neither server ingests, modifies or deletes survey data. They never:
 
-- Ingest, modify, or delete any data on disk
 - Handle or validate ingest tokens
 - Submit jobs (Slurm or otherwise)
-- Execute SQL (queries are built as strings, not run)
-- Spawn subprocesses beyond the FastMCP stdio loop
+- Execute SQL (`build_query` returns the SQL as text)
+- Run shell commands
 
-All write operations go through the `dl-*` CLIs directly.
+Use the `dl-*` CLIs for all writes.
 
-If your team deployment has a shared lake on a read-only mount, the MCP servers
-work correctly: they only read registry files, Parquet tile metadata, and JSON
-sidecar files.
+A few calls do write lake metadata files when they are missing or when the agent asks for a rebuild:
+
+| Call | Writes |
+|------|--------|
+| `describe_lake(refresh=True)`, or `describe_lake` / `list_products` when no registry exists | The lake registry `shared/registry/surveys.parquet` and the tile indices under `shared/registry/tile_index/` |
+| `describe_survey(rebuild=True)`, or `describe_survey` / `describe_product` when the survey has no `schema_manifest.json` | That survey's `schema_manifest.json` |
+
+On a read-only lake mount these calls fail (`describe_product` instead returns an empty column summary), but everything else works, because the servers otherwise only read the registry, Parquet tile metadata and JSON sidecar files. Run `dl-refresh-lake-registry` and `dl-finalize-catalog` from an account with write access so the files already exist.
 
 ## Shared team lake
 
-For a team lake (e.g. `/shared/como`):
+For a team lake (for example `/shared/como`):
 
-1. Set `DATA_LAKE_CONFIG=/shared/como/lake_config.toml` in the MCP server env.
-2. Each user runs their own stdio process — the servers are single-process and
-   stateless; there is no daemon or shared socket.
-3. The lake registry (`shared/registry/lake_registry.parquet`) is read at startup
-   and cached per-process. A `refresh=True` call or restarting the server picks up
-   new surveys.
-4. There is no authentication on the MCP layer. Access control is filesystem-level:
-   restrict `DATA_LAKE_CONFIG` and the lake directory as needed.
+1. Set `DATA_LAKE_CONFIG=/shared/como/lake_config.toml` in each server's `env` block.
+2. Each user's MCP client starts its own stdio process. There is no daemon or shared socket.
+3. The lake registry is read from disk on each tool call, so new surveys appear as soon as the registry is refreshed with `dl-refresh-lake-registry` (or `describe_lake(refresh=True)`). The documentation search index is built once per process; restart the docs server to pick up edited pages.
+4. The MCP layer has no authentication. Access control is at the filesystem level: restrict who can read `lake_config.toml` and the lake directory.
 
 ## Troubleshooting
 
-**"No lake root: pass lake_root or set DATA_LAKE_CONFIG"**
-→ `DATA_LAKE_CONFIG` is not set or the path does not exist.
+**"No lake root: pass lake_root or set DATA_LAKE_CONFIG / lake_config.toml."**
+No lake was found by any of the methods in [lake configuration](#lake-configuration). Set `DATA_LAKE_CONFIG` in the server's `env` block and check the path exists.
 
-**"Run dl-refresh-lake-registry to build the registry"**
-→ The lake has data on disk but no registry file yet.
-Run `dl-refresh-lake-registry` (or `dl-ingest-catalog` which refreshes automatically).
+**"No lake registry at … Run: dl-refresh-lake-registry"**, or `lake_health` reports "Run dl-refresh-lake-registry to build the registry."
+The lake has data on disk but no registry file yet. Run `dl-refresh-lake-registry`.
 
-**"Registry is N h old"** (from `lake_health`)
-→ New surveys were ingested since the registry was last refreshed.
-Run `dl-refresh-lake-registry`.
+**"Registry is N h old — consider dl-refresh-lake-registry."** (from `lake_health`)
+The registry is more than 24 hours old, so surveys ingested since then may be missing. Run `dl-refresh-lake-registry`.
+
+**`lake_health` reports unfinalized live surveys**
+Run `dl-finalize-catalog` for those surveys.
+
+**`lake_health` reports surveys missing a tile index**
+Run `dl-refresh-lake-registry`, which rebuilds all tile indices.
 
 **MCP server does not appear in Cursor**
-→ Ensure `uv sync --extra mcp` ran successfully in the project root.
-Check `.cursor/mcp.json` has the correct `command` path and `DATA_LAKE_CONFIG`.
-Restart Cursor after any config change.
+Check that `uv sync --extra mcp` succeeded in the project root, that `.cursor/mcp.json` has the right `command` and `DATA_LAKE_CONFIG`, and that the repository is open as the Cursor workspace. Restart Cursor after any config change.
 
 ## See also
 
-- [MCP lake explorer](mcp-lake.md) — full tool reference
-- [MCP docs server](mcp.md) — documentation search reference
-- [lake-config.md](lake-config.md) — `lake_config.toml` reference
-- [cli-reference.md](cli-reference.md) — all `dl-*` commands
+- [MCP lake explorer](mcp-lake.md): full tool reference
+- [MCP docs server](mcp.md): documentation search reference
+- [lake-config.md](lake-config.md): `lake_config.toml` reference
+- [cli-reference.md](cli-reference.md): all `dl-*` commands

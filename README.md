@@ -64,6 +64,7 @@ dl-describe-lake --count-total
 |-------|--------|
 | Validate and repair | [validate-and-repair.md](docs/validate-and-repair.md) |
 | Export and sharing | [export-and-sharing.md](docs/export-and-sharing.md) |
+| Performance tuning (workers, caches, ML) | [performance.md](docs/performance.md) |
 | Troubleshooting | [troubleshooting.md](docs/troubleshooting.md) |
 
 ### Discovery and query
@@ -80,7 +81,6 @@ dl-describe-lake --count-total
 | **Reference workflow** (region → ML export) | [discovery/workflow.md](docs/discovery/workflow.md) · [notebook](notebooks/14_discovery_workflow.ipynb) |
 | Homogenization (`dl-homogenize`) | [homogenization.md](docs/homogenization.md) |
 | SED + spectrum plot (`dl-plot-source`) | [plotting.md](docs/plotting.md) |
-| Performance tuning | [performance.md](docs/performance.md) |
 | DuckDB ID-list queries | [discovery/duckdb-queries.md](docs/discovery/duckdb-queries.md) |
 
 ### Layout and design
@@ -91,19 +91,16 @@ dl-describe-lake --count-total
 | Data on disk (HEALPix tiles) | [layout/data-on-disk.md](docs/layout/data-on-disk.md) |
 | Design decisions | [design-decisions.md](docs/design-decisions.md) |
 
-### Sprints
-
-| Sprint | Notes |
-|--------|-------|
-| Lake COMO — July 2026 | [sprints/como-2026-07.md](docs/sprints/como-2026-07.md) |
-
 ## Which command for this file?
 
 ```
-1-D spectrum FITS  → dl-ingest-spectra / dl-ingest-spectra-from-list / dl-ingest-spectra-batch-desi-coadds
-Catalog table      → dl-check-fits-table-format (FITS pre-check) → dl-ingest-catalog / dl-ingest-catalog-from-list / dl-ingest-catalog-batch
-Image cutouts      → dl-ingest-cutouts / dl-ingest-cutouts-from-list
-What's in the lake → dl-describe-lake --count-total
+1-D spectrum FITS     → dl-ingest-spectra / dl-ingest-spectra-from-list / dl-ingest-spectra-batch-desi-coadds
+Catalog table         → dl-check-fits-table-format (FITS pre-check)
+                      → dl-ingest-catalog / dl-ingest-catalog-from-list / dl-ingest-catalog-batch
+Joined MEF tables     → dl-ingest-catalog-mef          # row-aligned extensions (same NAXIS2)
+Image cutouts         → dl-ingest-cutouts / dl-ingest-cutouts-from-list
+What's in the lake    → dl-describe-lake --count-total
+Slow crossmatch / I/O → docs/performance.md
 ```
 
 See [design-decisions.md](docs/design-decisions.md) for the full decision tree.

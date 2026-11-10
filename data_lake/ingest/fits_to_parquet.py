@@ -4216,7 +4216,7 @@ try:
         quiet: bool,
         verbose: bool,
     ) -> None:
-        """Rebuild ``catalog_info.json``, ``_metadata``, and ``schema_manifest.json`` from tiles."""
+        """Rebuild ``catalog_info.json``, ``_common_metadata``, ``_metadata``, and ``schema_manifest.json`` from tiles."""
         validate_quiet_verbose(quiet, verbose)
         cfg = load_optional_config(config_path)
         configure_cli_logging(

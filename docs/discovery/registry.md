@@ -1,42 +1,77 @@
 # Lake registry and overlays
 
-### Lake registry and master metadata (P1)
+The lake registry is an index of every survey and modality on disk, so you can see what the
+lake holds without walking the directory tree. Use this page to list surveys, get row totals,
+map a master association table to catalog ID columns, and add analyst notes (units,
+descriptions) to columns.
 
-**Lake index** — scan what is deployed:
+## Quick start
 
 ```bash
-dl-refresh-lake-registry              # write shared/registry/surveys.parquet
-dl-describe-lake                      # print survey × modality summary
-dl-describe-lake --modality catalog   # catalogs only (or spectra / cutout / crossmatch)
-dl-describe-lake --modality crossmatch   # crossmatch rows in the registry table
-dl-describe-crossmatch                   # list every sky/column tree
-dl-describe-crossmatch A B --radius-arcsec 1.0   # one tree detail
-dl-describe-lake --kind ingested      # primary ingest across modalities (catalogs + spectra + cutouts)
-dl-describe-lake --kind product       # derived products (gather/homogenize)
-dl-describe-lake --count-total        # footer: per-modality totals + grand total (registry sums)
-dl-describe-lake --modality catalog --count-total
-dl-describe-lake --json               # {"entries": [...]} per survey × modality
-dl-describe-lake --json --count-total # entries + summary object
-dl-describe-lake --json --pair-surveys  # entries + catalog/spectra hats_order pairing
-dl-describe-lake --verbose            # tiles, ingest sidecars, meta_fields, spectrum_sky_meta, path, …
-dl-describe-lake --pair-surveys       # footer: catalog vs spectra hats_order per survey name
-dl-describe-lake --refresh            # rebuild registry from disk first, then print
+dl-refresh-lake-registry      # scan disk, write shared/registry/surveys.parquet
+dl-describe-lake              # print the survey × modality summary
 ```
 
-**`--count-total` does not rescan catalog/spectra tiles.** Counts for those
-modalities are read from the registry (`surveys.parquet`), which stores row
-counts recorded at ingest time. If you have ingested new data since the last
-`dl-refresh-lake-registry`, run `dl-describe-lake --refresh --count-total` to
-get up-to-date numbers.
+`dl-describe-lake` builds the registry automatically if `surveys.parquet` does not exist yet.
+Both commands take the lake root as an optional positional argument, or read it from
+`$DATA_LAKE_CONFIG`.
 
-**Crossmatch totals always come from on-disk Parquet footers** (not
-`crossmatch_info.json`), including during `--refresh`. That keeps lake-wide
-inventory correct even if an older region-bounded run wrote a shrunken sidecar.
-For **area-scoped** inventory (including crossmatch tile overlap and exact
-`--count`), use [`dl-region --from-area`](regions-and-areas.md) with
-`--modalities …,crossmatch`.
+## `dl-describe-lake` options
 
-The default table adds **sky** (`ra_column`/`dec_column`), a **detail** column (`link_id_mode` for catalogs; `n_pix` + `wavelength_mode` for spectra; band stack shape for cutouts), and **manifest** (`Y`/`·`). Full registry fields (including `link_id_mode`, `native_id_column`, `n_tiles`, ingest checkpoint flags, `hats_order_match`, `created_utc`, …) are in `shared/registry/surveys.parquet` and `--json`.
+```bash
+dl-describe-lake --modality catalog       # one modality: catalog, spectra, cutout, crossmatch
+dl-describe-lake --kind ingested          # primary ingest (catalogs, spectra, cutouts)
+dl-describe-lake --kind product           # derived products (gather, homogenize)
+dl-describe-lake --kind crossmatch        # crossmatch trees
+dl-describe-lake --count-total            # footer with per-modality totals and grand total
+dl-describe-lake --modality catalog --count-total
+dl-describe-lake --pair-surveys           # footer: catalog vs spectra hats_order per survey
+dl-describe-lake --areas                  # append the list of saved areas
+dl-describe-lake --verbose                # wide table: path, tiles, ingest sidecars, meta fields, …
+dl-describe-lake --refresh                # rebuild the registry from disk first, then print
+dl-describe-lake --json                   # {"entries": [...]}, one per survey × modality
+dl-describe-lake --json --count-total     # adds a "summary" object
+dl-describe-lake --json --pair-surveys    # adds a "pairing" object
+```
+
+For crossmatch trees specifically:
+
+```bash
+dl-describe-crossmatch                             # list every sky and column tree
+dl-describe-crossmatch A B --radius-arcsec 1.0     # details of one tree
+```
+
+### Row counts and freshness
+
+`--count-total` sums the `total_rows` stored in the registry; it does not rescan tiles. The
+registry records counts when it is built, so after new ingests run
+`dl-describe-lake --refresh --count-total` for current numbers.
+
+How `total_rows` is filled in when the registry is built:
+
+- **Catalogs:** `total_rows` from `catalog_info.json` (or the schema manifest).
+- **Spectra:** the sum of `_source_id` lengths across all `Npix=*.zarr` tiles, the same
+  number the ingestion report notebook shows as `n_spectra_in_zarr`.
+- **Crossmatch:** recounted from the on-disk Parquet footers, not from
+  `crossmatch_info.json`, so the lake-wide total stays correct even if an older
+  region-bounded run left a smaller sidecar.
+
+For counts inside one area (including crossmatch tile overlap and exact `--count`), use
+[`dl-region --from-area`](regions-and-areas.md) with `--modalities …,crossmatch`.
+
+### Table columns
+
+Besides survey, modality, HEALPix order, column count, and rows, the default table shows:
+
+- **sky:** the `ra_column` / `dec_column` pair;
+- **detail:** `link_id_mode` for catalogs, `n_pix` and `wavelength_mode` for spectra, and the
+  band × height × width stack for cutouts;
+- **id_col:** the join ID column;
+- **mf:** `Y` if a `schema_manifest.json` exists, `.` otherwise.
+
+All registry fields (including `link_id_mode`, `native_id_column`, `n_tiles`, ingest
+checkpoint flags, `hats_order_match`, and `created_utc`) are in
+`shared/registry/surveys.parquet` and in `--json` output.
 
 | Question | Registry field | Also see |
 |----------|----------------|----------|
@@ -44,15 +79,14 @@ The default table adds **sky** (`ra_column`/`dec_column`), a **detail** column (
 | Sky columns for joins / crossmatch | `ra_column`, `dec_column` | `dl-extract-catalog`, STILTS |
 | Catalog vs spectra HEALPix order | `hats_order_match`, `--pair-surveys` | `dl-validate-catalog-spectra-link` |
 | Spectrum pixel width / wavelength layout | `n_pix`, `wavelength_mode` | `spectrum_info.json` |
-| Per-spectrum Zarr meta (redshift, sky provenance, …) | `meta_fields`, `spectrum_sky_meta_fields`, `has_spectrum_sky_meta` | `dl-describe-lake` detail/`--verbose`; `dl-describe-survey NAME --modality spectra` lists `meta.*` columns with dtypes and `meta.sky` group |
-| Ingest still running? | `has_ingest_checkpoint`, `has_ingest_inflight` | survey `.ingest_*.json` sidecars |
+| Per-spectrum Zarr metadata (redshift, sky provenance, …) | `meta_fields`, `spectrum_sky_meta_fields`, `has_spectrum_sky_meta` | `dl-describe-lake --verbose`; `dl-describe-survey NAME --modality spectra` |
+| Is an ingest still running? | `has_ingest_checkpoint`, `has_ingest_inflight` | the survey's `.ingest_checkpoint.json` / `.ingest_inflight.json` |
 
-For **spectra**, ``total_rows`` in the registry is the sum of ``source_id`` lengths
-across all ``Npix=*.zarr`` tiles (same count as the ingestion report notebook’s
-``n_spectra_in_zarr``). Catalog rows use ``catalog_info.json`` ``total_rows``.
+## Master association tables
 
-**Master association** — map master ID columns to catalog join keys. Keep the
-master Parquet thin; store mapping in a sidecar ``<master>.meta.json``:
+A master association table maps your science sample to the IDs of each survey. Keep the
+master Parquet thin (IDs and match QA only) and describe its columns in a sidecar
+`<master>.meta.json`:
 
 ```json
 {
@@ -66,20 +100,24 @@ master Parquet thin; store mapping in a sidecar ``<master>.meta.json``:
 }
 ```
 
+Inspect a master and save the mapping:
+
 ```bash
 dl-describe-master associations/master.parquet
 dl-describe-master associations/master.parquet --write-meta   # save guessed .meta.json
 ```
 
-If ``.meta.json`` is missing, columns are matched heuristically against on-disk
-``schema_manifest.json`` files (run ``dl-describe-survey <name> --rebuild`` first
-for surveys without a manifest).
+If `.meta.json` is missing, `dl-describe-master` guesses the mapping by matching master column
+names against each survey's `schema_manifest.json`. Pass `--primary-survey NAME` to set the
+home survey of the guess, and `--json` for machine-readable output. For catalogs without a
+manifest, run `dl-describe-survey <name> --rebuild` first.
 
-### Spectra, cutouts, and column overlays (P2)
+## Spectra and cutout manifests
 
-**Spectra and cutout layers** get ``schema_manifest.json`` at ingest finalize
-(from ``spectrum_info.json`` / ``cutout_info.json``): Zarr array names, dtypes,
-roles (`flux`, `ivar`, `mask`, `wavelength`, `image`, `metadata`, …).
+Spectra and cutout layers get a `schema_manifest.json` when ingest finalizes, built from
+`spectrum_info.json` / `cutout_info.json`. It lists the Zarr array names, dtypes, and roles
+(`flux`, `ivar`, `mask`, `wavelength`, `image`, `metadata`, …). See
+[Schema registry](schema-registry.md) for catalog manifests.
 
 ```bash
 dl-describe-survey DESI_DR1 --modality catalog    # default
@@ -88,14 +126,20 @@ dl-describe-survey LSST_DR1 --modality cutout
 dl-describe-survey ALLWISE --rebuild
 ```
 
-**Optional overlays** — analyst JSON under ``shared/registry/overlays/``
-(see ``shared/registry/overlays/README.md``). Merged at describe time with
-``unit``, ``description``, and homogenization hints (e.g. WISE Vega → AB offset).
+## Column overlays (optional)
 
-**Discovery workflow** (master → columns → SQL):
+Overlays are analyst-written JSON files under `<lake_root>/shared/registry/overlays/` that add
+`unit`, `description`, and homogenization hints (for example the WISE Vega-to-AB offset) to
+columns. `dl-describe-survey` merges them at display time, looking first for
+`<survey>.<modality>.json` and then `<survey>.json`. The format is described in
+[`shared/registry/overlays/README.md`](../../shared/registry/overlays/README.md).
 
-1. ``dl-refresh-lake-registry`` then ``dl-describe-lake``
-2. ``dl-describe-master associations/master.parquet`` (``--write-meta`` once)
-3. ``dl-describe-survey <partner>`` for each catalog; ``--modality spectra`` if needed
-4. DuckDB ``want → master → catalog`` (``notebooks/11_duckdb_catalog_query.ipynb`` §9–§10)
+## Discovery workflow
 
+To go from "what is in the lake" to a SQL query:
+
+1. Run `dl-refresh-lake-registry`, then `dl-describe-lake`.
+2. Run `dl-describe-master associations/master.parquet` (add `--write-meta` once).
+3. Run `dl-describe-survey <partner>` for each catalog, with `--modality spectra` if needed.
+4. Join your ID list to the master and catalogs in DuckDB; see
+   [DuckDB queries](duckdb-queries.md) and `notebooks/11_duckdb_catalog_query.ipynb` §9–§10.

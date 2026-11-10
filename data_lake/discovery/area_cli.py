@@ -178,7 +178,7 @@ try:
         help='JSON mapping {survey: [col, ...]} (check dl-describe-survey).',
     )
     @click.option("--materialize-as", required=True,
-                  help="Product name under catalogs/.")
+                  help="Product name under products/.")
     @click.option(
         "--multiplicity", type=click.Choice(["nearest", "all"]),
         default="nearest", show_default=True,

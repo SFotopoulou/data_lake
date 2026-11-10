@@ -518,16 +518,29 @@ class CatalogAccessor:
 
     def get_sources_by_id(
         self,
-        source_ids: list[int],
+        source_ids: Sequence[int] | np.ndarray,
         columns: list[str] | None = None,
         fmt: ReturnFormat = "polars",
+        *,
+        batch_size: int = ID_SCAN_CHUNK,
     ):
-        """Fetch rows by a list of source_ids (using the catalog's actual ID column)."""
+        """Fetch rows by a list of source_ids (using the catalog's actual ID column).
+
+        Scans the whole survey once per *batch_size* unique IDs; prefer
+        :meth:`get_sources_by_id_in_healpix_pixels` when the tiles are known.
+        """
+        if len(source_ids) == 0:
+            return self._empty_result(fmt, columns)
         col_expr = ", ".join(columns) if columns else "*"
-        id_list = ", ".join(str(i) for i in source_ids)
-        sid_col = self._link_id_column
-        sql = f"SELECT {col_expr} FROM catalog WHERE {sid_col} IN ({id_list})"
-        return self.query(sql, fmt=fmt)
+        sid_sql = _quote_sql_ident(self._link_id_column)
+        chunks = [
+            self.query(
+                f"SELECT {col_expr} FROM catalog WHERE {sid_sql} IN (SELECT id FROM {ids_table})",
+                fmt=fmt,
+            )
+            for ids_table in self._id_tables(source_ids, batch_size)
+        ]
+        return self._concat_results(chunks, fmt, columns)
 
     def get_sources_by_id_in_healpix_pixels(
         self,
@@ -577,7 +590,9 @@ class CatalogAccessor:
                 f"WHERE {sid_sql} IN (SELECT id FROM {ids_table})"
             )
             chunks.append(self.query(sql, fmt=fmt))
+        return self._concat_results(chunks, fmt, columns)
 
+    def _concat_results(self, chunks: list, fmt: ReturnFormat, columns: list[str] | None):
         if not chunks:
             return self._empty_result(fmt, columns)
         if len(chunks) == 1:
