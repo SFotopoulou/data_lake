@@ -19,6 +19,7 @@ from data_lake.export.catalog_extract import (
     extract_catalog,
     extract_from_catalog_path,
     filter_valid_sky_rows,
+    map_ids_via_crossmatch,
     parse_column_spec,
     resolve_column_specs,
     select_catalog_columns,
@@ -358,6 +359,103 @@ class TestExtractFromLake:
         )
         assert not called["duckdb"]
         assert result.n_rows == 1
+
+    def _partner_lake(self, tmp_path: Path) -> Path:
+        """DESI-like IDS + LEG partner + DESI_x_LEG crossmatch tree."""
+        lake = self._id_lake(tmp_path)
+        leg = lake / "catalogs" / "LEG"
+        for npix, ids, flux in (
+            (1, [101, 102], [1.5, 2.5]),
+            (2, [103], [3.5]),
+        ):
+            tile_dir = leg / "Norder=5" / "Dir=0"
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            pq.write_table(
+                pa.table({
+                    "_source_id": pa.array(ids, type=pa.int64()),
+                    "ra": pa.array([float(i) for i in ids], type=pa.float64()),
+                    "flux_g": pa.array(flux, type=pa.float64()),
+                    "_healpix_norder5": pa.array([npix] * len(ids), type=pa.int64()),
+                }),
+                tile_dir / f"Npix={npix}.parquet",
+            )
+        (leg / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 3}',
+        )
+        xm = lake / "crossmatch" / "IDS_x_LEG__r1.0"
+        xm_tile = xm / "Norder=5" / "Dir=0"
+        xm_tile.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "source_id_a": pa.array([11, 12, 13], type=pa.int64()),
+                "source_id_b": pa.array([101, 102, 103], type=pa.int64()),
+                "sep_arcsec": pa.array([0.1, 0.2, 0.3], type=pa.float64()),
+            }),
+            xm_tile / "Npix=1.parquet",
+        )
+        (xm / "crossmatch_info.json").write_text(
+            '{"survey_a": "IDS", "survey_b": "LEG", "match_radius_arcsec": 1.0, '
+            '"hats_order": 5}',
+        )
+        return lake
+
+    def test_map_ids_via_crossmatch(self, tmp_path: Path) -> None:
+        lake = self._partner_lake(tmp_path)
+        mapped = map_ids_via_crossmatch(
+            lake,
+            "IDS_x_LEG__r1.0",
+            extract_survey="LEG",
+            source_ids=np.array([11, 13, 99], dtype=np.int64),
+        )
+        assert sorted(mapped.tolist()) == [101, 103]
+
+    def test_via_crossmatch_extract(self, tmp_path: Path) -> None:
+        lake = self._partner_lake(tmp_path)
+        ids = tmp_path / "desi_ids.parquet"
+        pq.write_table(
+            pa.table({"TARGETID": pa.array([12, 11], type=pa.int64())}),
+            ids,
+        )
+        out = tmp_path / "leg.parquet"
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--lake-root", str(lake),
+                "--survey", "LEG",
+                "--via-crossmatch", "IDS_x_LEG__r1.0",
+                "--target-list", str(ids),
+                "--target-id-col", "TARGETID",
+                "-c", "_source_id,flux_g",
+                "-o", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        tbl = pq.read_table(out)
+        assert sorted(tbl.column("_source_id").to_pylist()) == [101, 102]
+        assert sorted(tbl.column("flux_g").to_pylist()) == [1.5, 2.5]
+
+    def test_via_crossmatch_requires_target_list(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--lake-root", str(tmp_path),
+                "--survey", "LEG",
+                "--via-crossmatch", "IDS_x_LEG__r1.0",
+                "--all-columns",
+                "-o", str(tmp_path / "out.parquet"),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--via-crossmatch requires --target-list" in result.output
 
     def test_target_list_duckdb_engine(self, tmp_path: Path, caplog) -> None:
         lake = self._id_lake(tmp_path)

@@ -365,6 +365,13 @@ dl-extract-catalog --survey DESI_DR1 \
   --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
   -o /scratch/desi_stars.parquet
 
+# Partner catalog columns via an existing tree (one command)
+dl-extract-catalog --survey Legacy_DR11_north \
+  --via-crossmatch DESI_DR1_x_Legacy_DR11_north__r1.0 \
+  --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
+  -c _source_id,ra,dec,flux_g,flux_r,flux_z \
+  -o /scratch/legacy_for_desi_stars.parquet
+
 # Same survey
 dl-extract-spectra-subset --survey DESI_DR1 \
   --target-list /scratch/desi_stars.parquet --target-id-col _source_id \

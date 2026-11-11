@@ -36,7 +36,15 @@ dl-extract-cutout-subset --survey DESI_DR1 \
   --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
   --output /scratch/desi_stars_cutouts.zarr
 
-# 2b. Partner survey — positional match, then that survey's modalities
+# 2b. Partner survey columns in one go (existing crossmatch tree)
+# --survey = catalog to extract; --target-list IDs are the *other* side of the tree
+dl-extract-catalog --survey Legacy_DR11_north \
+  --via-crossmatch DESI_DR1_x_Legacy_DR11_north__r1.0 \
+  --target-list DESI-subset.fits --target-id-col TARGETID,SURVEY,PROGRAM \
+  -c _source_id,ra,dec,type,flux_g,flux_r,flux_z \
+  -o /scratch/legacy_for_desi_subset.parquet
+
+# 2c. Partner modalities after a manual ID map (same as before)
 dl-extract-catalog --survey EUCLID_DR1 \
   -c _source_id,ra,dec -o /scratch/euclid_sky.parquet
 

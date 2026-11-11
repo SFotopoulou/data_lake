@@ -253,6 +253,118 @@ def _sql_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def resolve_via_crossmatch_root(lake_root: Path | str, spec: str) -> Path:
+    """Resolve ``--via-crossmatch`` to a tree directory (path or ``crossmatch/`` name)."""
+    from data_lake.io.crossmatch import (
+        crossmatch_modality_root,
+        parse_column_crossmatch_dirname,
+        parse_crossmatch_dirname,
+    )
+
+    raw = Path(spec)
+    if raw.is_dir():
+        return raw.resolve()
+    lake_root = Path(lake_root)
+    named = crossmatch_modality_root(lake_root) / spec
+    if named.is_dir():
+        return named.resolve()
+    # Allow a bare path that does not exist yet to produce a clear error.
+    hint = ""
+    if (
+        parse_crossmatch_dirname(spec) is None
+        and parse_column_crossmatch_dirname(spec) is None
+        and not raw.suffix
+    ):
+        hint = (
+            " Expected a directory under "
+            f"{crossmatch_modality_root(lake_root)}/ or an absolute tree path."
+        )
+    raise FileNotFoundError(f"No crossmatch tree for --via-crossmatch={spec!r}.{hint}")
+
+
+def map_ids_via_crossmatch(
+    lake_root: Path | str,
+    via_crossmatch: str,
+    *,
+    extract_survey: str,
+    source_ids: np.ndarray,
+) -> np.ndarray:
+    """Map partner-side ``_source_id`` values through a crossmatch to *extract_survey* IDs.
+
+    ``source_ids`` belong to the tree side that is *not* ``extract_survey``.
+    Returns unique ``_source_id`` values for ``extract_survey`` (``source_id_a`` or
+    ``source_id_b`` depending on which side ``extract_survey`` is).
+    """
+    from data_lake.io.crossmatch import (
+        load_crossmatch_info,
+        parse_column_crossmatch_dirname,
+        parse_crossmatch_dirname,
+    )
+
+    ids = np.unique(np.asarray(source_ids, dtype=np.int64).ravel())
+    if ids.size == 0:
+        return ids
+
+    xm_root = resolve_via_crossmatch_root(lake_root, via_crossmatch)
+    info = load_crossmatch_info(xm_root)
+    survey_a = info.get("survey_a")
+    survey_b = info.get("survey_b")
+    if not survey_a or not survey_b:
+        parsed = parse_crossmatch_dirname(xm_root.name) or parse_column_crossmatch_dirname(
+            xm_root.name
+        )
+        if parsed is None:
+            raise ValueError(
+                f"Cannot determine survey_a/survey_b for crossmatch tree {xm_root}"
+            )
+        survey_a, survey_b = parsed[0], parsed[1]
+
+    if extract_survey == survey_a:
+        from_col, to_col = "source_id_b", "source_id_a"
+        partner = survey_b
+    elif extract_survey == survey_b:
+        from_col, to_col = "source_id_a", "source_id_b"
+        partner = survey_a
+    else:
+        raise ValueError(
+            f"--survey {extract_survey!r} is not a side of crossmatch "
+            f"{xm_root.name} ({survey_a}_x_{survey_b}). "
+            f"Target-list IDs are resolved on the partner side; "
+            f"--survey must be the catalog you extract from."
+        )
+
+    tiles = sorted(xm_root.rglob("Npix=*.parquet"))
+    if not tiles:
+        raise FileNotFoundError(f"No Parquet tiles under crossmatch tree {xm_root}")
+
+    con = _connect_extract_duckdb(ids)
+    try:
+        files = [str(p.resolve()) for p in tiles]
+        sql = (
+            f"SELECT DISTINCT {_sql_ident(to_col)} AS id "
+            f"FROM read_parquet($files, hive_partitioning=false) "
+            f"WHERE {_sql_ident(from_col)} IN "
+            f"(SELECT id FROM {_TARGET_IDS_RELATION})"
+        )
+        rows = con.execute(sql, {"files": files}).fetchnumpy()
+    finally:
+        con.close()
+
+    if not rows:
+        mapped = np.asarray([], dtype=np.int64)
+    else:
+        mapped = np.unique(np.asarray(next(iter(rows.values())), dtype=np.int64))
+    log.info(
+        "Via crossmatch %s: %d %s id(s) → %d %s id(s)",
+        xm_root.name,
+        int(ids.size),
+        partner,
+        int(mapped.size),
+        extract_survey,
+    )
+    return mapped
+
+
 def _prepare_source_id_filter(
     catalog_root: Path,
     schema_names: Sequence[str],
@@ -2033,7 +2145,9 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     help=(
         "File of source IDs to keep (FITS, CSV, Parquet, or plain text). "
         "IDs are resolved with the same link-id rule as ingest and matched to "
-        "catalog _source_id. Requires --survey. Mutually exclusive with --where."
+        "catalog _source_id. With --via-crossmatch, IDs are for the *partner* "
+        "survey (the other side of the tree) and are mapped to --survey before "
+        "extract. Requires --survey. Mutually exclusive with --where."
     ),
 )
 @click.option(
@@ -2042,8 +2156,19 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     show_default=True,
     help=(
         "Column in --target-list carrying source IDs, or a comma-separated "
-        "composite matching catalog --link-id-col (e.g. TARGETID,SURVEY,PROGRAM). "
-        "Ignored for plain-text files."
+        "composite matching the partner (or --survey) --link-id-col "
+        "(e.g. TARGETID,SURVEY,PROGRAM). Ignored for plain-text files."
+    ),
+)
+@click.option(
+    "--via-crossmatch",
+    default=None,
+    help=(
+        "Existing crossmatch tree name under crossmatch/ (or absolute path). "
+        "With --target-list, map partner-side IDs through the tree to --survey "
+        "_source_id values, then extract. --survey must be survey_a or survey_b "
+        "of the tree (e.g. Legacy_DR11_north with "
+        "DESI_DR1_x_Legacy_DR11_north__r1.0 and a DESI target list)."
     ),
 )
 @click.option(
@@ -2103,6 +2228,7 @@ def cli(
     dec_col: str | None,
     target_list: Path | None,
     target_id_col: str,
+    via_crossmatch: str | None,
     where_sql: str | None,
     row_limit: int | None,
     add_input_path: bool,
@@ -2117,7 +2243,9 @@ def cli(
     """Export selected catalog columns for catalog–catalog association (sky matching).
 
     Pass --target-list to keep rows whose _source_id matches an external ID file
-    (same resolution as dl-extract-spectra-subset). Mutually exclusive with --where.
+    (same resolution as dl-extract-spectra-subset). With --via-crossmatch, those
+    IDs are on the partner side of the tree and are mapped to --survey first.
+    Mutually exclusive with --where.
     """
     validate_quiet_verbose(quiet, verbose)
     configure_cli_logging(
@@ -2145,6 +2273,8 @@ def cli(
         raise click.ClickException("Pass -c or --all-columns.")
     if target_list is not None and where_sql:
         raise click.ClickException("Use --target-list or --where, not both.")
+    if via_crossmatch is not None and target_list is None:
+        raise click.ClickException("--via-crossmatch requires --target-list.")
 
     cfg = load_optional_config(config_path)
     if lake_root is None and survey is not None:
@@ -2190,6 +2320,10 @@ def cli(
         raise click.ClickException(
             "--target-list requires an ingested catalog (--survey)."
         )
+    if via_crossmatch is not None and lake_root is None:
+        raise click.ClickException(
+            "--via-crossmatch requires --lake-root / $DATA_LAKE_CONFIG."
+        )
     if where_sql:
         from data_lake.export.row_filter import validate_predicate
 
@@ -2214,6 +2348,17 @@ def cli(
             target_list,
             target_id_col,
         )
+        if via_crossmatch is not None:
+            assert survey is not None and lake_root is not None
+            try:
+                source_ids = map_ids_via_crossmatch(
+                    lake_root,
+                    via_crossmatch,
+                    extract_survey=survey,
+                    source_ids=source_ids,
+                )
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                raise click.ClickException(str(exc)) from exc
 
     fmt: OutputFormat | None = (
         output_format.lower()  # type: ignore[assignment]
