@@ -95,7 +95,7 @@ DEFAULT_FITS_CHUNK_ROWS: int = 50_000
 MAX_PARALLEL_WORKERS_CAP: int = 64
 """Hard ceiling for homogenize / discovery thread or process pools."""
 
-CROSSMATCH_DENSE_TILE_WARN: int = 50_000
+CROSSMATCH_DENSE_TILE_WARN: int = 1_500_000
 """Warn when a survey-A tile has at least this many sources."""
 
 DEFAULT_HATS_ORDER: int = 5
