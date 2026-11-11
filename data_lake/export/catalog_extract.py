@@ -74,18 +74,24 @@ _TARGET_IDS_RELATION = "extract_target_ids"
 
 @contextmanager
 def _extract_staging_dir(parent: Path | str | None = None) -> Iterator[Path]:
-    """Create a staging directory under *parent* (default: process cwd).
+    """Create a staging directory under the process cwd (not system ``/tmp``).
 
     FITS/VOTable lake exports write an intermediate Parquet here, then convert
-    and delete the directory.  *parent* is created with ``mkdir(parents=True,
-    exist_ok=True)`` when missing so nested ``-o`` paths work. Prefer the
-    output file's directory when known so staging stays on the same filesystem
-    as the final write (not system ``/tmp``).
+    and delete the directory.  *parent* is accepted for API compatibility but
+    ignored: staging always uses :func:`Path.cwd` so the temp tree appears in
+    the directory where the command was launched.  Cwd is created with
+    ``mkdir(parents=True, exist_ok=True)`` if missing (unusual, but safe).
     """
-    base = Path(parent) if parent is not None else Path.cwd()
+    del parent  # callers may pass output.parent; staging is always cwd
+    base = Path.cwd()
     base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="dl_extract_", dir=str(base)) as tmp:
         yield Path(tmp)
+
+
+def _staging_parquet_path(staging_dir: Path, output: Path) -> Path:
+    """Absolute staging Parquet path derived from the final output name."""
+    return (staging_dir / f"{Path(output).stem}.dl_extract.parquet").resolve()
 
 
 @dataclass(frozen=True)
@@ -915,8 +921,8 @@ def _stream_lake_via_duckdb(
     out_names = tuple(out for _, out in mapping)
     if not tile_paths:
         empty = pa.table({name: pa.array([], type=pa.null()) for name in out_names})
-        with _extract_staging_dir(output.parent) as tmp:
-            tmp_pq = tmp / "empty.parquet"
+        with _extract_staging_dir() as tmp:
+            tmp_pq = _staging_parquet_path(tmp, output)
             pq.write_table(empty, tmp_pq, compression="zstd", compression_level=_ZSTD_LEVEL)
             if output_format == "parquet":
                 shutil.copyfile(tmp_pq, output)
@@ -930,8 +936,10 @@ def _stream_lake_via_duckdb(
     convert_after = output_format in ("fits", "votable")
     copy_format: OutputFormat = "parquet" if convert_after else output_format
 
-    with _extract_staging_dir(output.parent) as tmp:
-        copy_target = tmp / "lake_extract.parquet" if convert_after else output
+    with _extract_staging_dir() as tmp:
+        copy_target = (
+            _staging_parquet_path(tmp, output) if convert_after else Path(output).resolve()
+        )
         if copy_format == "parquet":
             copy_to = "TO $out (FORMAT PARQUET, COMPRESSION ZSTD)"
         elif copy_format == "csv":
@@ -943,9 +951,10 @@ def _stream_lake_via_duckdb(
         try:
             # Explicit file list avoids hive_partitioning on Norder=/Dir= paths and
             # dodges COPY placeholder ordering quirks with read vs write targets.
+            # Always pass an absolute path: a relative $out would land in cwd.
             con.execute(
                 f"COPY ({select_sql}) {copy_to}",
-                {"files": files, "out": str(copy_target)},
+                {"files": files, "out": str(copy_target.resolve())},
             )
         finally:
             con.close()
@@ -1500,8 +1509,8 @@ def _stream_lake_tile_by_tile(
     ) if tiles else None
 
     if output_format in ("fits", "votable"):
-        with _extract_staging_dir(output.parent) as tmp:
-            tmp_pq = tmp / "lake_extract.parquet"
+        with _extract_staging_dir() as tmp:
+            tmp_pq = _staging_parquet_path(tmp, output)
             n_rows = _write_chunks_to_parquet(
                 _iter_lake_extract_chunks(
                     catalog_root,
