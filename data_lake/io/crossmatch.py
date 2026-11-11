@@ -3080,9 +3080,13 @@ def execute_crossmatch_plan(
     missing tiles in the area are computed. ``crossmatch_info.json`` always
     stores full on-disk tree totals after the run.
     """
-    from data_lake.discovery.area_plan import partner_match_mode
+    from data_lake.discovery.area_plan import (
+        partner_match_mode,
+        strip_crossmatch_plan_annotations,
+    )
 
     lake_root = Path(lake_root)
+    plan = strip_crossmatch_plan_annotations(plan)
     base = plan.get("base_catalog")
     if not base:
         raise ValueError("crossmatch_plan missing 'base_catalog'")
@@ -3170,6 +3174,8 @@ def load_crossmatch_plan(
     """
     if (from_area is None) == (plan_file is None):
         raise ValueError("provide exactly one of from_area or plan_file")
+    from data_lake.discovery.area_plan import strip_crossmatch_plan_annotations
+
     if from_area is not None:
         from data_lake.discovery.areas import load_area
 
@@ -3177,9 +3183,12 @@ def load_crossmatch_plan(
         plan = area.crossmatch_plan
         if plan is None:
             raise ValueError(f"area {from_area!r} has no 'crossmatch_plan' block")
-        return plan, area.region
+        return strip_crossmatch_plan_annotations(plan), area.region
     with open(plan_file) as fh:  # type: ignore[arg-type]
-        return json.load(fh), None
+        raw = json.load(fh)
+    if not isinstance(raw, dict):
+        raise ValueError(f"crossmatch plan file must be a JSON object: {plan_file}")
+    return strip_crossmatch_plan_annotations(raw), None
 
 
 # ---------------------------------------------------------------------------

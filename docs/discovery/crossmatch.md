@@ -123,6 +123,26 @@ The usual setup is to save a cone (or npix list, or box) with
 [`dl-area set-crossmatch`](areas-cli.md) (or `dl-area import`). See
 [End-to-end workflow](regions-and-areas.md#end-to-end-workflow-cone--crossmatch--gather).
 
+### Draft a plan (`--suggest-plan`)
+
+To get a starting JSON with an automatic **sky vs column** choice per partner
+(from schema manifests), without running any match:
+
+```bash
+dl-crossmatch --suggest-plan \
+  --base EUCLID_Q1_MER \
+  --partner GAIA_DR3_source \
+  --partner ALLWISE \
+  -o euclid_partners.suggest.json
+```
+
+Heuristics (first hit wins): shared ID-like column names; foreign-key style
+columns such as `GAIA_ID` → partner `source_id`; otherwise sky with
+`--radius-arcsec` as the default (1.0). Reasons are printed on stderr and stored
+under `_suggestions` in the JSON. Edit radii/columns by hand, then run with
+`--plan` or copy partners into an area. `_suggestions` is ignored at execute
+time. Suggest never joins on `_source_id` (lake-local hashes differ by survey).
+
 ```bash
 # Run the area's crossmatch_plan, bounded to the area's region (gap-fill only)
 dl-crossmatch /data/lake --from-area Euclid_North --n-workers 8

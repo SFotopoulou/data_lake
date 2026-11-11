@@ -21,6 +21,7 @@ from data_lake.knobs import (
     PARTNER_TILE_CACHE_MAX_BYTES,
     PARTNER_TILE_CACHE_MAX_TILES,
 )
+from data_lake.discovery.area_plan import suggest_crossmatch_plan
 from data_lake.io.crossmatch import (
     CrossmatchResult,
     build_column_crossmatch,
@@ -65,6 +66,34 @@ _cli_b_cache_mib = PARTNER_TILE_CACHE_MAX_BYTES // (1024 * 1024)
     type=click.Path(path_type=Path),
     default=None,
     help="Run a crossmatch plan from a JSON file (no region restriction).",
+)
+@click.option(
+    "--suggest-plan",
+    is_flag=True,
+    help=(
+        "Write a draft crossmatch_plan JSON (auto sky vs column) and exit; "
+        "does not run matching. Requires --base and repeatable --partner."
+    ),
+)
+@click.option(
+    "--base",
+    "suggest_base",
+    default=None,
+    help="[suggest-plan] Base catalog survey name.",
+)
+@click.option(
+    "--partner",
+    "suggest_partners",
+    multiple=True,
+    help="[suggest-plan] Partner survey name (repeatable). Bare name only.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "suggest_output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="[suggest-plan] Write draft JSON here (default: stdout).",
 )
 @click.option(
     "--radius-arcsec",
@@ -207,6 +236,10 @@ def cli(
     config_path: Path | None,
     from_area: str | None,
     plan_file: Path | None,
+    suggest_plan: bool,
+    suggest_base: str | None,
+    suggest_partners: tuple[str, ...],
+    suggest_output: Path | None,
     radius_arcsec: float,
     norder_a: int | None,
     norder_b: int | None,
@@ -243,6 +276,11 @@ def cli(
     Column mode (--match-mode column): equality join on ``--match-col-a`` /
     ``--match-col-b``.  Output: ``crossmatch/<A>_x_<B>__col_<cola>__<colb>/``.
     All matching pairs are written (many-to-many); sep_arcsec is 0.
+
+    Draft a multi-partner plan without running::
+
+        dl-crossmatch --suggest-plan --base EUCLID_Q1_MER \\
+          --partner GAIA_DR3_source --partner ALLWISE -o plan.json
     """
     validate_quiet_verbose(quiet, verbose)
     cfg = load_optional_config(config_path)
@@ -252,6 +290,49 @@ def cli(
         quiet=quiet,
         log_file=log_file,
     )
+
+    if suggest_plan:
+        if from_area is not None or plan_file is not None:
+            raise click.ClickException(
+                "--suggest-plan cannot be combined with --from-area or --plan"
+            )
+        if not suggest_base:
+            raise click.ClickException("--suggest-plan requires --base SURVEY")
+        if not suggest_partners:
+            raise click.ClickException(
+                "--suggest-plan requires at least one --partner SURVEY"
+            )
+        # Positional may be the lake root when config is unset.
+        lake_arg = output_root
+        if lake_arg is None and survey_a is not None and survey_b is None:
+            lake_arg = Path(survey_a)
+        lake = require_output_root(lake_arg, cfg, kind="catalogs")
+        try:
+            draft = suggest_crossmatch_plan(
+                lake,
+                suggest_base,
+                list(suggest_partners),
+                default_sky_radius_arcsec=radius_arcsec,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        reasons = draft.get("_suggestions") or {}
+        if isinstance(reasons, dict):
+            for name, reason in reasons.items():
+                click.echo(f"  {name}: {reason}", err=True)
+        text = json.dumps(draft, indent=2) + "\n"
+        if suggest_output is not None:
+            suggest_output.parent.mkdir(parents=True, exist_ok=True)
+            suggest_output.write_text(text, encoding="utf-8")
+            click.echo(
+                f"Wrote draft crossmatch_plan → {suggest_output} "
+                "(edit, then dl-crossmatch --plan …)",
+                err=True,
+            )
+        else:
+            click.echo(text, nl=False)
+        return
+
     if n_workers < 1:
         raise click.ClickException("--n-workers must be >= 1")
     if tiles_per_worker < 1:

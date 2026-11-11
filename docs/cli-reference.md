@@ -83,7 +83,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-crossmatch` | Catalog↔catalog match at lake scale; sky mode (default, `--radius-arcsec`) or column equality (`--match-mode column --match-col-a COL --match-col-b COL`); `--from-area`/`--plan` for region-bounded sky plans; `--n-workers`, `--strips-per-worker` and `--memory-budget-gb` for large runs ([tuning](discovery/crossmatch.md)); progress on by default (`--no-progress`) |
+| `dl-crossmatch` | Catalog↔catalog match at lake scale; sky mode (default, `--radius-arcsec`) or column equality (`--match-mode column --match-col-a COL --match-col-b COL`); `--from-area`/`--plan` for multi-partner plans; `--suggest-plan --base S --partner P` drafts a plan JSON (auto sky/column); `--n-workers`, `--strips-per-worker` and `--memory-budget-gb` for large runs ([tuning](discovery/crossmatch.md)); progress on by default (`--no-progress`) |
 | `dl-gather` | Materialise a derived product catalog joining base × partners over a selection; `--from-area`, `--matches-only` (default: keep all base rows), partner cache flags, nearest/`--multiplicity all`, `--where-joined`, `--extract-modalities`; progress on by default (`--no-progress`) ([docs](discovery/gather.md)) |
 | `dl-homogenize` | Apply transform registry to a survey+region → homogenized product catalog; progress on by default (`--no-progress`) ([docs](homogenization.md)) |
 | `dl-validate-homogenization` | Lint transform registry, golden spot checks, homogenized product validation |
