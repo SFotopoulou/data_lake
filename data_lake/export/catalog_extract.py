@@ -73,16 +73,18 @@ _TARGET_IDS_RELATION = "extract_target_ids"
 
 
 @contextmanager
-def _extract_staging_dir() -> Iterator[Path]:
-    """Create a staging directory under the process cwd (not system ``/tmp``).
+def _extract_staging_dir(parent: Path | str | None = None) -> Iterator[Path]:
+    """Create a staging directory under *parent* (default: process cwd).
 
     FITS/VOTable lake exports write an intermediate Parquet here, then convert
-    and delete the directory.  Using cwd keeps large staging files on the same
-    filesystem the operator is working in (often scratch), not the node tmpfs.
+    and delete the directory.  *parent* is created with ``mkdir(parents=True,
+    exist_ok=True)`` when missing so nested ``-o`` paths work. Prefer the
+    output file's directory when known so staging stays on the same filesystem
+    as the final write (not system ``/tmp``).
     """
-    with tempfile.TemporaryDirectory(
-        prefix="dl_extract_", dir=str(Path.cwd()),
-    ) as tmp:
+    base = Path(parent) if parent is not None else Path.cwd()
+    base.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="dl_extract_", dir=str(base)) as tmp:
         yield Path(tmp)
 
 
@@ -913,7 +915,7 @@ def _stream_lake_via_duckdb(
     out_names = tuple(out for _, out in mapping)
     if not tile_paths:
         empty = pa.table({name: pa.array([], type=pa.null()) for name in out_names})
-        with _extract_staging_dir() as tmp:
+        with _extract_staging_dir(output.parent) as tmp:
             tmp_pq = tmp / "empty.parquet"
             pq.write_table(empty, tmp_pq, compression="zstd", compression_level=_ZSTD_LEVEL)
             if output_format == "parquet":
@@ -928,7 +930,7 @@ def _stream_lake_via_duckdb(
     convert_after = output_format in ("fits", "votable")
     copy_format: OutputFormat = "parquet" if convert_after else output_format
 
-    with _extract_staging_dir() as tmp:
+    with _extract_staging_dir(output.parent) as tmp:
         copy_target = tmp / "lake_extract.parquet" if convert_after else output
         if copy_format == "parquet":
             copy_to = "TO $out (FORMAT PARQUET, COMPRESSION ZSTD)"
@@ -1491,13 +1493,14 @@ def _stream_lake_tile_by_tile(
 
     assert output is not None
     output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
 
     unified_schema = _unified_schema_for_mapping(
         tiles, mapping, catalog_root=catalog_root,
     ) if tiles else None
 
     if output_format in ("fits", "votable"):
-        with _extract_staging_dir() as tmp:
+        with _extract_staging_dir(output.parent) as tmp:
             tmp_pq = tmp / "lake_extract.parquet"
             n_rows = _write_chunks_to_parquet(
                 _iter_lake_extract_chunks(

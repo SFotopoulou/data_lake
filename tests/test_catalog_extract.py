@@ -45,6 +45,14 @@ class TestColumnSpecs:
             assert staging.parent.resolve() == tmp_path.resolve()
             assert staging.name.startswith("dl_extract_")
 
+    def test_staging_dir_creates_missing_parent(self, tmp_path: Path) -> None:
+        parent = tmp_path / "nested" / "out"
+        assert not parent.exists()
+        with _extract_staging_dir(parent) as staging:
+            assert parent.is_dir()
+            assert staging.is_dir()
+            assert staging.parent.resolve() == parent.resolve()
+
     def test_parse_alias(self) -> None:
         assert parse_column_spec("ra:RA") == ("ra", "RA")
         assert parse_column_spec("TARGETID") == ("TARGETID", None)
