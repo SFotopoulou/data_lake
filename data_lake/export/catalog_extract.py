@@ -45,6 +45,7 @@ import json
 import logging
 import shutil
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal, Sequence
@@ -69,6 +70,20 @@ _SKY_DEC_ALIASES = ("dec", "dec_deg", "decdeg", "dej2000", "dec_obj")
 _LARGE_OUTPUT_ROW_WARN = 5_000_000
 _FITS_STREAM_BATCH_ROWS = 1_000_000
 _TARGET_IDS_RELATION = "extract_target_ids"
+
+
+@contextmanager
+def _extract_staging_dir() -> Iterator[Path]:
+    """Create a staging directory under the process cwd (not system ``/tmp``).
+
+    FITS/VOTable lake exports write an intermediate Parquet here, then convert
+    and delete the directory.  Using cwd keeps large staging files on the same
+    filesystem the operator is working in (often scratch), not the node tmpfs.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="dl_extract_", dir=str(Path.cwd()),
+    ) as tmp:
+        yield Path(tmp)
 
 
 @dataclass(frozen=True)
@@ -898,8 +913,8 @@ def _stream_lake_via_duckdb(
     out_names = tuple(out for _, out in mapping)
     if not tile_paths:
         empty = pa.table({name: pa.array([], type=pa.null()) for name in out_names})
-        with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
-            tmp_pq = Path(tmp) / "empty.parquet"
+        with _extract_staging_dir() as tmp:
+            tmp_pq = tmp / "empty.parquet"
             pq.write_table(empty, tmp_pq, compression="zstd", compression_level=_ZSTD_LEVEL)
             if output_format == "parquet":
                 shutil.copyfile(tmp_pq, output)
@@ -913,8 +928,8 @@ def _stream_lake_via_duckdb(
     convert_after = output_format in ("fits", "votable")
     copy_format: OutputFormat = "parquet" if convert_after else output_format
 
-    with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
-        copy_target = Path(tmp) / "lake_extract.parquet" if convert_after else output
+    with _extract_staging_dir() as tmp:
+        copy_target = tmp / "lake_extract.parquet" if convert_after else output
         if copy_format == "parquet":
             copy_to = "TO $out (FORMAT PARQUET, COMPRESSION ZSTD)"
         elif copy_format == "csv":
@@ -1482,8 +1497,8 @@ def _stream_lake_tile_by_tile(
     ) if tiles else None
 
     if output_format in ("fits", "votable"):
-        with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
-            tmp_pq = Path(tmp) / "lake_extract.parquet"
+        with _extract_staging_dir() as tmp:
+            tmp_pq = tmp / "lake_extract.parquet"
             n_rows = _write_chunks_to_parquet(
                 _iter_lake_extract_chunks(
                     catalog_root,
@@ -1524,8 +1539,6 @@ def extract_from_lake_catalog(
     source_ids: np.ndarray | None = None,
 ) -> pa.Table:
     """In-memory lake extract (small catalogs / tests only)."""
-    import tempfile
-
     catalog_root = _lake_catalog_root(lake_root, survey)
     tiles = list(iter_lake_catalog_tiles(catalog_root, norder=_lake_norder(catalog_root, norder)))
     schema_names = pq.read_schema(str(tiles[0])).names
@@ -1534,8 +1547,8 @@ def extract_from_lake_catalog(
         specs_from_schema(schema_names, all_columns=all_columns, specs=specs),
     )
 
-    with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
-        out = Path(tmp) / "extract.parquet"
+    with _extract_staging_dir() as tmp:
+        out = tmp / "extract.parquet"
         result = stream_extract_from_lake_catalog(
             lake_root,
             survey,

@@ -13,6 +13,7 @@ from astropy.table import Table
 
 from data_lake.export.catalog_extract import (
     ExtractResult,
+    _extract_staging_dir,
     _promote_arrow_type,
     expand_column_args,
     extract_catalog,
@@ -37,6 +38,13 @@ def _write_fits_catalog(path: Path, n: int = 3) -> None:
 
 
 class TestColumnSpecs:
+    def test_staging_dir_is_under_cwd(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        with _extract_staging_dir() as staging:
+            assert staging.is_dir()
+            assert staging.parent.resolve() == tmp_path.resolve()
+            assert staging.name.startswith("dl_extract_")
+
     def test_parse_alias(self) -> None:
         assert parse_column_spec("ra:RA") == ("ra", "RA")
         assert parse_column_spec("TARGETID") == ("TARGETID", None)
