@@ -50,7 +50,7 @@ df = cat.query("SELECT _source_id, SPECOBJID FROM catalog WHERE SPECOBJID = 123"
 Or from the command line:
 
 ```bash
-dl-extract-catalog --survey SDSS_DR17 -c _source_id -c SPECOBJID \
+dl-extract-catalog --survey SDSS_DR17 -c _source_id,SPECOBJID \
     --where "SPECOBJID = 123" -o /tmp/lookup.csv
 
 # Peek a few IDs from the spectrum store

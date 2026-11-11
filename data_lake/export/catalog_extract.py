@@ -17,10 +17,10 @@ Example
 ::
 
     dl-extract-catalog survey_a.fits -o a_positions.parquet \\
-        -c TARGETID -c RA -c DEC
+        -c TARGETID,RA,DEC
 
     dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \\
-        -c source_id -c ra -c dec -o desi_sky.parquet
+        -c source_id,ra,dec -o desi_sky.parquet
 
     dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \\
         -c TARGETID -c Z --where "upper(trim(SPECTYPE)) = 'STAR'" \\
@@ -80,6 +80,27 @@ class ExtractResult:
     output: Path | None = None
     output_dir: Path | None = None
     n_tiles: int = 0
+
+
+def expand_column_args(args: Sequence[str]) -> list[str]:
+    """Expand ``-c`` values that may be comma-separated lists.
+
+    Each ``-c`` / ``--column`` value may be a single ``NAME`` / ``NAME:alias``
+    or a comma-separated list of those (e.g. ``RA,DEC,TARGETID`` or
+    ``ra:RA,dec:DEC``). Repeated ``-c`` flags are concatenated in order.
+    Empty segments (``a,,b`` or a trailing comma) raise ``ValueError``.
+    """
+    out: list[str] = []
+    for raw in args:
+        for part in str(raw).split(","):
+            text = part.strip()
+            if not text:
+                raise ValueError(
+                    f"empty column spec in {raw!r} "
+                    "(use comma-separated names with no empty segments)"
+                )
+            out.append(text)
+    return out
 
 
 def parse_column_spec(spec: str) -> tuple[str, str | None]:
@@ -1610,7 +1631,10 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     "--column",
     "columns",
     multiple=True,
-    help="Column to export (repeatable). Use NAME:alias to rename (e.g. ra:RA).",
+    help=(
+        "Column to export (repeatable). Pass one NAME / NAME:alias per -c, or a "
+        "comma-separated list (e.g. -c RA,DEC,TARGETID or -c ra:RA,dec:DEC)."
+    ),
 )
 @click.option(
     "--all-columns",
@@ -1770,6 +1794,10 @@ def cli(
 
     if output is None and output_dir is None:
         raise click.ClickException("Pass -o/--output or --output-dir.")
+    try:
+        columns = tuple(expand_column_args(columns))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     if all_columns and columns:
         raise click.ClickException("Use --all-columns or -c, not both.")
     if not all_columns and not columns:

@@ -14,6 +14,7 @@ from astropy.table import Table
 from data_lake.export.catalog_extract import (
     ExtractResult,
     _promote_arrow_type,
+    expand_column_args,
     extract_catalog,
     extract_from_catalog_path,
     filter_valid_sky_rows,
@@ -39,6 +40,17 @@ class TestColumnSpecs:
     def test_parse_alias(self) -> None:
         assert parse_column_spec("ra:RA") == ("ra", "RA")
         assert parse_column_spec("TARGETID") == ("TARGETID", None)
+
+    def test_expand_column_args_comma_and_repeat(self) -> None:
+        assert expand_column_args(["TARGETID,RA", "DEC"]) == [
+            "TARGETID", "RA", "DEC",
+        ]
+        assert expand_column_args(["ra:RA,dec:DEC"]) == ["ra:RA", "dec:DEC"]
+        assert expand_column_args(["  a , b  ", "c"]) == ["a", "b", "c"]
+
+    def test_expand_column_args_rejects_empty_segment(self) -> None:
+        with pytest.raises(ValueError, match="empty column spec"):
+            expand_column_args(["RA,,DEC"])
 
     def test_resolve_case_insensitive(self) -> None:
         mapping = resolve_column_specs(["RA", "Dec", "id"], ["ra", "dec:DEC", "ID"])
@@ -757,6 +769,37 @@ class TestExtractCatalogCli:
         )
         assert result.exit_code != 0
         assert "not both" in result.output
+
+    def test_cli_comma_separated_columns(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        lake = tmp_path / "lake"
+        tile_dir = lake / "catalogs" / "S" / "Norder=5" / "Dir=0"
+        tile_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({
+                "ra": pa.array([1.0], type=pa.float64()),
+                "dec": pa.array([2.0], type=pa.float64()),
+                "id": pa.array([9], type=pa.int64()),
+            }),
+            tile_dir / "Npix=1.parquet",
+        )
+        (lake / "catalogs" / "S" / "catalog_info.json").write_text(
+            '{"hats_order": 5, "ra_column": "ra", "dec_column": "dec", '
+            '"link_id_mode": "sequential", "total_rows": 1}',
+        )
+        out = tmp_path / "out.parquet"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--lake-root", str(lake), "--survey", "S",
+                "-c", "id,ra,dec", "-o", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert pq.read_table(out).column_names == ["id", "ra", "dec"]
 
     def test_cli_requires_column_or_all_columns(self) -> None:
         from click.testing import CliRunner

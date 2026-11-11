@@ -22,7 +22,7 @@ crossmatch tree.
 
 # 1. Catalog from the lake survey name
 dl-extract-catalog --survey DESI_DR1 \
-  -c _source_id -c TARGET_RA -c TARGET_DEC -c SPECTYPE -c Z \
+  -c _source_id,TARGET_RA,TARGET_DEC,SPECTYPE,Z \
   --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
   -o /scratch/desi_stars.parquet
 
@@ -38,7 +38,7 @@ dl-extract-cutout-subset --survey DESI_DR1 \
 
 # 2b. Partner survey — positional match, then that survey's modalities
 dl-extract-catalog --survey EUCLID_DR1 \
-  -c _source_id -c ra -c dec -o /scratch/euclid_sky.parquet
+  -c _source_id,ra,dec -o /scratch/euclid_sky.parquet
 
 dl-crossmatch DESI_DR1 EUCLID_DR1 "$LAKE" --radius-arcsec 1.0
 # Tree: crossmatch/DESI_DR1_x_EUCLID_DR1__r1.0/  (source_id_a, source_id_b)

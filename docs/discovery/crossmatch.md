@@ -305,41 +305,42 @@ catalog:
 
 ```bash
 # Raw survey catalog → Parquet for STILTS
+# -c accepts a comma-separated list or repeated flags
 dl-extract-catalog survey_a.fits -o a_sky.parquet \
-  -c TARGETID -c RA -c DEC --valid-sky-only
+  -c TARGETID,RA,DEC --valid-sky-only
 
 # Rename columns for STILTS (NAME:alias)
 dl-extract-catalog survey_b.fits -o b_sky.csv --format csv \
-  -c ID:id -c ra:RA -c dec:DEC
+  -c ID:id,ra:RA,dec:DEC
 
 # Already-ingested lake catalog (streams; does not load full survey into RAM)
 dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \
-  -o desi_sky.parquet -c _source_id -c ra -c dec --engine tiles
+  -o desi_sky.parquet -c _source_id,ra,dec --engine tiles
 
 # Predicate + cap without a separate DuckDB step (lake or raw files)
 dl-extract-catalog --lake-root /data/lake --survey DESI_DR1 \
-  -c TARGETID -c Z --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
+  -c TARGETID,Z --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
   -o desi_stars.parquet
-dl-extract-catalog zall-pix-iron.fits -c TARGETID -c Z \
+dl-extract-catalog zall-pix-iron.fits -c TARGETID,Z \
   --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 -o desi_stars.parquet
 
 # Same lake export to CSV or FITS (CSV streams tile-by-tile; FITS uses a temp Parquet pass)
 dl-extract-catalog --lake-root /data/lake --survey zCOSMOS_DR3 \
-  -o zCOSMOS_sky.csv -c _source_id -c ra -c dec_
+  -o zCOSMOS_sky.csv -c _source_id,ra,dec_
 dl-extract-catalog --lake-root /data/lake --survey zCOSMOS_DR3 \
-  -o zCOSMOS_sky.fits -c _source_id -c ra -c dec_
+  -o zCOSMOS_sky.fits -c _source_id,ra,dec_
 
 # 100M+ rows: tiled export (parallel STILTS / bounded memory)
 dl-extract-catalog --lake-root /data/lake --survey GAIA_DR3 \
-  --output-dir /scratch/gaia_sky/ -c source_id -c ra -c dec
+  --output-dir /scratch/gaia_sky/ -c source_id,ra,dec
 
 # Large FITS before ingest
 dl-extract-catalog huge_cat.fits -o sky.parquet --streaming \
-  -c TARGETID -c RA -c DEC --valid-sky-only
+  -c TARGETID,RA,DEC --valid-sky-only
 
 # Many files
 dl-extract-catalog --file-list catalog_paths.txt -o all_a.parquet \
-  -c serial -c RA -c DEC --add-input-path
+  -c serial,RA,DEC --add-input-path
 
 # Full gathered product → single FITS (or Parquet/CSV/VOTable)
 dl-extract-catalog --lake-root /data/lake --survey EUCLID_north_joined \
@@ -360,7 +361,7 @@ the partner's rows. See
 
 ```bash
 dl-extract-catalog --survey DESI_DR1 \
-  -c _source_id -c TARGET_RA -c TARGET_DEC -c SPECTYPE \
+  -c _source_id,TARGET_RA,TARGET_DEC,SPECTYPE \
   --where "upper(trim(SPECTYPE)) = 'STAR'" --limit 1000 \
   -o /scratch/desi_stars.parquet
 
