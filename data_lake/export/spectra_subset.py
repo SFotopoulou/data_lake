@@ -65,6 +65,25 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _try_numeric_id_array(column) -> np.ndarray | None:
+    """Return int64 IDs from a numeric Arrow column, or ``None`` if not safe."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    arr = column.combine_chunks() if hasattr(column, "combine_chunks") else column
+    if pa.types.is_dictionary(arr.type):
+        arr = pc.dictionary_decode(arr)
+    if not (
+        pa.types.is_integer(arr.type)
+        or pa.types.is_floating(arr.type)
+    ):
+        return None
+    try:
+        return np.asarray(arr, dtype=np.int64).ravel()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _read_target_ids(path: Path, column: str) -> np.ndarray:
     """Read a 1-D int64 array of target IDs from a variety of file formats.
 
@@ -105,6 +124,10 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
                 f"Available columns: {tbl.column_names[:20]}"
                 f"{'…' if len(tbl.column_names) > 20 else ''}"
             )
+        if len(parts) == 1:
+            fast = _try_numeric_id_array(tbl.column(parts[0]))
+            if fast is not None:
+                return fast
         cols = {p: tbl.column(p).to_pylist() for p in parts}
         return resolve_link_object_ids(column, cols, context=path.name)
 
@@ -120,6 +143,14 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
             f"Column(s) {missing} not in {path.name} "
             f"(spec={column!r}). Available columns: {preview}{ellipsis}"
         )
+    if len(parts) == 1:
+        col = tbl[parts[0]]
+        try:
+            fast = np.asarray(col, dtype=np.int64).ravel()
+            if fast.size == len(col):
+                return fast
+        except (TypeError, ValueError, OverflowError):
+            pass
     cols = {p: list(tbl[p]) for p in parts}
     return resolve_link_object_ids(column, cols, context=path.name)
 

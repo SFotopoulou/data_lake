@@ -95,6 +95,25 @@ DEFAULT_FITS_CHUNK_ROWS: int = 50_000
 MAX_PARALLEL_WORKERS_CAP: int = 64
 """Hard ceiling for homogenize / discovery thread or process pools."""
 
+EXTRACT_TILE_WORKERS: int = 4
+"""Default parallel tile workers for ``dl-extract-catalog --output-dir`` and
+multi-tile spectra/cutout subset extracts.  Capped by ``MAX_PARALLEL_WORKERS_CAP``.
+``1`` keeps the historical serial path.  Override with ``$DATA_LAKE_EXTRACT_TILE_WORKERS``."""
+
+
+def extract_tile_workers(*, force_serial: bool = False) -> int:
+    """Resolve extract tile parallelism (env override, then knob, then cap)."""
+    import os
+
+    if force_serial:
+        return 1
+    raw = os.environ.get("DATA_LAKE_EXTRACT_TILE_WORKERS", "").strip()
+    try:
+        n = int(raw) if raw else int(EXTRACT_TILE_WORKERS)
+    except ValueError:
+        n = int(EXTRACT_TILE_WORKERS)
+    return max(1, min(n, int(MAX_PARALLEL_WORKERS_CAP)))
+
 CROSSMATCH_DENSE_TILE_WARN: int = 1_500_000
 """Warn when a survey-A tile has at least this many sources."""
 

@@ -472,10 +472,35 @@ class CutoutAccessor:
     # Subset extraction
     # ------------------------------------------------------------------
 
+    def _load_subset_tile_batch(
+        self,
+        npix: int,
+        pairs: list[tuple[int, int]],
+    ):
+        """Read one cutout tile (private store; safe for worker threads)."""
+        sids = np.array([p[0] for p in pairs], dtype=np.int64)
+        local_idxs = np.array([p[1] for p in pairs], dtype=np.int64)
+        store = TileStore(self._tile_path(npix))
+        try:
+            images = np.asarray(store.get_images(local_idxs))
+            if images.ndim == 3:
+                images = images[:, np.newaxis, ...]
+            elif images.ndim == 2:
+                images = images[np.newaxis, np.newaxis, ...]
+            # WCS is a 1-D structured/bytes array; element gets are safer than
+            # read_zarr_rows (which reshapes scalar rows for numeric slabs).
+            wcs_arr = store._open()["wcs"]
+            wcs_raw = [wcs_arr[int(i)] for i in local_idxs]
+        finally:
+            store.close()
+        return sids, images, wcs_raw
+
     def _iter_subset_batches(
         self,
         sid_to_loc: "dict[int, tuple[int, int]]",
         show_progress: bool,
+        *,
+        n_workers: int | None = None,
     ):
         """Yield ``(sorted_sids, images, wcs_raw_list)`` per tile.
 
@@ -485,38 +510,57 @@ class CutoutAccessor:
         """
         from collections import defaultdict
 
+        from data_lake.knobs import extract_tile_workers
+
         tile_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
         for sid, (npix, local_idx) in sid_to_loc.items():
             tile_groups[npix].append((sid, local_idx))
 
-        items = list(tile_groups.items())
-        if show_progress:
-            try:
-                from tqdm.auto import tqdm
-                items = tqdm(items, desc="cutout tiles", unit="tile")
-            except ImportError:
-                pass
+        tile_items = list(tile_groups.items())
+        workers = extract_tile_workers() if n_workers is None else max(1, int(n_workers))
 
         if self._max_open_tiles > 0 and self._tile_stores:
             for _npix in list(self._tile_stores):
                 self._release_tile_store(_npix)
 
-        for npix, pairs in items:
-            sids = np.array([p[0] for p in pairs], dtype=np.int64)
-            local_idxs = np.array([p[1] for p in pairs], dtype=np.int64)
-            store = self._get_tile_store(npix)
-            images = np.asarray(store.get_images(local_idxs))
-            # Ensure (k, B, H, W). Single-band tiles can come back as (k, H, W)
-            # when the read path squeezes a length-1 band axis.
-            if images.ndim == 3:
-                images = images[:, np.newaxis, ...]
-            elif images.ndim == 2:
-                images = images[np.newaxis, np.newaxis, ...]
-            root = store._open()
-            wcs_raw = [root["wcs"][int(i)] for i in local_idxs]
-            if self._max_open_tiles > 0:
-                self._release_tile_store(npix)
-            yield sids, images, wcs_raw
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:
+            def tqdm(x, **_kw):
+                return x
+
+        if workers <= 1 or len(tile_items) <= 1:
+            for npix, pairs in tqdm(
+                tile_items, desc="cutout tiles", unit="tile", disable=not show_progress,
+            ):
+                yield self._load_subset_tile_batch(npix, pairs)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pending = []
+            it = iter(tile_items)
+            bar = tqdm(
+                total=len(tile_items),
+                desc="cutout tiles",
+                unit="tile",
+                disable=not show_progress,
+            )
+            try:
+                while True:
+                    while len(pending) < workers:
+                        try:
+                            npix, pairs = next(it)
+                        except StopIteration:
+                            break
+                        pending.append(pool.submit(self._load_subset_tile_batch, npix, pairs))
+                    if not pending:
+                        break
+                    yield pending.pop(0).result()
+                    bar.update(1)
+            finally:
+                bar.close()
 
     def extract_subset_to_zarr(
         self,

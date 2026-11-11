@@ -23,7 +23,8 @@ environment variable, or by editing the module.
 | `CUTOUT_CHUNKS_PER_SHARD` | 1024 | Cutout image-stack Zarr shards |
 | `ZSTD_INGEST` / `ZSTD_GATHER` / `ZSTD_COMPACT` | 3 / 7 / 9 | Catalog and crossmatch tiles; gather products; `compact()` |
 | `DEFAULT_FITS_CHUNK_ROWS` | 50 000 | Catalog-FITS export chunking (`--fits-chunk-rows`) |
-| `MAX_PARALLEL_WORKERS_CAP` | 64 | Homogenize worker-pool ceiling |
+| `MAX_PARALLEL_WORKERS_CAP` | 64 | Homogenize / extract worker-pool ceiling |
+| `EXTRACT_TILE_WORKERS` | 4 | Parallel tile workers for `dl-extract-catalog --output-dir` and multi-tile spectra/cutout extracts |
 | `CROSSMATCH_DENSE_TILE_WARN` | 50 000 | `dl-crossmatch` warns when one survey-A tile has more sources than this |
 | `DEFAULT_HATS_ORDER` | 5 | Fallback HEALPix order when catalog/spectrum info lacks one |
 
@@ -34,6 +35,7 @@ Environment variables read at run time:
 | `DATA_LAKE_PARQUET_METADATA_CACHE` | `0`/`false`/`no`/`off` or `1`/`true`/`yes`/`on`; overrides `CATALOG_PARQUET_METADATA_CACHE` |
 | `DATA_LAKE_DUCKDB_THREADS` | DuckDB threads per connection (overrides the per-worker split) |
 | `DATA_LAKE_DUCKDB_MEMORY_LIMIT_MIB` | DuckDB memory limit per connection in MiB (overrides the per-worker split) |
+| `DATA_LAKE_EXTRACT_TILE_WORKERS` | Override `EXTRACT_TILE_WORKERS` (`1` = serial) |
 | `DATA_LAKE_FITS_MEMMAP` | Default for `--fits-memmap` (`auto`, `on`, `off`) |
 
 Some differences between knobs are deliberate; do not unify them without a
@@ -99,7 +101,13 @@ scan for IDs the catalog cannot resolve. Avoid loops over `get_spectrum(id)` /
   `dl-extract-cutout-subset` or `extract_subset_to_zarr`. These, and
   `get_batch()`, close each Zarr tile after reading it when the extract spans
   more tiles than `READ_MAX_OPEN_TILES`, so raising that knob does not speed up
-  multi-tile extracts.
+  multi-tile extracts. Raise `EXTRACT_TILE_WORKERS` / `$DATA_LAKE_EXTRACT_TILE_WORKERS`
+  instead to read several tiles concurrently (writers stay ordered).
+- `dl-extract-catalog --target-list` first prunes to HEALPix tiles that hold the
+  IDs (`_healpix_norder{N}`), then projects only those tiles. Prefer Parquet/CSV
+  output (DuckDB `COPY`); `--limit` under `engine=auto` uses the tile engine so
+  it can stop early without a global `ORDER BY`. FITS/VOTable lake exports go
+  through a temp Parquet pass.
 - Build crossmatch association tables once and join them in DuckDB or Polars,
   instead of re-running positional matching inside analysis loops.
 
@@ -159,8 +167,8 @@ to bound open file descriptors.
 | Parallel ingest writers | `WRITE_MAX_OPEN_TILES=64` (`--max-open-tiles`) | Open Zarr groups + optional `_source_id` sets | Writer thrash or `ulimit -n` errors; prefer sky-local file order, and `--on-duplicate append` when safe |
 | Crossmatch / gather partner caches | 48 tiles / 512 MiB | Polars frames in RAM (no Zarr file descriptors) | Crossmatch on HDD/NFS; raise `--b-cache-mib` / `--partner-cache-mb` |
 
-Do not raise the read LRU for large extracts; they already stream one tile at
-a time.
+Do not raise the read LRU for large extracts; they already stream tiles (and
+can parallelize via `EXTRACT_TILE_WORKERS`).
 
 ## Ingest
 

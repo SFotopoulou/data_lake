@@ -47,7 +47,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Literal, Sequence
+from typing import Any, Iterable, Iterator, Literal, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -234,15 +234,15 @@ def _prepare_source_id_filter(
     catalog_root: Path,
     schema_names: Sequence[str],
     source_ids: np.ndarray | None,
-) -> tuple[np.ndarray | None, str | None]:
-    """Return unique ``_source_id`` values and a DuckDB membership predicate.
+) -> tuple[np.ndarray | None, str | None, str | None]:
+    """Return unique ``_source_id`` values, a DuckDB membership predicate, and link col.
 
     *source_ids* are lake join ids (the same int64 values ``--target-list``
     resolves).  The predicate references a relation registered with
     :func:`_register_target_ids`.
     """
     if source_ids is None:
-        return None, None
+        return None, None, None
     from data_lake.ingest.fits_to_parquet import resolve_link_id_column
 
     try:
@@ -258,7 +258,7 @@ def _prepare_source_id_filter(
         int(ids.size),
         link_col,
     )
-    return ids, predicate
+    return ids, predicate, link_col
 
 
 def _register_target_ids(connection, source_ids: np.ndarray) -> None:
@@ -270,12 +270,114 @@ def _register_target_ids(connection, source_ids: np.ndarray) -> None:
 
 
 def _connect_extract_duckdb(source_ids: np.ndarray | None):
-    import duckdb
+    """Open an extract DuckDB connection with process/env limits and metadata cache."""
+    from data_lake.io.duckdb_limits import connect as connect_duckdb
+    from data_lake.io.duckdb_limits import parquet_metadata_cache_default
 
-    connection = duckdb.connect(database=":memory:")
+    connection = connect_duckdb(
+        ":memory:",
+        parquet_metadata_cache=parquet_metadata_cache_default(),
+    )
     if source_ids is not None:
         _register_target_ids(connection, source_ids)
     return connection
+
+
+def _npix_from_tile_path(tile_path: Path) -> int | None:
+    """Parse ``Npix=<int>`` from a lake tile filename."""
+    stem = tile_path.stem
+    if not stem.startswith("Npix="):
+        return None
+    try:
+        return int(stem.split("=", 1)[1])
+    except ValueError:
+        return None
+
+
+def _prune_tiles_for_source_ids(
+    lake_root: Path | str,
+    survey: str,
+    tiles: Sequence[Path],
+    source_ids: np.ndarray,
+    *,
+    norder: int,
+) -> list[Path]:
+    """Keep only tiles that contain any of *source_ids* (via ``_healpix_norder{N}``).
+
+    Falls back to the full *tiles* list when the HEALPix column is missing or
+    the lightweight catalog scan fails.
+    """
+    ids = np.unique(np.asarray(source_ids, dtype=np.int64).ravel())
+    if ids.size == 0:
+        return []
+    try:
+        from data_lake.io.catalog import CatalogAccessor
+
+        cat = CatalogAccessor(lake_root, survey, norder=norder)
+        hp_col = f"_healpix_norder{cat.norder}"
+        if hp_col not in cat.columns:
+            log.info(
+                "Tile prune skipped: %s not in catalog schema; scanning all %d tile(s).",
+                hp_col,
+                len(tiles),
+            )
+            return list(tiles)
+        sid_sql = _sql_ident(cat.link_id_column)
+        hp_sql = _sql_ident(hp_col)
+        hit_npix: set[int] = set()
+        for ids_table in cat._id_tables(ids, 1_000_000):
+            sql = (
+                f"SELECT DISTINCT {hp_sql} FROM catalog "
+                f"WHERE {sid_sql} IN (SELECT id FROM {ids_table})"
+            )
+            rows = cat._con.execute(sql).fetchnumpy()
+            if not rows:
+                continue
+            arr = np.asarray(next(iter(rows.values())), dtype=np.int64)
+            hit_npix.update(int(v) for v in arr.tolist() if v >= 0)
+        if not hit_npix:
+            log.info(
+                "Tile prune: 0 hit tile(s) for %d id(s) (of %d surveyed).",
+                int(ids.size),
+                len(tiles),
+            )
+            return []
+        pruned = [
+            p for p in tiles
+            if (npix := _npix_from_tile_path(p)) is not None and npix in hit_npix
+        ]
+        log.info(
+            "Tile prune: %d/%d tile(s) hold %d target id(s).",
+            len(pruned),
+            len(tiles),
+            int(ids.size),
+        )
+        return pruned
+    except Exception:
+        log.warning(
+            "Tile prune failed; scanning all %d tile(s).",
+            len(tiles),
+            exc_info=True,
+        )
+        return list(tiles)
+
+
+def _parquet_num_rows(path: Path) -> int:
+    """Row count from Parquet footers (no data scan)."""
+    pf = pq.ParquetFile(path)
+    return int(pf.metadata.num_rows) if pf.metadata is not None else 0
+
+
+def _lake_schema_names(catalog_root: Path, tiles: Sequence[Path]) -> list[str]:
+    """Column names from ``_common_metadata`` when present, else the first tile."""
+    from data_lake.schema_registry import catalog_schema_source
+
+    source = catalog_schema_source(catalog_root)
+    if source is not None:
+        return list(pq.read_schema(str(source)).names)
+    if tiles:
+        return list(pq.read_schema(str(tiles[0])).names)
+    return []
 
 
 def _projected_select_sql(
@@ -285,20 +387,25 @@ def _projected_select_sql(
     where_sql: str | None = None,
     extra_predicates: Sequence[str] = (),
     row_limit: int | None = None,
+    order_for_limit: bool = False,
 ) -> str:
     """``SELECT src AS out FROM … [WHERE user AND extra] [ORDER BY … LIMIT n]``.
 
-    *from_sql* must be a ``read_parquet`` scan.  With a limit, rows are ordered
-    by file then row (DuckDB ``file_index`` / ``file_row_number``) so the cap
-    keeps the first rows in tile order; parallel filters and semi-joins do not
-    preserve that order on their own.
+    *from_sql* must be a ``read_parquet`` scan.  ``order_for_limit`` is only used
+    when the caller explicitly wants deterministic tile/file order under LIMIT
+    (costly on large semi-joins); the default lake path uses the tile engine for
+    ``--limit`` instead.
     """
     from data_lake.export.row_filter import compose_where_clause, format_limit
 
     col_sql = ", ".join(
         f"{_sql_ident(src)} AS {_sql_ident(out)}" for src, out in mapping
     )
-    order_sql = " ORDER BY file_index, file_row_number" if row_limit is not None else ""
+    order_sql = (
+        " ORDER BY file_index, file_row_number"
+        if row_limit is not None and order_for_limit
+        else ""
+    )
     return (
         f"SELECT {col_sql} FROM {from_sql}"
         f"{compose_where_clause(where_sql, extra_predicates)}"
@@ -374,9 +481,31 @@ def _promote_arrow_type(a: pa.DataType, b: pa.DataType) -> pa.DataType:
 def _unified_schema_for_mapping(
     tile_paths: Sequence[Path],
     mapping: Sequence[tuple[str, str]],
+    *,
+    catalog_root: Path | None = None,
 ) -> pa.Schema:
-    """Merge per-tile Parquet schemas so null-only columns unify with typed columns."""
+    """Merge Parquet schemas so null-only columns unify with typed columns.
+
+    Prefer ``_common_metadata`` / cheapest schema source under *catalog_root*
+    when every mapped column is present there; otherwise fall back to scanning
+    tile footers (needed when tiles disagree on null vs typed columns).
+    """
     src_types: dict[str, pa.DataType] = {}
+    if catalog_root is not None:
+        from data_lake.schema_registry import catalog_schema_source
+
+        source = catalog_schema_source(catalog_root)
+        if source is not None:
+            sch = pq.read_schema(str(source))
+            names = set(sch.names)
+            # Use the cheap schema only when every mapped column is present and
+            # none are null-typed (null in _common_metadata can hide float tiles).
+            if all(src in names for src, _ in mapping) and not any(
+                pa.types.is_null(sch.field(src).type) for src, _ in mapping
+            ):
+                return pa.schema([
+                    pa.field(out, sch.field(src).type) for src, out in mapping
+                ])
     for path in tile_paths:
         sch = pq.read_schema(str(path))
         for src, _out in mapping:
@@ -574,16 +703,20 @@ def stream_extract_from_lake_catalog(
     if not tiles:
         raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
 
-    schema_names = pq.read_schema(str(tiles[0])).names
+    schema_names = _lake_schema_names(catalog_root, tiles)
     effective_specs = specs_from_schema(
         schema_names, all_columns=all_columns, specs=specs,
     )
     mapping = resolve_column_specs(schema_names, effective_specs)
     src_cols = [src for src, _ in mapping]
     out_names = tuple(out for _, out in mapping)
-    source_ids, id_predicate = _prepare_source_id_filter(
+    source_ids, id_predicate, link_col = _prepare_source_id_filter(
         catalog_root, schema_names, source_ids,
     )
+    if source_ids is not None:
+        tiles = _prune_tiles_for_source_ids(
+            lake_root, survey, tiles, source_ids, norder=order,
+        )
 
     fmt: OutputFormat = "parquet"
     if output is not None:
@@ -594,12 +727,16 @@ def stream_extract_from_lake_catalog(
             "for a single-file export."
         )
 
+    # Prefer the tile engine for --limit under auto: it early-stops without a
+    # global ORDER BY over the filtered set. Explicit engine=duckdb keeps ORDER BY.
+    prefer_tiles_for_limit = row_limit is not None and engine == "auto"
     use_duckdb = (
-        tiles
+        bool(tiles)
         and output is not None
         and output_dir is None
-        and fmt in ("parquet", "csv")
+        and fmt in ("parquet", "csv", "fits", "votable")
         and (engine == "duckdb" or engine == "auto")
+        and not prefer_tiles_for_limit
     )
     if use_duckdb:
         try:
@@ -615,6 +752,7 @@ def stream_extract_from_lake_catalog(
                 row_limit=row_limit,
                 source_ids=source_ids,
                 id_predicate=id_predicate,
+                order_for_limit=(engine == "duckdb"),
             )
             return _finalize_lake_extract_result(
                 result,
@@ -645,6 +783,7 @@ def stream_extract_from_lake_catalog(
         row_limit=row_limit,
         source_ids=source_ids,
         id_predicate=id_predicate,
+        link_col=link_col,
     )
     return _finalize_lake_extract_result(
         result,
@@ -735,6 +874,7 @@ def _stream_lake_via_duckdb(
     row_limit: int | None = None,
     source_ids: np.ndarray | None = None,
     id_predicate: str | None = None,
+    order_for_limit: bool = False,
 ) -> ExtractResult:
     extra: list[str] = []
     if valid_sky_only:
@@ -747,6 +887,7 @@ def _stream_lake_via_duckdb(
         where_sql=where_sql,
         extra_predicates=extra,
         row_limit=row_limit,
+        order_for_limit=order_for_limit,
     )
 
     output = Path(output).resolve()
@@ -754,31 +895,64 @@ def _stream_lake_via_duckdb(
     if output.exists():
         output.unlink()
 
-    files = [str(Path(p).resolve()) for p in tile_paths]
-    if output_format == "parquet":
-        copy_to = "TO $out (FORMAT PARQUET, COMPRESSION ZSTD)"
-        count_from = "read_parquet($out)"
-    elif output_format == "csv":
-        copy_to = "TO $out (HEADER, DELIMITER ',')"
-        count_from = "read_csv($out, header=true)"
-    else:
-        raise ValueError(f"DuckDB lake export does not support {output_format!r}")
-
-    con = _connect_extract_duckdb(source_ids)
-    try:
-        # Explicit file list avoids hive_partitioning on Norder=/Dir= paths and
-        # dodges COPY placeholder ordering quirks with read vs write targets.
-        con.execute(
-            f"COPY ({select_sql}) {copy_to}",
-            {"files": files, "out": str(output)},
-        )
-        n_rows = int(
-            con.execute(f"SELECT count(*) FROM {count_from}", {"out": str(output)}).fetchone()[0]
-        )
-    finally:
-        con.close()
-
     out_names = tuple(out for _, out in mapping)
+    if not tile_paths:
+        empty = pa.table({name: pa.array([], type=pa.null()) for name in out_names})
+        with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
+            tmp_pq = Path(tmp) / "empty.parquet"
+            pq.write_table(empty, tmp_pq, compression="zstd", compression_level=_ZSTD_LEVEL)
+            if output_format == "parquet":
+                shutil.copyfile(tmp_pq, output)
+            else:
+                write_catalog_extract_from_parquet(
+                    tmp_pq, output, output_format=output_format,
+                )
+        return ExtractResult(n_rows=0, column_names=out_names, output=output)
+
+    files = [str(Path(p).resolve()) for p in tile_paths]
+    convert_after = output_format in ("fits", "votable")
+    copy_format: OutputFormat = "parquet" if convert_after else output_format
+
+    with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
+        copy_target = Path(tmp) / "lake_extract.parquet" if convert_after else output
+        if copy_format == "parquet":
+            copy_to = "TO $out (FORMAT PARQUET, COMPRESSION ZSTD)"
+        elif copy_format == "csv":
+            copy_to = "TO $out (HEADER, DELIMITER ',')"
+        else:
+            raise ValueError(f"DuckDB lake export does not support {copy_format!r}")
+
+        con = _connect_extract_duckdb(source_ids)
+        try:
+            # Explicit file list avoids hive_partitioning on Norder=/Dir= paths and
+            # dodges COPY placeholder ordering quirks with read vs write targets.
+            con.execute(
+                f"COPY ({select_sql}) {copy_to}",
+                {"files": files, "out": str(copy_target)},
+            )
+        finally:
+            con.close()
+
+        if copy_format == "parquet":
+            n_rows = _parquet_num_rows(copy_target)
+        else:
+            # CSV: one pass with DuckDB is still cheaper than Python; footer N/A.
+            con = _connect_extract_duckdb(None)
+            try:
+                n_rows = int(
+                    con.execute(
+                        "SELECT count(*) FROM read_csv($out, header=true)",
+                        {"out": str(copy_target)},
+                    ).fetchone()[0]
+                )
+            finally:
+                con.close()
+
+        if convert_after:
+            write_catalog_extract_from_parquet(
+                copy_target, output, output_format=output_format,
+            )
+
     log.info("DuckDB wrote %d row(s) → %s", n_rows, output)
     return ExtractResult(
         n_rows=n_rows,
@@ -870,6 +1044,7 @@ def _iter_lake_extract_chunks(
     row_limit: int | None = None,
     source_ids: np.ndarray | None = None,
     id_predicate: str | None = None,
+    link_col: str | None = None,
 ) -> Iterator[pa.Table]:
     """Yield projected catalog chunks one HEALPix tile at a time."""
     iterator: Iterable[Path] = tiles
@@ -881,6 +1056,24 @@ def _iter_lake_extract_chunks(
         except ImportError:
             pass
 
+    # Early-exit once every target ID has been seen (target-list only; --where
+    # can select rows beyond the ID set so we keep scanning).
+    pending_ids: set[int] | None = None
+    track_out: str | None = None
+    work_mapping = list(mapping)
+    if (
+        source_ids is not None
+        and id_predicate is not None
+        and where_sql is None
+        and link_col is not None
+    ):
+        pending_ids = {int(x) for x in np.asarray(source_ids, dtype=np.int64).tolist()}
+        if not any(src == link_col for src, _ in work_mapping):
+            track_out = "__extract_sid__"
+            work_mapping.append((link_col, track_out))
+        else:
+            track_out = next(out for src, out in work_mapping if src == link_col)
+
     duckdb_con = None
     remaining = row_limit
     try:
@@ -889,10 +1082,12 @@ def _iter_lake_extract_chunks(
         for tile_path in iterator:
             if remaining is not None and remaining <= 0:
                 break
+            if pending_ids is not None and not pending_ids:
+                break
             chunk = _tile_extract_chunk(
                 tile_path,
-                mapping,
-                src_cols=src_cols,
+                work_mapping,
+                src_cols=[src for src, _ in work_mapping],
                 valid_sky_only=valid_sky_only,
                 ra_col=ra_col,
                 dec_col=dec_col,
@@ -902,6 +1097,11 @@ def _iter_lake_extract_chunks(
                 id_predicate=id_predicate,
             )
             if chunk.num_rows > 0:
+                if pending_ids is not None and track_out is not None and track_out in chunk.column_names:
+                    seen = chunk.column(track_out).to_pylist()
+                    pending_ids.difference_update(int(v) for v in seen if v is not None)
+                if track_out == "__extract_sid__" and track_out in chunk.column_names:
+                    chunk = chunk.drop_columns([track_out])
                 if remaining is not None:
                     remaining -= chunk.num_rows
                 yield chunk
@@ -1057,6 +1257,56 @@ def write_catalog_extract_from_parquet(
     raise ValueError(f"unsupported output format {fmt!r}")
 
 
+def _extract_tile_worker_count(*, row_limit: int | None = None) -> int:
+    """Parallel tile workers for catalog ``--output-dir`` extracts."""
+    from data_lake.knobs import extract_tile_workers
+
+    return extract_tile_workers(force_serial=row_limit is not None)
+
+
+def _write_one_output_dir_tile(
+    tile_path: Path,
+    *,
+    catalog_root: Path,
+    output_dir: Path,
+    mapping: Sequence[tuple[str, str]],
+    src_cols: Sequence[str],
+    valid_sky_only: bool,
+    ra_col: str | None,
+    dec_col: str | None,
+    where_sql: str | None,
+    source_ids: np.ndarray | None,
+    id_predicate: str | None,
+) -> tuple[int, Path | None]:
+    """Project one tile into ``output_dir``; return ``(n_rows, out_path|None)``."""
+    duckdb_con = None
+    try:
+        if where_sql is not None or id_predicate is not None:
+            duckdb_con = _connect_extract_duckdb(source_ids)
+        chunk = _tile_extract_chunk(
+            tile_path,
+            mapping,
+            src_cols=src_cols,
+            valid_sky_only=valid_sky_only,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            where_sql=where_sql,
+            remaining_limit=None,
+            duckdb_con=duckdb_con,
+            id_predicate=id_predicate,
+        )
+    finally:
+        if duckdb_con is not None:
+            duckdb_con.close()
+    if chunk.num_rows == 0:
+        return 0, None
+    rel = tile_path.relative_to(catalog_root)
+    out_path = output_dir / rel
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL)
+    return int(chunk.num_rows), out_path
+
+
 def _stream_lake_tile_by_tile(
     catalog_root: Path,
     tiles: Sequence[Path],
@@ -1075,11 +1325,9 @@ def _stream_lake_tile_by_tile(
     row_limit: int | None = None,
     source_ids: np.ndarray | None = None,
     id_predicate: str | None = None,
+    link_col: str | None = None,
 ) -> ExtractResult:
-    chunk_iter = _iter_lake_extract_chunks(
-        catalog_root,
-        tiles,
-        mapping,
+    chunk_kwargs = dict(
         src_cols=src_cols,
         valid_sky_only=valid_sky_only,
         ra_col=ra_col,
@@ -1089,54 +1337,130 @@ def _stream_lake_tile_by_tile(
         row_limit=row_limit,
         source_ids=source_ids,
         id_predicate=id_predicate,
+        link_col=link_col,
+    )
+    chunk_iter = _iter_lake_extract_chunks(
+        catalog_root,
+        tiles,
+        mapping,
+        **chunk_kwargs,
     )
 
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        n_rows = 0
-        n_written_tiles = 0
-        iterator: Iterable[Path] = tiles
-        if show_progress:
-            try:
-                from tqdm.auto import tqdm
+        n_workers = _extract_tile_worker_count(row_limit=row_limit)
+        if n_workers > 1 and row_limit is None:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                iterator = tqdm(tiles, unit="tile", desc="extract")
-            except ImportError:
-                pass
-        duckdb_con = None
-        remaining = row_limit
-        try:
-            if where_sql is not None or remaining is not None or id_predicate is not None:
-                duckdb_con = _connect_extract_duckdb(source_ids)
-            for tile_path in iterator:
-                if remaining is not None and remaining <= 0:
-                    break
-                chunk = _tile_extract_chunk(
-                    tile_path,
-                    mapping,
-                    src_cols=src_cols,
-                    valid_sky_only=valid_sky_only,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                    where_sql=where_sql,
-                    remaining_limit=remaining,
-                    duckdb_con=duckdb_con,
-                    id_predicate=id_predicate,
-                )
-                if chunk.num_rows == 0:
-                    continue
-                if remaining is not None:
-                    remaining -= chunk.num_rows
-                rel = tile_path.relative_to(catalog_root)
-                out_path = output_dir / rel
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                pq.write_table(chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL)
-                n_rows += chunk.num_rows
-                n_written_tiles += 1
-        finally:
-            if duckdb_con is not None:
-                duckdb_con.close()
+            n_rows = 0
+            n_written_tiles = 0
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [
+                    pool.submit(
+                        _write_one_output_dir_tile,
+                        tile_path,
+                        catalog_root=catalog_root,
+                        output_dir=output_dir,
+                        mapping=mapping,
+                        src_cols=src_cols,
+                        valid_sky_only=valid_sky_only,
+                        ra_col=ra_col,
+                        dec_col=dec_col,
+                        where_sql=where_sql,
+                        source_ids=source_ids,
+                        id_predicate=id_predicate,
+                    )
+                    for tile_path in tiles
+                ]
+                iterator = as_completed(futures)
+                if show_progress:
+                    try:
+                        from tqdm.auto import tqdm
+
+                        iterator = tqdm(
+                            iterator, total=len(futures), unit="tile", desc="extract",
+                        )
+                    except ImportError:
+                        pass
+                for fut in iterator:
+                    rows, out_path = fut.result()
+                    n_rows += rows
+                    if out_path is not None:
+                        n_written_tiles += 1
+        else:
+            n_rows = 0
+            n_written_tiles = 0
+            iterator: Iterable[Path] = tiles
+            if show_progress:
+                try:
+                    from tqdm.auto import tqdm
+
+                    iterator = tqdm(tiles, unit="tile", desc="extract")
+                except ImportError:
+                    pass
+            duckdb_con = None
+            remaining = row_limit
+            pending_ids: set[int] | None = None
+            if (
+                source_ids is not None
+                and id_predicate is not None
+                and where_sql is None
+                and link_col is not None
+            ):
+                pending_ids = {
+                    int(x) for x in np.asarray(source_ids, dtype=np.int64).tolist()
+                }
+            try:
+                if where_sql is not None or remaining is not None or id_predicate is not None:
+                    duckdb_con = _connect_extract_duckdb(source_ids)
+                for tile_path in iterator:
+                    if remaining is not None and remaining <= 0:
+                        break
+                    if pending_ids is not None and not pending_ids:
+                        break
+                    chunk = _tile_extract_chunk(
+                        tile_path,
+                        mapping,
+                        src_cols=src_cols,
+                        valid_sky_only=valid_sky_only,
+                        ra_col=ra_col,
+                        dec_col=dec_col,
+                        where_sql=where_sql,
+                        remaining_limit=remaining,
+                        duckdb_con=duckdb_con,
+                        id_predicate=id_predicate,
+                    )
+                    if chunk.num_rows == 0:
+                        continue
+                    if pending_ids is not None and link_col is not None:
+                        # Best-effort: only when the projected chunk still has the link col.
+                        if link_col in chunk.column_names:
+                            pending_ids.difference_update(
+                                int(v)
+                                for v in chunk.column(link_col).to_pylist()
+                                if v is not None
+                            )
+                        elif any(out == link_col for _, out in mapping):
+                            out_name = next(out for src, out in mapping if src == link_col)
+                            pending_ids.difference_update(
+                                int(v)
+                                for v in chunk.column(out_name).to_pylist()
+                                if v is not None
+                            )
+                    if remaining is not None:
+                        remaining -= chunk.num_rows
+                    rel = tile_path.relative_to(catalog_root)
+                    out_path = output_dir / rel
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    pq.write_table(
+                        chunk, out_path, compression="zstd", compression_level=_ZSTD_LEVEL,
+                    )
+                    n_rows += chunk.num_rows
+                    n_written_tiles += 1
+            finally:
+                if duckdb_con is not None:
+                    duckdb_con.close()
         log.info(
             "Streamed %d row(s) from %d tile(s) → %s",
             n_rows,
@@ -1153,9 +1477,9 @@ def _stream_lake_tile_by_tile(
     assert output is not None
     output = Path(output)
 
-    unified_schema: pa.Schema | None = None
-    if output_dir is None:
-        unified_schema = _unified_schema_for_mapping(tiles, mapping)
+    unified_schema = _unified_schema_for_mapping(
+        tiles, mapping, catalog_root=catalog_root,
+    ) if tiles else None
 
     if output_format in ("fits", "votable"):
         with tempfile.TemporaryDirectory(prefix="dl_extract_") as tmp:
@@ -1165,15 +1489,7 @@ def _stream_lake_tile_by_tile(
                     catalog_root,
                     tiles,
                     mapping,
-                    src_cols=src_cols,
-                    valid_sky_only=valid_sky_only,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                    show_progress=show_progress,
-                    where_sql=where_sql,
-                    row_limit=row_limit,
-                    source_ids=source_ids,
-                    id_predicate=id_predicate,
+                    **chunk_kwargs,
                 ),
                 tmp_pq,
                 schema=unified_schema,

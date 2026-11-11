@@ -778,6 +778,77 @@ class SpectrumAccessor:
         pad_width = n_pix - tile_n_pix
         return np.pad(arr, ((0, 0), (0, pad_width)), constant_values=pad_value)
 
+    def _load_subset_tile_batch(
+        self,
+        npix: int,
+        items: Sequence[tuple[int, int]],
+        *,
+        plan: _SubsetExtractionPlan,
+        z_map: dict[int, float] | None,
+        flux_scale: float | None,
+        per_source: bool,
+    ):
+        """Read one planned tile into arrays (opens a private store; thread-safe)."""
+        local_idxs = np.fromiter((t[0] for t in items), dtype=np.int64, count=len(items))
+        sids = np.fromiter((t[1] for t in items), dtype=np.int64, count=len(items))
+        order = np.argsort(local_idxs)
+        sorted_local = local_idxs[order]
+        sorted_sids = sids[order]
+
+        t_store = SpectrumTileStore(self._tile_path(npix))
+        try:
+            if z_map is not None:
+                from data_lake.io.zarr_batch import read_zarr_rows
+
+                root = t_store._open()
+                flux_batch = read_zarr_rows(root["flux"], sorted_local)
+                ivar_batch = read_zarr_rows(root["ivar"], sorted_local)
+                mask_batch = read_zarr_rows(root["mask"], sorted_local)
+                if per_source:
+                    wave_or_1d = read_zarr_rows(root["wavelength"], sorted_local)
+                else:
+                    wave_or_1d = t_store._get_shared_wavelength()
+                meta_list: list = []
+            else:
+                flux_batch, ivar_batch, mask_batch, wave_or_1d, meta_list, _res = (
+                    t_store.get_spectra(sorted_local)
+                )
+        finally:
+            t_store.close()
+
+        if not per_source and flux_batch.shape[1] != plan.n_pix:
+            raise ValueError(
+                f"Tile {npix} has N_pix={flux_batch.shape[1]} but expected "
+                f"{plan.n_pix}; non-uniform wavelength grid is not supported "
+                f"for wavelength_mode='shared'."
+            )
+
+        if per_source:
+            flux_batch = self._pad_to_n_pix(
+                np.asarray(flux_batch, dtype=np.float32), plan.n_pix, np.nan
+            )
+            ivar_batch = self._pad_to_n_pix(
+                np.asarray(ivar_batch, dtype=np.float32), plan.n_pix, 0.0
+            )
+            mask_batch = self._pad_to_n_pix(
+                np.asarray(mask_batch), plan.n_pix, 0
+            )
+            wave_batch: np.ndarray | None = self._pad_to_n_pix(
+                np.asarray(wave_or_1d, dtype=np.float32), plan.n_pix, 0.0
+            )
+        else:
+            flux_batch = np.asarray(flux_batch, dtype=np.float32)
+            ivar_batch = np.asarray(ivar_batch, dtype=np.float32)
+            mask_batch = np.asarray(mask_batch)
+            wave_batch = None
+
+        z_batch = self._redshift_batch_for_sources(sorted_sids, z_map, meta_list)
+        if flux_scale is not None and flux_scale != 1.0:
+            from data_lake.export.spectra_calibration import apply_flux_scale
+
+            flux_batch, ivar_batch = apply_flux_scale(flux_batch, ivar_batch, flux_scale)
+        return sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch
+
     def _iter_subset_tile_batches(
         self,
         plan: _SubsetExtractionPlan,
@@ -785,6 +856,7 @@ class SpectrumAccessor:
         show_progress: bool,
         z_map: dict[int, float] | None = None,
         flux_scale: float | None = None,
+        n_workers: int | None = None,
     ):
         """Yield per-tile (sorted_sids, flux, ivar, mask, wave_batch|None, redshift) batches.
 
@@ -797,75 +869,71 @@ class SpectrumAccessor:
             def tqdm(x, **_kw):
                 return x
 
+        from data_lake.knobs import extract_tile_workers
+
         per_source = plan.wavelength_mode == "per_source"
+        workers = extract_tile_workers() if n_workers is None else max(1, int(n_workers))
 
         # Drop any stores pinned during planning — this pass never revisits tiles.
         if self._max_open_tiles > 0 and self._tile_stores:
             for _npix in list(self._tile_stores):
                 self._release_tile_store(_npix)
 
-        for npix, items in tqdm(
-            plan.by_tile.items(),
-            desc="extract",
-            disable=not show_progress,
-            unit="tile",
-            total=len(plan.by_tile),
-        ):
-            local_idxs = np.fromiter((t[0] for t in items), dtype=np.int64, count=len(items))
-            sids = np.fromiter((t[1] for t in items), dtype=np.int64, count=len(items))
-            order = np.argsort(local_idxs)
-            sorted_local = local_idxs[order]
-            sorted_sids = sids[order]
+        tile_items = list(plan.by_tile.items())
+        if workers <= 1 or len(tile_items) <= 1:
+            for npix, items in tqdm(
+                tile_items,
+                desc="extract",
+                disable=not show_progress,
+                unit="tile",
+                total=len(tile_items),
+            ):
+                yield self._load_subset_tile_batch(
+                    npix,
+                    items,
+                    plan=plan,
+                    z_map=z_map,
+                    flux_scale=flux_scale,
+                    per_source=per_source,
+                )
+            return
 
-            t_store = self._get_tile_store(npix)
-            # get_spectra handles shared/per_source wavelength internally.
-            flux_batch, ivar_batch, mask_batch, wave_or_1d, meta_list, _res = (
-                t_store.get_spectra(sorted_local)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # Sliding window keeps tile order for writers while bounding RAM.
+            pending = []
+            it = iter(tile_items)
+            bar = tqdm(
+                total=len(tile_items),
+                desc="extract",
+                disable=not show_progress,
+                unit="tile",
             )
-
-            # For shared surveys verify grid width consistency (already enforced by
-            # _plan_subset_extraction, but guard against concurrent tile widen).
-            if not per_source and flux_batch.shape[1] != plan.n_pix:
-                raise ValueError(
-                    f"Tile {npix} has N_pix={flux_batch.shape[1]} but expected "
-                    f"{plan.n_pix}; non-uniform wavelength grid is not supported "
-                    f"for wavelength_mode='shared'."
-                )
-
-            # Pad to plan.n_pix when this tile is narrower (per_source cross-tile).
-            if per_source:
-                flux_batch = self._pad_to_n_pix(
-                    np.asarray(flux_batch, dtype=np.float32), plan.n_pix, np.nan
-                )
-                ivar_batch = self._pad_to_n_pix(
-                    np.asarray(ivar_batch, dtype=np.float32), plan.n_pix, 0.0
-                )
-                mask_batch = self._pad_to_n_pix(
-                    np.asarray(mask_batch), plan.n_pix, 0
-                )
-                wave_batch: np.ndarray | None = self._pad_to_n_pix(
-                    np.asarray(wave_or_1d, dtype=np.float32), plan.n_pix, 0.0
-                )
-            else:
-                flux_batch = np.asarray(flux_batch, dtype=np.float32)
-                ivar_batch = np.asarray(ivar_batch, dtype=np.float32)
-                mask_batch = np.asarray(mask_batch)
-                wave_batch = None
-
-            z_batch = self._redshift_batch_for_sources(
-                sorted_sids, z_map, meta_list,
-            )
-
-            if flux_scale is not None and flux_scale != 1.0:
-                from data_lake.export.spectra_calibration import apply_flux_scale
-
-                flux_batch, ivar_batch = apply_flux_scale(flux_batch, ivar_batch, flux_scale)
-
-            # Extract never revisits a tile in this pass — free the FD promptly.
-            if self._max_open_tiles > 0:
-                self._release_tile_store(npix)
-
-            yield sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch
+            try:
+                while True:
+                    while len(pending) < workers:
+                        try:
+                            npix, items = next(it)
+                        except StopIteration:
+                            break
+                        pending.append(
+                            pool.submit(
+                                self._load_subset_tile_batch,
+                                npix,
+                                items,
+                                plan=plan,
+                                z_map=z_map,
+                                flux_scale=flux_scale,
+                                per_source=per_source,
+                            )
+                        )
+                    if not pending:
+                        break
+                    yield pending.pop(0).result()
+                    bar.update(1)
+            finally:
+                bar.close()
 
     def _collect_subset_stacks(
         self,
@@ -1236,15 +1304,27 @@ class SpectrumAccessor:
             for sorted_sids, flux_batch, ivar_batch, mask_batch, wave_batch, z_batch in self._iter_subset_tile_batches(
                 plan, show_progress=show_progress, z_map=z_map, flux_scale=flux_scale,
             ):
+                def _list_array_from_2d(arr: np.ndarray, value_type: pa.DataType) -> pa.Array:
+                    flat = np.ascontiguousarray(arr).reshape(-1)
+                    n_rows, width = arr.shape
+                    offsets = np.arange(0, (n_rows + 1) * width, width, dtype=np.int32)
+                    return pa.ListArray.from_arrays(
+                        offsets, pa.array(flat, type=value_type),
+                    )
+
                 arrays = [
                     pa.array(sorted_sids, type=pa.int64()),
                     pa.array(z_batch, type=pa.float32()),
-                    pa.array(flux_batch.tolist(), type=flt_vec),
-                    pa.array(ivar_batch.tolist(), type=flt_vec),
-                    pa.array(mask_batch.tolist(), type=mask_vec),
+                    _list_array_from_2d(np.asarray(flux_batch, dtype=np.float32), pa.float32()),
+                    _list_array_from_2d(np.asarray(ivar_batch, dtype=np.float32), pa.float32()),
+                    _list_array_from_2d(np.asarray(mask_batch), mask_vec.value_type),
                 ]
                 if per_source and wave_batch is not None:
-                    arrays.append(pa.array(wave_batch.tolist(), type=flt_vec))
+                    arrays.append(
+                        _list_array_from_2d(
+                            np.asarray(wave_batch, dtype=np.float32), pa.float32(),
+                        )
+                    )
                 table = pa.Table.from_arrays(arrays, schema=schema)
                 writer.write_table(table)
                 for j, sid in enumerate(sorted_sids.tolist()):

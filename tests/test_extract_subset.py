@@ -1068,6 +1068,20 @@ class TestReadTargetIdsComposite:
         ids = _read_target_ids(path, "TARGETID")
         np.testing.assert_array_equal(ids, np.asarray([101, 102], dtype=np.int64))
 
+    def test_parquet_numeric_fast_path(self, tmp_path: Path):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from data_lake.export.spectra_subset import _read_target_ids
+
+        path = tmp_path / "targets.parquet"
+        pq.write_table(
+            pa.table({"TARGETID": pa.array([101, 102, 103], type=pa.int64())}),
+            path,
+        )
+        ids = _read_target_ids(path, "TARGETID")
+        np.testing.assert_array_equal(ids, np.asarray([101, 102, 103], dtype=np.int64))
+
     def test_missing_component_reports_clear_error(self, tmp_path: Path):
         from astropy.table import Table
 

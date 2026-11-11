@@ -289,6 +289,61 @@ class TestExtractFromLake:
         assert tbl.column("TARGETID").to_pylist() == [12, 14]
         assert "_source_id" not in tbl.column_names
 
+    def test_target_list_prunes_to_hit_tiles(self, tmp_path: Path, monkeypatch) -> None:
+        """Sparse --target-list must not open every survey tile."""
+        lake = self._id_lake(tmp_path)
+        from data_lake.export import catalog_extract as ce
+
+        opened: list[Path] = []
+        real_read = ce._read_catalog_tile
+
+        def _tracking_read(tile_path: Path, columns):
+            opened.append(Path(tile_path))
+            return real_read(tile_path, columns)
+
+        monkeypatch.setattr(ce, "_read_catalog_tile", _tracking_read)
+        # Force Arrow tile path (no DuckDB filter) so _read_catalog_tile is used.
+        # With prune, only the tile holding id 14 (Npix=2) should be opened.
+        out_dir = tmp_path / "pruned"
+        result = extract_catalog(
+            output_dir=out_dir,
+            specs=["TARGETID"],
+            lake_root=lake,
+            survey="IDS",
+            engine="tiles",
+            source_ids=np.array([14], dtype=np.int64),
+        )
+        assert result.n_rows == 1
+        assert result.n_tiles == 1
+        # Parallel output-dir path uses DuckDB per tile; prune still limits work.
+        written = list(out_dir.rglob("Npix=*.parquet"))
+        assert len(written) == 1
+        assert written[0].name == "Npix=2.parquet"
+
+    def test_auto_limit_uses_tile_engine(self, tmp_path: Path, monkeypatch) -> None:
+        """engine=auto + --limit must not take the DuckDB ORDER BY path."""
+        lake = self._id_lake(tmp_path)
+        from data_lake.export import catalog_extract as ce
+
+        called = {"duckdb": False}
+
+        def _boom(*_a, **_k):
+            called["duckdb"] = True
+            raise AssertionError("DuckDB path should be skipped for auto+limit")
+
+        monkeypatch.setattr(ce, "_stream_lake_via_duckdb", _boom)
+        out = tmp_path / "lim.parquet"
+        result = extract_catalog(
+            output=out,
+            specs=["TARGETID"],
+            lake_root=lake,
+            survey="IDS",
+            engine="auto",
+            row_limit=1,
+        )
+        assert not called["duckdb"]
+        assert result.n_rows == 1
+
     def test_target_list_duckdb_engine(self, tmp_path: Path, caplog) -> None:
         lake = self._id_lake(tmp_path)
         out = tmp_path / "subset.parquet"
