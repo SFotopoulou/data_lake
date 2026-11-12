@@ -57,6 +57,23 @@ class TestMocExport:
         npix_back = Region.from_moc(path=out).to_npix(5)
         assert npix_back == npix_in
 
+    def test_ascii_and_json_export(self, tmp_path: Path) -> None:
+        """Non-FITS formats must not pass fits_keywords to mocpy.save."""
+        pytest.importorskip("mocpy")
+        region = Region.cone(120.0, 45.0, 600.0)
+        ascii_out = tmp_path / "cone.moc.txt"
+        json_out = tmp_path / "cone.moc.json"
+        export_region_moc(
+            region, ascii_out, moc_order=5, fmt="ascii", overwrite=True,
+        )
+        export_region_moc(
+            region, json_out, moc_order=5, fmt="json", overwrite=True,
+        )
+        assert ascii_out.is_file() and ascii_out.stat().st_size > 0
+        assert json_out.is_file() and json_out.stat().st_size > 0
+        text = ascii_out.read_text().strip()
+        assert "/" in text  # IVOA ASCII MOC: order/cells
+
     def test_survey_footprint(self, lake: Path, tmp_path: Path) -> None:
         pytest.importorskip("mocpy")
         out = tmp_path / "allwise.moc.fits"

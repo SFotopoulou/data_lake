@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dl-export-moc` / `dl-region --export-moc` ASCII and JSON** — no longer pass
+  FITS-only `fits_keywords` into mocpy (which raised
+  ``fits_keyword argument is only valid when fits is the output format``).
+
 ### Added
 
 - **`dl-samp-send-catalog`** — extract a lake catalog subset (or `--input` an

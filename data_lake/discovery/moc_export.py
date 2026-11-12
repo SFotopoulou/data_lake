@@ -99,7 +99,16 @@ def write_moc(
     path = Path(output)
     if fmt not in ("fits", "json", "ascii"):
         raise ValueError(f"unsupported MOC format {fmt!r}")
-    moc.save(str(path), format=fmt, overwrite=overwrite, fits_keywords=fits_keywords)
+    # mocpy only accepts fits_keywords for FITS serialization.
+    if fmt == "fits":
+        moc.save(
+            str(path),
+            format=fmt,
+            overwrite=overwrite,
+            fits_keywords=fits_keywords,
+        )
+    else:
+        moc.save(str(path), format=fmt, overwrite=overwrite)
     return path
 
 
