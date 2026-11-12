@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Notebook `17_region_extract_samp`** — EDFN bbox area → `dl-extract-catalog
+  --from-area` on `DESI_DR1` → optional `dl-samp-send-catalog` to TOPCAT.
 - **`dl-samp-send-catalog`** — extract a lake catalog subset (or `--input` an
   existing table) to a temp VOTable and load it in a running TOPCAT via SAMP
   (`table.load.votable`). Start TOPCAT first so a hub is available.

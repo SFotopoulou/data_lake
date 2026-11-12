@@ -42,6 +42,9 @@ dl-samp-send-catalog /data/lake --survey DESI_DR1 \
 dl-samp-send-catalog --input /scratch/desi_stars.vot --name desi_stars
 ```
 
+Worked example (EDFN bounding box → DESI extract → TOPCAT):
+[notebooks/17_region_extract_samp.ipynb](../notebooks/17_region_extract_samp.ipynb).
+
 ```bash
 # $DATA_LAKE_CONFIG supplies --lake-root when set
 

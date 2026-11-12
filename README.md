@@ -78,6 +78,7 @@ dl-describe-lake --count-total
 | Area plans (`dl-area`) | [discovery/areas-cli.md](docs/discovery/areas-cli.md) |
 | MOC export (`dl-export-moc`) | [regions-and-areas.md § Export as MOC](docs/discovery/regions-and-areas.md#export-as-moc) |
 | DS9 region export (`dl-export-ds9-region`) | [regions-and-areas.md § Export as DS9 region](docs/discovery/regions-and-areas.md#export-as-ds9-region) |
+| Send catalog to TOPCAT (`dl-samp-send-catalog`) | [export-and-sharing.md § SAMP](docs/export-and-sharing.md#send-to-topcat-via-samp) · [notebook](notebooks/17_region_extract_samp.ipynb) |
 | Gather products (`dl-gather`) | [discovery/gather.md](docs/discovery/gather.md) |
 | **Reference workflow** (region → ML export) | [discovery/workflow.md](docs/discovery/workflow.md) · [notebook](notebooks/14_discovery_workflow.ipynb) |
 | Homogenization (`dl-homogenize`) | [homogenization.md](docs/homogenization.md) |
