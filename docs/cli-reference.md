@@ -61,7 +61,8 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 |---------|---------|
 | `dl-extract-spectra-subset` | Export a curated ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / Parquet / HDF5 / FITS; `--via-crossmatch TREE` maps a partner `--target-list` through an existing crossmatch; writes `<output>.target_ids.parquet` with `--target-id-col` for join-back; progress on by default (`--no-progress` to disable) |
 | `dl-extract-cutout-subset` | Export a curated cutout ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / per-source FITS (with full WCS) / HDF5; `--via-crossmatch TREE` as for spectra; same target-id sidecar; `--format zarr\|fits\|hdf5`, `--target-id-col` supports composite specs |
-| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; lake survey via `--survey NAME` (not a positional); `--all-columns` for full schema; `--where` / `--limit`; `--via-crossmatch TREE` maps a partner `--target-list` through an existing crossmatch then extracts (merges `--target-id-col` into the file); then spectra/cutouts via `_source_id` ([example](export-and-sharing.md#catalog-by-survey-name-then-spectra--cutouts)) |
+| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; lake survey via `--survey NAME` (not a positional); `--all-columns` for full schema; `--where` / `--limit`; `--from-area` / `--cone` / `--bbox` / `--npix` / `--moc` region clip (lake only); `--via-crossmatch TREE` maps a partner `--target-list` through an existing crossmatch then extracts (merges `--target-id-col` into the file); then spectra/cutouts via `_source_id` ([example](export-and-sharing.md#catalog-by-survey-name-then-spectra--cutouts)) |
+| `dl-samp-send-catalog` | Extract a lake subset (or `--input` a table) and load it in TOPCAT via SAMP; same filters/region clips as extract ([docs](export-and-sharing.md#send-to-topcat-via-samp)) |
 | `dl-extract-spplate-catalog` | Build a specObj-style catalog from spPlate files; `--where` / `--limit` on plugmap columns |
 | `dl-pack-tile` | Package one HEALPix tile as a `.tar` for sharing |
 
@@ -97,6 +98,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | Command | Purpose |
 |---------|---------|
 | `dl-export-ds9-region` | DS9 region file: source circles and/or survey footprint polygons (`--mode`, `--where`, `--from-area`, …) ([docs](discovery/regions-and-areas.md#export-as-ds9-region)) |
+| `dl-samp-send-catalog` | Load a lake catalog subset (or `--input` table) into TOPCAT via SAMP ([docs](export-and-sharing.md#send-to-topcat-via-samp)) |
 | `dl-plot-source` | Two-panel SED + 1D spectrum figure for one source (`--id`, `--product`, `--spectra-survey`, `-o`); requires `--extra viz` ([docs](plotting.md)) |
 | `dl-plot-spectrum` | 1D spectrum only for one source (`SURVEY --id`, `-o`); requires `--extra viz` ([docs](plotting.md)) |
 

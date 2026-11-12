@@ -48,7 +48,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -60,6 +60,9 @@ from data_lake.ingest.fits_to_parquet import (
     _ZSTD_LEVEL,
     resolve_catalog_column_name,
 )
+
+if TYPE_CHECKING:
+    from data_lake.discovery.region import Region
 
 log = logging.getLogger(__name__)
 
@@ -508,6 +511,85 @@ def _npix_from_tile_path(tile_path: Path) -> int | None:
         return None
 
 
+def _prune_tiles_for_region(
+    lake_root: Path | str,
+    survey: str,
+    tiles: Sequence[Path],
+    region: Region,
+    *,
+    norder: int | None = None,
+) -> list[Path]:
+    """Keep only tiles whose ``Npix`` intersects *region* (catalog HEALPix order)."""
+    from data_lake.discovery.selection import selection_from_region
+
+    sel = selection_from_region(lake_root, survey, region)
+    keep = set(sel.npix)
+    if norder is not None and int(sel.norder) != int(norder):
+        log.debug(
+            "Region prune at survey order %d (requested norder=%d).",
+            sel.norder,
+            norder,
+        )
+    if not keep:
+        log.info(
+            "Region prune: 0 overlapping tile(s) of %d surveyed.",
+            len(tiles),
+        )
+        return []
+    pruned = [
+        p for p in tiles
+        if (npix := _npix_from_tile_path(p)) is not None and npix in keep
+    ]
+    log.info(
+        "Region prune: %d/%d tile(s) overlap the selection.",
+        len(pruned),
+        len(tiles),
+    )
+    return pruned
+
+
+def _write_empty_lake_extract(
+    mapping: Sequence[tuple[str, str]],
+    *,
+    catalog_root: Path,
+    schema_tiles: Sequence[Path],
+    output: Path | None,
+    output_dir: Path | None,
+    output_format: OutputFormat | None,
+) -> ExtractResult:
+    """Write a zero-row extract when region / ID prune leaves no tiles."""
+    from data_lake.schema_registry import catalog_schema_source
+
+    out_names = tuple(out for _, out in mapping)
+    schema_path = catalog_schema_source(catalog_root)
+    if schema_path is None:
+        if not schema_tiles:
+            raise FileNotFoundError(f"No Parquet schema under {catalog_root}")
+        schema_path = schema_tiles[0]
+    full_schema = pq.read_schema(str(schema_path))
+    empty = pa.table({
+        out: pa.array([], type=full_schema.field(src).type)
+        for src, out in mapping
+    })
+    if output_dir is not None:
+        dest = Path(output_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        log.info("Empty extract (no overlapping tiles) → %s", dest)
+        return ExtractResult(
+            n_rows=0, column_names=out_names, output_dir=dest, n_tiles=0,
+        )
+    if output is None:
+        raise ValueError("pass output or output_dir")
+    dest = Path(output)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fmt = infer_output_format(dest, output_format)
+    write_catalog_extract(empty, dest, output_format=fmt)
+    log.info("Empty extract (no overlapping tiles) → %s", dest)
+    return ExtractResult(
+        n_rows=0, column_names=out_names, output=dest, n_tiles=0,
+    )
+
+
 def _prune_tiles_for_source_ids(
     lake_root: Path | str,
     survey: str,
@@ -901,6 +983,7 @@ def stream_extract_from_lake_catalog(
     where_sql: str | None = None,
     row_limit: int | None = None,
     source_ids: np.ndarray | None = None,
+    region: Region | None = None,
 ) -> ExtractResult:
     """Stream column projection from lake Parquet tiles without loading the full survey."""
     if output is None and output_dir is None:
@@ -913,11 +996,11 @@ def stream_extract_from_lake_catalog(
     )
     catalog_root = _lake_catalog_root(lake_root, survey)
     order = _lake_norder(catalog_root, norder)
-    tiles = list(iter_lake_catalog_tiles(catalog_root, norder=order))
-    if not tiles:
+    all_tiles = list(iter_lake_catalog_tiles(catalog_root, norder=order))
+    if not all_tiles:
         raise FileNotFoundError(f"No Parquet tiles under {catalog_root}")
 
-    schema_names = _lake_schema_names(catalog_root, tiles)
+    schema_names = _lake_schema_names(catalog_root, all_tiles)
     effective_specs = specs_from_schema(
         schema_names, all_columns=all_columns, specs=specs,
     )
@@ -927,9 +1010,23 @@ def stream_extract_from_lake_catalog(
     source_ids, id_predicate, link_col = _prepare_source_id_filter(
         catalog_root, schema_names, source_ids,
     )
+    tiles = all_tiles
+    if region is not None:
+        tiles = _prune_tiles_for_region(
+            lake_root, survey, tiles, region, norder=order,
+        )
     if source_ids is not None:
         tiles = _prune_tiles_for_source_ids(
             lake_root, survey, tiles, source_ids, norder=order,
+        )
+    if not tiles:
+        return _write_empty_lake_extract(
+            mapping,
+            catalog_root=catalog_root,
+            schema_tiles=all_tiles,
+            output=Path(output) if output is not None else None,
+            output_dir=Path(output_dir) if output_dir is not None else None,
+            output_format=output_format,
         )
 
     fmt: OutputFormat = "parquet"
@@ -1749,6 +1846,7 @@ def extract_from_lake_catalog(
     where_sql: str | None = None,
     row_limit: int | None = None,
     source_ids: np.ndarray | None = None,
+    region: Region | None = None,
 ) -> pa.Table:
     """In-memory lake extract (small catalogs / tests only)."""
     catalog_root = _lake_catalog_root(lake_root, survey)
@@ -1775,6 +1873,7 @@ def extract_from_lake_catalog(
             where_sql=where_sql,
             row_limit=row_limit,
             source_ids=source_ids,
+            region=region,
         )
         if result.n_rows == 0:
             return pa.table({out_name: pa.array([], type=pa.float64()) for _, out_name in mapping})
@@ -2067,6 +2166,7 @@ def extract_catalog(
     where_sql: str | None = None,
     row_limit: int | None = None,
     source_ids: np.ndarray | None = None,
+    region: Region | None = None,
 ) -> ExtractResult | pa.Table:
     """Extract columns and write output; returns summary or small in-memory table."""
     if all_columns and specs:
@@ -2079,6 +2179,8 @@ def extract_catalog(
         raise ValueError("use --target-list or --where, not both")
     if source_ids is not None and lake_root is None:
         raise ValueError("--target-list requires an ingested catalog (--survey)")
+    if region is not None and lake_root is None:
+        raise ValueError("region clip requires an ingested catalog (--survey)")
     column_specs: Sequence[str] = specs or ()
 
     if lake_root is not None:
@@ -2105,6 +2207,7 @@ def extract_catalog(
             where_sql=where_sql,
             row_limit=row_limit,
             source_ids=source_ids,
+            region=region,
         )
         return result
 
@@ -2112,6 +2215,8 @@ def extract_catalog(
         raise ValueError("catalog path(s) or --lake-root required")
     if output_dir is not None:
         raise ValueError("--output-dir is only valid with --lake-root")
+    if region is not None:
+        raise ValueError("region clip is only valid with --lake-root/--survey")
 
     raw_result = extract_from_catalog_paths(
         paths,
@@ -2278,6 +2383,28 @@ from data_lake.cli_utils import config_option, load_optional_config, progress_op
     help="Maximum rows to write after --where (first rows in tile order).",
 )
 @click.option(
+    "--from-area",
+    default=None,
+    help="Clip lake extract to an area region (requires --survey).",
+)
+@click.option(
+    "--cone",
+    nargs=2,
+    type=float,
+    default=None,
+    help="Clip lake extract to cone: RA DEC (deg); needs --radius-arcsec.",
+)
+@click.option("--radius-arcsec", type=float, default=None)
+@click.option("--bbox", nargs=4, type=float, default=None)
+@click.option("--npix", default=None, help="Clip to npix list (needs --norder).")
+@click.option(
+    "--moc",
+    "moc_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Clip lake extract to an input MOC file.",
+)
+@click.option(
     "--add-input-path",
     is_flag=True,
     help="Add input_path column when merging multiple catalog files.",
@@ -2319,6 +2446,12 @@ def cli(
     via_crossmatch: str | None,
     where_sql: str | None,
     row_limit: int | None,
+    from_area: str | None,
+    cone: tuple[float, float] | None,
+    radius_arcsec: float | None,
+    bbox: tuple[float, float, float, float] | None,
+    npix: str | None,
+    moc_path: Path | None,
     add_input_path: bool,
     streaming: bool,
     batch_rows: int,
@@ -2334,6 +2467,9 @@ def cli(
     (same resolution as dl-extract-spectra-subset). With --via-crossmatch, those
     IDs are on the partner side of the tree and are mapped to --survey first.
     Mutually exclusive with --where.
+
+    Lake extracts accept an optional region clip (--from-area / --cone / --bbox /
+    --npix / --moc).
     """
     validate_quiet_verbose(quiet, verbose)
     configure_cli_logging(
@@ -2412,6 +2548,36 @@ def cli(
         raise click.ClickException(
             "--via-crossmatch requires --lake-root / $DATA_LAKE_CONFIG."
         )
+
+    region = None
+    clip_selectors = [from_area, cone, bbox, npix, moc_path]
+    if sum(x is not None for x in clip_selectors) > 1:
+        raise click.ClickException(
+            "Use at most one region clip selector "
+            "(--from-area | --cone | --bbox | --npix | --moc)"
+        )
+    if any(x is not None for x in clip_selectors):
+        if lake_root is None:
+            raise click.ClickException(
+                "Region clip (--from-area / --cone / --bbox / --npix / --moc) "
+                "requires --survey (lake extract)."
+            )
+        from data_lake.discovery.region_cli import _region_from_args
+
+        try:
+            region, _ = _region_from_args(
+                from_area=from_area,
+                npix=npix,
+                norder=norder,
+                cone=cone,
+                radius_arcsec=radius_arcsec,
+                bbox=bbox,
+                moc=moc_path,
+                lake_root=lake_root,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
     if where_sql:
         from data_lake.export.row_filter import validate_predicate
 
@@ -2489,6 +2655,7 @@ def cli(
         where_sql=where_sql,
         row_limit=row_limit,
         source_ids=source_ids,
+        region=region,
     )
 
     n_rows_echo: int | None = None

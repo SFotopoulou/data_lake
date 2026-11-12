@@ -44,7 +44,7 @@ data_lake/
     ds9_region.py             dl-export-ds9-region
 
   homogenize/               dl-homogenize: transform packs, bandpasses, per-survey recipes
-  export/                   dl-extract-catalog, spectra/cutout subsets, FITS writers
+  export/                   dl-extract-catalog, dl-samp-send-catalog, spectra/cutout subsets, FITS writers
   ml/                       PyTorch datasets (cutouts, spectra) with tile-ordered sampling
   plot/                     dl-plot-source, dl-plot-spectrum
   share/                    dl-pack-tile

@@ -17,6 +17,31 @@ catalog, spectra and cutouts. To fetch spectra or cutouts from a *different*
 STILTS) and use the partner's `_source_id`, which is `source_id_b` in a
 crossmatch tree.
 
+Lake extracts can also clip to a sky region (tile prune at the catalog HEALPix
+order), using the same selectors as `dl-region` / `dl-export-moc`:
+
+```bash
+dl-extract-catalog --survey DESI_DR1 \
+  --from-area MyCone -c _source_id,TARGET_RA,TARGET_DEC,Z \
+  -o /scratch/desi_cone.parquet
+
+# or ad-hoc: --cone RA DEC --radius-arcsec R, --bbox, --npix + --norder, --moc
+```
+
+## Send to TOPCAT via SAMP
+
+`dl-samp-send-catalog` extracts a lake subset (same filters and region clips as
+`dl-extract-catalog`) to a temporary VOTable and loads it in a **running**
+TOPCAT over SAMP. Start TOPCAT first so a hub is available.
+
+```bash
+dl-samp-send-catalog /data/lake --survey DESI_DR1 \
+  -c TARGETID,RA,DEC,Z --from-area MyCone --limit 5000 --name desi_cone
+
+# Or send an already-extracted table
+dl-samp-send-catalog --input /scratch/desi_stars.vot --name desi_stars
+```
+
 ```bash
 # $DATA_LAKE_CONFIG supplies --lake-root when set
 

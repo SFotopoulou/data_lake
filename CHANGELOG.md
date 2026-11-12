@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`dl-samp-send-catalog`** — extract a lake catalog subset (or `--input` an
+  existing table) to a temp VOTable and load it in a running TOPCAT via SAMP
+  (`table.load.votable`). Start TOPCAT first so a hub is available.
+- **Region clips on `dl-extract-catalog`** — lake extracts accept `--from-area`,
+  `--cone` (+ `--radius-arcsec`), `--bbox`, `--npix`, or `--moc` (tile prune at
+  catalog HEALPix order; compatible with `--where` / `--limit` / `--target-list`).
 - **`dl-export-ds9-region`** — write a DS9 `.reg` for a catalog survey: HEALPix
   footprint polygons and/or source circles (default 0.5″). Supports `--mode
   sources|footprint|both`, `--where` / `--limit` on sources, and optional region
