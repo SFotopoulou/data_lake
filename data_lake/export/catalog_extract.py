@@ -2420,6 +2420,22 @@ def cli(
             int(target_bridge.num_rows),
         )
 
+    # --target-list identity attach joins on _source_id; ensure it is present
+    # in the extract even when the user omitted it from -c.
+    column_specs: list[str] | None = list(columns) if columns else None
+    if (
+        target_list is not None
+        and not all_columns
+        and column_specs is not None
+        and not any(
+            parse_column_spec(s)[0] == "_source_id"
+            or parse_column_spec(s)[1] == "_source_id"
+            for s in column_specs
+        )
+    ):
+        column_specs = ["_source_id", *column_specs]
+        log.info("Auto-added _source_id to -c for target-id join-back.")
+
     fmt: OutputFormat | None = (
         output_format.lower()  # type: ignore[assignment]
         if output_format is not None
@@ -2428,7 +2444,7 @@ def cli(
 
     result = extract_catalog(
         output=output,
-        specs=list(columns) if columns else None,
+        specs=column_specs,
         all_columns=all_columns,
         paths=all_paths or None,
         lake_root=lake_root,
@@ -2459,15 +2475,22 @@ def cli(
         via = via_crossmatch is not None
         if output is not None and Path(output).is_file():
             try:
-                _dest, n_rows_echo, n_cols_echo = apply_bridge_to_catalog_file(
+                _dest, n_rows_echo, n_cols_echo, attached = apply_bridge_to_catalog_file(
                     Path(output),
                     target_bridge,
                     via_crossmatch=via,
                     output_format=fmt,
                 )
-                click.echo(
-                    f"  attached target-id column(s) from {target_list.name}"
-                )
+                if attached:
+                    click.echo(
+                        f"  attached target-id column(s) from {target_list.name}: "
+                        + ", ".join(attached)
+                    )
+                else:
+                    click.echo(
+                        f"  target-id column(s) from {target_list.name} already "
+                        f"present in extract (nothing new to attach)"
+                    )
             except (ValueError, OSError) as exc:
                 raise click.ClickException(str(exc)) from exc
         elif output_dir is not None:

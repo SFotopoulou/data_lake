@@ -430,11 +430,14 @@ class TestExtractFromLake:
                 "--via-crossmatch", "IDS_x_LEG__r1.0",
                 "--target-list", str(ids),
                 "--target-id-col", "TARGETID",
-                "-c", "_source_id,flux_g",
+                # Omit _source_id: CLI must auto-add it so TARGETID can merge in.
+                "-c", "flux_g",
                 "-o", str(out),
             ],
         )
         assert result.exit_code == 0, result.output
+        assert "attached target-id column(s)" in result.output
+        assert "TARGETID" in result.output
         tbl = pq.read_table(out)
         assert sorted(tbl.column("_source_id").to_pylist()) == [101, 102]
         assert sorted(tbl.column("flux_g").to_pylist()) == [1.5, 2.5]

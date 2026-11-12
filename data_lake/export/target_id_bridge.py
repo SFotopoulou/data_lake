@@ -210,12 +210,13 @@ def apply_bridge_to_catalog_file(
     *,
     via_crossmatch: bool = False,
     output_format: str | None = None,
-) -> tuple[Path, int, int]:
+) -> tuple[Path, int, int, tuple[str, ...]]:
     """Rewrite a single-file catalog extract with attached identity columns.
 
-    Returns ``(path_written, n_rows_after, n_cols_after)``.
+    Returns ``(path_written, n_rows_after, n_cols_after, attached_columns)``.
+    Raises ``ValueError`` when the extract has no ``_source_id`` join key
+    (callers should include ``_source_id`` in ``-c`` / auto-inject it).
     """
-    import pyarrow as pa
     import pyarrow.parquet as pq
 
     from data_lake.export.catalog_extract import (
@@ -239,19 +240,19 @@ def apply_bridge_to_catalog_file(
         extract = _astropy_table_to_arrow(Table.read(str(output)))
 
     if "_source_id" not in extract.column_names:
-        sidecar = write_target_id_sidecar(output, bridge)
-        log.warning(
-            "Extract %s has no _source_id; wrote target-id sidecar → %s",
-            output.name,
-            sidecar,
+        raise ValueError(
+            f"Cannot attach target-id columns to {output.name}: extract has no "
+            f"_source_id join key. Include _source_id in -c (dl-extract-catalog "
+            f"auto-adds it when --target-list is set)."
         )
-        return sidecar, extract.num_rows, extract.num_columns
 
+    before = set(extract.column_names)
     merged = attach_bridge_to_table(
         extract, bridge, via_crossmatch=via_crossmatch
     )
+    attached = tuple(n for n in merged.column_names if n not in before)
     write_catalog_extract(merged, output, output_format=fmt)
-    return output, merged.num_rows, merged.num_columns
+    return output, merged.num_rows, merged.num_columns, attached
 
 
 def resolve_target_bridge(
