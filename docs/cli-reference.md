@@ -77,6 +77,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 | `dl-region` | Discover survey × modality data in a region (`--from-area`/`--cone`/`--bbox`/`--npix`/`--moc`); `--modalities` may include `crossmatch`; rounded counts, `--count` exact for catalog/crossmatch, `--save-as` area, `--export-moc`, `--moc-format fits\|json\|ascii` ([docs](discovery/regions-and-areas.md)) |
 | `dl-area` | Manage `areas/<id>.json`: `list`, `show`, `validate`, `set-crossmatch`, `set-gather`, `set-homogenize`, `import` ([docs](discovery/areas-cli.md)) |
 | `dl-export-moc` | Write survey tile footprint (or region-clipped) as IVOA MOC FITS/JSON/ASCII; `--moc-order` ([docs](discovery/regions-and-areas.md#export-as-moc)) |
+| `dl-export-ds9-region` | Write DS9 `.reg` for catalog sources (0.5″ circles) and/or HEALPix footprint polygons; `--mode sources\|footprint\|both`, `--where`/`--limit`, `--from-area` / other region clips ([docs](discovery/regions-and-areas.md#export-as-ds9-region)) |
 
 
 **Associations**
@@ -95,6 +96,7 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
+| `dl-export-ds9-region` | DS9 region file: source circles and/or survey footprint polygons (`--mode`, `--where`, `--from-area`, …) ([docs](discovery/regions-and-areas.md#export-as-ds9-region)) |
 | `dl-plot-source` | Two-panel SED + 1D spectrum figure for one source (`--id`, `--product`, `--spectra-survey`, `-o`); requires `--extra viz` ([docs](plotting.md)) |
 | `dl-plot-spectrum` | 1D spectrum only for one source (`SURVEY --id`, `-o`); requires `--extra viz` ([docs](plotting.md)) |
 

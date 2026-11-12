@@ -41,6 +41,7 @@ data_lake/
     gather.py, gather_cli.py  dl-gather: base × partners → joined product catalog
     partner_tile_cache.py     Whole-tile LRU used by dl-gather for partner lookups
     moc_export.py             dl-export-moc
+    ds9_region.py             dl-export-ds9-region
 
   homogenize/               dl-homogenize: transform packs, bandpasses, per-survey recipes
   export/                   dl-extract-catalog, spectra/cutout subsets, FITS writers

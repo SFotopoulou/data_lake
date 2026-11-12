@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`dl-export-ds9-region`** — write a DS9 `.reg` for a catalog survey: HEALPix
+  footprint polygons and/or source circles (default 0.5″). Supports `--mode
+  sources|footprint|both`, `--where` / `--limit` on sources, and optional region
+  clips (`--from-area`, `--cone`, `--bbox`, `--npix`, `--moc`).
+
 ## [0.8.0] - 2026-11-10
 
 ### Added

@@ -114,6 +114,23 @@ dl-export-moc --survey DESI_DR1 --modality spectra \
 
 MOC import and export need the optional `moc` extra: `uv sync --extra moc` (installs `mocpy`).
 
+## Export as DS9 region
+
+`dl-export-ds9-region` writes a DS9 `.reg` (fk5) for a catalog survey: HEALPix
+tile polygons (`--mode footprint`), source circles (`--mode sources`, default
+radius 0.5″ via `--radius-arcsec`), or both (default). Source rows accept
+`--where` / `--limit` (same DuckDB predicate rules as `dl-extract-*`). Clip with
+at most one of `--from-area`, `--cone` (+ `--cone-radius-arcsec`), `--bbox`,
+`--npix`, or `--moc`:
+
+```bash
+dl-export-ds9-region /data/lake --survey SDSS_DR17 --mode both \
+  -o sdss.reg --overwrite
+
+dl-export-ds9-region --survey DESI_DR1 --mode sources \
+  --from-area MyCone --where "Z > 0.5" --limit 5000 -o desi.reg
+```
+
 ## Region selector (Python)
 
 A `Region` resolves to pixels at a target order, because catalog, spectra, and cutout layers
