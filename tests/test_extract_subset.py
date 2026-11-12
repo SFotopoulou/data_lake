@@ -1120,6 +1120,29 @@ class TestReadTargetIdsComposite:
         ids = _read_target_ids(path, "TARGETID")
         np.testing.assert_array_equal(ids, np.asarray([101, 102], dtype=np.int64))
 
+    def test_fits_big_endian_identity_table(self, tmp_path: Path):
+        """FITS BINTABLE is big-endian; identity bridge must not raise on Arrow."""
+        import pyarrow as pa
+        from astropy.table import Table
+
+        from data_lake.export.spectra_subset import read_target_list_table
+
+        path = tmp_path / "be_targets.fits"
+        Table({"TARGETID": [101, 102], "SURVEY": ["main", "sv3"]}).write(
+            path, overwrite=True,
+        )
+        # Round-trip through FITS → big-endian columns; raw pa.array would fail.
+        reloaded = Table.read(path)
+        be = np.asarray(reloaded["TARGETID"])
+        if be.dtype.byteorder == ">":
+            with pytest.raises(pa.lib.ArrowNotImplementedError, match="Byte-swapped"):
+                pa.array(be)
+        ids, identity = read_target_list_table(path, "TARGETID,SURVEY")
+        assert identity.num_rows == 2
+        assert identity.column("TARGETID").to_pylist() == [101, 102]
+        assert identity.column("SURVEY").to_pylist() == ["main", "sv3"]
+        assert ids.shape == (2,)
+
     def test_parquet_numeric_fast_path(self, tmp_path: Path):
         import pyarrow as pa
         import pyarrow.parquet as pq

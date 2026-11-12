@@ -142,6 +142,8 @@ def read_target_list_table(
 
     from astropy.table import Table
 
+    from data_lake.ingest.fits_to_parquet import _astropy_col_to_pyarrow
+
     tbl = Table.read(str(path))
     missing = [p for p in parts if p not in tbl.colnames]
     if missing:
@@ -151,13 +153,11 @@ def read_target_list_table(
             f"Column(s) {missing} not in {path.name} "
             f"(spec={column!r}). Available columns: {preview}{ellipsis}"
         )
-    arrays: dict[str, pa.Array] = {}
-    for p in parts:
-        col = tbl[p]
-        try:
-            arrays[p] = pa.array(np.asarray(col))
-        except (TypeError, ValueError):
-            arrays[p] = pa.array(list(col))
+    # FITS BINTABLE columns are big-endian; use the ingest converter so
+    # PyArrow does not raise ArrowNotImplementedError: Byte-swapped arrays.
+    arrays: dict[str, pa.Array] = {
+        p: _astropy_col_to_pyarrow(tbl[p]) for p in parts
+    }
     identity = pa.table(arrays)
     if len(parts) == 1:
         try:

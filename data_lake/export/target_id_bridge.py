@@ -233,15 +233,10 @@ def apply_bridge_to_catalog_file(
     else:
         from astropy.table import Table
 
-        at = Table.read(str(output))
-        arrays: dict[str, pa.Array] = {}
-        for name in at.colnames:
-            col = at[name]
-            try:
-                arrays[name] = pa.array(np.asarray(col))
-            except (TypeError, ValueError):
-                arrays[name] = pa.array(list(col))
-        extract = pa.table(arrays)
+        from data_lake.ingest.fits_to_parquet import _astropy_table_to_arrow
+
+        # FITS/VOTable may be big-endian; ingest converter byteswaps for Arrow.
+        extract = _astropy_table_to_arrow(Table.read(str(output)))
 
     if "_source_id" not in extract.column_names:
         sidecar = write_target_id_sidecar(output, bridge)
