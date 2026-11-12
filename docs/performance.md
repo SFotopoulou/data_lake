@@ -33,7 +33,7 @@ Environment variables read at run time:
 | Variable | Effect |
 |----------|--------|
 | `DATA_LAKE_PARQUET_METADATA_CACHE` | `0`/`false`/`no`/`off` or `1`/`true`/`yes`/`on`; overrides `CATALOG_PARQUET_METADATA_CACHE` |
-| `DATA_LAKE_DUCKDB_THREADS` | DuckDB threads per connection (overrides the per-worker split) |
+| `DATA_LAKE_DUCKDB_THREADS` | DuckDB threads per connection (overrides the per-worker split; also overrides the extract default of `EXTRACT_DUCKDB_THREADS=4`) |
 | `DATA_LAKE_DUCKDB_MEMORY_LIMIT_MIB` | DuckDB memory limit per connection in MiB (overrides the per-worker split) |
 | `DATA_LAKE_EXTRACT_TILE_WORKERS` | Override `EXTRACT_TILE_WORKERS` (`1` = serial) |
 | `DATA_LAKE_FITS_MEMMAP` | Default for `--fits-memmap` (`auto`, `on`, `off`) |

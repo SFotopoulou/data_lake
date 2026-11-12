@@ -468,13 +468,28 @@ def _register_target_ids(connection, source_ids: np.ndarray) -> None:
     )
 
 
-def _connect_extract_duckdb(source_ids: np.ndarray | None):
-    """Open an extract DuckDB connection with process/env limits and metadata cache."""
-    from data_lake.io.duckdb_limits import connect as connect_duckdb
-    from data_lake.io.duckdb_limits import parquet_metadata_cache_default
+def _connect_extract_duckdb(
+    source_ids: np.ndarray | None,
+    *,
+    n_workers: int = 1,
+):
+    """Open an extract DuckDB connection with capped threads and metadata cache.
 
+    Unlike a bare DuckDB connect (all cores), extract connections use
+    :func:`~data_lake.io.duckdb_limits.extract_duckdb_limits` so a shared node
+    is not flooded — especially when ``--output-dir`` runs several workers.
+    """
+    from data_lake.io.duckdb_limits import connect as connect_duckdb
+    from data_lake.io.duckdb_limits import (
+        extract_duckdb_limits,
+        parquet_metadata_cache_default,
+    )
+
+    limits = extract_duckdb_limits(n_workers=n_workers)
+    log.debug("Extract DuckDB limits: %s", limits.describe())
     connection = connect_duckdb(
         ":memory:",
+        limits,
         parquet_metadata_cache=parquet_metadata_cache_default(),
     )
     if source_ids is not None:
@@ -1479,12 +1494,13 @@ def _write_one_output_dir_tile(
     where_sql: str | None,
     source_ids: np.ndarray | None,
     id_predicate: str | None,
+    n_workers: int = 1,
 ) -> tuple[int, Path | None]:
     """Project one tile into ``output_dir``; return ``(n_rows, out_path|None)``."""
     duckdb_con = None
     try:
         if where_sql is not None or id_predicate is not None:
-            duckdb_con = _connect_extract_duckdb(source_ids)
+            duckdb_con = _connect_extract_duckdb(source_ids, n_workers=n_workers)
         chunk = _tile_extract_chunk(
             tile_path,
             mapping,
@@ -1555,6 +1571,13 @@ def _stream_lake_tile_by_tile(
         if n_workers > 1 and row_limit is None:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
+            from data_lake.io.duckdb_limits import extract_duckdb_limits
+
+            log.info(
+                "Extract --output-dir: %d tile worker(s); DuckDB per connection: %s",
+                n_workers,
+                extract_duckdb_limits(n_workers=n_workers).describe(),
+            )
             n_rows = 0
             n_written_tiles = 0
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -1572,6 +1595,7 @@ def _stream_lake_tile_by_tile(
                         where_sql=where_sql,
                         source_ids=source_ids,
                         id_predicate=id_predicate,
+                        n_workers=n_workers,
                     )
                     for tile_path in tiles
                 ]

@@ -202,6 +202,37 @@ def current_limits() -> DuckDBLimits:
     return _process_limits if _process_limits is not None else env_limits()
 
 
+def extract_duckdb_limits(*, n_workers: int = 1) -> DuckDBLimits:
+    """DuckDB limits for ``dl-extract*`` connections.
+
+    Prefer installed :func:`process_limits` / ``$DATA_LAKE_DUCKDB_*`` overrides.
+    Otherwise split the node across *n_workers* and cap threads at
+    ``EXTRACT_DUCKDB_THREADS`` so a single extract does not take every core
+    (or ``n_workers × cores`` under ``--output-dir`` parallelism).
+    """
+    from data_lake.knobs import EXTRACT_DUCKDB_THREADS
+
+    n = max(1, int(n_workers))
+    env = env_limits()
+    if _process_limits is not None and (
+        _process_limits.threads > 0 or _process_limits.memory_limit_bytes > 0
+    ):
+        # Worker already received a share (e.g. crossmatch); keep it.
+        threads = _process_limits.threads
+        memory = _process_limits.memory_limit_bytes
+        if env.threads > 0:
+            threads = env.threads
+        if env.memory_limit_bytes > 0:
+            memory = env.memory_limit_bytes
+        return DuckDBLimits(threads=threads, memory_limit_bytes=memory)
+
+    base = per_worker_limits(n)
+    cap = max(1, int(EXTRACT_DUCKDB_THREADS))
+    threads = env.threads or min(base.threads, cap)
+    memory = env.memory_limit_bytes or base.memory_limit_bytes
+    return DuckDBLimits(threads=threads, memory_limit_bytes=memory)
+
+
 def apply_limits(con, limits: DuckDBLimits | None = None):
     """Apply *limits* (default :func:`current_limits`) to an open connection."""
     limits = limits if limits is not None else current_limits()

@@ -100,6 +100,14 @@ EXTRACT_TILE_WORKERS: int = 4
 multi-tile spectra/cutout subset extracts.  Capped by ``MAX_PARALLEL_WORKERS_CAP``.
 ``1`` keeps the historical serial path.  Override with ``$DATA_LAKE_EXTRACT_TILE_WORKERS``."""
 
+EXTRACT_DUCKDB_THREADS: int = 4
+"""Default DuckDB threads per connection for ``dl-extract-catalog`` (and other
+extract helpers that open DuckDB without an installed process limit).
+
+Without this cap, DuckDB uses every core on the node; with ``--output-dir``
+tile workers that multiplies to ``workers × cores`` scan threads.  Override
+with ``$DATA_LAKE_DUCKDB_THREADS`` (applies to all lake DuckDB connections)."""
+
 
 def extract_tile_workers(*, force_serial: bool = False) -> int:
     """Resolve extract tile parallelism (env override, then knob, then cap)."""

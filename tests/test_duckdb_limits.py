@@ -89,6 +89,25 @@ class TestDetection:
         assert dl.available_cpus() >= 1
 
 
+class TestExtractDuckDBLimits:
+    def test_caps_threads_on_large_node(self, node_16cpu_64gib) -> None:
+        limits = dl.extract_duckdb_limits(n_workers=1)
+        assert limits.threads == 4  # EXTRACT_DUCKDB_THREADS default
+        assert limits.memory_limit_bytes > 0
+
+    def test_splits_across_workers_then_caps(self, node_16cpu_64gib) -> None:
+        # 16 CPUs / 8 workers = 2 threads each, under the extract cap.
+        assert dl.extract_duckdb_limits(n_workers=8).threads == 2
+
+    def test_env_overrides_extract_cap(self, node_16cpu_64gib, monkeypatch) -> None:
+        monkeypatch.setenv(dl.THREADS_ENV, "7")
+        assert dl.extract_duckdb_limits(n_workers=1).threads == 7
+
+    def test_process_limits_preferred(self, node_16cpu_64gib) -> None:
+        with process_limits(DuckDBLimits(1, 256 * MIB)):
+            assert dl.extract_duckdb_limits(n_workers=1) == DuckDBLimits(1, 256 * MIB)
+
+
 class TestConnections:
     def test_apply_limits(self) -> None:
         import duckdb

@@ -83,12 +83,13 @@ def build_target_id_bridge(
             f"(got {via_pairs.column_names})"
         )
 
-    import duckdb
+    from data_lake.io.duckdb_limits import connect as connect_duckdb
+    from data_lake.io.duckdb_limits import extract_duckdb_limits
 
     partner = identity.append_column(
         "_partner_id", pa.array(ids, type=pa.int64())
     )
-    con = duckdb.connect()
+    con = connect_duckdb(":memory:", extract_duckdb_limits())
     try:
         con.register("identity", partner)
         con.register("pairs", via_pairs)
@@ -155,7 +156,8 @@ def attach_bridge_to_table(
     join_key: str = "_source_id",
 ) -> "pa.Table":
     """Left-join *bridge* onto *extract* on *join_key* (row-expanding)."""
-    import duckdb
+    from data_lake.io.duckdb_limits import connect as connect_duckdb
+    from data_lake.io.duckdb_limits import extract_duckdb_limits
 
     if bridge.num_rows == 0 or set(bridge.column_names) <= {join_key}:
         return extract
@@ -171,7 +173,7 @@ def attach_bridge_to_table(
     if not identity_cols:
         return extract
 
-    con = duckdb.connect()
+    con = connect_duckdb(":memory:", extract_duckdb_limits())
     try:
         con.register("extract_tbl", extract)
         con.register("bridge_tbl", prepared)
