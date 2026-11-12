@@ -438,6 +438,45 @@ class TestExtractFromLake:
         tbl = pq.read_table(out)
         assert sorted(tbl.column("_source_id").to_pylist()) == [101, 102]
         assert sorted(tbl.column("flux_g").to_pylist()) == [1.5, 2.5]
+        # Partner TARGETID must survive so rows join back to the target-list.
+        assert "TARGETID" in tbl.column_names
+        by_sid = {
+            sid: tid
+            for sid, tid in zip(
+                tbl.column("_source_id").to_pylist(),
+                tbl.column("TARGETID").to_pylist(),
+            )
+        }
+        assert by_sid[101] == 11
+        assert by_sid[102] == 12
+
+    def test_target_list_keeps_id_col(self, tmp_path: Path) -> None:
+        lake = self._id_lake(tmp_path)
+        ids = tmp_path / "ids.parquet"
+        pq.write_table(
+            pa.table({"TARGETID": pa.array([11, 13], type=pa.int64())}),
+            ids,
+        )
+        out = tmp_path / "subset.parquet"
+        from click.testing import CliRunner
+
+        from data_lake.export.catalog_extract import cli
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--lake-root", str(lake),
+                "--survey", "IDS",
+                "--target-list", str(ids),
+                "--target-id-col", "TARGETID",
+                "-c", "_source_id,Z",
+                "-o", str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        tbl = pq.read_table(out)
+        assert "TARGETID" in tbl.column_names
+        assert sorted(tbl.column("TARGETID").to_pylist()) == [11, 13]
 
     def test_via_crossmatch_requires_target_list(self, tmp_path: Path) -> None:
         from click.testing import CliRunner

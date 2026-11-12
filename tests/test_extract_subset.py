@@ -649,6 +649,58 @@ class TestExtractSubsetToZarr:
         assert result.exit_code != 0
         assert "not both" in result.output
 
+    def test_cli_via_crossmatch_requires_target_list(self, synthetic_lake: Path) -> None:
+        from click.testing import CliRunner
+
+        from data_lake.export.spectra_subset import cli
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--survey", SURVEY,
+                "--via-crossmatch", "A_x_B__r1.0",
+                "--where", "SPECTYPE = 'STAR'",
+                "--lake-root", str(synthetic_lake),
+                "--output", str(synthetic_lake / "via.zarr"),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--via-crossmatch" in result.output
+
+    def test_cli_target_list_writes_id_sidecar(self, synthetic_lake: Path) -> None:
+        """--target-id-col values are written beside the extract for join-back."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from click.testing import CliRunner
+
+        from data_lake.export.spectra_subset import cli
+        from data_lake.export.target_id_bridge import target_id_sidecar_path
+
+        ids = synthetic_lake / "tid_list.parquet"
+        pq.write_table(
+            pa.table({"TARGETID": pa.array([101, 103], type=pa.int64())}),
+            ids,
+        )
+        out = synthetic_lake / "with_tid.zarr"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--survey", SURVEY,
+                "--target-list", str(ids),
+                "--target-id-col", "TARGETID",
+                "--lake-root", str(synthetic_lake),
+                "--output", str(out),
+                "--no-progress",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        side = target_id_sidecar_path(out)
+        assert side.is_file()
+        bridge = pq.read_table(side)
+        assert "TARGETID" in bridge.column_names
+        assert "_source_id" in bridge.column_names
+        assert sorted(bridge.column("TARGETID").to_pylist()) == [101, 103]
+
     def test_cli_where_limit(self, synthetic_lake: Path) -> None:
         from click.testing import CliRunner
 

@@ -282,18 +282,18 @@ def resolve_via_crossmatch_root(lake_root: Path | str, spec: str) -> Path:
     raise FileNotFoundError(f"No crossmatch tree for --via-crossmatch={spec!r}.{hint}")
 
 
-def map_ids_via_crossmatch(
+def map_id_pairs_via_crossmatch(
     lake_root: Path | str,
     via_crossmatch: str,
     *,
     extract_survey: str,
     source_ids: np.ndarray,
-) -> np.ndarray:
-    """Map partner-side ``_source_id`` values through a crossmatch to *extract_survey* IDs.
+) -> pa.Table:
+    """Map partner-side IDs through a crossmatch to extract-survey ID pairs.
 
     ``source_ids`` belong to the tree side that is *not* ``extract_survey``.
-    Returns unique ``_source_id`` values for ``extract_survey`` (``source_id_a`` or
-    ``source_id_b`` depending on which side ``extract_survey`` is).
+    Returns an Arrow table with ``partner_id`` and ``extract_id`` (one row per
+    match; not uniqued).  Empty when there are no hits.
     """
     from data_lake.io.crossmatch import (
         load_crossmatch_info,
@@ -302,8 +302,12 @@ def map_ids_via_crossmatch(
     )
 
     ids = np.unique(np.asarray(source_ids, dtype=np.int64).ravel())
+    empty = pa.table({
+        "partner_id": pa.array([], type=pa.int64()),
+        "extract_id": pa.array([], type=pa.int64()),
+    })
     if ids.size == 0:
-        return ids
+        return empty
 
     xm_root = resolve_via_crossmatch_root(lake_root, via_crossmatch)
     info = load_crossmatch_info(xm_root)
@@ -341,28 +345,88 @@ def map_ids_via_crossmatch(
     try:
         files = [str(p.resolve()) for p in tiles]
         sql = (
-            f"SELECT DISTINCT {_sql_ident(to_col)} AS id "
+            f"SELECT {_sql_ident(from_col)} AS partner_id, "
+            f"{_sql_ident(to_col)} AS extract_id "
             f"FROM read_parquet($files, hive_partitioning=false) "
             f"WHERE {_sql_ident(from_col)} IN "
             f"(SELECT id FROM {_TARGET_IDS_RELATION})"
         )
-        rows = con.execute(sql, {"files": files}).fetchnumpy()
+        pairs = con.execute(sql, {"files": files}).to_arrow_table()
     finally:
         con.close()
 
-    if not rows:
-        mapped = np.asarray([], dtype=np.int64)
-    else:
-        mapped = np.unique(np.asarray(next(iter(rows.values())), dtype=np.int64))
-    log.info(
-        "Via crossmatch %s: %d %s id(s) → %d %s id(s)",
-        xm_root.name,
-        int(ids.size),
-        partner,
-        int(mapped.size),
-        extract_survey,
+    n_partner = int(ids.size)
+    n_extract = (
+        0
+        if pairs.num_rows == 0
+        else int(np.unique(np.asarray(pairs.column("extract_id"), dtype=np.int64)).size)
     )
-    return mapped
+    log.info(
+        "Via crossmatch %s: %d %s id(s) → %d %s id(s) (%d pair(s))",
+        xm_root.name,
+        n_partner,
+        partner,
+        n_extract,
+        extract_survey,
+        int(pairs.num_rows),
+    )
+    return pairs
+
+
+def map_ids_via_crossmatch(
+    lake_root: Path | str,
+    via_crossmatch: str,
+    *,
+    extract_survey: str,
+    source_ids: np.ndarray,
+) -> np.ndarray:
+    """Map partner-side ``_source_id`` values through a crossmatch to *extract_survey* IDs.
+
+    ``source_ids`` belong to the tree side that is *not* ``extract_survey``.
+    Returns unique ``_source_id`` values for ``extract_survey`` (``source_id_a`` or
+    ``source_id_b`` depending on which side ``extract_survey`` is).
+    """
+    pairs = map_id_pairs_via_crossmatch(
+        lake_root,
+        via_crossmatch,
+        extract_survey=extract_survey,
+        source_ids=source_ids,
+    )
+    if pairs.num_rows == 0:
+        return np.asarray([], dtype=np.int64)
+    return np.unique(np.asarray(pairs.column("extract_id"), dtype=np.int64))
+
+
+def apply_via_crossmatch_ids(
+    lake_root: Path | str,
+    via_crossmatch: str | None,
+    *,
+    extract_survey: str,
+    source_ids: np.ndarray,
+    target_list: Path | None,
+) -> np.ndarray:
+    """CLI helper: optionally map *source_ids* through ``--via-crossmatch``.
+
+    Raises ``ValueError`` when ``via_crossmatch`` is set without ``target_list``.
+    """
+    if via_crossmatch is None:
+        return np.asarray(source_ids, dtype=np.int64)
+    if target_list is None:
+        raise ValueError("--via-crossmatch requires --target-list.")
+    return map_ids_via_crossmatch(
+        lake_root,
+        via_crossmatch,
+        extract_survey=extract_survey,
+        source_ids=source_ids,
+    )
+
+
+VIA_CROSSMATCH_HELP = (
+    "Existing crossmatch tree name under crossmatch/ (or absolute path). "
+    "With --target-list, map partner-side IDs through the tree to --survey "
+    "_source_id values, then extract. --survey must be survey_a or survey_b "
+    "of the tree."
+)
 
 
 def _prepare_source_id_filter(
@@ -2333,32 +2397,28 @@ def cli(
             raise click.ClickException(str(exc)) from exc
 
     source_ids = None
+    target_bridge = None
     if target_list is not None:
-        from data_lake.export.spectra_subset import _read_target_ids
+        from data_lake.export.target_id_bridge import resolve_target_bridge
 
         try:
-            loaded = _read_target_ids(target_list, target_id_col)
-        except (ValueError, KeyError, OSError) as exc:
+            source_ids, target_bridge = resolve_target_bridge(
+                target_list,
+                target_id_col,
+                lake_root=lake_root,
+                via_crossmatch=via_crossmatch,
+                extract_survey=survey,
+            )
+        except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
             raise click.ClickException(str(exc)) from exc
-        source_ids = np.unique(np.asarray(loaded, dtype=np.int64))
         log.info(
-            "Loaded %d source ID(s) (%d unique) from %s (column=%s).",
-            int(np.asarray(loaded).size),
-            int(source_ids.size),
+            "Loaded target-list %s (column=%s): %d extract id(s), "
+            "bridge %d row(s).",
             target_list,
             target_id_col,
+            int(np.asarray(source_ids).size),
+            int(target_bridge.num_rows),
         )
-        if via_crossmatch is not None:
-            assert survey is not None and lake_root is not None
-            try:
-                source_ids = map_ids_via_crossmatch(
-                    lake_root,
-                    via_crossmatch,
-                    extract_survey=survey,
-                    source_ids=source_ids,
-                )
-            except (FileNotFoundError, ValueError, OSError) as exc:
-                raise click.ClickException(str(exc)) from exc
 
     fmt: OutputFormat | None = (
         output_format.lower()  # type: ignore[assignment]
@@ -2391,11 +2451,42 @@ def cli(
         source_ids=source_ids,
     )
 
+    n_rows_echo: int | None = None
+    n_cols_echo: int | None = None
+    if target_bridge is not None and target_bridge.num_rows > 0:
+        from data_lake.export.target_id_bridge import apply_bridge_to_catalog_file
+
+        via = via_crossmatch is not None
+        if output is not None and Path(output).is_file():
+            try:
+                _dest, n_rows_echo, n_cols_echo = apply_bridge_to_catalog_file(
+                    Path(output),
+                    target_bridge,
+                    via_crossmatch=via,
+                    output_format=fmt,
+                )
+                click.echo(
+                    f"  attached target-id column(s) from {target_list.name}"
+                )
+            except (ValueError, OSError) as exc:
+                raise click.ClickException(str(exc)) from exc
+        elif output_dir is not None:
+            import pyarrow.parquet as _pq
+
+            side = Path(output_dir) / "target_ids.parquet"
+            side.parent.mkdir(parents=True, exist_ok=True)
+            _pq.write_table(
+                target_bridge, str(side), compression="zstd", compression_level=3,
+            )
+            click.echo(f"  target-id bridge → {side}")
+
     if isinstance(result, ExtractResult):
         dest = result.output_dir or result.output
         extra = f", {result.n_tiles} tile(s)" if result.n_tiles else ""
+        rows = n_rows_echo if n_rows_echo is not None else result.n_rows
+        ncols = n_cols_echo if n_cols_echo is not None else len(result.column_names)
         click.echo(
-            f"Wrote {result.n_rows} row(s), {len(result.column_names)} column(s)"
+            f"Wrote {rows} row(s), {ncols} column(s)"
             f"{extra} → {dest}"
         )
         if lake_root is not None and survey and not no_homogenize_provenance:

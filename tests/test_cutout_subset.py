@@ -392,3 +392,17 @@ class TestExtractCutoutSubsetCli:
         ])
         assert result.exit_code != 0
         assert "not both" in result.output
+
+    def test_via_crossmatch_requires_target_list(self, cutout_lake: Path) -> None:
+        from click.testing import CliRunner
+        from data_lake.export.cutout_subset import cli
+
+        result = CliRunner().invoke(cli, [
+            "--survey", SURVEY,
+            "--via-crossmatch", "A_x_B__r1.0",
+            "--where", "TARGETID > 0",
+            "--output", str(cutout_lake / "via.zarr"),
+            "--lake-root", str(cutout_lake),
+        ])
+        assert result.exit_code != 0
+        assert "--via-crossmatch" in result.output

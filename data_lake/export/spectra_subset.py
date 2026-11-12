@@ -84,14 +84,22 @@ def _try_numeric_id_array(column) -> np.ndarray | None:
         return None
 
 
-def _read_target_ids(path: Path, column: str) -> np.ndarray:
-    """Read a 1-D int64 array of target IDs from a variety of file formats.
+def read_target_list_table(
+    path: Path,
+    column: str,
+) -> tuple[np.ndarray, "pa.Table"]:
+    """Read ``--target-list`` identity columns plus resolved lake join IDs.
 
-    *column* may be a single name or a comma-separated composite spec matching
-    catalog / DESI ``--link-id-col`` (e.g. ``TARGETID,SURVEY,PROGRAM``).
-    Uses :func:`~data_lake.ingest.fits_to_parquet.resolve_link_object_ids` so
-    the hash is identical to catalog and spectra ingest.
+    Returns
+    -------
+    resolved_ids:
+        int64 lake ``_source_id`` values (one per input row; not uniqued).
+    identity:
+        Arrow table of the ``--target-id-col`` component columns (same row
+        order).  Used so extract outputs can be matched back to the file.
     """
+    import pyarrow as pa
+
     from data_lake.ingest.fits_to_parquet import (
         parse_link_id_column_spec,
         resolve_link_object_ids,
@@ -103,16 +111,16 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
 
     suffix = path.suffix.lower()
 
-    # Plain text: one int per line (composite specs are not supported)
     if suffix in {".txt", ".lst", ".list"}:
         if len(parts) > 1:
             raise ValueError(
                 f"Plain-text target lists cannot use composite --target-id-col "
                 f"{column!r}; use FITS/CSV/Parquet with the component columns."
             )
-        return np.loadtxt(str(path), dtype=np.int64, ndmin=1)
+        ids = np.loadtxt(str(path), dtype=np.int64, ndmin=1)
+        identity = pa.table({parts[0]: pa.array(ids, type=pa.int64())})
+        return ids, identity
 
-    # Parquet
     if suffix in {".parquet", ".pq"}:
         import pyarrow.parquet as pq
 
@@ -124,14 +132,14 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
                 f"Available columns: {tbl.column_names[:20]}"
                 f"{'…' if len(tbl.column_names) > 20 else ''}"
             )
+        identity = tbl.select(parts)
         if len(parts) == 1:
-            fast = _try_numeric_id_array(tbl.column(parts[0]))
+            fast = _try_numeric_id_array(identity.column(parts[0]))
             if fast is not None:
-                return fast
-        cols = {p: tbl.column(p).to_pylist() for p in parts}
-        return resolve_link_object_ids(column, cols, context=path.name)
+                return fast, identity
+        cols = {p: identity.column(p).to_pylist() for p in parts}
+        return resolve_link_object_ids(column, cols, context=path.name), identity
 
-    # CSV / TSV / FITS / VOTable / IPAC – let astropy figure it out
     from astropy.table import Table
 
     tbl = Table.read(str(path))
@@ -143,16 +151,35 @@ def _read_target_ids(path: Path, column: str) -> np.ndarray:
             f"Column(s) {missing} not in {path.name} "
             f"(spec={column!r}). Available columns: {preview}{ellipsis}"
         )
-    if len(parts) == 1:
-        col = tbl[parts[0]]
+    arrays: dict[str, pa.Array] = {}
+    for p in parts:
+        col = tbl[p]
         try:
-            fast = np.asarray(col, dtype=np.int64).ravel()
-            if fast.size == len(col):
-                return fast
+            arrays[p] = pa.array(np.asarray(col))
+        except (TypeError, ValueError):
+            arrays[p] = pa.array(list(col))
+    identity = pa.table(arrays)
+    if len(parts) == 1:
+        try:
+            fast = np.asarray(tbl[parts[0]], dtype=np.int64).ravel()
+            if fast.size == len(tbl):
+                return fast, identity
         except (TypeError, ValueError, OverflowError):
             pass
     cols = {p: list(tbl[p]) for p in parts}
-    return resolve_link_object_ids(column, cols, context=path.name)
+    return resolve_link_object_ids(column, cols, context=path.name), identity
+
+
+def _read_target_ids(path: Path, column: str) -> np.ndarray:
+    """Read a 1-D int64 array of target IDs from a variety of file formats.
+
+    *column* may be a single name or a comma-separated composite spec matching
+    catalog / DESI ``--link-id-col`` (e.g. ``TARGETID,SURVEY,PROGRAM``).
+    Uses :func:`~data_lake.ingest.fits_to_parquet.resolve_link_object_ids` so
+    the hash is identical to catalog and spectra ingest.
+    """
+    ids, _identity = read_target_list_table(path, column)
+    return ids
 
 
 def _validate_output_path(
@@ -242,7 +269,17 @@ try:
         help=(
             "Column carrying source IDs, or a comma-separated composite matching "
             "catalog/DESI --link-id-col (e.g. TARGETID,SURVEY,PROGRAM). "
+            "With --via-crossmatch, this is the *partner* survey link-id. "
             "Ignored for plain-text files."
+        ),
+    )
+    @click.option(
+        "--via-crossmatch",
+        default=None,
+        help=(
+            "Existing crossmatch tree name under crossmatch/ (or absolute path). "
+            "Maps partner-side --target-list IDs to --survey _source_id, then "
+            "extracts spectra. Requires --target-list."
         ),
     )
     @click.option(
@@ -337,6 +374,7 @@ try:
         where_sql: str | None,
         row_limit: int | None,
         target_id_col: str,
+        via_crossmatch: str | None,
         output_format: str,
         output_path: Path,
         fits_layout: str,
@@ -416,6 +454,10 @@ try:
             raise click.UsageError("Use --target-list or --where, not both.")
         if target_list is None and not where_sql:
             raise click.UsageError("Pass --target-list or --where.")
+        if via_crossmatch is not None and target_list is None:
+            raise click.UsageError("--via-crossmatch requires --target-list.")
+        if via_crossmatch is not None and where_sql:
+            raise click.UsageError("Use --via-crossmatch with --target-list, not --where.")
         if where_sql and not with_catalog:
             raise click.UsageError(
                 "--where requires the survey catalog (do not pass --no-with-catalog)."
@@ -442,18 +484,32 @@ try:
                         survey_name,
                     )
 
+            target_bridge = None
             try:
-                source_ids = load_extract_source_ids(
-                    catalog_accessor=catalog_accessor,
-                    target_list=target_list,
-                    target_id_col=target_id_col,
-                    where_sql=where_sql,
-                    row_limit=row_limit,
-                    index_column=SPECTRUM_INDEX_COLUMN,
-                    read_target_ids=_read_target_ids,
-                )
-            except ValueError as exc:
-                raise click.UsageError(str(exc)) from exc
+                if target_list is not None:
+                    from data_lake.export.target_id_bridge import resolve_target_bridge
+
+                    source_ids, target_bridge = resolve_target_bridge(
+                        target_list,
+                        target_id_col,
+                        lake_root=lake_root,
+                        via_crossmatch=via_crossmatch,
+                        extract_survey=survey_name,
+                    )
+                    if row_limit is not None:
+                        source_ids = np.asarray(source_ids, dtype=np.int64)[: int(row_limit)]
+                else:
+                    source_ids = load_extract_source_ids(
+                        catalog_accessor=catalog_accessor,
+                        target_list=None,
+                        target_id_col=target_id_col,
+                        where_sql=where_sql,
+                        row_limit=row_limit,
+                        index_column=SPECTRUM_INDEX_COLUMN,
+                        read_target_ids=_read_target_ids,
+                    )
+            except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+                raise click.ClickException(str(exc)) from exc
             n_unique = int(np.unique(source_ids).size)
             if where_sql:
                 log.info(
@@ -509,6 +565,11 @@ try:
             if calibration is not None and not no_calibration_sidecar:
                 sidecar = write_calibration_sidecar(out, calibration)
                 click.echo(f"  calibration → {sidecar}")
+            if target_bridge is not None and target_bridge.num_rows > 0:
+                from data_lake.export.target_id_bridge import write_target_id_sidecar
+
+                tid_side = write_target_id_sidecar(out, target_bridge)
+                click.echo(f"  target-id bridge → {tid_side}")
             fmt_label = f"{fmt}" + (f", {layout}" if fmt == "fits" else "")
             click.echo(
                 f"Wrote {result['n_written']}/{result['n_requested']} spectra "

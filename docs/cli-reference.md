@@ -59,9 +59,9 @@ All commands that read from or write to a lake honour `--config PATH` (or `$DATA
 
 | Command | Purpose |
 |---------|---------|
-| `dl-extract-spectra-subset` | Export a curated ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / Parquet / HDF5 / FITS; progress on by default (`--no-progress` to disable) |
-| `dl-extract-cutout-subset` | Export a curated cutout ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / per-source FITS (with full WCS) / HDF5; `--format zarr\|fits\|hdf5`, `--target-id-col` supports composite specs |
-| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; lake survey via `--survey NAME` (not a positional); `--all-columns` for full schema; `--where` / `--limit`; `--via-crossmatch TREE` maps a partner `--target-list` through an existing crossmatch then extracts; then spectra/cutouts via `_source_id` ([example](export-and-sharing.md#catalog-by-survey-name-then-spectra--cutouts)) |
+| `dl-extract-spectra-subset` | Export a curated ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / Parquet / HDF5 / FITS; `--via-crossmatch TREE` maps a partner `--target-list` through an existing crossmatch; writes `<output>.target_ids.parquet` with `--target-id-col` for join-back; progress on by default (`--no-progress` to disable) |
+| `dl-extract-cutout-subset` | Export a curated cutout ID list **or** `--where` / `--limit` catalog predicate → flat Zarr / per-source FITS (with full WCS) / HDF5; `--via-crossmatch TREE` as for spectra; same target-id sidecar; `--format zarr\|fits\|hdf5`, `--target-id-col` supports composite specs |
+| `dl-extract-catalog` | Project catalog columns → Parquet / CSV / FITS / VOTable; lake survey via `--survey NAME` (not a positional); `--all-columns` for full schema; `--where` / `--limit`; `--via-crossmatch TREE` maps a partner `--target-list` through an existing crossmatch then extracts (merges `--target-id-col` into the file); then spectra/cutouts via `_source_id` ([example](export-and-sharing.md#catalog-by-survey-name-then-spectra--cutouts)) |
 | `dl-extract-spplate-catalog` | Build a specObj-style catalog from spPlate files; `--where` / `--limit` on plugmap columns |
 | `dl-pack-tile` | Package one HEALPix tile as a `.tar` for sharing |
 

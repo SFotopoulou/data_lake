@@ -36,13 +36,28 @@ dl-extract-cutout-subset --survey DESI_DR1 \
   --target-list /scratch/desi_stars.parquet --target-id-col _source_id \
   --output /scratch/desi_stars_cutouts.zarr
 
-# 2b. Partner survey columns in one go (existing crossmatch tree)
-# --survey = catalog to extract; --target-list IDs are the *other* side of the tree
+# 2b. Partner survey in one go (existing crossmatch tree)
+# --survey = modality/catalog to extract; --target-list IDs are the *other* side
 dl-extract-catalog --survey Legacy_DR11_north \
   --via-crossmatch DESI_DR1_x_Legacy_DR11_north__r1.0 \
   --target-list DESI-subset.fits --target-id-col TARGETID,SURVEY,PROGRAM \
   -c _source_id,ra,dec,type,flux_g,flux_r,flux_z \
   -o /scratch/legacy_for_desi_subset.parquet
+
+# Same flag on spectra / cutout extract (partner must have that modality)
+dl-extract-cutout-subset --survey Legacy_DR11_north \
+  --via-crossmatch DESI_DR1_x_Legacy_DR11_north__r1.0 \
+  --target-list DESI-subset.fits --target-id-col TARGETID,SURVEY,PROGRAM \
+  --output /scratch/legacy_cutouts_for_desi.zarr
+
+dl-extract-spectra-subset --survey EUCLID_DR1 \
+  --via-crossmatch DESI_DR1_x_EUCLID_DR1__r1.0 \
+  --target-list DESI-subset.fits --target-id-col TARGETID,SURVEY,PROGRAM \
+  --output /scratch/euclid_spectra_for_desi.zarr
+
+# --target-id-col columns are kept for join-back to the target-list:
+# catalog extract merges them into the output table; spectra/cutout write
+# <output>.target_ids.parquet (_source_id + TARGETID / SURVEY / PROGRAM / …).
 
 # 2c. Partner modalities after a manual ID map (same as before)
 dl-extract-catalog --survey EUCLID_DR1 \

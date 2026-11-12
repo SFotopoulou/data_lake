@@ -77,7 +77,17 @@ try:
         help=(
             "Column carrying source IDs in --target-list, or a comma-separated "
             "composite matching catalog --link-id-col "
-            "(e.g. TARGETID,SURVEY,PROGRAM). Ignored for plain-text files."
+            "(e.g. TARGETID,SURVEY,PROGRAM). With --via-crossmatch, this is the "
+            "*partner* survey link-id. Ignored for plain-text files."
+        ),
+    )
+    @click.option(
+        "--via-crossmatch",
+        default=None,
+        help=(
+            "Existing crossmatch tree name under crossmatch/ (or absolute path). "
+            "Maps partner-side --target-list IDs to --survey _source_id, then "
+            "extracts cutouts. Requires --target-list."
         ),
     )
     @click.option(
@@ -134,6 +144,7 @@ try:
         where_sql: str | None,
         row_limit: int | None,
         target_id_col: str,
+        via_crossmatch: str | None,
         output_format: str,
         output_path: Path,
         fits_filename_template: str,
@@ -181,6 +192,10 @@ try:
             raise click.UsageError("Use --target-list or --where, not both.")
         if target_list is None and not where_sql:
             raise click.UsageError("Pass --target-list or --where.")
+        if via_crossmatch is not None and target_list is None:
+            raise click.UsageError("--via-crossmatch requires --target-list.")
+        if via_crossmatch is not None and where_sql:
+            raise click.UsageError("Use --via-crossmatch with --target-list, not --where.")
         if where_sql and not with_catalog:
             raise click.UsageError(
                 "--where requires the survey catalog (do not pass --no-with-catalog)."
@@ -214,18 +229,36 @@ try:
             with CutoutAccessor(
                 lake_root, survey_name, catalog_accessor=catalog_accessor,
             ) as acc:
+                target_bridge = None
                 try:
-                    source_ids_raw = load_extract_source_ids(
-                        catalog_accessor=catalog_accessor,
-                        target_list=target_list,
-                        target_id_col=target_id_col,
-                        where_sql=where_sql,
-                        row_limit=row_limit,
-                        index_column=CUTOUT_INDEX_COLUMN,
-                        read_target_ids=_read_target_ids,
-                    )
-                except ValueError as exc:
-                    raise click.UsageError(str(exc)) from exc
+                    if target_list is not None:
+                        from data_lake.export.target_id_bridge import resolve_target_bridge
+
+                        source_ids_raw, target_bridge = resolve_target_bridge(
+                            target_list,
+                            target_id_col,
+                            lake_root=lake_root,
+                            via_crossmatch=via_crossmatch,
+                            extract_survey=survey_name,
+                        )
+                        if row_limit is not None:
+                            import numpy as np
+
+                            source_ids_raw = np.asarray(
+                                source_ids_raw, dtype=np.int64
+                            )[: int(row_limit)]
+                    else:
+                        source_ids_raw = load_extract_source_ids(
+                            catalog_accessor=catalog_accessor,
+                            target_list=None,
+                            target_id_col=target_id_col,
+                            where_sql=where_sql,
+                            row_limit=row_limit,
+                            index_column=CUTOUT_INDEX_COLUMN,
+                            read_target_ids=_read_target_ids,
+                        )
+                except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+                    raise click.ClickException(str(exc)) from exc
                 source_ids = source_ids_raw.tolist()
                 if where_sql:
                     click.echo(f"Selected {len(source_ids):,} source IDs via --where")
@@ -284,6 +317,12 @@ try:
                         f"Wrote {result['n_written']:,} cutout(s) → {output_path} "
                         f"(skipped {len(result['missing_ids'])} missing)."
                     )
+
+                if target_bridge is not None and target_bridge.num_rows > 0:
+                    from data_lake.export.target_id_bridge import write_target_id_sidecar
+
+                    tid_side = write_target_id_sidecar(output_path, target_bridge)
+                    click.echo(f"  target-id bridge → {tid_side}")
 
                 if result.get("missing_ids") and missing == "skip":
                     click.echo(
